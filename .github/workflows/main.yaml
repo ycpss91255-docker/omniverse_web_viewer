@@ -22,6 +22,7 @@ jobs:
     with:
       image_name: omniverse_web_viewer
       submodules: recursive
+      build_runtime: false
 
   call-release:
     needs: call-docker-build
