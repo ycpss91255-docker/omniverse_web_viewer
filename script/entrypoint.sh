@@ -6,4 +6,12 @@
 # devel stage (refs #364 + #368).
 . /usr/local/lib/base/_entrypoint_logging.sh
 
+for js in /app/dist/assets/*.js; do
+  [ -f "${js}" ] || continue
+  sed -i \
+    -e "s|__OWV_SERVER__|${SIGNALING_SERVER:-127.0.0.1}|g" \
+    -e "s|\"__OWV_PORT__\"|${SIGNALING_PORT:-49100}|g" \
+    "${js}"
+done
+
 exec "${@}"

@@ -19,3 +19,22 @@ setup() {
 @test "bash is available on PATH" {
   assert_cmd_installed bash
 }
+
+@test "SIGNALING_SERVER env defaults to 127.0.0.1" {
+  assert [ "${SIGNALING_SERVER}" = "127.0.0.1" ]
+}
+
+@test "SIGNALING_PORT env defaults to 49100" {
+  assert [ "${SIGNALING_PORT}" = "49100" ]
+}
+
+@test "SERVE_PORT env defaults to 5173" {
+  assert [ "${SERVE_PORT}" = "5173" ]
+}
+
+@test "built JS contains OWV placeholders" {
+  run grep -r "__OWV_SERVER__" /app/dist/assets/
+  assert_success
+  run grep -r "__OWV_PORT__" /app/dist/assets/
+  assert_success
+}

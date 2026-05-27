@@ -25,48 +25,57 @@ The viewer is a static React app served by `serve`. Browser JS connects directly
 ## Quick Start
 
 ```bash
-# 1. Configure host IP + ports
-./script/setup.sh set build.arg_4 "SIGNALING_SERVER=<host-ip>"
-./script/setup.sh set build.arg_5 "SIGNALING_PORT=49100"
-./script/setup.sh set build.arg_6 "SERVE_PORT=5173"
-./script/setup.sh apply
-
-# 2. Build + run
+# 1. Build (one-time)
 make build
+
+# 2. Run (default: 127.0.0.1:49100, serve on 5173)
 make run -- -d
 
 # 3. Open Chrome -> http://<host-ip>:5173
 #    Select "UI for any streaming app" -> Next
 ```
 
-## Build args
+To override the default host IP or ports, edit `config/docker/setup.conf`:
 
-| Arg | Default | Purpose |
-|-----|---------|---------|
-| `SIGNALING_SERVER` | `127.0.0.1` | Host IP for WebRTC signaling (baked into `stream.config.json` at build time) |
+```ini
+[environment]
+SIGNALING_SERVER = <host-ip>
+SIGNALING_PORT = 49100
+SERVE_PORT = 5173
+```
+
+Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SIGNALING_SERVER` | `127.0.0.1` | Host IP for WebRTC signaling |
 | `SIGNALING_PORT` | `49100` | WebRTC signaling port (must match Kit app's `--/app/livestream/port`) |
 | `SERVE_PORT` | `5173` | Port the static file server listens on |
 
-All three are baked at build time via Vite. Changing any value requires `make build`.
+All three are injected at container startup via entrypoint — no rebuild needed when changing values.
 
 ## Multi-instance
 
-For monitoring multiple Isaac Sim instances, build separate images with different ports:
+One build, multiple containers with different ports:
 
 ```bash
-# Instance A: signal=49100, viewer=5173
-./script/setup.sh set build.arg_4 "SIGNALING_SERVER=10.2.23.83"
-./script/setup.sh set build.arg_5 "SIGNALING_PORT=49100"
-./script/setup.sh set build.arg_6 "SERVE_PORT=5173"
-make build
-make run -- -d
+make build  # one-time
 
-# Instance B: clone the repo or use docker build directly
-docker build --build-arg SIGNALING_SERVER=10.2.23.83 \
-  --build-arg SIGNALING_PORT=49200 \
-  --build-arg SERVE_PORT=5174 \
-  -t omniverse_web_viewer:b .
-docker run --rm -d --name owv-b --network=host omniverse_web_viewer:b
+# Instance A
+docker run --rm -d --name owv-a --network=host \
+  -e SIGNALING_SERVER=10.2.23.83 \
+  -e SIGNALING_PORT=49100 \
+  -e SERVE_PORT=5173 \
+  omniverse_web_viewer:devel
+
+# Instance B
+docker run --rm -d --name owv-b --network=host \
+  -e SIGNALING_SERVER=10.2.23.83 \
+  -e SIGNALING_PORT=49200 \
+  -e SERVE_PORT=5174 \
+  omniverse_web_viewer:devel
 ```
 
 ## Compatibility
@@ -82,7 +91,6 @@ docker run --rm -d --name owv-b --network=host omniverse_web_viewer:b
 
 - One interactive client per Kit instance (second connection rejected)
 - Firefox incompatible — must use Chrome/Chromium
-- `stream.config.json` server IP baked at build time (not runtime configurable)
 
 ## Smoke Tests
 
