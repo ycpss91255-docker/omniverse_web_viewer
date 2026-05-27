@@ -75,6 +75,8 @@ ARG CONFIG_DIR="/tmp/config"
 ARG SETUP_DIR="/tmp/setup"
 ARG CONFIG_SRC="config"
 ARG SIGNALING_SERVER="127.0.0.1"
+ARG SIGNALING_PORT="49100"
+ARG SERVE_PORT="5173"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
 COPY --chmod=0755 .base/script/docker/_entrypoint_logging.sh /usr/local/lib/base/_entrypoint_logging.sh
@@ -99,12 +101,15 @@ RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
 RUN sed -i "s|\"server\":.*|\"server\": \"${SIGNALING_SERVER}\",|" stream.config.json && \
+    sed -i "s|\"signalingPort\":.*|\"signalingPort\": ${SIGNALING_PORT},|" stream.config.json && \
     npm run build
 
 WORKDIR "${HOME}/work"
 
+ENV SERVE_PORT="${SERVE_PORT}"
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["serve", "-s", "/app/dist", "-l", "5173"]
+CMD ["sh", "-c", "serve -s /app/dist -l ${SERVE_PORT}"]
 
 ############################## devel-test ##############################
 FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
