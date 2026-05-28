@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Entrypoint reads `/etc/host.yaml` (when mounted) for `network.public_ip` → overrides `SIGNALING_SERVER`. Single source of truth across containers reading the same yaml (closes #11, aligns with ycpss91255-docker/isaac#65). Precedence: yaml > env var > `127.0.0.1` default.
 - `serve` Dockerfile stage — profile-gated extras stage for detached server use. Base template auto-emits with `tty: false` / `stdin_open: false`, avoiding the `/dev/pts` permission error that the `devel` service's `tty: true` triggers under `privileged: false`. Usage: `make run -- -t serve -d` (closes #9).
 
 ### Fixed

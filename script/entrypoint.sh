@@ -6,6 +6,16 @@
 # devel stage (refs #364 + #368).
 . /usr/local/lib/base/_entrypoint_logging.sh
 
+# Per-host config (mounted by caller from config/host.yaml). When
+# present, network.public_ip overrides the SIGNALING_SERVER env var —
+# keeps a single source of truth for the host IP across all containers
+# that read the same yaml (e.g. ycpss91255-docker/isaac#65).
+if [ -f /etc/host.yaml ]; then
+  HOST_IP=$(awk -F': *' '/^[[:space:]]*public_ip:/{gsub(/"/,""); print $2}' \
+    /etc/host.yaml 2>/dev/null || true)
+  [ -n "${HOST_IP}" ] && SIGNALING_SERVER="${HOST_IP}"
+fi
+
 for js in /app/dist/assets/*.js; do
   [ -f "${js}" ] || continue
   sed -i \
