@@ -110,6 +110,14 @@ ENV SERVE_PORT="5173"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "serve -s /app/dist -l ${SERVE_PORT}"]
 
+############################## serve ##############################
+# Profile-gated extra stage for detached server use. Base template
+# auto-emits this as a compose service with stdin_open: false /
+# tty: false, avoiding the /dev/pts permission issue that the
+# devel service's tty: true triggers under privileged: false.
+# Usage: make run -- -t serve -d. Closes #9.
+FROM devel AS serve
+
 ############################## devel-test ##############################
 FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
 
