@@ -11,14 +11,14 @@ Browser (Chrome/Chromium)
   -> http://<host-ip>:<SERVE_PORT>       (このコンテナ — 静的 React アプリ)
   -> ws://<host-ip>:<SIGNALING_PORT>     (ブラウザ JS -> Isaac Sim WebRTC シグナリング)
   -> udp://<host-ip>:<MEDIA_PORT>        (WebRTC メディアストリーム)
-  -> Omniverse Kit streaming app         (例: Isaac Sim headless-stream)
+  -> Omniverse Kit streaming app         (例: Isaac Sim stream)
 ```
 
 ビューアは `serve` で配信される静的 React アプリです。ブラウザの JS が Kit アプリの WebRTC シグナリング/メディアポートに直接接続します。このコンテナに GPU は不要です。
 
 ## 前提条件
 
-- NVCF ライブストリームが有効な状態で動作している Omniverse Kit アプリケーション（例: Isaac Sim `headless-stream` ステージ）
+- NVCF ライブストリームが有効な状態で動作している Omniverse Kit アプリケーション（例: Isaac Sim `stream` ステージ）
 - Chrome または Chromium（Firefox は Omniverse WebRTC と互換性がありません）
 - Docker
 

@@ -11,14 +11,14 @@ Browser (Chrome/Chromium)
   -> http://<host-ip>:<SERVE_PORT>       (本容器 — 静态 React 应用)
   -> ws://<host-ip>:<SIGNALING_PORT>     (浏览器 JS -> Isaac Sim WebRTC 信令)
   -> udp://<host-ip>:<MEDIA_PORT>        (WebRTC 媒体串流)
-  -> Omniverse Kit streaming app         (例如 Isaac Sim headless-stream)
+  -> Omniverse Kit streaming app         (例如 Isaac Sim stream)
 ```
 
 查看器是由 `serve` 提供的静态 React 应用。浏览器 JS 直接连接到 Kit 应用的 WebRTC 信令/媒体端口。本容器不需要 GPU。
 
 ## 前置条件
 
-- 已启用 NVCF livestream 的 Omniverse Kit 应用程序（例如 Isaac Sim `headless-stream` 阶段）
+- 已启用 NVCF livestream 的 Omniverse Kit 应用程序（例如 Isaac Sim `stream` 阶段）
 - Chrome 或 Chromium（Firefox 与 Omniverse WebRTC 不兼容）
 - Docker
 
