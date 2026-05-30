@@ -11,14 +11,14 @@ Browser (Chrome/Chromium)
   -> http://<host-ip>:<SERVE_PORT>       (this container — static React app)
   -> ws://<host-ip>:<SIGNALING_PORT>     (browser JS -> Isaac Sim WebRTC signaling)
   -> udp://<host-ip>:<MEDIA_PORT>        (WebRTC media stream)
-  -> Omniverse Kit streaming app         (e.g. Isaac Sim headless-stream)
+  -> Omniverse Kit streaming app         (e.g. Isaac Sim stream)
 ```
 
 The viewer is a static React app served by `serve`. Browser JS connects directly to the Kit app's WebRTC signaling/media ports. No GPU needed in this container.
 
 ## Prerequisites
 
-- An Omniverse Kit application running with NVCF livestream enabled (e.g. Isaac Sim `headless-stream` stage)
+- An Omniverse Kit application running with NVCF livestream enabled (e.g. Isaac Sim `stream` stage)
 - Chrome or Chromium (Firefox incompatible with Omniverse WebRTC)
 - Docker
 
