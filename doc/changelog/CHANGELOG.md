@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Configurable UI mode and auto-launch (closes #14). A `viewer` config (`ui_mode`, `auto_launch`) lets the client default into `stream-only` and skip the "UI Option" selection screen — needed for Isaac Sim / non-USD-Viewer Kit apps. Org-owned `overlay/` files (`App.tsx`, `stream.config.json`) are layered onto the upstream sample at build time (the `src` submodule is read-only); the entrypoint resolves the values into the built JS with precedence host.yaml `viewer:` > `VIEWER_*` env > built-in default. Documented in `config/host.yaml.example`. Defaults (`usd-viewer` / `false`) keep the stock selection-screen behavior.
 - Entrypoint reads `/etc/host.yaml` (when mounted) for `network.public_ip` → overrides `SIGNALING_SERVER`. Single source of truth across containers reading the same yaml (closes #11, aligns with ycpss91255-docker/isaac#65). Precedence: yaml > env var > `127.0.0.1` default.
 - `serve` Dockerfile stage — profile-gated extras stage for detached server use. Base template auto-emits with `tty: false` / `stdin_open: false`, avoiding the `/dev/pts` permission error that the `devel` service's `tty: true` triggers under `privileged: false`. Usage: `make run -- -t serve -d` (closes #9).
 

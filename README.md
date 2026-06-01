@@ -53,8 +53,10 @@ Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 | `SIGNALING_SERVER` | `127.0.0.1` | Host IP for WebRTC signaling |
 | `SIGNALING_PORT` | `49100` | WebRTC signaling port (must match Kit app's `--/app/livestream/port`) |
 | `SERVE_PORT` | `5173` | Port the static file server listens on |
+| `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer` (full USD Viewer UI) or `stream-only` (pure video, for Isaac Sim / non-USD-Viewer Kit apps) |
+| `VIEWER_AUTO_LAUNCH` | `false` | `true` skips the "UI Option" selection screen and boots straight into `VIEWER_UI_MODE` |
 
-All three are injected at container startup via entrypoint — no rebuild needed when changing values.
+All of these are injected at container startup via entrypoint — no rebuild needed when changing values. `VIEWER_*` can also be set via `config/host.yaml` (`viewer:` section, mounted at `/etc/host.yaml`), which takes precedence; see `config/host.yaml.example`.
 
 ## Multi-instance
 
