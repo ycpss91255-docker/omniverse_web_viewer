@@ -1,0 +1,36 @@
+# omniverse_web_viewer runtime config template.
+# ---------------------------------------------------------------------
+# Copy to config/host.yaml (gitignored, per-host) and mount it into the
+# container at /etc/host.yaml. This file is documentation only -- it is
+# NOT baked into the image. Defaults live in the entrypoint
+# (${VAR:-default}); a value here, or a VIEWER_* / SIGNALING_* env var,
+# overrides them. Precedence: host.yaml > env > built-in default.
+# ---------------------------------------------------------------------
+
+network:
+  # Address the browser uses for the WebRTC stream (ICE candidates).
+  #   127.0.0.1   -> same-machine browser only (default)
+  #   <LAN IP>    -> remote browser on same network, e.g. "192.168.50.1"
+  public_ip: "127.0.0.1"
+
+viewer:
+  # Which client UI to render once connected:
+  #   "usd-viewer"  -> full USD Viewer UI (asset selector + stage tree).
+  #                    = the "UI for default streaming USD Viewer app" radio.
+  #                    Only works with the kit-app-template USD Viewer
+  #                    protocol; a plain Kit / Isaac Sim stream stays blank
+  #                    because it does not speak that protocol.
+  #   "stream-only" -> pure video, no UI messaging.
+  #                    = the "UI for any streaming app" radio.
+  #                    Use this for Isaac Sim or any non-USD-Viewer Kit app.
+  ui_mode: "usd-viewer"
+
+  # Skip the initial "UI Option" selection screen:
+  #   false -> show the screen; pick a mode + click Next (default, = stock
+  #            NVIDIA sample behavior).
+  #   true  -> go straight in using ui_mode above, no clicks.
+  #
+  # To boot directly into "any streaming app" mode (e.g. Isaac Sim), set:
+  #   ui_mode: "stream-only"
+  #   auto_launch: true
+  auto_launch: false

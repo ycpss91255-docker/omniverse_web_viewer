@@ -97,8 +97,15 @@ WORKDIR /app
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
+# Overlay org-owned files on top of the upstream sample (src is a pinned
+# read-only submodule). stream.config.json adds a `ui` block; App.tsx reads
+# it to pick the initial form. Re-sync these on an upstream version bump.
+COPY --chown="${USER}":"${GROUP}" overlay/stream.config.json /app/stream.config.json
+COPY --chown="${USER}":"${GROUP}" overlay/App.tsx /app/src/App.tsx
 RUN sed -i 's|"server":.*|"server": "__OWV_SERVER__",|' stream.config.json && \
     sed -i 's|"signalingPort":.*|"signalingPort": "__OWV_PORT__",|' stream.config.json && \
+    sed -i 's|"mode":.*|"mode": "__OWV_UI_MODE__",|' stream.config.json && \
+    sed -i 's|"autoLaunch":.*|"autoLaunch": "__OWV_AUTOLAUNCH__"|' stream.config.json && \
     npm run build
 
 WORKDIR "${HOME}/work"
