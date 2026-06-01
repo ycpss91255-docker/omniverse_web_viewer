@@ -73,22 +73,28 @@ interface AppState {
 }
 
 class App extends Component<{}, AppState>{
+    // Raw `ui` config from stream.config.json. The entrypoint substitutes
+    // these at container start. They are kept as instance fields (assigned,
+    // never compared against the JSON literal) so the build-time sentinels
+    // survive bundling like __OWV_SERVER__ / __OWV_PORT__ — the comparisons
+    // in the constructor read `this.*`, which the bundler does not
+    // constant-fold (a direct `StreamConfig.ui.* === ...` would be folded
+    // away, dropping the sentinel and breaking the runtime substitution).
+    private _uiMode = (StreamConfig as { ui?: { mode?: string } }).ui?.mode;
+    private _autoLaunch = (StreamConfig as { ui?: { autoLaunch?: boolean } }).ui?.autoLaunch;
+
     constructor(props: {}) {
         super(props);
 
-        // Initial UI mode / launch behavior comes from stream.config.json's
-        // `ui` block, whose values the entrypoint substitutes at container
-        // start (VIEWER_* env / host.yaml viewer.*). Defaults reproduce the
-        // stock sample: the UI Option selection screen with the USD Viewer UI.
-        const ui = (StreamConfig as { ui?: { mode?: string; autoLaunch?: boolean } }).ui;
-        const useWebUI = ui?.mode !== "stream-only";
-        const initialForm = ui?.autoLaunch === true
-            ? (StreamConfig.source === "stream" ? Forms.StreamURLs : Forms.Stream)
-            : Forms.AppOnly;
-
+        // Initial UI mode / launch behavior from the `ui` config above.
+        // Defaults reproduce the stock sample: the UI Option selection
+        // screen with the USD Viewer UI. stream-only + auto_launch boots
+        // straight into the stream.
         this.state = {
-            currentForm: initialForm,
-            useWebUI: useWebUI,
+            currentForm: this._autoLaunch === true
+                ? (StreamConfig.source === "stream" ? Forms.StreamURLs : Forms.Stream)
+                : Forms.AppOnly,
+            useWebUI: this._uiMode !== "stream-only",
             streamServer: StreamConfig.stream.streamServer,
             appServer: StreamConfig.stream.appServer,
             applications: [],
