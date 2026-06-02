@@ -49,11 +49,30 @@ setup() {
   # tests in file order).
   run /entrypoint.sh true
   assert_success
+  # All four sentinels are gone after substitution.
+  run grep -r "__OWV_SERVER__" /app/dist/assets/
+  assert_failure
+  run grep -r "__OWV_PORT__" /app/dist/assets/
+  assert_failure
   run grep -r "__OWV_UI_MODE__" /app/dist/assets/
   assert_failure
   run grep -r "__OWV_AUTOLAUNCH__" /app/dist/assets/
   assert_failure
-  # Default ui_mode is usd-viewer.
-  run grep -r "usd-viewer" /app/dist/assets/
+  # Defaults are applied: server 127.0.0.1, port 49100, ui_mode usd-viewer.
+  # (Plain value greps — the minified bundle may quote object keys, so we do
+  # not anchor on the property name. The autoLaunch fold-regression is already
+  # guarded by the placeholder-presence test above.)
+  run grep -rF "127.0.0.1" /app/dist/assets/
+  assert_success
+  run grep -rF "49100" /app/dist/assets/
+  assert_success
+  run grep -rF "usd-viewer" /app/dist/assets/
   assert_success
 }
+
+# NOTE: env-override (VIEWER_* without host.yaml) and host.yaml-precedence
+# coverage is deferred to the entrypoint redesign (#17): the current
+# entrypoint mutates /app/dist in place (one-shot), so a second run with
+# different config does nothing within the same image, which makes those
+# paths untestable here. They become the red guards once #17 makes the
+# substitution re-runnable (template-render).
