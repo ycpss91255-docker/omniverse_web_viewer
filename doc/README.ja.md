@@ -95,6 +95,10 @@ docker run --rm -d --name owv-b --network=host \
 - Kit インスタンスあたりインタラクティブクライアントは 1 つのみ（2 番目の接続は拒否されます）
 - Firefox は非対応 — Chrome/Chromium を使用してください
 
+## サンプル
+
+- [`examples/embedded-site-demo`](../examples/embedded-site-demo/) — ストリーム映像を自分の Web ページに直接埋め込むサンプル（vanilla TS、ランタイム依存は 1 つだけ）。独立した stage として 8080 で動作し（`make run -- -t example -d`）、メインビューア（5173）と同時に実行できます。直接接続の統合方法と `<iframe>` の代替案は README を参照してください。
+
 ## トラブルシューティング
 
 - **画面が真っ白でエラーも出ない** — 通常は UI モードと Kit アプリの不一致です。`usd-viewer` モードは kit-app-template の USD Viewer でのみ動作します。Isaac Sim や他の Kit アプリに対しては準備完了ポーリングが完了せず、何も描画されず、エラーも表示されません。`stream-only` に切り替えてください（`VIEWER_UI_MODE=stream-only`、または `host.yaml` の `viewer.ui_mode`）。

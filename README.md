@@ -95,6 +95,10 @@ docker run --rm -d --name owv-b --network=host \
 - One interactive client per Kit instance (second connection rejected)
 - Firefox incompatible — must use Chrome/Chromium
 
+## Examples
+
+- [`examples/embedded-site-demo`](examples/embedded-site-demo/) -- embed a stream-only feed into your own page (vanilla TS, single runtime dependency). Runs as a separate stage on 8080 (`make run -- -t example -d`), alongside the main viewer on 5173. See its README for the direct-connect integration and the `<iframe>` alternative.
+
 ## Troubleshooting
 
 - **Blank screen, no error** — usually a UI-mode / Kit-app mismatch. `usd-viewer` mode only works with the kit-app-template USD Viewer; against Isaac Sim or another Kit app the readiness poll never completes and nothing renders, with no error shown. Switch to `stream-only` (`VIEWER_UI_MODE=stream-only`, or `viewer.ui_mode` in `host.yaml`).

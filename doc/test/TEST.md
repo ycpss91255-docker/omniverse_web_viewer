@@ -1,6 +1,8 @@
 # TEST.md
 
-**14 tests** total.
+**18 tests** total (bats). The example also has 10 `node --test` unit
+tests for `buildStreamConfig` (run in the `example` stage build and via
+the `example: ... node --test` bats below).
 
 ## test/smoke/omniverse_web_viewer_env.bats (14)
 
@@ -20,3 +22,16 @@
 | `non-numeric SIGNALING_PORT is rejected` | Invalid port fails the container fast (exit 1) instead of baking malformed JS |
 | `invalid VIEWER_UI_MODE is rejected` | ui_mode outside `{usd-viewer, stream-only}` fails fast (exit 1) |
 | `SIGNALING_SERVER with shell/sed metacharacters is rejected` | Charset whitelist blocks sed/JS metacharacter injection (exit 1) |
+
+## test/smoke/example_demo.bats (4)
+
+Source-contract smoke for `examples/embedded-site-demo`. The full example
+build (eslint / vite / serve-200 / sentinel templating) runs in the
+Dockerfile `example` stage.
+
+| Test | Description |
+|------|-------------|
+| `example: key files exist` | index.html / package.json / main.ts / buildStreamConfig(.js/.test.js) present |
+| `example: only runtime dependency is the streaming library` | `package.json` `dependencies` is exactly `@nvidia/omniverse-webrtc-streaming-library` |
+| `example: streamTarget.json carries both sentinels` | `__OWV_SERVER__` + `__OWV_PORT__` present for entrypoint substitution |
+| `example: buildStreamConfig unit tests pass (node --test)` | Runs the 10 `node --test` unit cases (valid / numeric-string / hostname / empty / whitespace / sentinel / metachar server / non-numeric / non-integer / out-of-range port) |
