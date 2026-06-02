@@ -53,8 +53,10 @@ SERVE_PORT = 5173
 | `SIGNALING_SERVER` | `127.0.0.1` | WebRTC シグナリング用ホスト IP |
 | `SIGNALING_PORT` | `49100` | WebRTC シグナリングポート（Kit アプリの `--/app/livestream/port` と一致させる必要があります） |
 | `SERVE_PORT` | `5173` | 静的ファイルサーバーがリッスンするポート |
+| `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer`（フル USD Viewer UI）または `stream-only`（純粋な映像ストリーム。Isaac Sim / USD Viewer 以外の Kit アプリ向け） |
+| `VIEWER_AUTO_LAUNCH` | `false` | `true` にすると「UI Option」選択画面をスキップし、`VIEWER_UI_MODE` で直接起動する |
 
-3 つとも entrypoint 経由でコンテナ起動時に注入されます。値を変更する際にリビルドは不要です。
+3 つとも entrypoint 経由でコンテナ起動時に注入されます。値を変更する際にリビルドは不要です。 `VIEWER_*` は `config/host.yaml`（`viewer:` セクション、`/etc/host.yaml` にマウント）でも設定でき、そちらが優先されます。`config/host.yaml.example` を参照。
 
 ## マルチインスタンス
 

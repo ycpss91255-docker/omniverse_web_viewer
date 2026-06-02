@@ -37,4 +37,23 @@ setup() {
   assert_success
   run grep -r "__OWV_PORT__" /app/dist/assets/
   assert_success
+  run grep -r "__OWV_UI_MODE__" /app/dist/assets/
+  assert_success
+  run grep -r "__OWV_AUTOLAUNCH__" /app/dist/assets/
+  assert_success
+}
+
+@test "entrypoint substitutes viewer placeholders with defaults" {
+  # Runs the entrypoint with a no-op command; it rewrites /app/dist in
+  # place. Must come after the placeholder-presence test above (bats runs
+  # tests in file order).
+  run /entrypoint.sh true
+  assert_success
+  run grep -r "__OWV_UI_MODE__" /app/dist/assets/
+  assert_failure
+  run grep -r "__OWV_AUTOLAUNCH__" /app/dist/assets/
+  assert_failure
+  # Default ui_mode is usd-viewer.
+  run grep -r "usd-viewer" /app/dist/assets/
+  assert_success
 }

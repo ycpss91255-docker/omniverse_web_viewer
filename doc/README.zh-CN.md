@@ -53,8 +53,10 @@ SERVE_PORT = 5173
 | `SIGNALING_SERVER` | `127.0.0.1` | WebRTC 信令的主机 IP |
 | `SIGNALING_PORT` | `49100` | WebRTC 信令端口（必须与 Kit 应用的 `--/app/livestream/port` 一致） |
 | `SERVE_PORT` | `5173` | 静态文件服务器监听的端口 |
+| `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer`（完整 USD Viewer UI）或 `stream-only`（纯画面串流，用于 Isaac Sim / 非 USD-Viewer 的 Kit app） |
+| `VIEWER_AUTO_LAUNCH` | `false` | `true` 会跳过 "UI Option" 选择界面，直接以 `VIEWER_UI_MODE` 启动 |
 
-三个变量均在容器启动时通过 entrypoint 注入 — 更改值时无需重新构建。
+三个变量均在容器启动时通过 entrypoint 注入 — 更改值时无需重新构建。 `VIEWER_*` 也可通过 `config/host.yaml`（`viewer:` 段，挂载到 `/etc/host.yaml`）设置，优先级更高；见 `config/host.yaml.example`。
 
 ## 多实例
 
