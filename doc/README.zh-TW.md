@@ -21,6 +21,7 @@ Browser (Chrome/Chromium)
 - 已啟用 NVCF livestream 的 Omniverse Kit 應用程式（例如 Isaac Sim `stream` 階段）
 - Chrome 或 Chromium（Firefox 與 Omniverse WebRTC 不相容）
 - Docker
+- 支援的 image 架構：`linux/amd64`、`linux/arm64`
 
 ## 快速開始
 
@@ -56,7 +57,7 @@ SERVE_PORT = 5173
 | `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer`（完整 USD Viewer UI）或 `stream-only`（純畫面串流，給 Isaac Sim / 非 USD-Viewer 的 Kit app） |
 | `VIEWER_AUTO_LAUNCH` | `false` | `true` 會跳過「UI Option」選單，直接以 `VIEWER_UI_MODE` 啟動 |
 
-三個變數皆在容器啟動時透過 entrypoint 注入，變更數值時無需重新建置。 `VIEWER_*` 也可透過 `config/host.yaml`（`viewer:` 段，掛載到 `/etc/host.yaml`）設定，優先序較高；見 `config/host.yaml.example`。
+`SIGNALING_SERVER` / `SIGNALING_PORT` / `VIEWER_UI_MODE` / `VIEWER_AUTO_LAUNCH` 會在容器啟動時被代入到已建置的 JS 中（變更數值時無需重新建置）。`SERVE_PORT` 不會被注入到資源中，它僅透過容器的 `CMD` 設定靜態伺服器監聽的連接埠。`VIEWER_*` 與 `SIGNALING_SERVER` 也可透過 `config/host.yaml`（`viewer:` / `network:` 段，掛載到 `/etc/host.yaml`）設定，且優先序較高；見 `config/host.yaml.example`。
 
 ## 多實例部署
 
@@ -93,6 +94,12 @@ docker run --rm -d --name owv-b --network=host \
 
 - 每個 Kit 實例僅支援一個互動式客戶端（第二個連線會被拒絕）
 - Firefox 不相容，必須使用 Chrome/Chromium
+
+## 疑難排解
+
+- **畫面空白、無錯誤訊息** — 通常是 UI 模式與 Kit 應用程式不匹配。`usd-viewer` 模式僅適用於 kit-app-template 的 USD Viewer；對 Isaac Sim 或其他 Kit 應用程式而言，就緒輪詢永遠不會完成，畫面不會渲染任何內容，也不會顯示錯誤。請切換為 `stream-only`（`VIEWER_UI_MODE=stream-only`，或 `host.yaml` 中的 `viewer.ui_mode`）。
+- **連線被拒 / 串流始終未出現** — 檢查 `SIGNALING_SERVER` / `SIGNALING_PORT` 是否指向正在執行的 Kit 應用程式，且該 Kit 應用程式已啟用 NVCF livestream。若是遠端瀏覽器，請在 `host.yaml` 中設定 `network.public_ip`。
+- **開啟瀏覽器主控台**（F12） — WebRTC 連線錯誤會記錄在那裡。
 
 ## 冒煙測試
 
