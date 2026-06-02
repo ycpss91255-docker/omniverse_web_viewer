@@ -12,6 +12,10 @@ ARG TZ="Asia/Taipei"
 ARG APT_MIRROR_UBUNTU="tw.archive.ubuntu.com"
 ARG DEBIAN_FRONTEND=noninteractive
 
+# Requires BASE_IMAGE to provide /bin/bash (true for the default ubuntu:24.04
+# and any debian-family base). This SHELL is set before the first RUN, so bash
+# cannot be installed first — overriding BASE_IMAGE to a bash-less base (e.g.
+# alpine/busybox) requires changing this line too.
 SHELL ["/bin/bash", "-x", "-euo", "pipefail", "-c"]
 
 RUN sed -i "s@archive.ubuntu.com@${APT_MIRROR_UBUNTU}@g" /etc/apt/sources.list || true; \
@@ -61,7 +65,7 @@ RUN apt-get update && \
         && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    npm install -g serve@14 && \
+    npm install -g serve@14.2.6 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
