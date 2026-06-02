@@ -99,6 +99,7 @@ docker run --rm -d --name owv-b --network=host \
 
 - **画面空白，无错误** — 通常是 UI 模式与 Kit 应用不匹配。`usd-viewer` 模式仅适用于 kit-app-template 的 USD Viewer；对接 Isaac Sim 或其他 Kit 应用时，就绪轮询永远不会完成，画面无法渲染，且不显示任何错误。请切换到 `stream-only`（`VIEWER_UI_MODE=stream-only`，或 `host.yaml` 中的 `viewer.ui_mode`）。
 - **连接被拒绝 / 画面串流始终不出现** — 检查 `SIGNALING_SERVER` / `SIGNALING_PORT` 是否指向正在运行的 Kit 应用，以及该 Kit 应用是否已启用 NVCF livestream。对于远端浏览器，请在 `host.yaml` 中设置 `network.public_ip`。
+- **容器启动后立即退出** — entrypoint 在渲染前会校验配置；无效值（非数字的 `SIGNALING_PORT`、未知的 `VIEWER_UI_MODE` / `VIEWER_AUTO_LAUNCH`、或含非法字符的 `SIGNALING_SERVER`，包括 `host.yaml` 值末尾误带的行内 `#` 注释）会被拒绝并打印错误信息，而不是启动一个损坏的查看器。请根据错误信息修正对应的环境变量 / `host.yaml` 值。
 - **打开浏览器控制台**（F12）— WebRTC 连接错误会记录在那里。
 
 ## 冒烟测试

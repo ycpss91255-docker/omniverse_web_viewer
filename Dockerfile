@@ -110,7 +110,10 @@ RUN sed -i 's|"server":.*|"server": "__OWV_SERVER__",|' stream.config.json && \
     sed -i 's|"signalingPort":.*|"signalingPort": "__OWV_PORT__",|' stream.config.json && \
     sed -i 's|"mode":.*|"mode": "__OWV_UI_MODE__",|' stream.config.json && \
     sed -i 's|"autoLaunch":.*|"autoLaunch": "__OWV_AUTOLAUNCH__"|' stream.config.json && \
-    npm run build
+    npm run build && \
+    for f in dist/assets/*.js; do \
+        if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
+    done
 
 WORKDIR "${HOME}/work"
 

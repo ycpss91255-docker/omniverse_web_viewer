@@ -99,6 +99,7 @@ docker run --rm -d --name owv-b --network=host \
 
 - **Blank screen, no error** — usually a UI-mode / Kit-app mismatch. `usd-viewer` mode only works with the kit-app-template USD Viewer; against Isaac Sim or another Kit app the readiness poll never completes and nothing renders, with no error shown. Switch to `stream-only` (`VIEWER_UI_MODE=stream-only`, or `viewer.ui_mode` in `host.yaml`).
 - **Connection refused / stream never appears** — check `SIGNALING_SERVER` / `SIGNALING_PORT` point at the running Kit app, and that the Kit app has NVCF livestream enabled. For remote browsers set `network.public_ip` in `host.yaml`.
+- **Container exits immediately at startup** — the entrypoint validates config before rendering; an invalid value (non-numeric `SIGNALING_PORT`, unknown `VIEWER_UI_MODE` / `VIEWER_AUTO_LAUNCH`, or a `SIGNALING_SERVER` with illegal characters, including a stray inline `#` comment on a `host.yaml` value) is rejected with an error message instead of booting a broken viewer. Fix the reported env / `host.yaml` value.
 - **Open the browser console** (F12) — WebRTC connection errors are logged there.
 
 ## Smoke Tests
