@@ -17,9 +17,11 @@ viewer:
   # Which client UI to render once connected:
   #   "usd-viewer"  -> full USD Viewer UI (asset selector + stage tree).
   #                    = the "UI for default streaming USD Viewer app" radio.
-  #                    Only works with the kit-app-template USD Viewer
-  #                    protocol; a plain Kit / Isaac Sim stream stays blank
-  #                    because it does not speak that protocol.
+  #                    WARNING: only works with the kit-app-template USD
+  #                    Viewer. Against Isaac Sim or any other Kit app the
+  #                    readiness poll never completes -> the page stays blank
+  #                    with NO error and never times out. Use "stream-only"
+  #                    for those.
   #   "stream-only" -> pure video, no UI messaging.
   #                    = the "UI for any streaming app" radio.
   #                    Use this for Isaac Sim or any non-USD-Viewer Kit app.

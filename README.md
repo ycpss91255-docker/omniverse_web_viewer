@@ -21,6 +21,7 @@ The viewer is a static React app served by `serve`. Browser JS connects directly
 - An Omniverse Kit application running with NVCF livestream enabled (e.g. Isaac Sim `stream` stage)
 - Chrome or Chromium (Firefox incompatible with Omniverse WebRTC)
 - Docker
+- Supported image architectures: `linux/amd64`, `linux/arm64`
 
 ## Quick Start
 
@@ -56,7 +57,7 @@ Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 | `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer` (full USD Viewer UI) or `stream-only` (pure video, for Isaac Sim / non-USD-Viewer Kit apps) |
 | `VIEWER_AUTO_LAUNCH` | `false` | `true` skips the "UI Option" selection screen and boots straight into `VIEWER_UI_MODE` |
 
-All of these are injected at container startup via entrypoint — no rebuild needed when changing values. `VIEWER_*` can also be set via `config/host.yaml` (`viewer:` section, mounted at `/etc/host.yaml`), which takes precedence; see `config/host.yaml.example`.
+`SIGNALING_SERVER` / `SIGNALING_PORT` / `VIEWER_UI_MODE` / `VIEWER_AUTO_LAUNCH` are substituted into the built JS at container startup (no rebuild needed when changing values). `SERVE_PORT` is not asset-injected — it only sets the static server's listen port via the container `CMD`. `VIEWER_*` and `SIGNALING_SERVER` can also be set via `config/host.yaml` (`viewer:` / `network:`, mounted at `/etc/host.yaml`), which takes precedence; see `config/host.yaml.example`.
 
 ## Multi-instance
 
@@ -93,6 +94,12 @@ docker run --rm -d --name owv-b --network=host \
 
 - One interactive client per Kit instance (second connection rejected)
 - Firefox incompatible — must use Chrome/Chromium
+
+## Troubleshooting
+
+- **Blank screen, no error** — usually a UI-mode / Kit-app mismatch. `usd-viewer` mode only works with the kit-app-template USD Viewer; against Isaac Sim or another Kit app the readiness poll never completes and nothing renders, with no error shown. Switch to `stream-only` (`VIEWER_UI_MODE=stream-only`, or `viewer.ui_mode` in `host.yaml`).
+- **Connection refused / stream never appears** — check `SIGNALING_SERVER` / `SIGNALING_PORT` point at the running Kit app, and that the Kit app has NVCF livestream enabled. For remote browsers set `network.public_ip` in `host.yaml`.
+- **Open the browser console** (F12) — WebRTC connection errors are logged there.
 
 ## Smoke Tests
 

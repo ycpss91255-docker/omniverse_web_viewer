@@ -21,6 +21,7 @@ Browser (Chrome/Chromium)
 - NVCF ライブストリームが有効な状態で動作している Omniverse Kit アプリケーション（例: Isaac Sim `stream` ステージ）
 - Chrome または Chromium（Firefox は Omniverse WebRTC と互換性がありません）
 - Docker
+- 対応イメージアーキテクチャ：`linux/amd64`、`linux/arm64`
 
 ## クイックスタート
 
@@ -56,7 +57,7 @@ SERVE_PORT = 5173
 | `VIEWER_UI_MODE` | `usd-viewer` | `usd-viewer`（フル USD Viewer UI）または `stream-only`（純粋な映像ストリーム。Isaac Sim / USD Viewer 以外の Kit アプリ向け） |
 | `VIEWER_AUTO_LAUNCH` | `false` | `true` にすると「UI Option」選択画面をスキップし、`VIEWER_UI_MODE` で直接起動する |
 
-3 つとも entrypoint 経由でコンテナ起動時に注入されます。値を変更する際にリビルドは不要です。 `VIEWER_*` は `config/host.yaml`（`viewer:` セクション、`/etc/host.yaml` にマウント）でも設定でき、そちらが優先されます。`config/host.yaml.example` を参照。
+`SIGNALING_SERVER` / `SIGNALING_PORT` / `VIEWER_UI_MODE` / `VIEWER_AUTO_LAUNCH` は、コンテナ起動時にビルド済み JS へ差し込まれます（値を変更してもリビルドは不要です）。`SERVE_PORT` はアセットには注入されません。コンテナの `CMD` を介して静的サーバーがリッスンするポートを設定するだけです。`VIEWER_*` と `SIGNALING_SERVER` は `config/host.yaml`（`viewer:` / `network:`、`/etc/host.yaml` にマウント）でも設定でき、そちらが優先されます。`config/host.yaml.example` を参照。
 
 ## マルチインスタンス
 
@@ -93,6 +94,12 @@ docker run --rm -d --name owv-b --network=host \
 
 - Kit インスタンスあたりインタラクティブクライアントは 1 つのみ（2 番目の接続は拒否されます）
 - Firefox は非対応 — Chrome/Chromium を使用してください
+
+## トラブルシューティング
+
+- **画面が真っ白でエラーも出ない** — 通常は UI モードと Kit アプリの不一致です。`usd-viewer` モードは kit-app-template の USD Viewer でのみ動作します。Isaac Sim や他の Kit アプリに対しては準備完了ポーリングが完了せず、何も描画されず、エラーも表示されません。`stream-only` に切り替えてください（`VIEWER_UI_MODE=stream-only`、または `host.yaml` の `viewer.ui_mode`）。
+- **接続拒否 / ストリームが表示されない** — `SIGNALING_SERVER` / `SIGNALING_PORT` が動作中の Kit アプリを指していること、およびその Kit アプリで NVCF ライブストリームが有効になっていることを確認してください。リモートブラウザの場合は `host.yaml` で `network.public_ip` を設定してください。
+- **ブラウザコンソールを開く**（F12） — WebRTC の接続エラーはそこに記録されます。
 
 ## スモークテスト
 
