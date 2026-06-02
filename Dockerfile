@@ -132,6 +132,60 @@ CMD ["sh", "-c", "serve -s /app/dist -l ${SERVE_PORT}"]
 # Usage: make run -- -t serve -d. Closes #9.
 FROM devel AS serve
 
+############################## example ##############################
+# Embeddable stream demo site (examples/embedded-site-demo). Vanilla
+# TS + Vite, single runtime dependency (the streaming library), served
+# on EXAMPLE_PORT (8080) -- independent of the main viewer (5173) so
+# both can run at once. Reuses the same entrypoint: __OWV_SERVER__ /
+# __OWV_PORT__ are substituted from SIGNALING_SERVER / SIGNALING_PORT
+# (env or /etc/host.yaml) on every boot. Closes #15.
+FROM devel-base AS example
+
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+ARG ENTRYPOINT_FILE="script/entrypoint.sh"
+
+COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
+COPY --chmod=0755 .base/script/docker/_entrypoint_logging.sh /usr/local/lib/base/_entrypoint_logging.sh
+
+USER "${USER}"
+ENV HOME="/home/${USER_NAME}"
+
+WORKDIR /app
+COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo/ /app/
+# install -> lint -> unit test -> build, then preserve sentinel-bearing
+# chunks as templates (the entrypoint re-renders them on every boot).
+RUN npm install && \
+    npm run lint && \
+    node --test && \
+    npm run build && \
+    for f in dist/assets/*.js; do \
+        if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
+    done && \
+    test -n "$(ls dist/assets/*.js.tmpl 2>/dev/null)"
+# Smoke: the static server answers 200 on 8080 (pre-render bundle is fine).
+# Run in a bounded inner shell that backgrounds serve and exits as soon as a
+# request succeeds; the build step tears the backgrounded server down on exit.
+# SC2016: the $ expressions are meant for the inner `bash -c`, not the outer shell.
+# hadolint ignore=SC2016
+RUN timeout 30 bash -c 'serve -s /app/dist -l 8080 & \
+    for _ in $(seq 1 30); do \
+        curl -fsS http://127.0.0.1:8080 >/dev/null 2>&1 && exit 0; \
+        sleep 0.5; \
+    done; \
+    exit 1'
+
+WORKDIR "${HOME}/work"
+
+ENV SIGNALING_SERVER="127.0.0.1"
+ENV SIGNALING_PORT="49100"
+ENV EXAMPLE_PORT="8080"
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sh", "-c", "serve -s /app/dist -l ${EXAMPLE_PORT}"]
+
 ############################## devel-test ##############################
 FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
 
@@ -161,6 +215,11 @@ ENV BATS_LIB_PATH="/usr/lib/bats"
 
 COPY .base/test/smoke/ /smoke_test/
 COPY test/smoke/ /smoke_test/
+
+# Example source is checked by example_demo.bats (contract + node --test);
+# the full example build (lint / vite / serve smoke) runs in the `example`
+# stage above.
+COPY examples/ /examples/
 
 ARG USER
 USER "${USER}"

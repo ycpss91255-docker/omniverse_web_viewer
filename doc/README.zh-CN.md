@@ -95,6 +95,10 @@ docker run --rm -d --name owv-b --network=host \
 - 每个 Kit 实例仅支持一个交互式客户端（第二个连接将被拒绝）
 - Firefox 不兼容 — 必须使用 Chrome/Chromium
 
+## 示例
+
+- [`examples/embedded-site-demo`](../examples/embedded-site-demo/) — 将纯画面串流嵌入你自己的网页（vanilla TS，单一运行时依赖）。以独立 stage 在 8080 运行（`make run -- -t example -d`），与主查看器（5173）并存。集成方式与 `<iframe>` 替代方案见其 README。
+
 ## 故障排查
 
 - **画面空白，无错误** — 通常是 UI 模式与 Kit 应用不匹配。`usd-viewer` 模式仅适用于 kit-app-template 的 USD Viewer；对接 Isaac Sim 或其他 Kit 应用时，就绪轮询永远不会完成，画面无法渲染，且不显示任何错误。请切换到 `stream-only`（`VIEWER_UI_MODE=stream-only`，或 `host.yaml` 中的 `viewer.ui_mode`）。
