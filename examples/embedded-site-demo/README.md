@@ -36,7 +36,7 @@ substitutes `__OWV_SERVER__` / `__OWV_PORT__` from `SIGNALING_SERVER` /
 `SIGNALING_PORT` (env) or `/etc/host.yaml` (`network.public_ip`) on every boot.
 
 ```bash
-make run -- -t example -d -e SIGNALING_SERVER=10.2.23.83 -e SIGNALING_PORT=49100
+make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
 ```
 
 ## Run it (dev)
@@ -50,7 +50,7 @@ There is no entrypoint in dev, so the placeholders are not substituted -- pass
 the target as a query string:
 
 ```
-http://localhost:8080/?server=10.2.23.83&port=49100
+http://localhost:8080/?server=<host-ip>&port=49100
 ```
 
 ## Integration in your own page
@@ -61,7 +61,7 @@ The whole integration is three steps (see `src/main.ts`):
 import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
 import { buildStreamConfig } from './buildStreamConfig.js';
 
-const streamConfig = buildStreamConfig('10.2.23.83', 49100); // validates + returns a DIRECT config
+const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
 AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
