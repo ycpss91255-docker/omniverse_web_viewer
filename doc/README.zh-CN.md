@@ -97,7 +97,7 @@ docker run --rm -d --name owv-b --network=host \
 
 ## 示例
 
-- [`examples/embedded-site-demo`](../examples/embedded-site-demo/) — 将纯画面串流嵌入你自己的网页（vanilla TS，单一运行时依赖）。以独立 stage 在 8080 运行（`make run -- -t example -d`），与主查看器（5173）并存。集成方式与 `<iframe>` 替代方案见其 README。
+- 可嵌入的串流 demo 站台 — [`examples/embedded-site-demo/`](../examples/embedded-site-demo/README.md)
 
 ## 故障排查
 

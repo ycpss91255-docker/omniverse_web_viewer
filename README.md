@@ -97,7 +97,7 @@ docker run --rm -d --name owv-b --network=host \
 
 ## Examples
 
-- [`examples/embedded-site-demo`](examples/embedded-site-demo/) -- embed a stream-only feed into your own page (vanilla TS, single runtime dependency). Runs as a separate stage on 8080 (`make run -- -t example -d`), alongside the main viewer on 5173. See its README for the direct-connect integration and the `<iframe>` alternative.
+- Embeddable stream demo site -- [`examples/embedded-site-demo/`](examples/embedded-site-demo/README.md)
 
 ## Troubleshooting
 

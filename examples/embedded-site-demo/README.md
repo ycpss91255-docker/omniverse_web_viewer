@@ -1,5 +1,7 @@
 # embedded-site-demo
 
+**[English](README.md)** | **[繁體中文](doc/README.zh-TW.md)** | **[简体中文](doc/README.zh-CN.md)** | **[日本語](doc/README.ja.md)**
+
 A self-contained example site that embeds a live Isaac Sim / Kit stream directly
 into a "real website" page. It is both a **showcase** (header + layout with a
 live stream panel) and a **developer reference** (clean, copy-pasteable
