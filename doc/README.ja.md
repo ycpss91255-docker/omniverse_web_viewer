@@ -97,7 +97,7 @@ docker run --rm -d --name owv-b --network=host \
 
 ## サンプル
 
-- [`examples/embedded-site-demo`](../examples/embedded-site-demo/) — ストリーム映像を自分の Web ページに直接埋め込むサンプル（vanilla TS、ランタイム依存は 1 つだけ）。独立した stage として 8080 で動作し（`make run -- -t example -d`）、メインビューア（5173）と同時に実行できます。直接接続の統合方法と `<iframe>` の代替案は README を参照してください。
+- 埋め込み可能なストリーム demo サイト — [`examples/embedded-site-demo/`](../examples/embedded-site-demo/README.md)
 
 ## トラブルシューティング
 
