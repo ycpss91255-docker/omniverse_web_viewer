@@ -28,7 +28,7 @@ make run -- -t example -d
 与主查看器一样指向一个正在运行的串流：entrypoint 会在每次启动时，从 `SIGNALING_SERVER` / `SIGNALING_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）替换 `__OWV_SERVER__` / `__OWV_PORT__`。
 
 ```bash
-make run -- -t example -d -e SIGNALING_SERVER=10.2.23.83 -e SIGNALING_PORT=49100
+make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
 ```
 
 ## 运行（开发模式）
@@ -41,7 +41,7 @@ npm run dev        # http://localhost:8080
 开发模式下没有 entrypoint，因此占位符不会被替换 -- 请通过 query string 传入目标：
 
 ```
-http://localhost:8080/?server=10.2.23.83&port=49100
+http://localhost:8080/?server=<host-ip>&port=49100
 ```
 
 ## 在你自己的页面中集成
@@ -52,7 +52,7 @@ http://localhost:8080/?server=10.2.23.83&port=49100
 import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
 import { buildStreamConfig } from './buildStreamConfig.js';
 
-const streamConfig = buildStreamConfig('10.2.23.83', 49100); // validates + returns a DIRECT config
+const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
 AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```

@@ -28,7 +28,7 @@ make run -- -t example -d
 メインビューアと同じ方法で、動作中のストリームを指定します: エントリポイントが起動のたびに `SIGNALING_SERVER` / `SIGNALING_PORT`（env）または `/etc/host.yaml`（`network.public_ip`）から `__OWV_SERVER__` / `__OWV_PORT__` を差し込みます。
 
 ```bash
-make run -- -t example -d -e SIGNALING_SERVER=10.2.23.83 -e SIGNALING_PORT=49100
+make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
 ```
 
 ## 実行する（開発）
@@ -41,7 +41,7 @@ npm run dev        # http://localhost:8080
 開発モードにはエントリポイントがないため、プレースホルダーは差し込まれません -- ターゲットはクエリ文字列で渡してください:
 
 ```
-http://localhost:8080/?server=10.2.23.83&port=49100
+http://localhost:8080/?server=<host-ip>&port=49100
 ```
 
 ## 自分のページへの統合
@@ -52,7 +52,7 @@ http://localhost:8080/?server=10.2.23.83&port=49100
 import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
 import { buildStreamConfig } from './buildStreamConfig.js';
 
-const streamConfig = buildStreamConfig('10.2.23.83', 49100); // validates + returns a DIRECT config
+const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
 AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```

@@ -68,14 +68,14 @@ make build  # one-time
 
 # Instance A
 docker run --rm -d --name owv-a --network=host \
-  -e SIGNALING_SERVER=10.2.23.83 \
+  -e SIGNALING_SERVER=<host-ip> \
   -e SIGNALING_PORT=49100 \
   -e SERVE_PORT=5173 \
   omniverse_web_viewer:devel
 
 # Instance B
 docker run --rm -d --name owv-b --network=host \
-  -e SIGNALING_SERVER=10.2.23.83 \
+  -e SIGNALING_SERVER=<host-ip> \
   -e SIGNALING_PORT=49200 \
   -e SERVE_PORT=5174 \
   omniverse_web_viewer:devel

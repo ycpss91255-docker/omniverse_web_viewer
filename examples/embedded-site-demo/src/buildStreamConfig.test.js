@@ -7,9 +7,9 @@ import assert from 'node:assert/strict';
 import { buildStreamConfig } from './buildStreamConfig.js';
 
 test('builds a DIRECT config for a valid server + numeric port', () => {
-  const cfg = buildStreamConfig('10.2.23.83', 49100);
-  assert.equal(cfg.signalingServer, '10.2.23.83');
-  assert.equal(cfg.mediaServer, '10.2.23.83');
+  const cfg = buildStreamConfig('127.0.0.1', 49100);
+  assert.equal(cfg.signalingServer, '127.0.0.1');
+  assert.equal(cfg.mediaServer, '127.0.0.1');
   assert.equal(cfg.signalingPort, 49100);
   assert.equal(typeof cfg.signalingPort, 'number');
   // Stream-only direct-connect essentials the streaming library needs.

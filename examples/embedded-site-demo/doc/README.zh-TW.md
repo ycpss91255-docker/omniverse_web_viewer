@@ -28,7 +28,7 @@ make run -- -t example -d
 指向執行中串流的方式與主檢視器相同：entrypoint 會在每次啟動時，從 `SIGNALING_SERVER` / `SIGNALING_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）代入 `__OWV_SERVER__` / `__OWV_PORT__`。
 
 ```bash
-make run -- -t example -d -e SIGNALING_SERVER=10.2.23.83 -e SIGNALING_PORT=49100
+make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
 ```
 
 ## 執行（開發模式）
@@ -41,7 +41,7 @@ npm run dev        # http://localhost:8080
 開發模式下沒有 entrypoint，因此 placeholder 不會被代入 -- 請以 query string 傳入 target：
 
 ```
-http://localhost:8080/?server=10.2.23.83&port=49100
+http://localhost:8080/?server=<host-ip>&port=49100
 ```
 
 ## 整合到你自己的頁面
@@ -52,7 +52,7 @@ http://localhost:8080/?server=10.2.23.83&port=49100
 import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
 import { buildStreamConfig } from './buildStreamConfig.js';
 
-const streamConfig = buildStreamConfig('10.2.23.83', 49100); // validates + returns a DIRECT config
+const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
 AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
