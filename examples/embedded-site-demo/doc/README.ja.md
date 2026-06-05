@@ -18,18 +18,21 @@
 
 ## 実行する（コンテナ）
 
-このサンプルは、メインビューア（5173）とは別の `EXAMPLE_PORT`（8080）上で、プロファイルで制御される Docker ステージとして提供されます -- 両方を同時に実行できます。
+このサンプルは、ビルド済みのサイトを `EXAMPLE_PORT`（8080）上で配信する Docker の `example` ステージです。メインビューア（5173）とは別であり -- 両方を同時に実行できます。**ページ** は `http://<host>:8080` で開きます。`SIGNALING_SERVER` / `SIGNALING_PORT`（デフォルト `49100`）は、ページを Kit/Isaac の **ストリーム** のシグナリングへ向けるためのものです -- これはページが接続する先であって、開く URL ではありません。
+
+イメージをビルドし、動作中のストリームを指定して host ネットワークで実行します（`SIGNALING_SERVER` は Kit/Isaac ストリームを実行しているホストです）:
 
 ```bash
-make run -- -t example -d
-# open http://<host>:8080
+make build -- -t example
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+# then open http://<host-ip>:8080
 ```
 
-メインビューアと同じ方法で、動作中のストリームを指定します: エントリポイントが起動のたびに `SIGNALING_SERVER` / `SIGNALING_PORT`（env）または `/etc/host.yaml`（`network.public_ip`）から `__OWV_SERVER__` / `__OWV_PORT__` を差し込みます。
+エントリポイントは起動のたびに、`SIGNALING_SERVER` / `SIGNALING_PORT`（env）または `/etc/host.yaml`（`network.public_ip`）から `__OWV_SERVER__` / `__OWV_PORT__` を、ビルド済みバンドルへ差し込みます。
 
-```bash
-make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
-```
+> 注意: `make run -- -t example -d` はまだ使用できません -- `example`（および `serve`）compose サービスは `devel` から `/dev:/dev` のデバイスマウントを継承しており、起動時に `/dev/pts` エラーで失敗します（#26 で追跡中）。修正されるまでは上記の `docker run` の形式を使用してください。（また `make run` はデタッチモードで `-e` の env 変数を転送しません。）
 
 ## 実行する（開発）
 

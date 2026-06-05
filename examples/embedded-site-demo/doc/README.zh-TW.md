@@ -18,18 +18,21 @@
 
 ## 執行（容器）
 
-此範例以 profile-gated 的 Docker stage 形式發布，使用 `EXAMPLE_PORT`（8080），與主檢視器（5173）分開 -- 兩者可同時執行。
+此範例是一個 Docker `example` stage，會在 `EXAMPLE_PORT`（8080）上提供已建置好的網站，與主檢視器（5173）分開 -- 兩者可同時執行。你要開啟的**頁面**是 `http://<host>:8080`。`SIGNALING_SERVER` / `SIGNALING_PORT`（預設 `49100`）則是把頁面指向 Kit/Isaac **串流**的 signaling -- 那是頁面要連線的對象，而不是你直接開啟的 URL。
+
+先建置 image，接著以 host networking 執行它，並指向一個執行中的串流（`SIGNALING_SERVER` 是執行 Kit/Isaac 串流的主機）：
 
 ```bash
-make run -- -t example -d
-# open http://<host>:8080
+make build -- -t example
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+# then open http://<host-ip>:8080
 ```
 
-指向執行中串流的方式與主檢視器相同：entrypoint 會在每次啟動時，從 `SIGNALING_SERVER` / `SIGNALING_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）代入 `__OWV_SERVER__` / `__OWV_PORT__`。
+entrypoint 會在每次啟動時，從 `SIGNALING_SERVER` / `SIGNALING_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）代入 `__OWV_SERVER__` / `__OWV_PORT__` 到已建置好的 bundle 中。
 
-```bash
-make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
-```
+> 注意：`make run -- -t example -d` 目前還不能用 -- `example`（以及 `serve`）的 compose service 從 `devel` 繼承了 `/dev:/dev` device mount，啟動時會因 `/dev/pts` 錯誤而失敗（追蹤於 #26）。在修好之前，請改用上面的 `docker run` 形式。（`make run` 在 detached 模式下也不會轉發 `-e` env vars。）
 
 ## 執行（開發模式）
 
