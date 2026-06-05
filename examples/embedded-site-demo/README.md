@@ -23,21 +23,32 @@ React, no bootstrap, no selection screen: it does a stream-only direct connect.
 
 ## Run it (container)
 
-The example ships as a profile-gated Docker stage on `EXAMPLE_PORT` (8080),
-separate from the main viewer (5173) -- both can run at once.
+The example is a Docker `example` stage that serves the built site on
+`EXAMPLE_PORT` (8080), separate from the main viewer (5173) -- both can run at
+once. You open the **page** at `http://<host>:8080`. `SIGNALING_SERVER` /
+`SIGNALING_PORT` (default `49100`) point the page at the Kit/Isaac **stream's**
+signaling -- that is what the page connects to, not a URL you open.
+
+Build the image, then run it with host networking, pointing it at a running
+stream (`SIGNALING_SERVER` is the host running the Kit/Isaac stream):
 
 ```bash
-make run -- -t example -d
-# open http://<host>:8080
+make build -- -t example
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+# then open http://<host-ip>:8080
 ```
 
-Point it at a running stream the same way as the main viewer: the entrypoint
-substitutes `__OWV_SERVER__` / `__OWV_PORT__` from `SIGNALING_SERVER` /
-`SIGNALING_PORT` (env) or `/etc/host.yaml` (`network.public_ip`) on every boot.
+The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` from
+`SIGNALING_SERVER` / `SIGNALING_PORT` (env) or `/etc/host.yaml`
+(`network.public_ip`) into the built bundle on every boot.
 
-```bash
-make run -- -t example -d -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100
-```
+> Note: `make run -- -t example -d` is not usable yet -- the `example` (and
+> `serve`) compose service inherits a `/dev:/dev` device mount from `devel` and
+> fails at start with a `/dev/pts` error (tracked in #26). Use the `docker run`
+> form above until that is fixed. (`make run` also does not forward `-e` env
+> vars in detached mode.)
 
 ## Run it (dev)
 
