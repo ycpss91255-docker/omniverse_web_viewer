@@ -1,0 +1,23 @@
+{
+  "name": "stream-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reusable stream-only kernel: the single consumer of the NVIDIA WebRTC streaming library.",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "eslint . --ext .ts,.js --max-warnings 0"
+  },
+  "peerDependencies": {
+    "@nvidia/omniverse-webrtc-streaming-library": "5.6.0"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.7.0",
+    "@typescript-eslint/parser": "^7.7.0",
+    "eslint": "^8.57.0"
+  }
+}

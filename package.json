@@ -1,0 +1,11 @@
+{
+  "name": "omniverse-web-viewer-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "npm workspace root: stream-core kernel + viewer apps + examples. usd-viewer (src/ submodule) is built directly, not a workspace package.",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "examples/*"
+  ]
+}
