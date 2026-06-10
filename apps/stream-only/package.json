@@ -1,0 +1,25 @@
+{
+  "name": "stream-only",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Full-screen auto-connect stream-only viewer (served for VIEWER_UI_MODE=stream-only). Thin DOM glue over stream-core.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "eslint . --ext .ts,.js --max-warnings 0"
+  },
+  "dependencies": {
+    "stream-core": "*",
+    "@nvidia/omniverse-webrtc-streaming-library": "5.6.0"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.7.0",
+    "@typescript-eslint/parser": "^7.7.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0"
+  }
+}
