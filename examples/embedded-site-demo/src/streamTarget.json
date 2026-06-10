@@ -1,5 +1,6 @@
 {
-  "$comment": "Build-time placeholders. The container entrypoint substitutes __OWV_SERVER__ / __OWV_PORT__ from SIGNALING_SERVER / SIGNALING_PORT (env or /etc/host.yaml) on every boot -- same mechanism as the main viewer. For `npm run dev` (no entrypoint) override at runtime: open ?server=<ip>&port=<port>.",
+  "$comment": "Build-time placeholders. The container entrypoint substitutes __OWV_SERVER__ / __OWV_PORT__ / __OWV_MEDIA_PORT__ from SIGNALING_SERVER / SIGNALING_PORT / MEDIA_PORT (env or /etc/host.yaml) on every boot -- same mechanism as the main viewer. MEDIA_PORT is optional: unset renders to null and the library negotiates media via SDP. For `npm run dev` (no entrypoint) override at runtime: open ?server=<ip>&port=<port>&media=<port>.",
   "server": "__OWV_SERVER__",
-  "signalingPort": "__OWV_PORT__"
+  "signalingPort": "__OWV_PORT__",
+  "mediaPort": "__OWV_MEDIA_PORT__"
 }

@@ -154,17 +154,23 @@ USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
 
 WORKDIR /app
-COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo/ /app/
-# install -> lint -> unit test -> build, then preserve sentinel-bearing
-# chunks as templates (the entrypoint re-renders them on every boot).
+# Workspace-aware build: the example imports its sibling `stream-core`, so the
+# whole npm workspace must be present and installed at the root (an isolated
+# install of only the example can no longer resolve stream-core). The built
+# example dist is copied to /app/dist so the generic entrypoint renders it.
+COPY --chown="${USER}":"${GROUP}" package.json .npmrc /app/
+COPY --chown="${USER}":"${GROUP}" packages/stream-core /app/packages/stream-core
+COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo /app/examples/embedded-site-demo
 RUN npm install && \
-    npm run lint && \
-    node --test && \
-    npm run build && \
-    for f in dist/assets/*.js; do \
+    npm -w stream-core test && \
+    npm -w embedded-site-demo run lint && \
+    npm -w embedded-site-demo test && \
+    npm -w embedded-site-demo run build && \
+    cp -r examples/embedded-site-demo/dist /app/dist && \
+    for f in /app/dist/assets/*.js; do \
         if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
     done && \
-    test -n "$(ls dist/assets/*.js.tmpl 2>/dev/null)"
+    test -n "$(ls /app/dist/assets/*.js.tmpl 2>/dev/null)"
 # Smoke: the static server answers 200 on 8080 (pre-render bundle is fine).
 # Run in a bounded inner shell that backgrounds serve and exits as soon as a
 # request succeeds; the build step tears the backgrounded server down on exit.
