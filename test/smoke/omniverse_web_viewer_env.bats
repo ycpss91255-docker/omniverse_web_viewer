@@ -6,20 +6,17 @@
 # assert_dir_exists, assert_file_owned_by, assert_pip_pkg, ...) to keep
 # assertions terse.
 #
-# Config-pipeline model (#17): the build injects four sentinels
-# (__OWV_SERVER__ / "__OWV_PORT__" / __OWV_UI_MODE__ /
-# "__OWV_AUTOLAUNCH__") into the bundle, then preserves each
-# sentinel-bearing chunk as a pristine *.js.tmpl. The entrypoint
-# re-renders *.js.tmpl -> *.js on EVERY boot (idempotent, de-one-shot),
-# after validating every operator-supplied value (a bad value fails the
-# container fast instead of baking a broken bundle).
+# Config-pipeline model (#17): the build injects the server + port
+# sentinels (__OWV_SERVER__ / "__OWV_PORT__") into the upstream usd-viewer
+# bundle, then preserves each sentinel-bearing chunk as a pristine
+# *.js.tmpl. The entrypoint re-renders *.js.tmpl -> *.js on EVERY boot
+# (idempotent, de-one-shot), after validating every operator value.
 #
-# Discriminator note: ui_mode / auto_launch string values ("stream-only"
-# etc.) also appear as source literals in App.tsx, so grepping for them
-# does not prove substitution. The render path is therefore proven with
-# DISTINCTIVE server IPs / ports that cannot appear except via the
-# sentinel substitution; ui_mode / auto_launch are covered by the
-# validation (reject) tests instead.
+# (S4 removed the ui_mode / auto_launch overlay -- usd-viewer is now
+# upstream unmodified. The media-port sentinel + VIEWER_UI_MODE app-select
+# land with the entrypoint rewrite in S5.)
+# The render path is proven with DISTINCTIVE server IPs that cannot appear
+# except via sentinel substitution.
 
 setup() {
   load "${BATS_TEST_DIRNAME}/test_helper"
@@ -59,10 +56,6 @@ teardown() {
   assert_success
   run grep -rF "__OWV_PORT__" /app/dist/assets/ --include="*.js.tmpl"
   assert_success
-  run grep -rF "__OWV_UI_MODE__" /app/dist/assets/ --include="*.js.tmpl"
-  assert_success
-  run grep -rF "__OWV_AUTOLAUNCH__" /app/dist/assets/ --include="*.js.tmpl"
-  assert_success
 }
 
 @test "entrypoint renders defaults into *.js and clears sentinels" {
@@ -73,16 +66,10 @@ teardown() {
   assert_failure
   run grep -rF "__OWV_PORT__" /app/dist/assets/ --include="*.js"
   assert_failure
-  run grep -rF "__OWV_UI_MODE__" /app/dist/assets/ --include="*.js"
-  assert_failure
-  run grep -rF "__OWV_AUTOLAUNCH__" /app/dist/assets/ --include="*.js"
-  assert_failure
-  # Defaults applied: server 127.0.0.1, port 49100, ui_mode usd-viewer.
+  # Defaults applied: server 127.0.0.1, port 49100.
   run grep -rF "127.0.0.1" /app/dist/assets/ --include="*.js"
   assert_success
   run grep -rF "49100" /app/dist/assets/ --include="*.js"
-  assert_success
-  run grep -rF "usd-viewer" /app/dist/assets/ --include="*.js"
   assert_success
 }
 
