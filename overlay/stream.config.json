@@ -14,14 +14,9 @@
         "cmsId": 0
     },
     "local": {
-        "$comment": "Required props if source is set to 'local'.",
+        "$comment": "Required props if source is set to 'local'. server/signalingPort are entrypoint-substituted at boot; mediaPort stays null (upstream SDP negotiation).",
         "server": "127.0.0.1",
         "signalingPort": 49100,
         "mediaPort": null
-    },
-    "ui": {
-        "$comment": "Build-time defaults; the entrypoint substitutes these at container start from VIEWER_* env / host.yaml viewer.*. See config/host.yaml.example.",
-        "mode": "usd-viewer",
-        "autoLaunch": false
     }
 }
