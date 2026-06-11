@@ -22,7 +22,16 @@ jobs:
     with:
       image_name: omniverse_web_viewer
       submodules: recursive
-      build_runtime: false
+      build_runtime: true
+      test_tools_version: v0.41.0
+      # The Dockerfile's runtime-test stage bakes a strong default
+      # RUNTIME_SMOKE_CMD (serve + curl 200 for BOTH /app/usd-viewer/dist
+      # and /app/stream-only/dist), so passing it here is optional. We pass
+      # it explicitly so the production serve smoke is visible in the CI
+      # config, not only in the Dockerfile. Single quotes around the inner
+      # bash -c body keep the YAML value one literal line.
+      build_args: |
+        RUNTIME_SMOKE_CMD=timeout 30 bash -c 'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'
 
   call-release:
     needs: call-docker-build

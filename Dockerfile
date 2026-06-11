@@ -73,9 +73,125 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+############################## usd-viewer-build ##############################
+# Build the upstream web-viewer-sample (the `src/` submodule) UNMODIFIED (D2):
+# no App.tsx fork. Only overlay/stream.config.json is layered (a supported
+# config override, not a code patch) carrying the server/port sentinels the
+# entrypoint renders at boot. The resulting dist is staged at
+# /app/usd-viewer/dist so the lean runtime COPYs it to the same path the
+# uniform entrypoint serves (/app/${VIEWER_UI_MODE}/dist). No __OWV_MEDIA_PORT__
+# sentinel here -- usd-viewer keeps upstream's native SDP media negotiation
+# (D1 back-compat default).
+FROM devel-base AS usd-viewer-build
+
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+
+USER "${USER}"
+ENV HOME="/home/${USER_NAME}"
+
+COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
+WORKDIR /app
+RUN npm install
+
+COPY --chown="${USER}":"${GROUP}" src/ /app/
+COPY --chown="${USER}":"${GROUP}" overlay/stream.config.json /app/stream.config.json
+RUN sed -i 's|"server":.*|"server": "__OWV_SERVER__",|' stream.config.json && \
+    sed -i 's|"signalingPort":.*|"signalingPort": "__OWV_PORT__",|' stream.config.json && \
+    npm run build && \
+    for f in dist/assets/*.js; do \
+        if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
+    done && \
+    test -n "$(ls dist/assets/*.js.tmpl 2>/dev/null)" && \
+    sudo mkdir -p /app/usd-viewer && sudo mv /app/dist /app/usd-viewer/dist && \
+    sudo chown -R "${USER}":"${GROUP}" /app/usd-viewer
+# (path arranged above: built dist staged at /app/usd-viewer/dist via sudo so
+# the build stays as the non-root USER -- runtime COPYs it to the served path.)
+
+############################## stream-only-build ##############################
+# Build OUR OWN full-screen stream-only app (apps/stream-only) over stream-core
+# inside the npm workspace (D2/D3). The whole workspace must be present so the
+# app resolves its sibling `stream-core` dep; an isolated per-app install can't.
+# streamTarget.json carries all 3 sentinels (server / port / media); media
+# (__OWV_MEDIA_PORT__) is the stream-only app's knob (D1). Output staged at
+# /app/stream-only/dist for the runtime COPY.
+FROM devel-base AS stream-only-build
+
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+
+USER "${USER}"
+ENV HOME="/home/${USER_NAME}"
+
+WORKDIR /build
+COPY --chown="${USER}":"${GROUP}" package.json .npmrc /build/
+COPY --chown="${USER}":"${GROUP}" packages/stream-core /build/packages/stream-core
+COPY --chown="${USER}":"${GROUP}" apps/stream-only /build/apps/stream-only
+RUN npm install && \
+    npm -w stream-core test && \
+    npm -w stream-only run lint && \
+    npm -w stream-only test && \
+    npm -w stream-only run build && \
+    for f in apps/stream-only/dist/assets/*.js; do \
+        if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
+    done && \
+    test -n "$(ls apps/stream-only/dist/assets/*.js.tmpl 2>/dev/null)" && \
+    sudo mkdir -p /app/stream-only && \
+    sudo mv /build/apps/stream-only/dist /app/stream-only/dist && \
+    sudo chown -R "${USER}":"${GROUP}" /app/stream-only
+
+############################## runtime ##############################
+# LEAN deployed image (replaces the old `serve = FROM devel`). FROM devel-base
+# for node + serve only -- NO npm install, NO src/ submodule, NO node_modules,
+# NO build toolchain. Both built dists are COPY'd in from the build stages so
+# the uniform entrypoint can serve either app by VIEWER_UI_MODE. This is the
+# image Isaac runs (omniverse_web_viewer:runtime).
+FROM devel-base AS runtime
+
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+ARG ENTRYPOINT_FILE="script/entrypoint.sh"
+
+COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
+# Host-side log tee helper (base#328 / base#368). No-op when [logging]
+# local_path is unset; sourced unconditionally by script/entrypoint.sh.
+COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
+
+# Both app dists at the path the entrypoint serves: /app/<mode>/dist.
+COPY --from=usd-viewer-build --chown="${USER}":"${GROUP}" /app/usd-viewer/dist /app/usd-viewer/dist
+COPY --from=stream-only-build --chown="${USER}":"${GROUP}" /app/stream-only/dist /app/stream-only/dist
+
+USER "${USER}"
+ENV HOME="/home/${USER_NAME}"
+
+# Interim runtime ENV defaults (until Phase-2 base-A2 .env). MEDIA_PORT has
+# NO default: unset = null = the library negotiates media via SDP (D1).
+ENV SIGNALING_SERVER="127.0.0.1"
+ENV SIGNALING_PORT="49100"
+ENV SERVE_PORT="5173"
+ENV VIEWER_UI_MODE="usd-viewer"
+
+WORKDIR "${HOME}/work"
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
+
 ############################## devel ##############################
+# Interactive dev image: full toolchain + sources for building in place, PLUS
+# both built dists COPY'd from the build stages so the uniform entrypoint
+# (which targets /app/<mode>/dist) works here too. devel-test (FROM devel) thus
+# has /app/usd-viewer/dist + /app/stream-only/dist present for the bats to
+# exercise the render path.
 FROM devel-base AS devel
 
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
@@ -83,8 +199,6 @@ ARG CONFIG_DIR="/tmp/config"
 ARG CONFIG_SRC="config"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
-# Host-side log tee helper (base#328 / base#368). No-op when [logging]
-# local_path is unset; sourced unconditionally by script/entrypoint.sh.
 COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/config "${CONFIG_DIR}"
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
@@ -104,47 +218,55 @@ RUN cat "${CONFIG_DIR}"/shell/bashrc >> "${HOME}/.bashrc" && \
     chown -R "${USER}":"${GROUP}" "${HOME}/.bashrc.d" && \
     sudo rm -rf "${CONFIG_DIR}"
 
+# Full workspace + upstream submodule for in-place dev builds.
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
-# Overlay ONLY the config -- src is a pinned read-only upstream submodule built
-# UNMODIFIED (no App.tsx fork, D2). stream.config.json carries the server/port
-# sentinels the entrypoint renders at boot; usd-viewer is upstream's native
-# landing + USD UI + any-app stream, reached interactively.
 COPY --chown="${USER}":"${GROUP}" overlay/stream.config.json /app/stream.config.json
-RUN sed -i 's|"server":.*|"server": "__OWV_SERVER__",|' stream.config.json && \
-    sed -i 's|"signalingPort":.*|"signalingPort": "__OWV_PORT__",|' stream.config.json && \
-    npm run build && \
-    for f in dist/assets/*.js; do \
-        if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
-    done
+
+# Both built dists present so the uniform entrypoint (/app/<mode>/dist) works
+# in devel and devel-test exactly as it does in runtime.
+COPY --from=usd-viewer-build --chown="${USER}":"${GROUP}" /app/usd-viewer/dist /app/usd-viewer/dist
+COPY --from=stream-only-build --chown="${USER}":"${GROUP}" /app/stream-only/dist /app/stream-only/dist
 
 WORKDIR "${HOME}/work"
 
 ENV SIGNALING_SERVER="127.0.0.1"
 ENV SIGNALING_PORT="49100"
 ENV SERVE_PORT="5173"
+ENV VIEWER_UI_MODE="usd-viewer"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "serve -s /app/dist -l ${SERVE_PORT}"]
+CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
 
-############################## serve ##############################
-# Profile-gated extra stage for detached server use. Base template
-# auto-emits this as a compose service with stdin_open: false /
-# tty: false, avoiding the /dev/pts permission issue that the
-# devel service's tty: true triggers under privileged: false.
-# Usage: make run -- -t serve -d. Closes #9.
-FROM devel AS serve
+############################## runtime-test ##############################
+# Install-check smoke for the LEAN runtime image. Mirrors `FROM devel AS
+# devel-test` -- ephemeral, build-only, never pushed. CI builds this target
+# after `target: runtime` (gated by build_runtime: true); build failure
+# surfaces a smoke failure in the GHA log.
+#
+# Strong baked default: prove the production image actually serves BOTH app
+# modes. Background `serve` on each dist on a spare port, curl both for HTTP
+# 200, exit 0/1. Override per repo via build_args: RUNTIME_SMOKE_CMD=<command>.
+#
+# `bash -c` wrapper required: `RUN ${ARG}` word-splits the value and treats
+# shell operators as literal args; wrapping passes it as one string for bash
+# to parse (preserving &&, ||, nested quotes, parameter expansion). See
+# Dockerfile.example ~lines 387-399.
+FROM runtime AS runtime-test
+
+# hadolint ignore=SC2016
+ARG RUNTIME_SMOKE_CMD='timeout 30 bash -c '"'"'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'"'"''
+# Inherit USER from runtime (non-root). The smoke does not need privilege.
+RUN bash -c "${RUNTIME_SMOKE_CMD}"
 
 ############################## example ##############################
 # Embeddable stream demo site (examples/embedded-site-demo). Vanilla
-# TS + Vite, single runtime dependency (the streaming library), served
-# on EXAMPLE_PORT (8080) -- independent of the main viewer (5173) so
-# both can run at once. Reuses the same entrypoint: __OWV_SERVER__ /
-# __OWV_PORT__ are substituted from SIGNALING_SERVER / SIGNALING_PORT
-# (env or /etc/host.yaml) on every boot. Closes #15.
+# TS + Vite, served on EXAMPLE_PORT (8080) -- independent of the main
+# viewer so both can run at once. Reuses the same entrypoint, serving the
+# example bundle under the usd-viewer mode dir. Closes #15.
 FROM devel-base AS example
 
 ARG USER_NAME="user"
@@ -154,8 +276,8 @@ ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
-# Same log tee helper as the devel stage: this stage builds from
-# devel-base, so the devel COPY is not inherited and must be repeated.
+# Same log tee helper as the runtime/devel stages: this stage builds from
+# devel-base, so those COPYs are not inherited and must be repeated.
 COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
 
 USER "${USER}"
@@ -165,7 +287,8 @@ WORKDIR /app
 # Workspace-aware build: the example imports its sibling `stream-core`, so the
 # whole npm workspace must be present and installed at the root (an isolated
 # install of only the example can no longer resolve stream-core). The built
-# example dist is copied to /app/dist so the generic entrypoint renders it.
+# example dist is served via the usd-viewer mode dir so the generic entrypoint
+# renders it (VIEWER_UI_MODE=usd-viewer).
 COPY --chown="${USER}":"${GROUP}" package.json .npmrc /app/
 COPY --chown="${USER}":"${GROUP}" packages/stream-core /app/packages/stream-core
 COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo /app/examples/embedded-site-demo
@@ -174,17 +297,18 @@ RUN npm install && \
     npm -w embedded-site-demo run lint && \
     npm -w embedded-site-demo test && \
     npm -w embedded-site-demo run build && \
-    cp -r examples/embedded-site-demo/dist /app/dist && \
-    for f in /app/dist/assets/*.js; do \
+    mkdir -p /app/usd-viewer && \
+    cp -r examples/embedded-site-demo/dist /app/usd-viewer/dist && \
+    for f in /app/usd-viewer/dist/assets/*.js; do \
         if grep -q '__OWV_' "${f}"; then cp -- "${f}" "${f}.tmpl"; fi; \
     done && \
-    test -n "$(ls /app/dist/assets/*.js.tmpl 2>/dev/null)"
+    test -n "$(ls /app/usd-viewer/dist/assets/*.js.tmpl 2>/dev/null)"
 # Smoke: the static server answers 200 on 8080 (pre-render bundle is fine).
 # Run in a bounded inner shell that backgrounds serve and exits as soon as a
 # request succeeds; the build step tears the backgrounded server down on exit.
 # SC2016: the $ expressions are meant for the inner `bash -c`, not the outer shell.
 # hadolint ignore=SC2016
-RUN timeout 30 bash -c 'serve -s /app/dist -l 8080 & \
+RUN timeout 30 bash -c 'serve -s /app/usd-viewer/dist -l 8080 & \
     for _ in $(seq 1 30); do \
         curl -fsS http://127.0.0.1:8080 >/dev/null 2>&1 && exit 0; \
         sleep 0.5; \
@@ -196,9 +320,10 @@ WORKDIR "${HOME}/work"
 ENV SIGNALING_SERVER="127.0.0.1"
 ENV SIGNALING_PORT="49100"
 ENV EXAMPLE_PORT="8080"
+ENV VIEWER_UI_MODE="usd-viewer"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "serve -s /app/dist -l ${EXAMPLE_PORT}"]
+CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${EXAMPLE_PORT}"]
 
 ############################## devel-test ##############################
 # Resolves to test-tools:local (local build.sh) or ghcr.io/.../test-tools:vX.Y.Z (CI).
@@ -234,7 +359,7 @@ RUN ln -sf /opt/bats/bin/bats /usr/local/bin/bats
 ENV BATS_LIB_PATH="/usr/lib/bats"
 
 COPY .base/test/smoke/ /smoke_test/
-COPY test/smoke/ /smoke_test/
+COPY test/smoke/bats/ /smoke_test/
 
 # Example source is checked by example_demo.bats (contract + node --test);
 # the full example build (lint / vite / serve smoke) runs in the `example`
