@@ -7,3 +7,5 @@ setup.conf.local
 coverage/
 .Dockerfile.generated
 .docker.xauth
+
+.env.generated

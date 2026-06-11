@@ -11,6 +11,7 @@
 # separate self-test.yaml job that has access to the host Docker daemon.
 
 setup() {
+  export LOG_FORMAT=text
   load "${BATS_TEST_DIRNAME}/../unit/test_helper"
 
   # Stage a fake repo dir whose basename will become IMAGE_NAME
@@ -65,7 +66,7 @@ teardown() {
 
 @test "new repo: script/entrypoint.sh sources [logging] helper by default (refs #364)" {
   # The helper is no-op safe when LOG_FILE_PATH is unset (early-return
-  # in _entrypoint_logging.sh), so default-sourcing has zero side
+  # in logging.sh), so default-sourcing has zero side
   # effect when [logging] local_path is empty. Wiring it here closes
   # the v0.30.0 `local_path` UX gap: setting the conf alone is now
   # enough for the host file to materialise -- no manual entrypoint.sh
@@ -79,7 +80,7 @@ teardown() {
   local _entry="${REPO_DIR}/script/entrypoint.sh"
   assert [ -f "${_entry}" ]
   # Source line — must be the in-image path.
-  run grep -F '. /usr/local/lib/base/_entrypoint_logging.sh' "${_entry}"
+  run grep -F '. /usr/local/lib/base/logging.sh' "${_entry}"
   assert_success
   # Explanatory comment so casual readers know what the source does.
   run grep -F '[logging] local_path' "${_entry}"
@@ -150,25 +151,26 @@ teardown() {
   bash .base/init.sh
   assert [ -L "${REPO_DIR}/script/build.sh" ]
   run readlink "${REPO_DIR}/script/build.sh"
-  assert_output "../.base/script/docker/build.sh"
+  assert_output "../.base/script/docker/wrapper/build.sh"
   # Root must NOT have build.sh after #330.
   assert [ ! -e "${REPO_DIR}/build.sh" ]
 }
 
-@test "new repo: 7 wrapper symlinks under script/, Makefile stays at root (#330)" {
+@test "new repo: 7 wrapper symlinks under script/, justfile at root (#330, #546)" {
   bash .base/init.sh
-  # 7 wrappers under script/, each pointing to ../.base/script/docker/<name>.sh
+  # 7 wrappers under script/, each pointing to ../.base/script/docker/wrapper/<name>.sh
   for f in run.sh exec.sh stop.sh prune.sh setup.sh setup_tui.sh; do
     assert [ -L "${REPO_DIR}/script/${f}" ]
     run readlink "${REPO_DIR}/script/${f}"
-    assert_output "../.base/script/docker/${f}"
+    assert_output "../.base/script/docker/wrapper/${f}"
     # And NOT at root.
     assert [ ! -e "${REPO_DIR}/${f}" ]
   done
-  # Makefile retains the root location (the elevated user entry).
-  assert [ -L "${REPO_DIR}/Makefile" ]
-  run readlink "${REPO_DIR}/Makefile"
-  assert_output ".base/script/docker/Makefile"
+  # #546: the root user entry is the justfile (Makefile retired).
+  assert [ -L "${REPO_DIR}/justfile" ]
+  run readlink "${REPO_DIR}/justfile"
+  assert_output ".base/script/docker/justfile"
+  assert [ ! -e "${REPO_DIR}/Makefile" ]
 }
 
 @test "new repo: config/ is an empty placeholder (template#254 layered override)" {
@@ -285,18 +287,18 @@ teardown() {
   assert_success
 }
 
-@test "new repo: Dockerfile contains _entrypoint_logging.sh in-image COPY (#368)" {
+@test "new repo: Dockerfile contains logging.sh in-image COPY (#368)" {
   # End-to-end check that a fresh init.sh-generated repo includes the
   # Dockerfile COPY for the helper. The helper must land at the
   # stable in-image path so downstream entrypoints can source it
-  # with a clean `. /usr/local/lib/base/_entrypoint_logging.sh`
+  # with a clean `. /usr/local/lib/base/logging.sh`
   # one-liner -- no $USER deref, no WS_PATH dependence, works at
   # build-time smoke AND runtime on multi-repo workspaces. Pin the
   # COPY here so init.sh seeding regressions are caught.
   bash .base/init.sh
   local _df="${REPO_DIR}/Dockerfile"
   assert [ -f "${_df}" ]
-  run grep -F 'COPY --chmod=0755 .base/script/docker/_entrypoint_logging.sh /usr/local/lib/base/_entrypoint_logging.sh' "${_df}"
+  run grep -F 'COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh' "${_df}"
   assert_success
 }
 
@@ -321,7 +323,7 @@ teardown() {
   bash .base/init.sh
   assert [ -L "${REPO_DIR}/script/setup_tui.sh" ]
   run readlink "${REPO_DIR}/script/setup_tui.sh"
-  assert_output "../.base/script/docker/setup_tui.sh"
+  assert_output "../.base/script/docker/wrapper/setup_tui.sh"
   # Neither old root-level setup_tui.sh nor pre-rename tui.sh.
   assert [ ! -e "${REPO_DIR}/tui.sh" ]
   assert [ ! -e "${REPO_DIR}/setup_tui.sh" ]
@@ -330,7 +332,7 @@ teardown() {
 @test "new repo: init.sh removes stale tui.sh symlink from earlier versions (#330 stale-removal loop)" {
   bash .base/init.sh
   # Simulate a very old upgrade path: legacy tui.sh symlink at root.
-  ln -sf ".base/script/docker/setup_tui.sh" "${REPO_DIR}/tui.sh"
+  ln -sf ".base/script/docker/wrapper/setup_tui.sh" "${REPO_DIR}/tui.sh"
   run bash .base/init.sh
   assert_success
   assert [ ! -e "${REPO_DIR}/tui.sh" ]
@@ -343,7 +345,7 @@ teardown() {
   # an older init.sh would have produced. Re-running the post-#330
   # init.sh must remove all of them and ensure script/ versions exist.
   for f in build.sh run.sh exec.sh stop.sh prune.sh setup.sh setup_tui.sh; do
-    ln -sf ".base/script/docker/${f}" "${REPO_DIR}/${f}"
+    ln -sf ".base/script/docker/wrapper/${f}" "${REPO_DIR}/${f}"
   done
   run bash .base/init.sh
   assert_success
@@ -378,11 +380,11 @@ teardown() {
   assert_success
 }
 
-@test "new repo: setup.sh symlink under script/ → ../.base/script/docker/setup.sh" {
+@test "new repo: setup.sh symlink under script/ → ../.base/script/docker/wrapper/setup.sh" {
   bash .base/init.sh
   assert [ -L "${REPO_DIR}/script/setup.sh" ]
   run readlink "${REPO_DIR}/script/setup.sh"
-  assert_output "../.base/script/docker/setup.sh"
+  assert_output "../.base/script/docker/wrapper/setup.sh"
 }
 
 @test "new repo: setup.sh -h works against the generated symlink" {
@@ -440,13 +442,16 @@ teardown() {
   assert_output --partial "AUTO-GENERATED"
 }
 
-@test "new repo: compose.yaml ships devices: /dev:/dev by default" {
+@test "new repo: compose.yaml omits devices block by default (#466 opt-in)" {
+  # #466 F2: a fresh repo no longer binds /dev:/dev (or any device) by
+  # default -- device access is opt-in. Repos that need it uncomment the
+  # template example or add via the TUI / `setup.sh add devices.device`.
   bash .base/init.sh
   assert [ -f "${REPO_DIR}/compose.yaml" ]
   run grep -E '^    devices:$' "${REPO_DIR}/compose.yaml"
-  assert_success
+  assert_failure
   run grep -F -- '- /dev:/dev' "${REPO_DIR}/compose.yaml"
-  assert_success
+  assert_failure
 }
 
 @test "new repo: setup.conf mount_1 is NOT empty after first init (workspace detected + written)" {

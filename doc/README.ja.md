@@ -27,10 +27,10 @@ Browser (Chrome/Chromium)
 
 ```bash
 # 1. ビルド（初回のみ）
-make build
+just build
 
 # 2. 実行（デフォルト: 127.0.0.1:49100、serve は 5173）
-make run -- -d
+just run -d
 
 # 3. Chrome で http://<host-ip>:5173 を開く
 #    「UI for any streaming app」を選択 -> Next
@@ -64,7 +64,7 @@ SERVE_PORT = 5173
 1 回のビルドで、異なるポートを持つ複数のコンテナを起動できます:
 
 ```bash
-make build  # 初回のみ
+just build  # 初回のみ
 
 # インスタンス A
 docker run --rm -d --name owv-a --network=host \

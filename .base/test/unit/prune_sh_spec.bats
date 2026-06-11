@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 #
-# Unit tests for script/docker/prune.sh argument handling and target
+# Unit tests for script/docker/wrapper/prune.sh argument handling and target
 # selection. Mirrors the sandbox/mock strategy from build_sh_spec.bats:
 # a sandbox tree with symlinked prune.sh + a PATH-shimmed `docker` stub
 # that echoes its argv so tests can assert which prune subcommand was
@@ -11,6 +11,7 @@
 bats_require_minimum_version 1.5.0
 
 setup() {
+  export LOG_FORMAT=text
   load "${BATS_TEST_DIRNAME}/test_helper"
 
   # shellcheck disable=SC2154
@@ -20,14 +21,14 @@ setup() {
   SANDBOX="${TEMP_DIR}/repo"
   mkdir -p "${SANDBOX}/.base/script/docker/lib"
 
-  cp /source/script/docker/_lib.sh  "${SANDBOX}/.base/script/docker/_lib.sh"
-  cp /source/script/docker/i18n.sh  "${SANDBOX}/.base/script/docker/i18n.sh"
-  cp /source/script/docker/lib/*.sh "${SANDBOX}/.base/script/docker/lib/"
-  ln -s /source/script/docker/prune.sh "${SANDBOX}/prune.sh"
+  cp /source/script/docker/lib/_lib.sh  "${SANDBOX}/.base/script/docker/lib/_lib.sh"
+  cp /source/script/docker/lib/i18n.sh  "${SANDBOX}/.base/script/docker/lib/i18n.sh"
+  cp /source/script/docker/lib/* "${SANDBOX}/.base/script/docker/lib/"
+  ln -s /source/script/docker/wrapper/prune.sh "${SANDBOX}/prune.sh"
 
   # prune.sh doesn't load .env, but a seed file keeps the sandbox layout
   # uniform with stop_sh_spec / exec_sh_spec.
-  : > "${SANDBOX}/.env"
+  : > "${SANDBOX}/.env.generated"
 
   BIN_DIR="${TEMP_DIR}/bin"
   mkdir -p "${BIN_DIR}"
@@ -189,10 +190,10 @@ teardown() {
 @test "prune.sh -C <dir> --networks --dry-run is accepted (chdir parity)" {
   local ALT="${TEMP_DIR}/alt"
   mkdir -p "${ALT}/.base/script/docker/lib"
-  cp /source/script/docker/_lib.sh "${ALT}/.base/script/docker/_lib.sh"
-  cp /source/script/docker/i18n.sh "${ALT}/.base/script/docker/i18n.sh"
-  cp /source/script/docker/lib/*.sh "${ALT}/.base/script/docker/lib/"
-  : > "${ALT}/.env"
+  cp /source/script/docker/lib/_lib.sh "${ALT}/.base/script/docker/lib/_lib.sh"
+  cp /source/script/docker/lib/i18n.sh "${ALT}/.base/script/docker/lib/i18n.sh"
+  cp /source/script/docker/lib/* "${ALT}/.base/script/docker/lib/"
+  : > "${ALT}/.env.generated"
   run bash "${SANDBOX}/prune.sh" -C "${ALT}" --networks --dry-run
   assert_success
   assert_output --partial "docker network prune"
@@ -265,7 +266,7 @@ EOS
   {
     printf 'WS_PATH=%s\n' "${_ws}"
     printf 'DOCKER_HUB_USER=%s\n' "${_owner}"
-  } > "${SANDBOX}/.env"
+  } > "${SANDBOX}/.env.generated"
 }
 
 @test "prune.sh --worktree-orphans on empty image list → no rmi" {
@@ -383,7 +384,7 @@ tester/foo-99:devel"
 
 @test "prune.sh --worktree-orphans without --workspace + empty .env → exit 2" {
   # No WS_PATH in .env, no --workspace flag → must error out.
-  : > "${SANDBOX}/.env"
+  : > "${SANDBOX}/.env.generated"
   cat > "${BIN_DIR}/docker" <<'EOS'
 #!/usr/bin/env bash
 exit 0

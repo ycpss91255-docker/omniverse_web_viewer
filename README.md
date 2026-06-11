@@ -27,10 +27,10 @@ The viewer is a static React app served by `serve`. Browser JS connects directly
 
 ```bash
 # 1. Build (one-time)
-make build
+just build
 
 # 2. Run (default: 127.0.0.1:49100, serve on 5173)
-make run -- -d
+just run -d
 
 # 3. Open Chrome -> http://<host-ip>:5173
 #    Select "UI for any streaming app" -> Next
@@ -64,7 +64,7 @@ Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 One build, multiple containers with different ports:
 
 ```bash
-make build  # one-time
+just build  # one-time
 
 # Instance A
 docker run --rm -d --name owv-a --network=host \

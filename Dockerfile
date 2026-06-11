@@ -2,6 +2,7 @@ ARG BASE_IMAGE="ubuntu:24.04"
 ARG TEST_TOOLS_IMAGE="test-tools:local"
 
 ############################## sys ##############################
+# hadolint ignore=DL3006
 FROM ${BASE_IMAGE} AS sys
 
 ARG USER_NAME="user"
@@ -45,7 +46,7 @@ RUN if getent group "${USER_GID}" >/dev/null; then \
         usermod -l "${USER_NAME}" -d "/home/${USER_NAME}" -m \
             "$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
     else \
-        useradd -m -s /bin/bash -u "${USER_UID}" -g "${USER_GID}" "${USER_NAME}"; \
+        useradd -m -l -s /bin/bash -u "${USER_UID}" -g "${USER_GID}" "${USER_NAME}"; \
     fi && \
     echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
@@ -54,6 +55,9 @@ FROM sys AS devel-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# DL4006: the bash SHELL with pipefail set in the sys stage carries over
+# via FROM (image config); hadolint just doesn't track SHELL across stages.
+# hadolint ignore=DL4006
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         -o Dpkg::Options::="--force-confdef" \
@@ -76,25 +80,29 @@ ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
 ARG CONFIG_DIR="/tmp/config"
-ARG SETUP_DIR="/tmp/setup"
 ARG CONFIG_SRC="config"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
-COPY --chmod=0755 .base/script/docker/_entrypoint_logging.sh /usr/local/lib/base/_entrypoint_logging.sh
+# Host-side log tee helper (base#328 / base#368). No-op when [logging]
+# local_path is unset; sourced unconditionally by script/entrypoint.sh.
+COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/config "${CONFIG_DIR}"
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
-COPY --chmod=0755 .base/dockerfile/setup "${SETUP_DIR}"
 
 USER "${USER}"
 
 ENV HOME="/home/${USER_NAME}"
 
+# Shell setup per Dockerfile.example's devel stage, minus the
+# terminator/tmux setup.sh calls: this trimmed devel-base ships
+# neither binary (node/serve image), and those scripts hard-fail
+# their check_deps when the tool is absent.
 RUN cat "${CONFIG_DIR}"/shell/bashrc >> "${HOME}/.bashrc" && \
     chown "${USER}":"${GROUP}" "${HOME}/.bashrc" && \
     mkdir -p "${HOME}/.bashrc.d" && \
     cp -n "${CONFIG_DIR}"/shell/bashrc.d/*.sh "${HOME}/.bashrc.d/" 2>/dev/null || true && \
     chown -R "${USER}":"${GROUP}" "${HOME}/.bashrc.d" && \
-    sudo rm -rf "${CONFIG_DIR}" "${SETUP_DIR}"
+    sudo rm -rf "${CONFIG_DIR}"
 
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
@@ -146,7 +154,9 @@ ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
-COPY --chmod=0755 .base/script/docker/_entrypoint_logging.sh /usr/local/lib/base/_entrypoint_logging.sh
+# Same log tee helper as the devel stage: this stage builds from
+# devel-base, so the devel COPY is not inherited and must be repeated.
+COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
 
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
@@ -191,6 +201,8 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "serve -s /app/dist -l ${EXAMPLE_PORT}"]
 
 ############################## devel-test ##############################
+# Resolves to test-tools:local (local build.sh) or ghcr.io/.../test-tools:vX.Y.Z (CI).
+# hadolint ignore=DL3006
 FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
 
 FROM devel AS devel-test
@@ -202,14 +214,18 @@ COPY --from=test-tools-stage /usr/local/bin/hadolint /usr/local/bin/hadolint
 
 COPY .hadolint.yaml /lint/.hadolint.yaml
 COPY Dockerfile /lint/Dockerfile
+# script/*.sh = repo entrypoint.sh + the wrapper symlinks (BuildKit
+# dereferences them; the targets live inside the build context).
 COPY script/*.sh /lint/
-COPY .base/script/docker/_lib.sh \
-     .base/script/docker/i18n.sh \
-     .base/script/docker/_tui_conf.sh \
-     /lint/
+# base#406: all helper libs (_lib.sh, i18n.sh, _tui_conf.sh, ...) now
+# live under lib/; the wrappers themselves under wrapper/.
 COPY .base/script/docker/lib /lint/lib
-RUN shellcheck -S warning /lint/*.sh /lint/lib/*.sh
-RUN cd /lint && hadolint Dockerfile
+COPY .base/script/docker/wrapper /lint/wrapper
+# /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
+# top of the template's wrapper + lib coverage.
+RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh
+WORKDIR /lint
+RUN hadolint Dockerfile
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats
