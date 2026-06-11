@@ -27,10 +27,10 @@ Browser (Chrome/Chromium)
 
 ```bash
 # 1. 构建（仅需一次）
-make build
+just build
 
 # 2. 运行（默认：127.0.0.1:49100，serve 监听 5173）
-make run -- -d
+just run -d
 
 # 3. 打开 Chrome -> http://<host-ip>:5173
 #    选择 "UI for any streaming app" -> Next
@@ -64,7 +64,7 @@ SERVE_PORT = 5173
 一次构建，使用不同端口运行多个容器：
 
 ```bash
-make build  # 仅需一次
+just build  # 仅需一次
 
 # 实例 A
 docker run --rm -d --name owv-a --network=host \

@@ -17,10 +17,10 @@ set -euo pipefail
 # Tee container stdout/stderr to a host file when [logging] local_path
 # is set in setup.conf. No-op when local_path is unset (default), so
 # default-sourcing has zero side effect on stock repos. Helper is
-# COPY'd into the image at /usr/local/lib/base/ by Dockerfile.example's
-# devel stage (refs #364 + #368).
+# COPY'd into the image at /usr/local/lib/base/ by the Dockerfile's
+# devel + example stages (refs base#328 + base#368).
 # shellcheck source=/dev/null
-. /usr/local/lib/base/_entrypoint_logging.sh
+. /usr/local/lib/base/logging.sh
 
 # yaml_value <key> <file>: extract a scalar value for a top-level-ish
 # `<key>: <value>` line. Strips surrounding quotes, a trailing inline
