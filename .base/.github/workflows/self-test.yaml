@@ -1,4 +1,4 @@
-name: Self Test
+name: CI
 
 on:
   push:
@@ -100,13 +100,13 @@ jobs:
                   'compose.yaml' \
                   'dockerfile/Dockerfile.example' \
                   'dockerfile/Dockerfile.test-tools' \
-                  'script/docker/build.sh' \
-                  'script/docker/run.sh' \
-                  'script/docker/exec.sh' \
-                  'script/docker/stop.sh' \
-                  'script/docker/prune.sh' \
-                  'script/docker/setup.sh' \
-                  'script/docker/i18n.sh' \
+                  'script/docker/wrapper/build.sh' \
+                  'script/docker/wrapper/run.sh' \
+                  'script/docker/wrapper/exec.sh' \
+                  'script/docker/wrapper/stop.sh' \
+                  'script/docker/wrapper/prune.sh' \
+                  'script/docker/wrapper/setup.sh' \
+                  'script/docker/lib/i18n.sh' \
                   'script/docker/lib/**' \
                   'test/behavioural/**' \
                   'init.sh' 'upgrade.sh' \
@@ -398,11 +398,12 @@ jobs:
           bash .base/init.sh
 
           # Sanity: verify symlinks resolve and core files exist.
-          # Post-#330: wrappers live under script/; Makefile stays at root.
+          # Post-#330: wrappers live under script/; #546: the root user
+          # entry is the justfile (the container-ops Makefile was retired).
           test -L script/build.sh && test -L script/run.sh \
             && test -L script/exec.sh && test -L script/stop.sh
           test -L script/setup_tui.sh
-          test -L Makefile
+          test -L justfile
           test -f Dockerfile && test -f compose.yaml && test -f config/docker/setup.conf
 
           echo "REPO_DIR=${REPO_DIR}" >> "${GITHUB_ENV}"
