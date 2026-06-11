@@ -3,8 +3,10 @@
 # Copy to config/host.yaml (gitignored, per-host) and mount it into the
 # container at /etc/host.yaml. This file is documentation only -- it is
 # NOT baked into the image. Defaults live in the entrypoint
-# (${VAR:-default}); a value here, or a VIEWER_* / SIGNALING_* env var,
-# overrides them. Precedence: host.yaml > env > built-in default.
+# (${VAR:-default}); a value here, or a VIEWER_UI_MODE / SIGNALING_*
+# env var, overrides them. Precedence: host.yaml > env > built-in
+# default. Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are workload
+# runtime params delivered via env / .env (D8), NOT host.yaml.
 # ---------------------------------------------------------------------
 
 network:
@@ -14,25 +16,17 @@ network:
   public_ip: "127.0.0.1"
 
 viewer:
-  # Which client UI to render once connected:
-  #   "usd-viewer"  -> full USD Viewer UI (asset selector + stage tree).
-  #                    = the "UI for default streaming USD Viewer app" radio.
-  #                    WARNING: only works with the kit-app-template USD
-  #                    Viewer. Against Isaac Sim or any other Kit app the
-  #                    readiness poll never completes -> the page stays blank
-  #                    with NO error and never times out. Use "stream-only"
-  #                    for those.
-  #   "stream-only" -> pure video, no UI messaging.
-  #                    = the "UI for any streaming app" radio.
+  # Which APP the entrypoint serves (D7 app selector). The image ships two
+  # built apps; ui_mode picks which dist is served:
+  #   "usd-viewer"  -> upstream web-viewer-sample built UNMODIFIED: the
+  #                    landing / "UI Option" selection screen + full USD
+  #                    Viewer UI + any-app stream, all reached interactively
+  #                    by clicking (default).
+  #                    WARNING: the full USD Viewer UI only works with the
+  #                    kit-app-template USD Viewer. Against Isaac Sim or any
+  #                    other Kit app, pick that path's "any streaming app"
+  #                    option, or use "stream-only".
+  #   "stream-only" -> our own full-screen auto-connect app: a bare video
+  #                    stream with no chrome, connects on load (no click).
   #                    Use this for Isaac Sim or any non-USD-Viewer Kit app.
   ui_mode: "usd-viewer"
-
-  # Skip the initial "UI Option" selection screen:
-  #   false -> show the screen; pick a mode + click Next (default, = stock
-  #            NVIDIA sample behavior).
-  #   true  -> go straight in using ui_mode above, no clicks.
-  #
-  # To boot directly into "any streaming app" mode (e.g. Isaac Sim), set:
-  #   ui_mode: "stream-only"
-  #   auto_launch: true
-  auto_launch: false
