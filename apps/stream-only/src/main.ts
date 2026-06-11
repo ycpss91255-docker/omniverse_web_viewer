@@ -30,6 +30,14 @@ function start(): void {
     return;
   }
 
+  // Announce the resolved dial intent before connecting, so an embedding host
+  // page can observe exactly what the viewer is about to connect to (server /
+  // signaling port / media port). Behavior-neutral: it changes nothing about
+  // the connection itself. Not test-only -- it is part of the embedder surface.
+  document.dispatchEvent(
+    new CustomEvent('owv:dial', { detail: { server, port, mediaPort } }),
+  );
+
   connectStream(streamConfig, {
     onStart: () => showStatus(`streaming ${server}:${port}`),
   }).catch((e: unknown) => showStatus(`connection failed: ${String(e)}`, true));

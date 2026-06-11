@@ -370,3 +370,51 @@ ARG USER
 USER "${USER}"
 
 RUN bats /smoke_test/
+
+############################## e2e-test ##############################
+# Tier-1 browser config-dial e2e (#47). FROM runtime so it drives the REAL
+# served dists at /app/<mode>/dist through the production entrypoint -- the one
+# layer the curl-200 runtime smoke never reaches (does the booted bundle feed
+# the injected SIGNALING_SERVER:PORT, and the media port, into the stream
+# client?). No GPU / Isaac / Kit: the app dials a dead test host and we record
+# what it dials. Standalone, @nvidia-FREE (test/e2e is outside the npm
+# workspaces, so installing it here never touches the private streaming-library
+# registry). Built only as a build-worker `extra_stage` (per-PR), never pushed.
+#
+# This stage MUST NOT be named after the standard pipeline stages
+# (sys/devel-base/devel/devel-test/runtime-test/runtime) -- base#415 extra_stages
+# blocklist.
+FROM runtime AS e2e-test
+
+ARG USER_NAME="user"
+ARG USER_GROUP="user"
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+
+# Browsers go to a world-readable path so the non-root USER can run them in the
+# gate RUN below (Chromium refuses its sandbox as root). node + npm come from
+# devel-base (carried via runtime's FROM chain).
+ENV PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
+
+# Root for the apt install Playwright's `install --with-deps chromium` performs.
+USER root
+
+WORKDIR /e2e
+COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
+
+# Install the e2e tooling (Playwright only -- no @nvidia) and the Chromium
+# browser plus its OS deps. `--with-deps` apt-installs the headless libs.
+# Browsers land in the world-readable PLAYWRIGHT_BROWSERS_PATH so the non-root
+# user can launch them. hadolint ignore=DL3016
+RUN npm install --no-audit --no-fund && \
+    npx playwright install --with-deps chromium && \
+    chmod -R a+rx "${PLAYWRIGHT_BROWSERS_PATH}" && \
+    chown -R "${USER}":"${GROUP}" /e2e
+
+# Drop privilege: Chromium must not run as root. The gate renders+serves each
+# mode via the entrypoint with distinctive test values, runs Playwright against
+# the live server, and fails the build on any non-zero Playwright exit.
+# Orchestration lives in run-in-image.sh (shellcheck-clean) so this RUN stays a
+# single call rather than a giant inline script.
+USER "${USER}"
+RUN bash /e2e/run-in-image.sh
