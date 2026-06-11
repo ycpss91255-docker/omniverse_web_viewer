@@ -1,0 +1,13 @@
+{
+  "name": "owv-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tier-1 browser config-dial e2e for omniverse_web_viewer. Standalone (NOT an npm-workspace package): no @nvidia dependency, installed only in the Dockerfile e2e-test stage so it never drags the private streaming-library registry into the app builds.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0"
+  }
+}

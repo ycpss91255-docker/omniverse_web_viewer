@@ -1,6 +1,6 @@
 # TEST.md
 
-**61 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **31 node** (per-package unit, `node --test`, run in the package builds and `devel-test`).
+**63 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **31 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **2 Playwright** (tier-1 browser config-dial e2e, `test/e2e/`, run in the `e2e-test` extra stage).
 
 Layout follows base #473 (`test/<category>/<tool>/` for the multi-tool repo level; each npm package carries its own single-tool `test/`).
 
@@ -61,8 +61,20 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 
 `resolveTarget.test.js`: target fallback, query override, `?media=` override, unsubstituted media sentinel -> null, server sentinel pass-through. (The example's `buildStreamConfig` tests moved to `stream-core` in S1/S3.)
 
+## test/e2e/ (2, Playwright + headless Chromium)
+
+`config-dial.spec.ts` -- tier-1 browser config-dial e2e (#47). Standalone, `@nvidia`-free (outside the npm workspaces). Drives the REAL dist served by the `runtime` image: `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it. The specs wrap `window.WebSocket` / `window.RTCPeerConnection` (via `addInitScript`, before app code) to record dial targets and listen for the `owv:dial` CustomEvent; the app dialing a dead host (async failure) is EXPECTED.
+
+| Test | Mode | Description |
+|------|------|-------------|
+| `stream-only dials the injected target` | stream-only | Asserts the `owv:dial` event detail (server/port/media) matches the injected values (media pinned == `MEDIA_PORT`, null when unset, D1); best-effort WS-URL corroboration; `#stream-status` not in error / no `invalid` |
+| `usd-viewer dials the injected target` | usd-viewer | BLACK BOX (upstream unmodified, no event): asserts the WebSocket dial URL carries `server:port`, with a served-JS string-presence fallback (injected server present, `__OWV_SERVER__` sentinel absent) + no uncaught page error |
+
+`run-in-image.sh` is the in-image gate runner (not a counted spec); a non-zero Playwright exit fails the `e2e-test` stage build.
+
 ## Where they run
 
 - bats: `devel-test` stage (`/smoke_test/`, alongside `.base/test/smoke/` shared specs).
 - node: each package's build stage (`stream-only-build` runs stream-core + stream-only tests; the `example` stage runs stream-core + example tests) and locally via `npm -w <pkg> test`.
 - runtime smoke: `runtime-test` stage serves BOTH app dists and curls each for 200 (not counted above; it is a stage gate, not a spec file).
+- Playwright e2e: `e2e-test` extra stage (`FROM runtime`, built via the build-worker `extra_stages` input, per-PR, no GPU / Isaac / self-hosted runner). Installs Playwright + Chromium at build time and runs `run-in-image.sh` against the served dists.

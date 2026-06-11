@@ -24,6 +24,11 @@ jobs:
       submodules: recursive
       build_runtime: true
       test_tools_version: v0.41.0
+      # Tier-1 browser config-dial e2e (#47): an extra Dockerfile stage
+      # (FROM runtime) that boots the served dists in headless Chromium and
+      # asserts the bundle dials the injected server/port (+ media). No GPU,
+      # no Isaac, no self-hosted runner -- runs per-PR on the hosted builder.
+      extra_stages: e2e-test
       # The Dockerfile's runtime-test stage bakes a strong default
       # RUNTIME_SMOKE_CMD (serve + curl 200 for BOTH /app/usd-viewer/dist
       # and /app/stream-only/dist), so passing it here is optional. We pass
