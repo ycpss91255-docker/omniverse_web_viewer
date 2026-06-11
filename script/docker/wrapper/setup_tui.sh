@@ -32,14 +32,15 @@ readonly FILE_PATH
 
 _TUI_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 _TUI_SCRIPT_DIR="$(cd -- "$(dirname -- "${_TUI_SELF}")" && pwd -P)"
-_TUI_TPL_DIR="$(cd -- "${_TUI_SCRIPT_DIR}/../.." && pwd -P)"
+_TUI_LIB_DIR="$(cd -- "${_TUI_SCRIPT_DIR}/../lib" && pwd -P)"
+_TUI_TPL_DIR="$(cd -- "${_TUI_SCRIPT_DIR}/../../.." && pwd -P)"
 
 # shellcheck disable=SC1091
-source "${_TUI_SCRIPT_DIR}/i18n.sh"
+source "${_TUI_LIB_DIR}/i18n.sh"
 # shellcheck disable=SC1091
-source "${_TUI_SCRIPT_DIR}/_tui_backend.sh"
+source "${_TUI_LIB_DIR}/_tui_backend.sh"
 # shellcheck disable=SC1091
-source "${_TUI_SCRIPT_DIR}/_tui_conf.sh"
+source "${_TUI_LIB_DIR}/_tui_conf.sh"
 
 # ── Messages (4 languages) ────────────────────────────────────────────────
 # Flat associative arrays per language. Key format: <ns>.<name>. Missing
@@ -50,7 +51,7 @@ _TUI_MSG_EN[title]="Docker Container Configuration"
 _TUI_MSG_EN[main.prompt]=""
 _TUI_MSG_EN[main.image]="IMAGE_NAME detection rules"
 _TUI_MSG_EN[main.build]="APT mirrors + Dockerfile build args"
-_TUI_MSG_EN[main.network]="mode / ipc / name"
+_TUI_MSG_EN[main.network]="mode / ipc / pid / name"
 _TUI_MSG_EN[main.deploy]="GPU reservation"
 _TUI_MSG_EN[main.gui]="display mode"
 _TUI_MSG_EN[main.volumes]="workspace + extra mounts"
@@ -90,7 +91,7 @@ _TUI_MSG_EN[per_stage.overrides_set]="overrides set"
 _TUI_MSG_EN[per_stage.inherits_all]="(inherits all)"
 _TUI_MSG_EN[per_stage.one.menu]="Pick a section to edit, or Back"
 _TUI_MSG_EN[per_stage.scalar.menu]="Pick a key to edit, or Back"
-_TUI_MSG_EN[per_stage.scalar.prompt]=$'Override value\n  - Empty = inherit top-level (clear this override)\n  - For mode keys: auto / force / off (gui, gpu)\n  - For network mode: host / bridge / none\n  - For ipc: host / shareable / private\n  - For privileged: true / false\n  - For runtime: auto / nvidia / off'
+_TUI_MSG_EN[per_stage.scalar.prompt]=$'Override value\n  - Empty = inherit top-level (clear this override)\n  - For mode keys: auto / force / off (gui, gpu)\n  - For network mode: host / bridge / none\n  - For ipc: host / shareable / private\n  - For pid: host / private\n  - For privileged: true / false\n  - For gpu_runtime (legacy runtime): auto / nvidia / off'
 _TUI_MSG_EN[per_stage.list.menu]="Edit list entries, toggle inheritance, or Back"
 _TUI_MSG_EN[per_stage.list.entry_prompt]=$'List entry value\n  - Empty = delete this entry\n  - Format depends on the list (mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE)'
 _TUI_MSG_EN[per_stage.network.ports]="ports list (per-stage)"
@@ -152,6 +153,9 @@ _TUI_MSG_EN[network.ipc.prompt]="IPC namespace"
 _TUI_MSG_EN[network.ipc.host]="host (share host IPC / shared memory)"
 _TUI_MSG_EN[network.ipc.shareable]="shareable (own IPC, accessible to other containers)"
 _TUI_MSG_EN[network.ipc.private]="private (own IPC, isolated — Docker default)"
+_TUI_MSG_EN[network.pid.prompt]="PID namespace"
+_TUI_MSG_EN[network.pid.host]="host (share host PID namespace — required for multi-GPU-container NVIDIA driver mutex)"
+_TUI_MSG_EN[network.pid.private]="private (own PID namespace — Docker default)"
 _TUI_MSG_EN[network.priv.prompt]="Run container privileged?"
 _TUI_MSG_EN[network.name.prompt]=$'Bridge network name\n  - Empty = compose auto-creates <project>_default bridge each run\n  - Non-empty = compose creates a bridge with this name (auto-managed)\n      Example: my_bridge\n        → compose creates <project>_my_bridge on up\n        → removed on down'
 _TUI_MSG_EN[deploy.title]="Deploy"
@@ -169,6 +173,8 @@ _TUI_MSG_EN[deploy.runtime.prompt]="Docker runtime override (Jetson / csv-mode t
 _TUI_MSG_EN[deploy.runtime.auto]="auto (emit runtime: nvidia on Jetson — /etc/nv_tegra_release)"
 _TUI_MSG_EN[deploy.runtime.nvidia]="nvidia (force emit on all hosts)"
 _TUI_MSG_EN[deploy.runtime.off]="off (no runtime override — Docker default runc)"
+# [deploy] runtime -> gpu_runtime migration suggestion (#517, fast-follow of #481)
+_TUI_MSG_EN[deploy.runtime.migrate]=$'Your setup.conf still uses the legacy [deploy] runtime key.\n\nIt was renamed to gpu_runtime in #481 (the old name keeps working as a\npermanent alias). Saving here writes the new gpu_runtime key; you can\nthen remove the old runtime line from setup.conf. This page never edits\nthe legacy key for you.'
 _TUI_MSG_EN[deploy.mig.title]="Deploy — NVIDIA MIG detected"
 _TUI_MSG_EN[deploy.mig.warning]=$'NVIDIA MIG (Multi-Instance GPU) mode is enabled on this host.\n\nDocker\'s deploy `count=N` reservation addresses whole GPUs; it cannot pin a specific MIG slice. To target one slice, leave count as-is and add to the [environment] section:\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\nAvailable GPU / MIG instances:\n%s'
 _TUI_MSG_EN[gui.title]="GUI"
@@ -189,7 +195,7 @@ _TUI_MSG_EN[devices.edit_cgroup]="Cgroup rules (device_cgroup_rules:)"
 _TUI_MSG_EN[devices.add_device]="Add device binding"
 _TUI_MSG_EN[devices.add_cgroup]="Add cgroup rule"
 _TUI_MSG_EN[devices.back]="Back to main menu"
-_TUI_MSG_EN[devices.device.prompt]=$'Device binding\n  - Format: <host>[:<container>[:rwm]]\n  - Empty = delete this entry\n  - Default: /dev:/dev (bind whole /dev tree)\n  - Example (single): /dev/video0:/dev/video0'
+_TUI_MSG_EN[devices.device.prompt]=$'Device binding\n  - Format: <host>[:<container>[:rwm]]\n  - Empty = delete this entry\n  - Example (whole tree): /dev:/dev\n  - Example (single): /dev/video0:/dev/video0'
 _TUI_MSG_EN[devices.cgroup.title]="Cgroup rules"
 _TUI_MSG_EN[devices.cgroup.menu]="Select an entry to edit, or Add a new cgroup rule"
 _TUI_MSG_EN[devices.cgroup.prompt]=$'Cgroup rule\n  - Format: <type> <major>:<minor|*> <perms>\n    type: c (char), b (block), a (all)\n    perms: any of r / w / m\n  - Empty = delete this entry\n  - Example (USB): c 189:* rwm\n  - Example (V4L2): c 81:* rwm'
@@ -221,6 +227,21 @@ _TUI_MSG_EN[err.invalid_mount]="Invalid mount format (expected <host>:<container
 _TUI_MSG_EN[err.invalid_cgroup_rule]="Invalid cgroup rule (expected: <c|b|a> <major>:<minor|*> <r|w|m>)"
 _TUI_MSG_EN[err.invalid_gpu_count]="Invalid GPU count (expected 'all' or a positive integer)"
 _TUI_MSG_EN[err.invalid_runtime]="Invalid runtime (expected 'auto', 'nvidia', or 'off')"
+# [lifecycle] restart policy page (#514, fast-follow of #478)
+_TUI_MSG_EN[main.lifecycle]="container restart policy"
+# runtime-env info page (#497, info-only: points at the .env workload overlay)
+_TUI_MSG_EN[main.envinfo]="workload env (.env) -- how to set"
+_TUI_MSG_EN[envinfo.title]="Workload env (.env)"
+_TUI_MSG_EN[envinfo.info]=$'Volatile per-task env vars (ROS_DOMAIN_ID, LOG_LEVEL, tokens, ...)\nbelong in the gitignored .env overlay -- edit that file directly.\nsetup.sh never touches .env after scaffolding it, and changes take\neffect with `make run` alone: no compose regenerate, no SETUP_CONF_HASH\ndrift, no git churn.\n\nSet-once defaults that rarely change live in [environment] (this menu ->\n"runtime env vars"). They are baked into the field image as ENV and\nemitted into compose; .env overrides them at runtime (.env wins).\n\nThis page is informational -- it does not edit .env.'
+_TUI_MSG_EN[lifecycle.title]="Lifecycle"
+_TUI_MSG_EN[lifecycle.restart.prompt]=$'Container restart policy.\n\nCaveat: always / unless-stopped restart on ANY exit -- a stage that\nextends devel and exits 0 (e.g. the test service) would loop. Prefer\non-failure for auto-retry.'
+_TUI_MSG_EN[lifecycle.restart.no]="no (never restart -- default; emits no restart: field)"
+_TUI_MSG_EN[lifecycle.restart.always]="always (restart on any exit, incl. manual stop)"
+_TUI_MSG_EN[lifecycle.restart.unless_stopped]="unless-stopped (restart on any exit unless manually stopped)"
+_TUI_MSG_EN[lifecycle.restart.on_failure]="on-failure (restart only on non-zero exit)"
+_TUI_MSG_EN[lifecycle.restart.n_prompt]="Max retry count for on-failure (integer >= 1; leave empty for unlimited bare on-failure)"
+_TUI_MSG_EN[err.invalid_restart]="Invalid restart policy (no / always / unless-stopped / on-failure / on-failure:N)"
+_TUI_MSG_EN[err.invalid_restart_n]="Invalid retry count (expected a positive integer, or empty for bare on-failure)"
 _TUI_MSG_EN[err.invalid_shm_size]=$'Invalid shm_size\n  - Expected: <num><unit>\n  - Units: b, k/kb, m/mb, g/gb (case-insensitive)\n  - Example: 2gb, 512mb'
 _TUI_MSG_EN[err.invalid_port_mapping]=$'Invalid port mapping\n  - Expected: <host>:<container>[/tcp|udp]\n  - Example: 8080:80, 5000:5000/udp'
 _TUI_MSG_EN[err.invalid_env_kv]=$'Invalid env var\n  - Expected: KEY=VALUE\n  - KEY must start with letter or _ and contain only [A-Za-z0-9_]'
@@ -305,7 +326,7 @@ _TUI_MSG_ZH_TW[per_stage.overrides_set]="個 override"
 _TUI_MSG_ZH_TW[per_stage.inherits_all]="(全部繼承)"
 _TUI_MSG_ZH_TW[per_stage.one.menu]="選擇要編輯的 section，或返回"
 _TUI_MSG_ZH_TW[per_stage.scalar.menu]="選擇要編輯的 key，或返回"
-_TUI_MSG_ZH_TW[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 繼承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - privileged：true / false\n  - runtime：auto / nvidia / off'
+_TUI_MSG_ZH_TW[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 繼承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（舊稱 runtime）：auto / nvidia / off'
 _TUI_MSG_ZH_TW[per_stage.list.menu]="編輯 list 項目、切換繼承、或返回"
 _TUI_MSG_ZH_TW[per_stage.list.entry_prompt]=$'List 項目值\n  - 空白 = 刪除此項目\n  - 格式依 list 不同（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
 _TUI_MSG_ZH_TW[per_stage.network.ports]="ports list (per-stage)"
@@ -367,6 +388,9 @@ _TUI_MSG_ZH_TW[network.ipc.prompt]="IPC 命名空間"
 _TUI_MSG_ZH_TW[network.ipc.host]="host（共用主機 IPC／共享記憶體）"
 _TUI_MSG_ZH_TW[network.ipc.shareable]="shareable（獨立 IPC，其他容器可存取）"
 _TUI_MSG_ZH_TW[network.ipc.private]="private（獨立 IPC，Docker 預設）"
+_TUI_MSG_ZH_TW[network.pid.prompt]="PID 命名空間"
+_TUI_MSG_ZH_TW[network.pid.host]="host（共用主機 PID 命名空間 — 多 GPU 容器 NVIDIA 驅動 mutex 需要）"
+_TUI_MSG_ZH_TW[network.pid.private]="private（獨立 PID 命名空間 — Docker 預設）"
 _TUI_MSG_ZH_TW[network.priv.prompt]="以特權模式執行？"
 _TUI_MSG_ZH_TW[network.name.prompt]=$'Bridge 網路名稱\n  - 留空 = compose 每次自動建立 <project>_default bridge\n  - 填寫 = compose 建立以此為名的 bridge（仍由 compose 管理）\n      範例：my_bridge\n        → compose 啟動時建立 <project>_my_bridge\n        → 停止時自動移除'
 _TUI_MSG_ZH_TW[deploy.title]="Deploy"
@@ -384,6 +408,8 @@ _TUI_MSG_ZH_TW[deploy.runtime.prompt]="Docker runtime 覆寫（Jetson / csv 模�
 _TUI_MSG_ZH_TW[deploy.runtime.auto]="auto（Jetson 自動輸出 runtime: nvidia — /etc/nv_tegra_release）"
 _TUI_MSG_ZH_TW[deploy.runtime.nvidia]="nvidia（所有主機強制輸出）"
 _TUI_MSG_ZH_TW[deploy.runtime.off]="off（不覆寫 — Docker 預設 runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (#517, fast-follow of #481)
+_TUI_MSG_ZH_TW[deploy.runtime.migrate]=$'你的 setup.conf 仍使用舊的 [deploy] runtime key。\n\n#481 已將它更名為 gpu_runtime（舊名仍以永久 alias 形式可用）。在此\n儲存會寫入新的 gpu_runtime key；之後你可自行從 setup.conf 移除舊的\nruntime 那行。本頁不會替你改動舊 key。'
 _TUI_MSG_ZH_TW[deploy.mig.title]="Deploy — 偵測到 NVIDIA MIG"
 _TUI_MSG_ZH_TW[deploy.mig.warning]=$'此主機已啟用 NVIDIA MIG（Multi-Instance GPU）模式。\n\nDocker 的 deploy `count=N` 只能預留整張 GPU，無法指定特定 MIG slice。若要使用單一 slice，請維持 count 不變，並在 [environment] 區塊加入：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\n主機上的 GPU / MIG 實例：\n%s'
 _TUI_MSG_ZH_TW[gui.title]="GUI"
@@ -404,7 +430,7 @@ _TUI_MSG_ZH_TW[devices.edit_cgroup]="Cgroup 規則（device_cgroup_rules:）"
 _TUI_MSG_ZH_TW[devices.add_device]="新增 device binding"
 _TUI_MSG_ZH_TW[devices.add_cgroup]="新增 cgroup rule"
 _TUI_MSG_ZH_TW[devices.back]="回主選單"
-_TUI_MSG_ZH_TW[devices.device.prompt]=$'Device 綁定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 刪除此項目\n  - 預設：/dev:/dev（綁定整個 /dev）\n  - 範例（單一）：/dev/video0:/dev/video0'
+_TUI_MSG_ZH_TW[devices.device.prompt]=$'Device 綁定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 刪除此項目\n  - 範例（整個 /dev）：/dev:/dev\n  - 範例（單一）：/dev/video0:/dev/video0'
 _TUI_MSG_ZH_TW[devices.cgroup.title]="Cgroup 規則"
 _TUI_MSG_ZH_TW[devices.cgroup.menu]="選擇項目編輯，或新增 cgroup 規則"
 _TUI_MSG_ZH_TW[devices.cgroup.prompt]=$'Cgroup 規則\n  - 格式：<type> <major>:<minor|*> <perms>\n    type: c（字元）、b（區塊）、a（全部）\n    perms: r / w / m 任意組合\n  - 留空 = 刪除此項目\n  - USB 範例：c 189:* rwm\n  - V4L2 範例：c 81:* rwm'
@@ -436,6 +462,21 @@ _TUI_MSG_ZH_TW[err.invalid_mount]="掛載格式錯誤（預期 <host>:<container
 _TUI_MSG_ZH_TW[err.invalid_cgroup_rule]="Cgroup 規則格式錯誤（預期：<c|b|a> <major>:<minor|*> <r|w|m>）"
 _TUI_MSG_ZH_TW[err.invalid_gpu_count]="GPU 數量格式錯誤（預期 'all' 或正整數）"
 _TUI_MSG_ZH_TW[err.invalid_runtime]="runtime 值不合法（預期 'auto'、'nvidia' 或 'off'）"
+# [lifecycle] restart policy page (#514, fast-follow of #478)
+_TUI_MSG_ZH_TW[main.lifecycle]="容器重啟策略"
+# runtime-env info page (#497, info-only: points at the .env workload overlay)
+_TUI_MSG_ZH_TW[main.envinfo]="workload 環境變數（.env）-- 設定方式"
+_TUI_MSG_ZH_TW[envinfo.title]="Workload 環境變數（.env）"
+_TUI_MSG_ZH_TW[envinfo.info]=$'每個任務會變動的環境變數（ROS_DOMAIN_ID、LOG_LEVEL、token 等）\n應寫進 gitignore 的 .env overlay —— 直接編輯該檔。\nsetup.sh 在首次 scaffold 後永不碰 .env，且改動只要 `make run` 即\n生效：不需重生 compose、不會動 SETUP_CONF_HASH、不產生 git 變更。\n\n極少變動的 set-once 預設值放在 [environment]（本選單 ->「執行時期\n環境變數」）。它們會 bake 進 field image 的 ENV 並輸出到 compose；\n執行時 .env 會覆蓋它們（.env 優先）。\n\n本頁僅供說明 —— 不會編輯 .env。'
+_TUI_MSG_ZH_TW[lifecycle.title]="生命週期"
+_TUI_MSG_ZH_TW[lifecycle.restart.prompt]=$'容器重啟策略。\n\n注意：always / unless-stopped 會在「任何」退出時重啟 —— 一個 extends\ndevel 且以 0 結束的 stage（例如 test service）會無限重啟。要自動重試\n請優先選 on-failure。'
+_TUI_MSG_ZH_TW[lifecycle.restart.no]="no（永不重啟 —— 預設；不輸出 restart: 欄位）"
+_TUI_MSG_ZH_TW[lifecycle.restart.always]="always（任何退出都重啟，含手動停止）"
+_TUI_MSG_ZH_TW[lifecycle.restart.unless_stopped]="unless-stopped（任何退出都重啟，除非手動停止）"
+_TUI_MSG_ZH_TW[lifecycle.restart.on_failure]="on-failure（僅非零退出時重啟）"
+_TUI_MSG_ZH_TW[lifecycle.restart.n_prompt]="on-failure 最大重試次數（整數 >= 1；留空 = 不限次數的純 on-failure）"
+_TUI_MSG_ZH_TW[err.invalid_restart]="restart 策略不合法（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_ZH_TW[err.invalid_restart_n]="重試次數不合法（預期正整數，或留空為純 on-failure）"
 _TUI_MSG_ZH_TW[err.invalid_shm_size]=$'shm_size 格式錯誤\n  - 預期：<數字><單位>\n  - 單位：b、k/kb、m/mb、g/gb（大小寫不限）\n  - 範例：2gb、512mb'
 _TUI_MSG_ZH_TW[err.invalid_port_mapping]=$'Port 映射格式錯誤\n  - 預期：<host>:<container>[/tcp|udp]\n  - 範例：8080:80、5000:5000/udp'
 _TUI_MSG_ZH_TW[err.invalid_env_kv]=$'環境變數格式錯誤\n  - 預期：KEY=VALUE\n  - KEY 需以字母或 _ 開頭，僅含 [A-Za-z0-9_]'
@@ -518,7 +559,7 @@ _TUI_MSG_ZH_CN[per_stage.overrides_set]="个 override"
 _TUI_MSG_ZH_CN[per_stage.inherits_all]="(全部继承)"
 _TUI_MSG_ZH_CN[per_stage.one.menu]="选择要编辑的 section，或返回"
 _TUI_MSG_ZH_CN[per_stage.scalar.menu]="选择要编辑的 key，或返回"
-_TUI_MSG_ZH_CN[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 继承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - privileged：true / false\n  - runtime：auto / nvidia / off'
+_TUI_MSG_ZH_CN[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 继承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（旧称 runtime）：auto / nvidia / off'
 _TUI_MSG_ZH_CN[per_stage.list.menu]="编辑 list 项目、切换继承、或返回"
 _TUI_MSG_ZH_CN[per_stage.list.entry_prompt]=$'List 项目值\n  - 空白 = 删除此项目\n  - 格式依 list 不同（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
 _TUI_MSG_ZH_CN[per_stage.network.ports]="ports list (per-stage)"
@@ -580,6 +621,9 @@ _TUI_MSG_ZH_CN[network.ipc.prompt]="IPC 命名空间"
 _TUI_MSG_ZH_CN[network.ipc.host]="host（共用主机 IPC／共享内存）"
 _TUI_MSG_ZH_CN[network.ipc.shareable]="shareable（独立 IPC，其他容器可访问）"
 _TUI_MSG_ZH_CN[network.ipc.private]="private（独立 IPC，Docker 默认）"
+_TUI_MSG_ZH_CN[network.pid.prompt]="PID 命名空间"
+_TUI_MSG_ZH_CN[network.pid.host]="host（共用主机 PID 命名空间 — 多 GPU 容器 NVIDIA 驱动 mutex 需要）"
+_TUI_MSG_ZH_CN[network.pid.private]="private（独立 PID 命名空间 — Docker 默认）"
 _TUI_MSG_ZH_CN[network.priv.prompt]="以特权模式运行？"
 _TUI_MSG_ZH_CN[network.name.prompt]=$'Bridge 网络名称\n  - 留空 = compose 每次自动建立 <project>_default bridge\n  - 填写 = compose 建立以此为名的 bridge（仍由 compose 管理）\n      示例：my_bridge\n        → compose 启动时建立 <project>_my_bridge\n        → 停止时自动移除'
 _TUI_MSG_ZH_CN[deploy.title]="Deploy"
@@ -597,6 +641,8 @@ _TUI_MSG_ZH_CN[deploy.runtime.prompt]="Docker runtime 覆盖（Jetson / csv 模�
 _TUI_MSG_ZH_CN[deploy.runtime.auto]="auto（Jetson 自动输出 runtime: nvidia — /etc/nv_tegra_release）"
 _TUI_MSG_ZH_CN[deploy.runtime.nvidia]="nvidia（所有主机强制输出）"
 _TUI_MSG_ZH_CN[deploy.runtime.off]="off（不覆盖 — Docker 默认 runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (#517, fast-follow of #481)
+_TUI_MSG_ZH_CN[deploy.runtime.migrate]=$'你的 setup.conf 仍使用旧的 [deploy] runtime key。\n\n#481 已将它更名为 gpu_runtime（旧名仍以永久 alias 形式可用）。在此\n保存会写入新的 gpu_runtime key；之后你可自行从 setup.conf 移除旧的\nruntime 那行。本页不会替你改动旧 key。'
 _TUI_MSG_ZH_CN[deploy.mig.title]="Deploy — 检测到 NVIDIA MIG"
 _TUI_MSG_ZH_CN[deploy.mig.warning]=$'此主机已启用 NVIDIA MIG（Multi-Instance GPU）模式。\n\nDocker 的 deploy `count=N` 只能预留整张 GPU，无法指定特定 MIG slice。若要使用单一 slice，请保持 count 不变，并在 [environment] 区块加入：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\n主机上的 GPU / MIG 实例：\n%s'
 _TUI_MSG_ZH_CN[gui.title]="GUI"
@@ -617,7 +663,7 @@ _TUI_MSG_ZH_CN[devices.edit_cgroup]="Cgroup 规则（device_cgroup_rules:）"
 _TUI_MSG_ZH_CN[devices.add_device]="新增 device binding"
 _TUI_MSG_ZH_CN[devices.add_cgroup]="新增 cgroup rule"
 _TUI_MSG_ZH_CN[devices.back]="回主菜单"
-_TUI_MSG_ZH_CN[devices.device.prompt]=$'Device 绑定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 删除此项目\n  - 默认：/dev:/dev（绑定整个 /dev）\n  - 示例（单一）：/dev/video0:/dev/video0'
+_TUI_MSG_ZH_CN[devices.device.prompt]=$'Device 绑定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 删除此项目\n  - 示例（整个 /dev）：/dev:/dev\n  - 示例（单一）：/dev/video0:/dev/video0'
 _TUI_MSG_ZH_CN[devices.cgroup.title]="Cgroup 规则"
 _TUI_MSG_ZH_CN[devices.cgroup.menu]="选择项目编辑，或新增 cgroup 规则"
 _TUI_MSG_ZH_CN[devices.cgroup.prompt]=$'Cgroup 规则\n  - 格式：<type> <major>:<minor|*> <perms>\n    type: c（字符）、b（块）、a（全部）\n    perms: r / w / m 任意组合\n  - 留空 = 删除此项目\n  - USB 示例：c 189:* rwm\n  - V4L2 示例：c 81:* rwm'
@@ -673,6 +719,21 @@ _TUI_MSG_ZH_CN[err.invalid_log_local_path]=$'local_path 格式错误\n  - 不可
 _TUI_MSG_ZH_CN[err.invalid_cgroup_rule]="Cgroup 规则格式错误（预期：<c|b|a> <major>:<minor|*> <r|w|m>）"
 _TUI_MSG_ZH_CN[err.invalid_gpu_count]="GPU 数量格式错误（预期 'all' 或正整数）"
 _TUI_MSG_ZH_CN[err.invalid_runtime]="runtime 值不合法（预期 'auto'、'nvidia' 或 'off'）"
+# [lifecycle] restart policy page (#514, fast-follow of #478)
+_TUI_MSG_ZH_CN[main.lifecycle]="容器重启策略"
+# runtime-env info page (#497, info-only: points at the .env workload overlay)
+_TUI_MSG_ZH_CN[main.envinfo]="workload 环境变量（.env）-- 设置方式"
+_TUI_MSG_ZH_CN[envinfo.title]="Workload 环境变量（.env）"
+_TUI_MSG_ZH_CN[envinfo.info]=$'每个任务会变动的环境变量（ROS_DOMAIN_ID、LOG_LEVEL、token 等）\n应写进 gitignore 的 .env overlay —— 直接编辑该文件。\nsetup.sh 在首次 scaffold 后永不碰 .env，且改动只要 `make run` 即\n生效：无需重新生成 compose、不会动 SETUP_CONF_HASH、不产生 git 变更。\n\n极少变动的 set-once 默认值放在 [environment]（本菜单 ->「运行时\n环境变量」）。它们会 bake 进 field image 的 ENV 并输出到 compose；\n运行时 .env 会覆盖它们（.env 优先）。\n\n本页仅供说明 —— 不会编辑 .env。'
+_TUI_MSG_ZH_CN[lifecycle.title]="生命周期"
+_TUI_MSG_ZH_CN[lifecycle.restart.prompt]=$'容器重启策略。\n\n注意：always / unless-stopped 会在「任何」退出时重启 —— 一个 extends\ndevel 且以 0 结束的 stage（例如 test service）会无限重启。要自动重试\n请优先选 on-failure。'
+_TUI_MSG_ZH_CN[lifecycle.restart.no]="no（永不重启 —— 默认；不输出 restart: 字段）"
+_TUI_MSG_ZH_CN[lifecycle.restart.always]="always（任何退出都重启，含手动停止）"
+_TUI_MSG_ZH_CN[lifecycle.restart.unless_stopped]="unless-stopped（任何退出都重启，除非手动停止）"
+_TUI_MSG_ZH_CN[lifecycle.restart.on_failure]="on-failure（仅非零退出时重启）"
+_TUI_MSG_ZH_CN[lifecycle.restart.n_prompt]="on-failure 最大重试次数（整数 >= 1；留空 = 不限次数的纯 on-failure）"
+_TUI_MSG_ZH_CN[err.invalid_restart]="restart 策略不合法（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_ZH_CN[err.invalid_restart_n]="重试次数不合法（预期正整数，或留空为纯 on-failure）"
 _TUI_MSG_ZH_CN[err.no_backend]="未安装 dialog 或 whiptail，请执行：sudo apt install dialog"
 _TUI_MSG_ZH_CN[saved]="已保存至 %s，正在重新生成 .env + compose.yaml..."
 _TUI_MSG_ZH_CN[action.prompt]="选择动作"
@@ -726,7 +787,7 @@ _TUI_MSG_JA[per_stage.overrides_set]="件の override"
 _TUI_MSG_JA[per_stage.inherits_all]="(すべて継承)"
 _TUI_MSG_JA[per_stage.one.menu]="編集する section を選択するか、戻る"
 _TUI_MSG_JA[per_stage.scalar.menu]="編集する key を選択するか、戻る"
-_TUI_MSG_JA[per_stage.scalar.prompt]=$'Override 値\n  - 空白 = top-level を継承（この override をクリア）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - privileged：true / false\n  - runtime：auto / nvidia / off'
+_TUI_MSG_JA[per_stage.scalar.prompt]=$'Override 値\n  - 空白 = top-level を継承（この override をクリア）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（旧称 runtime）：auto / nvidia / off'
 _TUI_MSG_JA[per_stage.list.menu]="list 項目の編集、継承の切替、または戻る"
 _TUI_MSG_JA[per_stage.list.entry_prompt]=$'List 項目の値\n  - 空白 = この項目を削除\n  - 形式は list ごとに異なります（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
 _TUI_MSG_JA[per_stage.network.ports]="ports list (per-stage)"
@@ -788,6 +849,9 @@ _TUI_MSG_JA[network.ipc.prompt]="IPC 名前空間"
 _TUI_MSG_JA[network.ipc.host]="host（ホスト IPC／共有メモリを共有）"
 _TUI_MSG_JA[network.ipc.shareable]="shareable（独自 IPC、他コンテナから可）"
 _TUI_MSG_JA[network.ipc.private]="private（独自 IPC、Docker デフォルト）"
+_TUI_MSG_JA[network.pid.prompt]="PID 名前空間"
+_TUI_MSG_JA[network.pid.host]="host（ホスト PID 名前空間を共有 — マルチ GPU コンテナの NVIDIA ドライバ mutex に必要）"
+_TUI_MSG_JA[network.pid.private]="private（独自 PID 名前空間 — Docker デフォルト）"
 _TUI_MSG_JA[network.priv.prompt]="特権モードで実行？"
 _TUI_MSG_JA[network.name.prompt]=$'Bridge ネットワーク名\n  - 空 = compose が実行ごとに <project>_default bridge を自動作成\n  - 非空 = この名前の bridge を compose が作成 (compose が管理)\n      例: my_bridge\n        → 起動時 <project>_my_bridge を作成\n        → 停止時に自動削除'
 _TUI_MSG_JA[deploy.title]="Deploy"
@@ -805,6 +869,8 @@ _TUI_MSG_JA[deploy.runtime.prompt]="Docker ランタイムオーバーライド�
 _TUI_MSG_JA[deploy.runtime.auto]="auto（Jetson で自動的に runtime: nvidia を出力 — /etc/nv_tegra_release）"
 _TUI_MSG_JA[deploy.runtime.nvidia]="nvidia（全ホストで強制出力）"
 _TUI_MSG_JA[deploy.runtime.off]="off（オーバーライドなし — Docker 既定の runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (#517, fast-follow of #481)
+_TUI_MSG_JA[deploy.runtime.migrate]=$'setup.conf がまだ旧来の [deploy] runtime キーを使用しています。\n\n#481 で gpu_runtime に改名されました（旧名は恒久エイリアスとして\n動作し続けます）。ここで保存すると新しい gpu_runtime キーを書き込み\nます。その後、setup.conf から旧 runtime 行を手動で削除できます。\nこのページが旧キーを書き換えることはありません。'
 _TUI_MSG_JA[deploy.mig.title]="Deploy — NVIDIA MIG を検出"
 _TUI_MSG_JA[deploy.mig.warning]=$'このホストでは NVIDIA MIG（Multi-Instance GPU）モードが有効です。\n\nDocker の deploy `count=N` は GPU 単位の予約であり、特定の MIG スライスを指定できません。特定スライスを使う場合は count を変更せず、[environment] セクションに次を追加してください：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\nホストで利用可能な GPU / MIG インスタンス：\n%s'
 _TUI_MSG_JA[gui.title]="GUI"
@@ -825,7 +891,7 @@ _TUI_MSG_JA[devices.edit_cgroup]="Cgroup ルール (device_cgroup_rules:)"
 _TUI_MSG_JA[devices.add_device]="device binding を追加"
 _TUI_MSG_JA[devices.add_cgroup]="cgroup rule を追加"
 _TUI_MSG_JA[devices.back]="メインメニューへ戻る"
-_TUI_MSG_JA[devices.device.prompt]=$'デバイスバインド\n  - 形式: <host>[:<container>[:rwm]]\n  - 空 = この項目を削除\n  - デフォルト: /dev:/dev (/dev ツリー全体をバインド)\n  - 例 (単一): /dev/video0:/dev/video0'
+_TUI_MSG_JA[devices.device.prompt]=$'デバイスバインド\n  - 形式: <host>[:<container>[:rwm]]\n  - 空 = この項目を削除\n  - 例 (ツリー全体): /dev:/dev\n  - 例 (単一): /dev/video0:/dev/video0'
 _TUI_MSG_JA[devices.cgroup.title]="Cgroup ルール"
 _TUI_MSG_JA[devices.cgroup.menu]="編集する項目を選択、または cgroup ルールを追加"
 _TUI_MSG_JA[devices.cgroup.prompt]=$'Cgroup ルール\n  - 形式: <type> <major>:<minor|*> <perms>\n    type: c (文字)、b (ブロック)、a (全)\n    perms: r / w / m の任意組合せ\n  - 空 = この項目を削除\n  - USB 例: c 189:* rwm\n  - V4L2 例: c 81:* rwm'
@@ -881,6 +947,21 @@ _TUI_MSG_JA[err.invalid_log_local_path]=$'local_path が不正\n  - 空または
 _TUI_MSG_JA[err.invalid_cgroup_rule]="Cgroup ルール形式が不正（<c|b|a> <major>:<minor|*> <r|w|m> を期待）"
 _TUI_MSG_JA[err.invalid_gpu_count]="GPU 数が不正（'all' または正の整数を期待）"
 _TUI_MSG_JA[err.invalid_runtime]="無効な runtime（'auto'、'nvidia'、'off' のいずれか）"
+# [lifecycle] restart policy page (#514, fast-follow of #478)
+_TUI_MSG_JA[main.lifecycle]="コンテナ再起動ポリシー"
+# runtime-env info page (#497, info-only: points at the .env workload overlay)
+_TUI_MSG_JA[main.envinfo]="ワークロード環境変数（.env）-- 設定方法"
+_TUI_MSG_JA[envinfo.title]="ワークロード環境変数（.env）"
+_TUI_MSG_JA[envinfo.info]=$'タスクごとに変わる環境変数（ROS_DOMAIN_ID、LOG_LEVEL、token など）\nは gitignore された .env overlay に書きます —— そのファイルを直接編集\nします。setup.sh は scaffold 後 .env に触れず、変更は `make run` だけ\nで反映されます：compose 再生成なし、SETUP_CONF_HASH のdrift なし、\ngit の変更なし。\n\nめったに変わらない set-once 既定値は [environment]（本メニュー ->\n「実行時環境変数」）に置きます。これらは field image に ENV として\nbake され compose にも出力されます。実行時は .env が上書きします\n（.env 優先）。\n\nこのページは情報提供のみ —— .env は編集しません。'
+_TUI_MSG_JA[lifecycle.title]="ライフサイクル"
+_TUI_MSG_JA[lifecycle.restart.prompt]=$'コンテナ再起動ポリシー。\n\n注意：always / unless-stopped は「あらゆる」終了で再起動します ——\ndevel を extends して 0 で終了する stage（例：test サービス）は\nループします。自動リトライには on-failure を推奨します。'
+_TUI_MSG_JA[lifecycle.restart.no]="no（再起動しない —— デフォルト；restart: フィールドを出力しない）"
+_TUI_MSG_JA[lifecycle.restart.always]="always（手動停止を含むあらゆる終了で再起動）"
+_TUI_MSG_JA[lifecycle.restart.unless_stopped]="unless-stopped（手動停止を除くあらゆる終了で再起動）"
+_TUI_MSG_JA[lifecycle.restart.on_failure]="on-failure（非ゼロ終了時のみ再起動）"
+_TUI_MSG_JA[lifecycle.restart.n_prompt]="on-failure の最大リトライ回数（整数 >= 1；空欄 = 回数無制限の素の on-failure）"
+_TUI_MSG_JA[err.invalid_restart]="無効な restart ポリシー（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_JA[err.invalid_restart_n]="無効なリトライ回数（正の整数、または素の on-failure なら空欄）"
 _TUI_MSG_JA[err.no_backend]="dialog または whiptail がインストールされていません：sudo apt install dialog"
 _TUI_MSG_JA[saved]="%s に保存しました。.env + compose.yaml を再生成中..."
 _TUI_MSG_JA[action.prompt]="アクションを選択"
@@ -1388,6 +1469,13 @@ _edit_section_network() {
   _override_set "network.ipc" "${_v}"
   local _selected_ipc="${_v}"
 
+  _cur="$(_override_get "network.pid" "private")"
+  _v="$(_tui_select "$(_tui_msg network.title)" "$(_tui_msg network.pid.prompt)" \
+    host    "$(_tui_msg network.pid.host)"    "$([[ "${_cur}" == host ]]    && echo ON || echo off)" \
+    private "$(_tui_msg network.pid.private)" "$([[ "${_cur}" == private ]] && echo ON || echo off)")" \
+    || return 0
+  _override_set "network.pid" "${_v}"
+
   # mode=bridge triggers: network_name + ports list
   if [[ "${_selected_mode}" == "bridge" ]]; then
     _cur="$(_override_get "network.network_name" "")"
@@ -1544,17 +1632,65 @@ _edit_section_deploy() {
   [[ -z "${_v}" ]] && _v="gpu"
   _override_set "deploy.gpu_capabilities" "${_v}"
 
-  # runtime override (Jetson / csv-mode nvidia-container-toolkit).
-  _cur="$(_override_get "deploy.runtime" "auto")"
+  # runtime override (Jetson / csv-mode nvidia-container-toolkit). #481
+  # renamed the conf key deploy.runtime -> deploy.gpu_runtime (permanent
+  # legacy alias). #517: if the per-repo setup.conf still carries the
+  # legacy [deploy] runtime key (and no gpu_runtime), SUGGEST renaming it
+  # -- never silently rewrite. The read honours both keys; the write uses
+  # the canonical gpu_runtime.
+  if [[ -v '_TUI_CURRENT[deploy.runtime]' ]] && [[ ! -v '_TUI_CURRENT[deploy.gpu_runtime]' ]]; then
+    _tui_msgbox "$(_tui_msg deploy.title)" "$(_tui_msg deploy.runtime.migrate)"
+  fi
+  _cur="$(_override_get "deploy.gpu_runtime" "$(_override_get "deploy.runtime" "auto")")"
   _v="$(_tui_select "$(_tui_msg deploy.title)" "$(_tui_msg deploy.runtime.prompt)" \
     auto   "$(_tui_msg deploy.runtime.auto)"   "$([[ "${_cur}" == auto ]]   && echo ON || echo off)" \
     nvidia "$(_tui_msg deploy.runtime.nvidia)" "$([[ "${_cur}" == nvidia ]] && echo ON || echo off)" \
     off    "$(_tui_msg deploy.runtime.off)"    "$([[ "${_cur}" == off ]]    && echo ON || echo off)")" \
     || return 0
   if _validate_runtime "${_v}"; then
-    _override_set "deploy.runtime" "${_v}"
+    _override_set "deploy.gpu_runtime" "${_v}"
   else
     _tui_msgbox "$(_tui_msg deploy.title)" "$(_tui_msg err.invalid_runtime)"
+  fi
+}
+
+# [lifecycle] restart policy page (#514, fast-follow of #478). Radiolist of
+# the 4 docker policies; on-failure adds a two-step optional integer retry
+# count (>=1, empty -> bare on-failure). Reuses _validate_restart from
+# lib/_tui_conf.sh; the on-failure:N value is assembled here.
+_edit_section_lifecycle() {
+  local _v _cur _cur_base _n _cur_n
+  _cur="$(_override_get "lifecycle.restart" "no")"
+  _cur_base="${_cur%%:*}"
+  _v="$(_tui_select "$(_tui_msg lifecycle.title)" "$(_tui_msg lifecycle.restart.prompt)" \
+    no             "$(_tui_msg lifecycle.restart.no)"             "$([[ "${_cur_base}" == no ]]             && echo ON || echo off)" \
+    always         "$(_tui_msg lifecycle.restart.always)"         "$([[ "${_cur_base}" == always ]]         && echo ON || echo off)" \
+    unless-stopped "$(_tui_msg lifecycle.restart.unless_stopped)" "$([[ "${_cur_base}" == unless-stopped ]] && echo ON || echo off)" \
+    on-failure     "$(_tui_msg lifecycle.restart.on_failure)"     "$([[ "${_cur_base}" == on-failure ]]     && echo ON || echo off)")" \
+    || return 0
+
+  # on-failure: optional retry count. Empty input keeps the bare policy.
+  if [[ "${_v}" == "on-failure" ]]; then
+    _cur_n=""
+    [[ "${_cur}" == on-failure:* ]] && _cur_n="${_cur#on-failure:}"
+    while :; do
+      _n="$(_tui_inputbox "$(_tui_msg lifecycle.title)" "$(_tui_msg lifecycle.restart.n_prompt)" "${_cur_n}")" \
+        || return 0
+      if [[ -z "${_n}" ]]; then
+        _v="on-failure"
+        break
+      elif [[ "${_n}" =~ ^[1-9][0-9]*$ ]]; then
+        _v="on-failure:${_n}"
+        break
+      fi
+      _tui_msgbox "$(_tui_msg lifecycle.title)" "$(_tui_msg err.invalid_restart_n)"
+    done
+  fi
+
+  if _validate_restart "${_v}"; then
+    _override_set "lifecycle.restart" "${_v}"
+  else
+    _tui_msgbox "$(_tui_msg lifecycle.title)" "$(_tui_msg err.invalid_restart)"
   fi
 }
 
@@ -1567,6 +1703,45 @@ _edit_section_gui() {
     off   "$(_tui_msg gui.mode.off)"   "$([[ "${_cur}" == off ]]   && echo ON || echo off)")" \
     || return 0
   _override_set "gui.mode" "${_v}"
+}
+
+# _prompt_mount_with_picker [initial] — #461 mount mode picker
+#
+# Collects host, container, access mode, and propagation mode through
+# inputbox + radiolist primitives, then assembles via the pure
+# _assemble_mount_value helper. Lets users discover valid mode options
+# (rw, ro, rslave, rshared, etc.) without reading docs/CHANGELOG.
+#
+# Returns the assembled host:container[:mode] string on stdout.
+# Exit non-zero on cancel/Esc at any step.
+_prompt_mount_with_picker() {
+  local _initial="${1-}"
+  local _init_host="" _init_container="" _init_mode=""
+  if [[ -n "${_initial}" ]]; then
+    IFS=':' read -r _init_host _init_container _init_mode <<< "${_initial}"
+  fi
+  local _host _container _access _prop _mode_combined
+  _host="$(_tui_inputbox "Mount: host path" "Host path" "${_init_host}")"   || return 1
+  _container="$(_tui_inputbox "Mount: container path" "Container path" "${_init_container}")" || return 1
+  _access="$(_tui_radiolist "Access mode" "Pick access mode" \
+    none "no access constraint" on \
+    ro   "read-only"            off \
+    rw   "read-write"           off)" || return 1
+  _prop="$(_tui_radiolist "Propagation mode" "Pick mount propagation (Docker bind mount)" \
+    none     "no propagation flag (Docker default rprivate)" on \
+    rslave   "recursive slave (host events propagate in)"    off \
+    rshared  "recursive shared (bidirectional)"              off \
+    rprivate "recursive private (explicit Docker default)"   off \
+    slave    "non-recursive slave"                           off \
+    shared   "non-recursive shared"                          off \
+    private  "non-recursive private"                         off)" || return 1
+  _mode_combined=""
+  [[ "${_access}" != "none" ]] && _mode_combined="${_access}"
+  if [[ "${_prop}" != "none" ]]; then
+    [[ -n "${_mode_combined}" ]] && _mode_combined+=","
+    _mode_combined+="${_prop}"
+  fi
+  _assemble_mount_value "${_host}" "${_container}" "${_mode_combined}"
 }
 
 _edit_section_volumes() {
@@ -1895,7 +2070,10 @@ _list_dockerfile_stages_available() {
     [[ "${_line}" =~ ^FROM[[:space:]]+[^[:space:]#]+[[:space:]]+AS[[:space:]]+([^[:space:]#]+)[[:space:]]*$ ]] || continue
     _stage="${BASH_REMATCH[1]}"
     case "${_stage}" in
-      sys|devel-base|devel|devel-test|runtime-test) continue ;;
+      # #493 (A1'-b): devel-test is offered as an editable stage (the
+      # `test` service override surface); only the rest of the baseline
+      # and the legacy aliases stay hidden.
+      sys|devel-base|devel|runtime-test) continue ;;
       base|test) continue ;;
     esac
     case "${_seen}" in
@@ -2251,6 +2429,14 @@ _render_main_menu() {
   done
 }
 
+# Runtime-env info page (#497). Info-only: explains where volatile workload
+# env vars belong (the gitignored .env overlay, edited by hand) versus the
+# set-once [environment] defaults. The S2 (#502) invariant is that setup.sh
+# / the TUI never write .env, so this is a guidance msgbox, not an editor.
+_show_runtime_env_info() {
+  _tui_msgbox "$(_tui_msg envinfo.title)" "$(_tui_msg envinfo.info)"
+}
+
 _render_runtime_menu() {
   # Runtime grouper (#221): network / GPU / display / env vars / logging
   # — all the things that take effect when the container actually runs.
@@ -2264,9 +2450,12 @@ _render_runtime_menu() {
       gui         "$(_tui_msg main.gui)" \
       environment "$(_tui_msg main.environment)" \
       logging     "$(_tui_msg main.logging)" \
+      lifecycle   "$(_tui_msg main.lifecycle)" \
+      envinfo     "$(_tui_msg main.envinfo)" \
       __back      "$(_tui_msg runtime.back)")" || break
     case "${_choice}" in
-      network|deploy|gui|environment|logging) "_edit_section_${_choice}" ;;
+      network|deploy|gui|environment|logging|lifecycle) "_edit_section_${_choice}" ;;
+      envinfo) _show_runtime_env_info ;;
       __back|"") break ;;
     esac
   done
@@ -2516,6 +2705,10 @@ main() {
   fi
   _load_current "${_repo_conf}" "${_tpl_conf}"
 
+  # #440: pre-tui hook fires before TUI launches. Skipped under
+  # --dry-run.
+  _run_pre_hook setup_tui "$@" || exit $?
+
   if [[ -n "${_subcmd}" ]]; then
     "_edit_section_${_subcmd}"
   else
@@ -2527,6 +2720,10 @@ main() {
   fi
 
   _commit_and_setup "${_repo_conf}" "${_tpl_conf}"
+
+  # #440: post-tui hook fires after commit (.env / compose.yaml
+  # regenerated by setup.sh apply).
+  _run_post_hook setup_tui "$@"
 }
 
 # Guard: only run main when executed directly, not when sourced (for testing)
