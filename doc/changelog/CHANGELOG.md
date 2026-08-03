@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- `stream-only` viewer: the `#stream-status` readout no longer persists as a centered caption over the live video (closes #53). It was set to `streaming <server>:<port>` on connect and never cleared, so the connect-time confirmation stayed on top of the rendering stream and reappeared on every reconnect. The readout is now hidden once `#remote-video` is actually rendering (first `playing` / `loadeddata` event) and re-shown only on error / reconnect, so it reads as the transient "connected to X" confirmation it was meant to be. The show/hide logic is extracted into `apps/stream-only/src/streamStatus.js` (`createStatusController`) with `node --test` unit coverage; `main.ts` stays thin DOM glue.
+
 ### Docs
 - Phase-1 docs GA (S8): the 4-language README (`README.md` + `doc/README.{zh-TW,zh-CN,ja}.md`) rewritten from the pre-refactor single-app model to the current architecture — two served apps (`usd-viewer` upstream-unmodified + our own `stream-only`) selected at boot by `VIEWER_UI_MODE` as a serve-level app selector, the `stream-core` / apps / image layering, the boot-time config-injection contract (sentinels preserved as `*.js.tmpl`, re-rendered every boot, validation IS the escaping), `MEDIA_PORT` (D1, `stream-only` only) added to the env table, ports delivered via the `.env` mechanism (host.yaml = `public_ip` only, D8), the lean `runtime` deployable stage (`just run -t runtime -d`), and the sidecar multi-instance model (embed N times, one client per instance, D6). All `VIEWER_AUTO_LAUNCH` references removed from docs and the stale raw-docker `:devel` multi-instance recipe dropped. Covers D1-D7.
 
