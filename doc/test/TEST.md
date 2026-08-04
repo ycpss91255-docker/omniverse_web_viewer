@@ -1,6 +1,6 @@
 # TEST.md
 
-**63 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **31 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **2 Playwright** (tier-1 browser config-dial e2e, `test/e2e/`, run in the `e2e-test` extra stage).
+**70 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **38 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **2 Playwright** (tier-1 browser config-dial e2e, `test/e2e/`, run in the `e2e-test` extra stage).
 
 Layout follows base #473 (`test/<category>/<tool>/` for the multi-tool repo level; each npm package carries its own single-tool `test/`).
 
@@ -53,9 +53,10 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 - `buildStreamConfig.test.js` (16): valid server+port config shape (DIRECT essentials incl. `remote-video`/`remote-audio` ids), string-port coercion, hostname accept; rejects empty/whitespace/sentinel/metachar server, non-numeric / non-integer / out-of-range port; media-port arg -- omitted when unset/null, pinned when valid int, string coerced, non-integer / out-of-range throw (D1).
 - `connectStream.test.js` (4): `buildStreamProps` defaults all 5 lifecycle handlers to no-ops, preserves config fields, caller handler wins; `connectStream` hands the assembled cfg to an injected connector without loading `@nvidia`.
 
-## apps/stream-only/test/ (6, node --test)
+## apps/stream-only/test/ (13, node --test)
 
-`resolveTarget.test.js`: target fallback (entrypoint-substituted values), `?server=&port=` override, `?media=` override, unsubstituted media sentinel -> null, missing/empty media -> null, server sentinel passes through (rejected downstream by `buildStreamConfig`).
+- `resolveTarget.test.js` (6): target fallback (entrypoint-substituted values), `?server=&port=` override, `?media=` override, unsubstituted media sentinel -> null, missing/empty media -> null, server sentinel passes through (rejected downstream by `buildStreamConfig`).
+- `streamStatus.test.js` (7): the `#stream-status` show/hide controller (#53). `show()` writes the readout and leaves it visible; `show(text, true)` sets the error class; the readout hides on the first video `playing` event (and on `loadeddata`); re-showing after a hide un-hides it (reconnect/error); `show`/error route to `logger.info` / `logger.error`; tolerates null status/video elements.
 
 ## examples/embedded-site-demo/test/ (5, node --test)
 

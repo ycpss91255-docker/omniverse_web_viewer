@@ -1,27 +1,29 @@
 // Full-screen stream-only viewer: resolve the target, build a validated DIRECT
-// config, and connect. The testable parts live in resolveTarget.js (pure) and
-// stream-core (buildStreamConfig / connectStream); this file is DOM glue only.
+// config, and connect. The testable parts live in resolveTarget.js (pure),
+// streamStatus.js (the #stream-status show/hide state machine), and stream-core
+// (buildStreamConfig / connectStream); this file is DOM glue only.
 import { buildStreamConfig, connectStream } from 'stream-core';
 import { resolveTarget } from './resolveTarget.js';
+import { createStatusController } from './streamStatus.js';
 import target from './streamTarget.json';
 
-function showStatus(text: string, isError = false): void {
-  const el = document.getElementById('stream-status');
-  if (el) {
-    el.textContent = text;
-    el.classList.toggle('error', isError);
-  }
-  (isError ? console.error : console.info)(`[stream] ${text}`);
-}
-
 function start(): void {
+  // The controller owns #stream-status: show() writes the transient readout and
+  // makes it visible; it auto-hides once #remote-video actually renders (first
+  // `playing` / `loadeddata`), so the connect-time confirmation stops obscuring
+  // the viewport (#53). Re-showing on error/reconnect un-hides it again.
+  const status = createStatusController(
+    document.getElementById('stream-status'),
+    document.getElementById('remote-video'),
+  );
+
   const { server, port, mediaPort } = resolveTarget(window.location.search, target);
 
   let streamConfig;
   try {
     streamConfig = buildStreamConfig(server, port, mediaPort);
   } catch (err) {
-    showStatus(
+    status.show(
       `${(err as Error).message}\n` +
         'Set the target: open ?server=<ip>&port=<port>, or run the container ' +
         'with SIGNALING_SERVER / host.yaml configured.',
@@ -39,8 +41,8 @@ function start(): void {
   );
 
   connectStream(streamConfig, {
-    onStart: () => showStatus(`streaming ${server}:${port}`),
-  }).catch((e: unknown) => showStatus(`connection failed: ${String(e)}`, true));
+    onStart: () => status.show(`streaming ${server}:${port}`),
+  }).catch((e: unknown) => status.show(`connection failed: ${String(e)}`, true));
 }
 
 window.addEventListener('DOMContentLoaded', start);

@@ -19,6 +19,10 @@
         pointer-events: none;
       }
       #stream-status.error { color: #f85149; }
+      /* Cleared once the remote video is actually rendering (issue #53): the
+         connect-time "streaming ..." readout is transient, not a permanent
+         centered caption over the live viewport. */
+      #stream-status.hidden { display: none; }
     </style>
   </head>
   <body>
