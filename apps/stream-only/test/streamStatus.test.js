@@ -120,7 +120,8 @@ test('tolerates a null status element and a null video element', () => {
 // dead producer stops being a silent frozen frame. They take no arguments: the
 // library's message payload for those two handlers is not verifiable from this
 // repo (the upstream sample only console.logs it), so they are treated as bare
-// signals.
+// signals. (onTerminate turned out never to fire at all -- see the #58 block
+// below; terminated() is now reached from the escalation timer instead.)
 
 test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)', () => {
   const statusEl = fakeStatusEl();
@@ -134,7 +135,8 @@ test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)'
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
   assert.match(statusEl.textContent, /reconnect/i);
-  // Recoverable, not terminal: the library is still retrying (maxReconnects).
+  // Recoverable, not terminal: the stream may still come back inside the
+  // escalation window (#58), so no error class yet.
   assert.equal(statusEl.classList.contains('error'), false);
 });
 

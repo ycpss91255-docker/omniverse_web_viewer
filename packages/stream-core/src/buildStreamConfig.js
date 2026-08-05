@@ -44,6 +44,17 @@ export function buildStreamConfig(server, port, mediaPort = null) {
     videoElementId: 'remote-video',
     audioElementId: 'remote-audio',
     authenticate: true,
+    // Deliberately kept at 20 (the library default is 5), reviewed under #58.
+    // Despite the name this is NOT a mid-session reconnect budget: in the
+    // shipped bundle `maxReconnects` is passed straight through as
+    // `maxSessionStartRetry` and is only consumed by the session-START retry
+    // decision (`sessionStartRetryLeft` in onSessionStartResult). A producer
+    // that dies AFTER the stream is up never re-enters that path, so lowering
+    // it would not make the terminal state arrive any sooner -- that state is
+    // now derived locally in apps/stream-only/src/streamStatus.js. What the
+    // budget does buy is startup grace: a viewer opened before the Kit app
+    // finishes booting keeps retrying the initial session setup instead of
+    // giving up after 5 attempts.
     maxReconnects: 20,
     signalingServer: host,
     signalingPort,

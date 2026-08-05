@@ -40,12 +40,19 @@ function start(): void {
     new CustomEvent('owv:dial', { detail: { server, port, mediaPort } }),
   );
 
-  // onStop / onTerminate are the producer-loss signals (#56): without them a
-  // Kit process that dies mid-session leaves a frozen frame and no text, since
-  // the readout hides on the first rendered frame (#53). The library's message
-  // argument is deliberately ignored -- its shape for these two handlers is not
-  // verifiable from this repo, so they are consumed as bare signals; the
-  // wording / stickiness policy lives in streamStatus.js.
+  // onStop is the producer-loss signal (#56): without it a Kit process that
+  // dies mid-session leaves a frozen frame and no text, since the readout hides
+  // on the first rendered frame (#53). The library's message argument is
+  // deliberately ignored -- its shape is not verifiable from this repo, so it is
+  // consumed as a bare signal; the wording, the escalation to the terminal state
+  // and the stickiness policy all live in streamStatus.js.
+  //
+  // onTerminate is belt-and-braces ONLY. This library build never invokes it
+  // (#58: in the shipped bundle the name appears solely as an error-code enum,
+  // an error string and a null default -- no call site), which is exactly why
+  // the terminal state is now derived from a timer in streamStatus.js instead.
+  // Keeping the handler costs nothing if a future library build starts calling
+  // it; do NOT treat its presence here as evidence that it fires.
   connectStream(streamConfig, {
     onStart: () => status.show(`streaming ${server}:${port}`),
     onStop: () => status.stopped(),
