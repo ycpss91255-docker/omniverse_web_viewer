@@ -35,8 +35,15 @@
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
 // Recoverable: the stream may still come back, and a frame that renders inside
-// the escalation window hides the readout again.
-const STOPPED_TEXT = 'stream stopped -- reconnecting...';
+// the escalation window hides the readout again. It deliberately does NOT say
+// "reconnecting" (issue #60): nothing reconnects. `maxReconnects` reaches the
+// library as `maxSessionStartRetry` and is consumed only by the session-START
+// retry decision, so a producer that dies AFTER the stream is up is never
+// reconnected to -- the old wording promised a recovery that could not happen
+// for the whole escalation window. What IS true, either way, is that the viewer
+// is waiting to see whether frames resume; if none do, the escalation below
+// replaces this with the actionable terminal message.
+const STOPPED_TEXT = 'stream stopped -- waiting for frames to resume...';
 // Terminal: the escalation window elapsed with no frame, so the producer is
 // treated as gone. Only a reload can recover, so this stays on screen as an
 // error.
@@ -47,7 +54,7 @@ const TERMINATED_TEXT = 'stream ended -- the source is gone. Reload once it is b
 const VIDEO_READY_EVENTS = ['playing', 'loadeddata'];
 
 /**
- * How long a stopped stream may stay "reconnecting" before it is declared gone
+ * How long a stopped stream may stay in the waiting state before it is declared gone
  * (#58). Chosen as a compromise: long enough that a stream which does come back
  * clears the readout on its own (and, incidentally, far longer than the window
  * in which the config-dial e2e asserts `#stream-status` carries no `error`
