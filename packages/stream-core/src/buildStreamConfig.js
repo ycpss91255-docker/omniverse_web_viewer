@@ -51,10 +51,12 @@ export function buildStreamConfig(server, port, mediaPort = null) {
     // decision (`sessionStartRetryLeft` in onSessionStartResult). A producer
     // that dies AFTER the stream is up never re-enters that path, so lowering
     // it would not make the terminal state arrive any sooner -- that state is
-    // now derived locally in apps/stream-only/src/streamStatus.js. What the
-    // budget does buy is startup grace: a viewer opened before the Kit app
-    // finishes booting keeps retrying the initial session setup instead of
-    // giving up after 5 attempts.
+    // now derived locally in apps/stream-only/src/streamStatus.js. The viewer
+    // copy was corrected to match (#60): the recoverable readout no longer
+    // claims to be reconnecting, because this budget buys no such thing. What
+    // it does buy is startup grace: a viewer opened before the Kit app finishes
+    // booting keeps retrying the initial session setup instead of giving up
+    // after 5 attempts.
     maxReconnects: 20,
     signalingServer: host,
     signalingPort,

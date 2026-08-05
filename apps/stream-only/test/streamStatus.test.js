@@ -164,7 +164,7 @@ test('tolerates a null status element and a null video element', () => {
 // signals. (onTerminate turned out never to fire at all -- see the #58 block
 // below; terminated() is now reached from the escalation timer instead.)
 
-test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)', () => {
+test('stopped() re-shows the readout as a recoverable, waiting state (#56, #60)', () => {
   const statusEl = fakeStatusEl();
   const videoEl = fakeVideoEl();
   const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(fakeClock()));
@@ -175,10 +175,31 @@ test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)'
   ctl.stopped(); // producer went away mid-session
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
-  assert.match(statusEl.textContent, /reconnect/i);
+  // It describes what the viewer is doing -- waiting to see whether frames
+  // resume -- and nothing more (#60).
+  assert.match(statusEl.textContent, /waiting/i);
   // Recoverable, not terminal: the stream may still come back inside the
   // escalation window (#58), so no error class yet.
   assert.equal(statusEl.classList.contains('error'), false);
+});
+
+// The recoverable copy used to read "stream stopped -- reconnecting...", which
+// was false: `maxReconnects` reaches the library as `maxSessionStartRetry` and
+// is consumed only by the session-START retry decision, so a producer that dies
+// after the stream is up is never reconnected to. The message promised a
+// recovery that could not happen, for the whole ~15 s before the terminal state
+// (#59) replaced it. Locked as a regression: no claim of an automatic reconnect
+// in either producer-loss state.
+test('no producer-loss state claims a reconnect is under way (#60)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, clockOptions(clock));
+
+  ctl.stopped();
+  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
+
+  clock.fire(); // escalated to the terminal state
+  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
 });
 
 test('terminated() shows a distinct terminal state (#56)', () => {
@@ -188,7 +209,8 @@ test('terminated() shows a distinct terminal state (#56)', () => {
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.equal(statusEl.classList.contains('error'), true);
   assert.match(statusEl.textContent, /ended|gone/i);
-  assert.doesNotMatch(statusEl.textContent, /reconnecting/i);
+  // Distinct from the recoverable copy: no reconnect claim (#60), no waiting.
+  assert.doesNotMatch(statusEl.textContent, /reconnect|waiting/i);
 });
 
 test('the terminal state is sticky: a later stopped() does not downgrade it (#56)', () => {
@@ -287,7 +309,7 @@ test('escalate-on-timeout: no frame within the window reaches the terminal state
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.equal(statusEl.classList.contains('error'), true);
   assert.match(statusEl.textContent, /ended|gone/i);
-  assert.doesNotMatch(statusEl.textContent, /reconnecting/i);
+  assert.doesNotMatch(statusEl.textContent, /reconnect|waiting/i);
 });
 
 test('cancel-on-recovery: a frame after stopped() disarms the escalation and clears the readout (#53, #58)', () => {
