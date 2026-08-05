@@ -37,8 +37,9 @@ const HIDDEN_CLASS = 'hidden';
 // Recoverable: the stream may still come back, and a frame that renders inside
 // the escalation window hides the readout again.
 const STOPPED_TEXT = 'stream stopped -- reconnecting...';
-// Terminal: the library gave up (or the session was ended). Only a reload can
-// recover, so this stays on screen as an error.
+// Terminal: the escalation window elapsed with no frame, so the producer is
+// treated as gone. Only a reload can recover, so this stays on screen as an
+// error.
 const TERMINATED_TEXT = 'stream ended -- the source is gone. Reload once it is back.';
 // First real frame: `playing` covers (re)start after buffering/reconnect;
 // `loadeddata` is the belt-and-suspenders first-frame signal. hide() is

@@ -45,6 +45,47 @@ function fakeVideoEl() {
   };
 }
 
+// Deterministic stand-in for setTimeout/clearTimeout. Every spec that reaches
+// stopped() MUST inject it: stopped() arms the producer-loss escalation (#58),
+// and a real timer would both slow the run down by the whole window and keep
+// the node test process alive waiting for it. Nothing here waits.
+function fakeClock() {
+  let nextId = 0;
+  const timers = new Map();
+  return {
+    setTimer(fn, ms) {
+      const id = ++nextId;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimer(id) {
+      timers.delete(id);
+    },
+    // Everything currently armed, as {fn, ms} records.
+    get pending() {
+      return [...timers.values()];
+    },
+    // Run (and clear) everything armed, i.e. "the window elapsed".
+    fire() {
+      const due = [...timers.values()];
+      timers.clear();
+      for (const t of due) t.fn();
+    },
+  };
+}
+
+// Deliberately not the production default, so a spec asserting on it cannot
+// pass by accident if the default changes.
+const FAKE_DELAY_MS = 12_345;
+
+function clockOptions(clock, terminalDelayMs = FAKE_DELAY_MS) {
+  return {
+    terminalDelayMs,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  };
+}
+
 const silentLogger = { info() {}, error() {} };
 
 test('show writes the text and leaves the readout visible', () => {
@@ -126,7 +167,7 @@ test('tolerates a null status element and a null video element', () => {
 test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)', () => {
   const statusEl = fakeStatusEl();
   const videoEl = fakeVideoEl();
-  const ctl = createStatusController(statusEl, videoEl, silentLogger);
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(fakeClock()));
   ctl.show('streaming 1.2.3.4:49100');
   videoEl.emit('playing'); // normal stream: readout cleared
   assert.equal(statusEl.classList.contains('hidden'), true);
@@ -176,7 +217,7 @@ test('stopped() logs as info, terminated() logs as error (#56)', () => {
     info: (m) => calls.push(['info', m]),
     error: (m) => calls.push(['error', m]),
   };
-  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger);
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger, clockOptions(fakeClock()));
   ctl.stopped();
   ctl.terminated();
   assert.deepEqual(
@@ -198,7 +239,7 @@ test('a normal stream is unchanged by the #56 wiring: first frame still clears (
 });
 
 test('lifecycle transitions tolerate null status / video elements (#56)', () => {
-  const ctl = createStatusController(null, null, silentLogger);
+  const ctl = createStatusController(null, null, silentLogger, clockOptions(fakeClock()));
   assert.doesNotThrow(() => ctl.stopped());
   assert.doesNotThrow(() => ctl.terminated());
 });
@@ -213,43 +254,8 @@ test('lifecycle transitions tolerate null status / video elements (#56)', () => 
 //
 // The controller now derives it: stopped() arms a bounded escalation timer and
 // the next rendered frame (the #53 hide path) disarms it. The timer is
-// injected, so these specs never wait on a real clock.
-
-/** Deterministic stand-in for setTimeout/clearTimeout. Nothing here waits. */
-function fakeClock() {
-  let nextId = 0;
-  const timers = new Map();
-  return {
-    setTimer(fn, ms) {
-      const id = ++nextId;
-      timers.set(id, { fn, ms });
-      return id;
-    },
-    clearTimer(id) {
-      timers.delete(id);
-    },
-    // Everything currently armed, as {fn, ms} records.
-    get pending() {
-      return [...timers.values()];
-    },
-    // Run (and clear) everything armed, i.e. "the window elapsed".
-    fire() {
-      const due = [...timers.values()];
-      timers.clear();
-      for (const t of due) t.fn();
-    },
-  };
-}
-
-const FAKE_DELAY_MS = 12_345;
-
-function clockOptions(clock, terminalDelayMs = FAKE_DELAY_MS) {
-  return {
-    terminalDelayMs,
-    setTimer: clock.setTimer,
-    clearTimer: clock.clearTimer,
-  };
-}
+// injected (fakeClock / clockOptions, defined with the other fakes at the top),
+// so these specs never wait on a real clock.
 
 test('nothing is armed before a stop: show() alone schedules no escalation (#58)', () => {
   const clock = fakeClock();
