@@ -98,7 +98,7 @@ VIEWER_UI_MODE = usd-viewer
 
 - **画面が真っ白でエラーも出ない** — 通常は UI モードと Kit アプリの不一致です。`usd-viewer` モードは kit-app-template の USD Viewer でのみ動作します。Isaac Sim や他の Kit アプリに対しては準備完了ポーリングが完了せず、何も描画されず、エラーも表示されません。`stream-only` に切り替えてください（`VIEWER_UI_MODE=stream-only`、または `host.yaml` の `viewer.ui_mode`）。
 - **接続拒否 / ストリームが表示されない** — `SIGNALING_SERVER` / `SIGNALING_PORT` が動作中の Kit アプリを指していること、およびその Kit アプリで NVCF ライブストリームが有効になっていることを確認してください。リモートブラウザの場合は `host.yaml` で `network.public_ip` を設定してください。
-- **セッション中に映像が固まり、`stream stopped -- reconnecting...` または `stream ended -- the source is gone` と表示される**（`stream-only` のみ） — ストリーム開始後に Kit のプロデューサが消えました。前者はビューアがまだ再接続を試みている状態、後者は再接続を諦めた状態です。Kit アプリの復旧後にページを再読み込みしてください。ストリーミングホスト上の Kit プロセスを確認してください。
+- **セッション中に映像が固まり、`stream stopped -- reconnecting...` または `stream ended -- the source is gone` と表示される**（`stream-only` のみ） — ストリーム開始後に Kit のプロデューサが消えました。前者は映像が戻るかどうかをビューアが待っている状態で、約 15 秒以内に新しいフレームが描画されなければ後者の終了メッセージに切り替わります。Kit アプリの復旧後にページを再読み込みしてください。ストリーミングホスト上の Kit プロセスを確認してください。
 - **コンテナが起動直後に終了する** — エントリポイントはレンダリング前に設定を検証します。無効な値（数値でない `SIGNALING_PORT` / `MEDIA_PORT`、不明な `VIEWER_UI_MODE`、または不正な文字を含む `SIGNALING_SERVER`、`host.yaml` の値末尾に紛れ込んだインライン `#` コメントを含む）はエラーメッセージとともに拒否され、壊れたビューアを起動しません。表示された環境変数 / `host.yaml` の値を修正してください。
 - **ブラウザコンソールを開く**（F12） — WebRTC の接続エラーはそこに記録されます。
 

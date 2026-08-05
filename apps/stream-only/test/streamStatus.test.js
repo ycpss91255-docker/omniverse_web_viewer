@@ -9,7 +9,7 @@
 // (issue #53). Re-showing on error/reconnect un-hides it again.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createStatusController } from '../src/streamStatus.js';
+import { createStatusController, TERMINAL_ESCALATION_MS } from '../src/streamStatus.js';
 
 function fakeStatusEl() {
   const classes = new Set();
@@ -42,6 +42,47 @@ function fakeVideoEl() {
     emit(type) {
       for (const fn of listeners[type] || []) fn();
     },
+  };
+}
+
+// Deterministic stand-in for setTimeout/clearTimeout. Every spec that reaches
+// stopped() MUST inject it: stopped() arms the producer-loss escalation (#58),
+// and a real timer would both slow the run down by the whole window and keep
+// the node test process alive waiting for it. Nothing here waits.
+function fakeClock() {
+  let nextId = 0;
+  const timers = new Map();
+  return {
+    setTimer(fn, ms) {
+      const id = ++nextId;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimer(id) {
+      timers.delete(id);
+    },
+    // Everything currently armed, as {fn, ms} records.
+    get pending() {
+      return [...timers.values()];
+    },
+    // Run (and clear) everything armed, i.e. "the window elapsed".
+    fire() {
+      const due = [...timers.values()];
+      timers.clear();
+      for (const t of due) t.fn();
+    },
+  };
+}
+
+// Deliberately not the production default, so a spec asserting on it cannot
+// pass by accident if the default changes.
+const FAKE_DELAY_MS = 12_345;
+
+function clockOptions(clock, terminalDelayMs = FAKE_DELAY_MS) {
+  return {
+    terminalDelayMs,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
   };
 }
 
@@ -120,12 +161,13 @@ test('tolerates a null status element and a null video element', () => {
 // dead producer stops being a silent frozen frame. They take no arguments: the
 // library's message payload for those two handlers is not verifiable from this
 // repo (the upstream sample only console.logs it), so they are treated as bare
-// signals.
+// signals. (onTerminate turned out never to fire at all -- see the #58 block
+// below; terminated() is now reached from the escalation timer instead.)
 
 test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)', () => {
   const statusEl = fakeStatusEl();
   const videoEl = fakeVideoEl();
-  const ctl = createStatusController(statusEl, videoEl, silentLogger);
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(fakeClock()));
   ctl.show('streaming 1.2.3.4:49100');
   videoEl.emit('playing'); // normal stream: readout cleared
   assert.equal(statusEl.classList.contains('hidden'), true);
@@ -134,7 +176,8 @@ test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)'
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
   assert.match(statusEl.textContent, /reconnect/i);
-  // Recoverable, not terminal: the library is still retrying (maxReconnects).
+  // Recoverable, not terminal: the stream may still come back inside the
+  // escalation window (#58), so no error class yet.
   assert.equal(statusEl.classList.contains('error'), false);
 });
 
@@ -174,7 +217,7 @@ test('stopped() logs as info, terminated() logs as error (#56)', () => {
     info: (m) => calls.push(['info', m]),
     error: (m) => calls.push(['error', m]),
   };
-  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger);
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger, clockOptions(fakeClock()));
   ctl.stopped();
   ctl.terminated();
   assert.deepEqual(
@@ -196,7 +239,159 @@ test('a normal stream is unchanged by the #56 wiring: first frame still clears (
 });
 
 test('lifecycle transitions tolerate null status / video elements (#56)', () => {
-  const ctl = createStatusController(null, null, silentLogger);
+  const ctl = createStatusController(null, null, silentLogger, clockOptions(fakeClock()));
   assert.doesNotThrow(() => ctl.stopped());
   assert.doesNotThrow(() => ctl.terminated());
+});
+
+// --- deriving the terminal state locally (issue #58) -----------------------
+// #56/#57 reached terminated() only from the library's `onTerminate` handler.
+// That handler is never invoked by this library build (grep of the shipped
+// /app/stream-only/dist/assets/omniverse-webrtc-streaming-library-*.js: the
+// name occurs only as an error-code enum, an error string, and the null entry
+// of the defaults object -- no call site), so the terminal state was
+// unreachable and a dead producer sat on "reconnecting..." forever.
+//
+// The controller now derives it: stopped() arms a bounded escalation timer and
+// the next rendered frame (the #53 hide path) disarms it. The timer is
+// injected (fakeClock / clockOptions, defined with the other fakes at the top),
+// so these specs never wait on a real clock.
+
+test('nothing is armed before a stop: show() alone schedules no escalation (#58)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), silentLogger, clockOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  assert.equal(clock.pending.length, 0);
+});
+
+test('stopped() arms the escalation timer with the injected delay (#58)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), silentLogger, clockOptions(clock));
+  ctl.stopped();
+  assert.equal(clock.pending.length, 1);
+  assert.equal(clock.pending[0].ms, FAKE_DELAY_MS);
+});
+
+test('escalate-on-timeout: no frame within the window reaches the terminal state, with no onTerminate (#58)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.emit('playing'); // live stream, readout cleared
+  ctl.stopped(); // producer died
+  assert.equal(statusEl.classList.contains('error'), false);
+
+  clock.fire(); // the window elapsed with no new frame
+
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.match(statusEl.textContent, /ended|gone/i);
+  assert.doesNotMatch(statusEl.textContent, /reconnecting/i);
+});
+
+test('cancel-on-recovery: a frame after stopped() disarms the escalation and clears the readout (#53, #58)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(clock));
+  ctl.stopped();
+  assert.equal(clock.pending.length, 1);
+
+  videoEl.emit('playing'); // the stream came back
+
+  assert.equal(clock.pending.length, 0);
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  clock.fire(); // a stale timer must not resurrect the terminal state
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('a stop after a recovery re-arms the escalation (#58)', () => {
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), videoEl, silentLogger, clockOptions(clock));
+  ctl.stopped();
+  videoEl.emit('playing');
+  assert.equal(clock.pending.length, 0);
+  ctl.stopped();
+  assert.equal(clock.pending.length, 1);
+});
+
+test('repeated stopped() keeps exactly one escalation armed (#58)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), silentLogger, clockOptions(clock));
+  ctl.stopped();
+  ctl.stopped();
+  ctl.stopped();
+  assert.equal(clock.pending.length, 1);
+});
+
+test('the escalated terminal state is latched: a later stopped() neither downgrades it nor re-arms (#57, #58)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, clockOptions(clock));
+  ctl.stopped();
+  clock.fire();
+  const terminalText = statusEl.textContent;
+
+  ctl.stopped();
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(clock.pending.length, 0);
+});
+
+test('a stray video event does not clear the escalated terminal state (#57, #58)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, clockOptions(clock));
+  ctl.stopped();
+  clock.fire();
+  videoEl.emit('playing');
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+});
+
+test('terminated() disarms a pending escalation (no second transition) (#58)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), silentLogger, clockOptions(clock));
+  ctl.stopped();
+  ctl.terminated();
+  assert.equal(clock.pending.length, 0);
+});
+
+test('the escalation logs the terminal state as an error (#58)', () => {
+  const calls = [];
+  const logger = {
+    info: (m) => calls.push(['info', m]),
+    error: (m) => calls.push(['error', m]),
+  };
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger, clockOptions(clock));
+  ctl.stopped();
+  clock.fire();
+  assert.deepEqual(
+    calls.map(([level]) => level),
+    ['info', 'error'],
+  );
+});
+
+test('the escalation tolerates null status / video elements (#58)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(null, null, silentLogger, clockOptions(clock));
+  assert.doesNotThrow(() => ctl.stopped());
+  assert.doesNotThrow(() => clock.fire());
+});
+
+// The default delay is asserted as a value only -- deliberately WITHOUT calling
+// stopped(), which would arm a real setTimeout and hold the test runner open.
+// The lower bound is what keeps the config-dial e2e (test/e2e/config-dial.spec.ts,
+// which asserts #stream-status carries no `error` class while dialing a dead
+// host) unaffected by this escalation.
+test('the default escalation delay is exported and outlasts the e2e assertion window (#58)', () => {
+  assert.equal(typeof TERMINAL_ESCALATION_MS, 'number');
+  assert.ok(TERMINAL_ESCALATION_MS >= 10_000, `too short: ${TERMINAL_ESCALATION_MS}`);
 });
