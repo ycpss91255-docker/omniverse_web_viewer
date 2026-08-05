@@ -40,8 +40,16 @@ function start(): void {
     new CustomEvent('owv:dial', { detail: { server, port, mediaPort } }),
   );
 
+  // onStop / onTerminate are the producer-loss signals (#56): without them a
+  // Kit process that dies mid-session leaves a frozen frame and no text, since
+  // the readout hides on the first rendered frame (#53). The library's message
+  // argument is deliberately ignored -- its shape for these two handlers is not
+  // verifiable from this repo, so they are consumed as bare signals; the
+  // wording / stickiness policy lives in streamStatus.js.
   connectStream(streamConfig, {
     onStart: () => status.show(`streaming ${server}:${port}`),
+    onStop: () => status.stopped(),
+    onTerminate: () => status.terminated(),
   }).catch((e: unknown) => status.show(`connection failed: ${String(e)}`, true));
 }
 

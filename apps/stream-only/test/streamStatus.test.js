@@ -113,3 +113,90 @@ test('tolerates a null status element and a null video element', () => {
   assert.doesNotThrow(() => ctl.show('anything'));
   assert.doesNotThrow(() => ctl.hide());
 });
+
+// --- producer disappearing mid-session (issue #56) ------------------------
+// stopped() / terminated() are the DOM-free mapping of the streaming library's
+// two unused lifecycle handlers (onStop / onTerminate) onto the readout, so a
+// dead producer stops being a silent frozen frame. They take no arguments: the
+// library's message payload for those two handlers is not verifiable from this
+// repo (the upstream sample only console.logs it), so they are treated as bare
+// signals.
+
+test('stopped() re-shows the readout as a recoverable, reconnecting state (#56)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger);
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.emit('playing'); // normal stream: readout cleared
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  ctl.stopped(); // producer went away mid-session
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.match(statusEl.textContent, /stopped/i);
+  assert.match(statusEl.textContent, /reconnect/i);
+  // Recoverable, not terminal: the library is still retrying (maxReconnects).
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('terminated() shows a distinct terminal state (#56)', () => {
+  const statusEl = fakeStatusEl();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger);
+  ctl.terminated();
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.match(statusEl.textContent, /ended|gone/i);
+  assert.doesNotMatch(statusEl.textContent, /reconnecting/i);
+});
+
+test('the terminal state is sticky: a later stopped() does not downgrade it (#56)', () => {
+  const statusEl = fakeStatusEl();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger);
+  ctl.terminated();
+  const terminalText = statusEl.textContent;
+  ctl.stopped();
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+});
+
+test('a stray video event does not clear the terminal state (#56)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger);
+  ctl.terminated();
+  videoEl.emit('playing');
+  assert.equal(statusEl.classList.contains('hidden'), false);
+});
+
+test('stopped() logs as info, terminated() logs as error (#56)', () => {
+  const calls = [];
+  const logger = {
+    info: (m) => calls.push(['info', m]),
+    error: (m) => calls.push(['error', m]),
+  };
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), logger);
+  ctl.stopped();
+  ctl.terminated();
+  assert.deepEqual(
+    calls.map(([level]) => level),
+    ['info', 'error'],
+  );
+});
+
+test('a normal stream is unchanged by the #56 wiring: first frame still clears (#53)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger);
+  // Exactly the happy path main.ts drives: connect -> onStart -> first frame.
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.emit('loadeddata');
+  videoEl.emit('playing');
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('lifecycle transitions tolerate null status / video elements (#56)', () => {
+  const ctl = createStatusController(null, null, silentLogger);
+  assert.doesNotThrow(() => ctl.stopped());
+  assert.doesNotThrow(() => ctl.terminated());
+});
