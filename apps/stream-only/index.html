@@ -20,8 +20,10 @@
       }
       #stream-status.error { color: #f85149; }
       /* Cleared once the remote video is actually rendering (issue #53): the
-         connect-time "streaming ..." readout is transient, not a permanent
-         centered caption over the live viewport. */
+         connect-time "connecting to ..." readout is transient, not a permanent
+         centered caption over the live viewport. A rendered frame is also the
+         only thing that proves a stream exists (#63), which is why it -- and
+         not a library callback -- is what clears this. */
       #stream-status.hidden { display: none; }
     </style>
   </head>
