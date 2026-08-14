@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   createStatusController,
   TERMINAL_ESCALATION_MS,
+  CONNECT_ESCALATION_MS,
   FRAME_STALL_POLL_MS,
   FRAME_STALL_SAMPLES,
 } from '../src/streamStatus.js';
@@ -122,6 +123,15 @@ function clockOptions(clock, terminalDelayMs = FAKE_DELAY_MS) {
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
   };
+}
+
+// Connect-attempt window (#63), likewise deliberately not the production
+// default and deliberately different from FAKE_DELAY_MS, so a spec can tell the
+// two escalations apart by the delay a timer was armed with.
+const FAKE_CONNECT_MS = 9_876;
+
+function connectOptions(clock) {
+  return { ...clockOptions(clock), connectDelayMs: FAKE_CONNECT_MS };
 }
 
 // Watchdog knobs (#62), likewise deliberately not the production defaults.
@@ -666,4 +676,172 @@ test('the exported stall window is long enough to ride out a brief hiccup (#62)'
     FRAME_STALL_POLL_MS * FRAME_STALL_SAMPLES < TERMINAL_ESCALATION_MS,
     'the stall window must not outlast the escalation window',
   );
+});
+
+// --- a stream that never starts (issue #63) --------------------------------
+// Everything above assumes the stream came up at least once: the loss states
+// are entered from onStop or from frames that stop advancing, and the #53 hide
+// needs a frame. A viewer pointed at a producer that never answers reaches none
+// of them -- no frame, so no hide and no watchdog; no session, so no onStop and
+// no escalation -- and the app used to leave it on `streaming <server>:<port>`
+// forever, because it treated the library's `onStart` as success. `onStart`
+// only means a connect attempt BEGAN, and it re-fires on every session-start
+// retry (observed five times against a dead producer), which also let a retry
+// overwrite the latched terminal state through the one method that had no
+// terminal guard: show().
+//
+// So the controller now takes the connect attempt as a state of its own:
+// connecting(text) says the viewer is TRYING and arms the same kind of bounded
+// window, from the attempt rather than from a loss. A real first frame cancels
+// it exactly as it cancels the #58 escalation; nothing else does.
+
+test('connecting() shows the attempting readout and arms a bounded window (#63)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  assert.equal(statusEl.textContent, 'connecting to 1.2.3.4:49100...');
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  // Trying is not failing: no error styling while the window is open (#57).
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.deepEqual(
+    clock.pending.map((t) => t.ms),
+    [FAKE_CONNECT_MS],
+  );
+});
+
+test('never-connected: the connect window elapsing reaches an actionable state (#63)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  clock.fire(); // the window elapsed and not one frame ever rendered
+
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  // Actionable: it names what is wrong and what to do about it.
+  assert.match(statusEl.textContent, /no video/i);
+  assert.match(statusEl.textContent, /reload/i);
+  // And it does not claim a stream, a recovery or a reconnect (#60).
+  assert.doesNotMatch(statusEl.textContent, /streaming|waiting|reconnect/i);
+});
+
+test('the never-started state is distinct from the mid-session terminal one (#63)', () => {
+  const neverStartedEl = fakeStatusEl();
+  const clock = fakeClock();
+  const neverStarted = createStatusController(
+    neverStartedEl,
+    fakeVideoEl(),
+    silentLogger,
+    connectOptions(clock),
+  );
+  neverStarted.connecting('connecting to 1.2.3.4:49100...');
+  clock.fire();
+
+  const midSessionEl = fakeStatusEl();
+  createStatusController(midSessionEl, fakeVideoEl(), silentLogger).terminated();
+
+  // Both are terminal errors, but they are not the same news: nothing ended
+  // when nothing ever started, and the user's next move differs (check that the
+  // producer is running at all, vs. wait for the one that died to come back).
+  assert.notEqual(neverStartedEl.textContent, midSessionEl.textContent);
+  assert.doesNotMatch(neverStartedEl.textContent, /ended/i);
+});
+
+test('a first frame cancels the connect escalation and clears the readout (#53, #63)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, connectOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  assert.equal(clock.pending.length, 1);
+
+  videoEl.emit('playing'); // the stream really did come up
+
+  assert.equal(clock.pending.length, 0);
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  clock.fire(); // a stale timer must not declare a live stream dead
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('session-start retries do not push the connect deadline back (#63)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(fakeStatusEl(), fakeVideoEl(), silentLogger, connectOptions(clock));
+
+  // `onStart` re-fires on every session-start retry (five times, against a
+  // producer that was never there). Re-arming on each would move the deadline
+  // out by a whole window every time -- i.e. back to never.
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  const armed = clock.pending[0];
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  assert.equal(clock.pending.length, 1);
+  assert.equal(clock.pending[0].id, armed.id);
+});
+
+test('show() cannot overwrite the terminal state (#63)', () => {
+  const statusEl = fakeStatusEl();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger);
+  ctl.terminated();
+  const terminalText = statusEl.textContent;
+
+  ctl.show('streaming 1.2.3.4:49100'); // a retry re-announcing a dead stream
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+});
+
+test('connecting() after the terminal state is ignored (#63)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+  ctl.terminated();
+  const terminalText = statusEl.textContent;
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(clock.pending.length, 0);
+});
+
+test('a connect retry does not overwrite an announced producer loss (#63)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+  ctl.stopped(); // the producer went away mid-session
+  const armed = clock.pending[0];
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  // The loss state owns the readout until a frame clears it or it escalates:
+  // an attempt that has produced no picture is not news over a loss that has.
+  assert.match(statusEl.textContent, /waiting/i);
+  assert.equal(clock.pending.length, 1);
+  assert.equal(clock.pending[0].id, armed.id);
+  assert.equal(clock.pending[0].ms, FAKE_DELAY_MS);
+});
+
+test('the connect escalation tolerates null status / video elements (#63)', () => {
+  const clock = fakeClock();
+  const ctl = createStatusController(null, null, silentLogger, connectOptions(clock));
+  assert.doesNotThrow(() => ctl.connecting('connecting to 1.2.3.4:49100...'));
+  assert.doesNotThrow(() => clock.fire());
+});
+
+// Asserted as a value only, like the #58 delay above: calling connecting()
+// without an injected clock would arm a real setTimeout and hold the runner
+// open. The lower bound is what keeps the config-dial e2e (which dials a DEAD
+// host and asserts #stream-status carries no `error` class) unaffected -- that
+// suite finishes in well under a second per mode, and its longest poll is 15 s.
+test('the default connect window is exported and outlasts the config-dial e2e (#63)', () => {
+  assert.equal(typeof CONNECT_ESCALATION_MS, 'number');
+  assert.ok(CONNECT_ESCALATION_MS >= 15_000, `too short: ${CONNECT_ESCALATION_MS}`);
 });

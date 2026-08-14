@@ -42,6 +42,19 @@
 // `onStop` is kept as an ACCELERATOR -- it fires sooner than the poll can -- not
 // as the sole trigger; whichever notices first announces, and the other is
 // suppressed by `lossAnnounced` so the escalation is never re-armed.
+//
+// The CONNECT ATTEMPT is a state of its own too (issue #63). Everything above
+// assumes the stream came up at least once; a viewer whose producer never
+// answers reaches none of it -- no frame, so no hide() and no watchdog; no
+// session, so no `onStop` and no escalation. main.ts used to map the library's
+// `onStart` straight onto show(`streaming <server>:<port>`), but `onStart`
+// means a connect attempt BEGAN, not that anything is streaming, and it
+// re-fires on every session-start retry (observed five times against a dead
+// producer). The result was a page reporting a working stream, with no error
+// styling, forever. connecting() replaces that: it says the viewer is TRYING
+// and arms a bounded window from the attempt, which a real first frame cancels
+// through the same hide() path. Same lesson as #58, on a different callback --
+// state is derived from observable media, never from what a callback is named.
 
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
@@ -59,6 +72,12 @@ const STOPPED_TEXT = 'stream stopped -- waiting for frames to resume...';
 // treated as gone. Only a reload can recover, so this stays on screen as an
 // error.
 const TERMINATED_TEXT = 'stream ended -- the source is gone. Reload once it is back.';
+// Terminal, but a different piece of news (#63): the connect window elapsed
+// without a single frame ever rendering, so there is nothing to say ended. What
+// the user can act on is different too -- not "wait for the stream you had to
+// come back" but "check whether the source is running at all".
+const NEVER_STARTED_TEXT =
+  'no video from the source -- it never started. Check that it is running, then reload.';
 // First real frame: `playing` covers (re)start after buffering/reconnect;
 // `loadeddata` is the belt-and-suspenders first-frame signal. hide() is
 // idempotent, so firing both (or repeatedly) is harmless.
@@ -73,6 +92,22 @@ const VIDEO_READY_EVENTS = ['playing', 'loadeddata'];
  * viewer is told to reload rather than left waiting indefinitely.
  */
 export const TERMINAL_ESCALATION_MS = 15_000;
+
+/**
+ * How long a viewer may sit on the connect readout before the attempt is
+ * declared a failure (#63). Armed from the connect attempt, not from a loss,
+ * because a stream that never starts reaches no loss trigger at all.
+ *
+ * Longer than TERMINAL_ESCALATION_MS on purpose: a viewer opened before the Kit
+ * app has finished booting is the ordinary case, the library keeps retrying
+ * session start meanwhile (`maxReconnects` -> `maxSessionStartRetry`, 20), and
+ * declaring failure over a producer that is merely slow to come up would be the
+ * #60 mistake in the other direction. It must also outlast the window in which
+ * the config-dial e2e dials a DEAD host and asserts `#stream-status` carries no
+ * `error` class -- that suite finishes in well under a second per mode, so the
+ * margin is large, and a unit spec locks the lower bound.
+ */
+export const CONNECT_ESCALATION_MS = 20_000;
 
 /**
  * How often the frame-progress watchdog samples the video element, and how many
@@ -120,17 +155,19 @@ function readFrameProgress(el) {
  *   remove: Function}} | null} statusEl  the #stream-status element
  * @param {{addEventListener: Function} | null} videoEl  the #remote-video element
  * @param {{info: Function, error: Function}} [logger=console]  injectable for tests
- * @param {{terminalDelayMs?: number, stallPollMs?: number, stallSamples?: number,
- *   setTimer?: Function, clearTimer?: Function}}
- *   [options]  clock seam for the escalation and the frame-progress watchdog:
- *   injected wholesale by the unit tests so they exercise both timeout paths
+ * @param {{terminalDelayMs?: number, connectDelayMs?: number, stallPollMs?: number,
+ *   stallSamples?: number, setTimer?: Function, clearTimer?: Function}}
+ *   [options]  clock seam for the escalations and the frame-progress watchdog:
+ *   injected wholesale by the unit tests so they exercise every timeout path
  *   without any real waiting
  * @returns {{show: (text: string, isError?: boolean) => void, hide: () => void,
- *   stopped: () => void, terminated: () => void}}
+ *   connecting: (text: string) => void, stopped: () => void,
+ *   terminated: () => void}}
  */
 export function createStatusController(statusEl, videoEl, logger = console, options = {}) {
   const {
     terminalDelayMs = TERMINAL_ESCALATION_MS,
+    connectDelayMs = CONNECT_ESCALATION_MS,
     stallPollMs = FRAME_STALL_POLL_MS,
     stallSamples = FRAME_STALL_SAMPLES,
     setTimer = (fn, ms) => setTimeout(fn, ms),
@@ -172,6 +209,15 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
   }
 
   function show(text, isError = false) {
+    // The terminal state is latched, and show() is how everything else writes
+    // the readout -- including a `streaming ...` announcement from a
+    // session-start retry, which is what used to resurrect a connection that
+    // did not exist (#63). hide() and stopped() have always had this guard;
+    // show() not having it was the hole. terminate() writes through it before
+    // the latch closes, so the terminal message itself still lands.
+    if (terminal) {
+      return;
+    }
     if (statusEl) {
       statusEl.textContent = text;
       statusEl.classList.toggle('error', isError);
@@ -194,6 +240,32 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     }
   }
 
+  // A connect attempt began (#63). This is what main.ts hands the library's
+  // `onStart`, and what it calls once itself before connecting at all, so the
+  // window is armed even if `onStart` never fires. The readout says the viewer
+  // is trying -- it cannot know more than that until a frame renders -- and the
+  // window bounds the trying: if nothing has rendered when it elapses, the
+  // attempt is declared failed rather than left claiming success.
+  function connecting(text) {
+    // Nothing to add over a loss that has already been announced (or latched):
+    // an attempt that has produced no picture is not news over a state derived
+    // from real media, and its escalation is already armed and must not be
+    // pushed back.
+    if (terminal || lossAnnounced) {
+      return;
+    }
+    show(text);
+    // Armed once, from the FIRST attempt. `onStart` re-fires on every
+    // session-start retry, so re-arming here would move the deadline out by a
+    // whole window each time -- i.e. back to never.
+    if (escalation === null) {
+      escalation = setTimer(() => {
+        escalation = null;
+        terminate(NEVER_STARTED_TEXT);
+      }, connectDelayMs);
+    }
+  }
+
   // The stream ended and may still come back: say so, and arm the escalation.
   // Whichever happens first wins -- a rendered frame calls hide() and cancels
   // it, or the window elapses and we declare the producer gone ourselves (#58).
@@ -210,17 +282,26 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     }, terminalDelayMs);
   }
 
+  // Latch the readout on an actionable error. Two windows end here (#58, #63)
+  // with different news -- a stream that ended vs. one that never started --
+  // so the copy is the argument; everything else about being terminal is the
+  // same. show() runs before the latch closes, which is the one write that is
+  // allowed through it.
+  function terminate(text) {
+    cancelEscalation();
+    // Nothing left to watch for: the state is latched, so a frame that turns up
+    // afterwards must not clear it and there is no reason to keep sampling.
+    cancelSampler();
+    show(text, true);
+    terminal = true;
+  }
+
   // The stream is over for good: the escalation window elapsed with no frame
   // (the only path this library build actually reaches -- see the header note;
   // the loss it escalates may have been reported by onStop or noticed by the
   // watchdog), or the library surprised us by invoking onTerminate after all.
   function terminated() {
-    cancelEscalation();
-    // Nothing left to watch for: the state is latched, so a frame that turns up
-    // afterwards must not clear it and there is no reason to keep sampling.
-    cancelSampler();
-    show(TERMINATED_TEXT, true);
-    terminal = true;
+    terminate(TERMINATED_TEXT);
   }
 
   // --- frame-progress watchdog (#62) ---------------------------------------
@@ -286,5 +367,5 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     }
   }
 
-  return { show, hide, stopped, terminated };
+  return { show, hide, connecting, stopped, terminated };
 }

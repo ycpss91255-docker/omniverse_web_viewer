@@ -40,6 +40,16 @@ function start(): void {
     new CustomEvent('owv:dial', { detail: { server, port, mediaPort } }),
   );
 
+  // The viewer is TRYING, and that is all it can honestly say until a frame
+  // renders (#63). Announced here, before the connect, so the bounded
+  // connect window is armed even if the library never calls onStart -- a
+  // viewer whose producer never answers reaches no other trigger (no frame, so
+  // no hide() and no watchdog; no session, so no onStop and no escalation) and
+  // used to sit on `streaming <server>:<port>` indefinitely. The controller
+  // arms the window once and a real first frame cancels it.
+  const dialing = `connecting to ${server}:${port}...`;
+  status.connecting(dialing);
+
   // onStop is A producer-loss signal (#56): without it a Kit process that
   // dies mid-session leaves a frozen frame and no text, since the readout hides
   // on the first rendered frame (#53). The library's message argument is
@@ -59,8 +69,17 @@ function start(): void {
   // the terminal state is now derived from a timer in streamStatus.js instead.
   // Keeping the handler costs nothing if a future library build starts calling
   // it; do NOT treat its presence here as evidence that it fires.
+  //
+  // onStart is NOT "the stream is live" (#63). It fires when a connect attempt
+  // BEGINS and re-fires on every session-start retry (observed five times
+  // against a producer that was never there), so mapping it onto
+  // `streaming <server>:<port>` reported a working stream when nothing was
+  // connected. It is mapped onto the same attempting readout instead; the
+  // controller ignores the repeats rather than pushing its deadline back, and
+  // the readout is cleared by a rendered frame (#53), which is the only
+  // evidence that a stream exists.
   connectStream(streamConfig, {
-    onStart: () => status.show(`streaming ${server}:${port}`),
+    onStart: () => status.connecting(dialing),
     onStop: () => status.stopped(),
     onTerminate: () => status.terminated(),
   }).catch((e: unknown) => status.show(`connection failed: ${String(e)}`, true));
