@@ -67,6 +67,10 @@ declare global {
  */
 async function startLoopback(page: Page): Promise<void> {
   await page.evaluate(async () => {
+    // Replacing an earlier loopback (the latch check builds a second one).
+    if (window.__OWV_LOOPBACK__) {
+      window.clearInterval(window.__OWV_LOOPBACK__.timer);
+    }
     const canvas = document.createElement('canvas');
     canvas.width = 320;
     canvas.height = 240;
@@ -260,11 +264,18 @@ test('an unrecovered stall escalates to a distinct, latched terminal state (#57,
   // is a separate state rather than a longer wait.
   expect(terminalColor).not.toBe(recoverableColor);
 
-  // Latched (#57): frames really do come back here, and the terminal state must
-  // survive them -- only a reload clears it.
-  const before = await framesRendered(page);
-  await resumeFrames(page);
-  await expect.poll(() => framesRendered(page), { timeout: 20_000 }).toBeGreaterThan(before);
+  // Latched (#57): real frames really do arrive again here -- a whole new
+  // stream, with the loadeddata / playing events that normally clear the
+  // readout (#53) -- and the terminal state must survive them. Only a reload
+  // clears it, which is exactly what the copy tells the user.
+  //
+  // It is a NEW loopback rather than a resumed one on purpose: putting the
+  // original track back after it had been cut for the entire escalation window
+  // did not restart decoding in the element (observed, not assumed -- the frame
+  // counter stayed at zero for 20 s). Handing the page a fresh stream is both
+  // the stronger latch test and the case that actually occurs.
+  await startLoopback(page);
+  await expectFramesFlowing(page);
   await page.waitForTimeout(3_000);
 
   await expect(status).toBeVisible();
