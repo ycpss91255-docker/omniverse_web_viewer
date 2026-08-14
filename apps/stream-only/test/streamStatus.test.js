@@ -630,7 +630,9 @@ test('the terminal state latches the watchdog: nothing stays armed, frames canno
   const statusEl = fakeStatusEl();
   const clock = fakeClock();
   const videoEl = fakeStreamingVideoEl();
-  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  // No handle needed: everything below is driven through the element and the
+  // clock, which is the point -- no caller announced this loss.
+  createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
   videoEl.renderFrame();
   videoEl.emit('playing');
   pollTimes(clock, FAKE_SAMPLES);
