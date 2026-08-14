@@ -9,7 +9,12 @@
 // (issue #53). Re-showing on error/reconnect un-hides it again.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createStatusController, TERMINAL_ESCALATION_MS } from '../src/streamStatus.js';
+import {
+  createStatusController,
+  TERMINAL_ESCALATION_MS,
+  FRAME_STALL_POLL_MS,
+  FRAME_STALL_SAMPLES,
+} from '../src/streamStatus.js';
 
 function fakeStatusEl() {
   const classes = new Set();
@@ -45,6 +50,30 @@ function fakeVideoEl() {
   };
 }
 
+// A video element that CAN report frame progress -- i.e. the part of the real
+// HTMLVideoElement surface the media watchdog samples (#62). The plain
+// fakeVideoEl() above deliberately reports none, which is exactly what keeps
+// every spec written before #62 free of the watchdog (see the first #62 spec).
+function fakeStreamingVideoEl() {
+  const listeners = {};
+  let frames = 0;
+  return {
+    addEventListener(type, fn) {
+      (listeners[type] ||= []).push(fn);
+    },
+    emit(type) {
+      for (const fn of listeners[type] || []) fn();
+    },
+    getVideoPlaybackQuality() {
+      return { totalVideoFrames: frames };
+    },
+    // One more decoded frame reached the element.
+    renderFrame() {
+      frames += 1;
+    },
+  };
+}
+
 // Deterministic stand-in for setTimeout/clearTimeout. Every spec that reaches
 // stopped() MUST inject it: stopped() arms the producer-loss escalation (#58),
 // and a real timer would both slow the run down by the whole window and keep
@@ -61,15 +90,24 @@ function fakeClock() {
     clearTimer(id) {
       timers.delete(id);
     },
-    // Everything currently armed, as {fn, ms} records.
+    // Everything currently armed, as {id, fn, ms} records.
     get pending() {
-      return [...timers.values()];
+      return [...timers.entries()].map(([id, t]) => ({ id, ...t }));
     },
     // Run (and clear) everything armed, i.e. "the window elapsed".
     fire() {
       const due = [...timers.values()];
       timers.clear();
       for (const t of due) t.fn();
+    },
+    // Run (and clear) only the timers armed with `ms`. The watchdog poll and
+    // the escalation use different delays, so a #62 spec can advance one
+    // without the other -- "frames kept stalling for another second" is not
+    // the same event as "the escalation window elapsed".
+    fireEvery(ms) {
+      const due = [...timers.entries()].filter(([, t]) => t.ms === ms);
+      for (const [id] of due) timers.delete(id);
+      for (const [, t] of due) t.fn();
     },
   };
 }
@@ -84,6 +122,25 @@ function clockOptions(clock, terminalDelayMs = FAKE_DELAY_MS) {
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
   };
+}
+
+// Watchdog knobs (#62), likewise deliberately not the production defaults.
+const FAKE_POLL_MS = 250;
+const FAKE_SAMPLES = 3;
+
+function watchdogOptions(clock) {
+  return {
+    ...clockOptions(clock),
+    stallPollMs: FAKE_POLL_MS,
+    stallSamples: FAKE_SAMPLES,
+  };
+}
+
+// "Another `stallPollMs` elapsed", n times.
+function pollTimes(clock, n) {
+  for (let i = 0; i < n; i += 1) {
+    clock.fireEvery(FAKE_POLL_MS);
+  }
 }
 
 const silentLogger = { info() {}, error() {} };
@@ -416,4 +473,195 @@ test('the escalation tolerates null status / video elements (#58)', () => {
 test('the default escalation delay is exported and outlasts the e2e assertion window (#58)', () => {
   assert.equal(typeof TERMINAL_ESCALATION_MS, 'number');
   assert.ok(TERMINAL_ESCALATION_MS >= 10_000, `too short: ${TERMINAL_ESCALATION_MS}`);
+});
+
+// --- producer loss detected from the media itself (issue #62) --------------
+// Everything above reaches the loss states only through stopped(), i.e. only
+// through the library's `onStop` callback. That is the #58 failure mode one
+// step removed: an opaque third-party callback is the SOLE trigger, so if it
+// stops firing (as `onTerminate` already did) the states become unreachable --
+// and unreachable in a browser test too, since no test can make the library
+// call it.
+//
+// So the controller now also watches the thing the user actually experiences:
+// frame progress on the video element. Frames that stop advancing for
+// `stallSamples` consecutive `stallPollMs` polls announce the SAME recoverable
+// state, which then escalates through the SAME #58 timer to the SAME latched
+// terminal state. `onStop` is kept as an accelerator (it announces sooner than
+// the poll can), never as the only way in.
+//
+// The watchdog only arms once a frame has actually rendered AND the element can
+// report progress, which is what keeps a dead-host page (config-dial e2e: no
+// frames, ever) and every pre-#62 spec above untouched.
+
+test('a video element that reports no frame progress never arms the watchdog (#62)', () => {
+  const clock = fakeClock();
+  const videoEl = fakeVideoEl(); // no getVideoPlaybackQuality / currentTime
+  const ctl = createStatusController(fakeStatusEl(), videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.emit('playing');
+  assert.equal(clock.pending.length, 0);
+});
+
+test('the watchdog arms on the first rendered frame, not before (#62)', () => {
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(fakeStatusEl(), videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  // Nothing rendered yet (the dead-host case): the viewer is still connecting,
+  // so a stalled picture is not a producer that went away.
+  assert.equal(clock.pending.length, 0);
+
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  assert.deepEqual(
+    clock.pending.map((t) => t.ms),
+    [FAKE_POLL_MS],
+  );
+});
+
+test('frames that keep arriving never announce a loss (#62)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  for (let i = 0; i < FAKE_SAMPLES * 4; i += 1) {
+    videoEl.renderFrame();
+    pollTimes(clock, 1);
+  }
+
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('frames that stop arriving announce the recoverable state, with no onStop (#62)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  pollTimes(clock, FAKE_SAMPLES - 1); // still inside the tolerance
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  pollTimes(clock, 1); // the stall is now long enough to mean something
+
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.match(statusEl.textContent, /stopped/i);
+  assert.match(statusEl.textContent, /waiting/i);
+  // Recoverable, not terminal, and no reconnect claim (#57, #60).
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
+  // ... and it armed the ordinary #58 escalation, not some second mechanism.
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 1);
+});
+
+test('resumed frames clear a media-detected loss and disarm the escalation (#53, #62)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+  pollTimes(clock, FAKE_SAMPLES);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+
+  videoEl.renderFrame(); // the picture came back
+  pollTimes(clock, 1);
+
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 0);
+});
+
+test('a media-detected stall escalates to the same terminal state (#58, #62)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  ctl.show('streaming 1.2.3.4:49100');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+  pollTimes(clock, FAKE_SAMPLES);
+
+  clock.fireEvery(FAKE_DELAY_MS); // the escalation window elapsed, still no frame
+
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.match(statusEl.textContent, /ended|gone/i);
+  assert.doesNotMatch(statusEl.textContent, /reconnect|waiting/i);
+});
+
+test('onStop stays an accelerator: a stall after it neither re-announces nor re-arms (#62)', () => {
+  const calls = [];
+  const logger = {
+    info: (m) => calls.push(['info', m]),
+    error: (m) => calls.push(['error', m]),
+  };
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(fakeStatusEl(), videoEl, logger, watchdogOptions(clock));
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  ctl.stopped(); // the library got there first
+  const armed = clock.pending.find((t) => t.ms === FAKE_DELAY_MS);
+  calls.length = 0;
+
+  pollTimes(clock, FAKE_SAMPLES * 2); // the watchdog now sees the same stall
+
+  assert.deepEqual(calls, []); // announced once, by whoever noticed first
+  const still = clock.pending.filter((t) => t.ms === FAKE_DELAY_MS);
+  assert.equal(still.length, 1);
+  // Same timer, so the terminal state still lands one window after the FIRST
+  // signal -- a watchdog that re-armed would push it back indefinitely.
+  assert.equal(still[0].id, armed.id);
+});
+
+test('the terminal state latches the watchdog: nothing stays armed, frames cannot clear it (#57, #62)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+  pollTimes(clock, FAKE_SAMPLES);
+  clock.fireEvery(FAKE_DELAY_MS);
+  const terminalText = statusEl.textContent;
+
+  assert.equal(clock.pending.length, 0); // no poll left running either
+
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(clock.pending.length, 0);
+});
+
+test('the exported stall window is long enough to ride out a brief hiccup (#62)', () => {
+  assert.equal(typeof FRAME_STALL_POLL_MS, 'number');
+  assert.equal(typeof FRAME_STALL_SAMPLES, 'number');
+  // A frozen picture is only news once it has been frozen for a while: too
+  // short and an ordinary hiccup shows a producer-loss readout over a stream
+  // that is fine.
+  assert.ok(
+    FRAME_STALL_POLL_MS * FRAME_STALL_SAMPLES >= 3_000,
+    `stall window too short: ${FRAME_STALL_POLL_MS} x ${FRAME_STALL_SAMPLES}`,
+  );
+  // And it must stay well inside the escalation window, so the state the user
+  // sees first is still the recoverable one.
+  assert.ok(
+    FRAME_STALL_POLL_MS * FRAME_STALL_SAMPLES < TERMINAL_ESCALATION_MS,
+    'the stall window must not outlast the escalation window',
+  );
 });
