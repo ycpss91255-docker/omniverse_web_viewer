@@ -211,8 +211,9 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
   }
 
   // The stream is over for good: the escalation window elapsed with no frame
-  // (the only path this library build actually reaches -- see the header note),
-  // or the library surprised us by invoking onTerminate after all.
+  // (the only path this library build actually reaches -- see the header note;
+  // the loss it escalates may have been reported by onStop or noticed by the
+  // watchdog), or the library surprised us by invoking onTerminate after all.
   function terminated() {
     cancelEscalation();
     // Nothing left to watch for: the state is latched, so a frame that turns up
