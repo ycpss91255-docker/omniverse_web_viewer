@@ -47,6 +47,10 @@ const ERROR_COLOR = 'rgb(248, 81, 73)'; // #f85149
 // not the app's numbers.
 const RECOVERABLE_TIMEOUT_MS = 15_000;
 const TERMINAL_TIMEOUT_MS = 30_000;
+// The never-connected case (#63) has no media at all: the page is left dialing
+// the dead test host and the app's own connect window (CONNECT_ESCALATION_MS,
+// 20 s) is what ends the wait. Generous, for the same reason as the two above.
+const NEVER_STARTED_TIMEOUT_MS = 45_000;
 
 interface Loopback {
   sender: RTCRtpSender;
@@ -187,10 +191,42 @@ test('the initial readout is visible and carries the stylesheet base styling', a
 }) => {
   const status = page.locator('#stream-status');
   await expect(status).toBeVisible();
-  await expect(status).toHaveText('Connecting...');
+  // Either the static placeholder in index.html or the dial readout the app
+  // writes at DOMContentLoaded -- which one has landed by now is a race, and
+  // #63 is the reason it no longer matters: both say the viewer is TRYING.
+  // What must never appear before a frame is a claim that it is streaming.
+  await expect(status).toHaveText(/^connecting/i);
+  await expect(status).not.toContainText(/streaming/i);
   await expect(status).not.toHaveClass(/error/);
   expect(await statusDisplay(page)).not.toBe('none');
   expect(await statusColor(page)).toBe(BASE_COLOR);
+});
+
+// The #63 case, and the one no browser test covered: the producer is not there
+// at all. No frame ever renders, so nothing hides the readout and the watchdog
+// never arms; no session ever starts, so the library's `onStop` never fires and
+// the #58 escalation was never armed either. The page used to sit on
+// `streaming <server>:<port>` -- styled as success -- indefinitely.
+test('a viewer whose producer never answers stops claiming a connection (#63)', async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  const status = page.locator('#stream-status');
+
+  // Deliberately NO loopback: this is the served app dialing the dead test
+  // host, exactly as a viewer opened against a Kit app that is not running.
+  await expect(status).toBeVisible();
+  await expect(status).toContainText(/connecting to/i);
+  await expect(status).not.toContainText(/streaming/i);
+  await expect(status).not.toHaveClass(/error/);
+
+  // The connect window elapses with no picture: an actionable readout, in the
+  // real error colour, instead of a permanent false success.
+  await expect(status).toContainText(/no video/i, { timeout: NEVER_STARTED_TIMEOUT_MS });
+  await expect(status).toContainText(/reload/i);
+  await expect(status).not.toContainText(/streaming|waiting|reconnect/i);
+  await expect(status).toHaveClass(/error/);
+  expect(await statusColor(page)).toBe(ERROR_COLOR);
 });
 
 test('real frames hide the readout through the real stylesheet (#53)', async ({ page }) => {
