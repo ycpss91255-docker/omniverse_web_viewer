@@ -40,12 +40,18 @@ function start(): void {
     new CustomEvent('owv:dial', { detail: { server, port, mediaPort } }),
   );
 
-  // onStop is the producer-loss signal (#56): without it a Kit process that
+  // onStop is A producer-loss signal (#56): without it a Kit process that
   // dies mid-session leaves a frozen frame and no text, since the readout hides
   // on the first rendered frame (#53). The library's message argument is
   // deliberately ignored -- its shape is not verifiable from this repo, so it is
   // consumed as a bare signal; the wording, the escalation to the terminal state
   // and the stickiness policy all live in streamStatus.js.
+  //
+  // Since #62 it is no longer the ONLY signal: streamStatus.js also watches
+  // frame progress on #remote-video and announces the same state when frames
+  // stall. Keeping onStop wired makes the announcement immediate instead of
+  // one stall window late -- it is an accelerator, and the controller ignores
+  // whichever of the two arrives second.
   //
   // onTerminate is belt-and-braces ONLY. This library build never invokes it
   // (#58: in the shipped bundle the name appears solely as an error-code enum,
