@@ -98,7 +98,7 @@ VIEWER_UI_MODE = usd-viewer
 
 - **畫面空白、無錯誤訊息** — 通常是 UI 模式與 Kit 應用程式不匹配。`usd-viewer` 模式僅適用於 kit-app-template 的 USD Viewer；對 Isaac Sim 或其他 Kit 應用程式而言，就緒輪詢永遠不會完成，畫面不會渲染任何內容，也不會顯示錯誤。請切換為 `stream-only`（`VIEWER_UI_MODE=stream-only`，或 `host.yaml` 中的 `viewer.ui_mode`）。
 - **連線被拒 / 串流始終未出現** — 檢查 `SIGNALING_SERVER` / `SIGNALING_PORT` 是否指向正在執行的 Kit 應用程式，且該 Kit 應用程式已啟用 NVCF livestream。若是遠端瀏覽器，請在 `host.yaml` 中設定 `network.public_ip`。
-- **串流中途畫面凍結，並顯示 `stream stopped -- waiting for frames to resume...` 或 `stream ended -- the source is gone`**（僅 `stream-only`） — 串流開始後 Kit 生產端消失了。前者表示檢視器正在等待畫面是否回來；系統不會自動替你重新連線，若約 15 秒內沒有新影格，會升級為後者的終止訊息，待 Kit 應用程式恢復後必須重新整理頁面。請檢查串流主機上的 Kit 程序。
+- **串流中途畫面凍結，並顯示 `stream stopped -- waiting for frames to resume...` 或 `stream ended -- the source is gone`**（僅 `stream-only`） — 串流開始後 Kit 生產端消失了。檢視器會從串流函式庫得知，若函式庫沒有任何通知，也會直接從畫面本身判斷：約 5 秒沒有新影格就足以判定。前者表示檢視器正在等待畫面是否回來；系統不會自動替你重新連線，若約 15 秒內沒有新影格，會升級為後者的終止訊息，待 Kit 應用程式恢復後必須重新整理頁面。請檢查串流主機上的 Kit 程序。
 - **容器啟動後立即結束** — entrypoint 在渲染前會驗證設定；無效值（非數字的 `SIGNALING_PORT` / `MEDIA_PORT`、未知的 `VIEWER_UI_MODE`、或含非法字元的 `SIGNALING_SERVER`，包含 `host.yaml` 值尾端誤帶的行內 `#` 註解）會被拒絕並印出錯誤訊息，而非啟動一個壞掉的檢視器。請依錯誤訊息修正對應的環境變數 / `host.yaml` 值。
 - **開啟瀏覽器主控台**（F12） — WebRTC 連線錯誤會記錄在那裡。
 

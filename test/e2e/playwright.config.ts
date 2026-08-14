@@ -31,7 +31,32 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testMatch: ['**/config-dial.spec.ts'],
       use: { ...devices['Desktop Chrome'] },
+    },
+    // The status-state specs (#62) drive real media through an in-page WebRTC
+    // loopback, which needs two Chromium switches. They live in their own
+    // project ON PURPOSE: appending launch args to the shared `use` would also
+    // change how config-dial's browser starts (a second --disable-features
+    // wins over Playwright's default one), and that suite must keep launching
+    // byte-identically to before.
+    //   --disable-features=WebRtcHideLocalIpsWithMdns: host candidates carry
+    //     real local IPs instead of .local names, so the loopback pair does not
+    //     depend on mDNS resolution inside the build container.
+    //   --autoplay-policy=no-user-gesture-required: no user gesture exists in a
+    //     headless run; without it a paused element would never decode a frame.
+    {
+      name: 'chromium-loopback',
+      testMatch: ['**/status-loopback.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          args: [
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
+            '--autoplay-policy=no-user-gesture-required',
+          ],
+        },
+      },
     },
   ],
 });
