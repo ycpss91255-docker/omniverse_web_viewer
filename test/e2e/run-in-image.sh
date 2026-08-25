@@ -12,6 +12,9 @@
 #   3. runs Playwright (Chromium, headless) with OWV_* env telling the spec what
 #      to expect;
 #   4. tears the server down.
+# The two per-PR projects are named EXPLICITLY: the Tier B visual acceptance
+# (#48, project chromium-tier-b) lives in the same directory but needs a real
+# GPU producer, so it must never be picked up by this gate. See run-tier-b.sh.
 # A non-zero Playwright exit fails the build (RUN propagates the exit code).
 #
 # The entrypoint itself backgrounds nothing; it exec's the CMD. We therefore run
@@ -89,7 +92,7 @@ run_mode() {
     OWV_EXPECT_SERVER="${TEST_SERVER}" \
     OWV_EXPECT_PORT="${TEST_SIGNALING_PORT}" \
     OWV_EXPECT_MEDIA="${media_port}" \
-      npx playwright test
+      npx playwright test --project=chromium --project=chromium-loopback
   ) || rc=$?
 
   stop_server

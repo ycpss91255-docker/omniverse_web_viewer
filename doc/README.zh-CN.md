@@ -106,6 +106,15 @@ VIEWER_UI_MODE = usd-viewer
 
 详情请参阅 [TEST.md](test/TEST.md)。
 
+除了每个 PR 都会运行的关卡之外，还有一个每晚执行的 `tier-b-visual-e2e` job，运行在自建的 GPU runner 上：它会启动真正的 Kit 流媒体来源，并在无头浏览器中验证 `stream-only` 查看器确实有画面 — `RTCPeerConnection` 进入 connected、收到 remote track、`videoWidth > 0`，并且抽样的帧不是全黑 — 让「有画面」这件事由 CI 证明，而不是靠人盯着页面看。在具备 GPU 的主机上也可以在本地运行同一套验收：
+
+```bash
+just build -t e2e-test               # 查看器 + 浏览器打包在同一个 image
+bash script/ci/tier_b_visual_e2e.sh  # 启动来源端，驱动浏览器
+```
+
+它使用带 instance 编号的容器名称，并且会先探测端口是否空闲，因此不会干扰同一台主机上正在运行的开发或演示环境。
+
 ## 许可证
 
 [Apache-2.0](../LICENSE)

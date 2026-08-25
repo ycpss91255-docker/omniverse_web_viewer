@@ -106,6 +106,15 @@ VIEWER_UI_MODE = usd-viewer
 
 詳見 [TEST.md](test/TEST.md)。
 
+除了每個 PR 都會跑的關卡之外，還有一個每晚執行的 `tier-b-visual-e2e` job，跑在自架的 GPU runner 上：它會啟動真正的 Kit 串流來源，並在無頭瀏覽器中驗證 `stream-only` 檢視器真的有畫面 — `RTCPeerConnection` 進入 connected、收到 remote track、`videoWidth > 0`，而且抽樣的畫格不是全黑 — 讓「有畫面」這件事由 CI 證明，而不是靠人盯著頁面看。在有 GPU 的主機上也可以在本機跑同一套驗收：
+
+```bash
+just build -t e2e-test               # 檢視器 + 瀏覽器打包在同一個 image
+bash script/ci/tier_b_visual_e2e.sh  # 啟動來源端，驅動瀏覽器
+```
+
+它使用帶 instance 編號的容器名稱，並且會先探測 port 是否空閒，因此不會干擾同一台主機上正在執行的開發或展示環境。
+
 ## 授權條款
 
 [Apache-2.0](../LICENSE)

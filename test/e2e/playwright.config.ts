@@ -8,8 +8,15 @@
 // intent*, not a successful connection). Timeouts are kept modest so a missing
 // dial fails fast rather than hanging the build.
 import { defineConfig, devices } from '@playwright/test';
+import { join } from 'node:path';
 
 const baseURL = process.env.OWV_BASE_URL || 'http://127.0.0.1:5174';
+
+// Tier B (#48) runs in a container with a host dir bind-mounted for evidence
+// (browser trace, failure screenshot). Unset everywhere else -- the per-PR
+// tier-1 gate keeps Playwright's default `test-results`, which it never writes
+// to on a passing run.
+const artifactDir = process.env.OWV_ARTIFACT_DIR || '';
 
 export default defineConfig({
   testDir: '.',
@@ -21,6 +28,7 @@ export default defineConfig({
   reporter: [['list']],
   timeout: 30_000,
   expect: { timeout: 10_000 },
+  ...(artifactDir ? { outputDir: join(artifactDir, 'playwright') } : {}),
   use: {
     baseURL,
     headless: true,
@@ -50,6 +58,36 @@ export default defineConfig({
       testMatch: ['**/status-loopback.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
+        launchOptions: {
+          args: [
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
+            '--autoplay-policy=no-user-gesture-required',
+          ],
+        },
+      },
+    },
+    // Tier B visual acceptance (#48): a REAL Kit producer -> the viewer -> this
+    // browser, asserting real frames render. NOT part of the per-PR gate --
+    // run-in-image.sh selects the two projects above explicitly, and this one
+    // is driven only by run-tier-b.sh on a GPU host.
+    //
+    // Same two switches as the loopback project, for the same reasons (real
+    // local ICE candidates instead of mDNS names inside a container; no user
+    // gesture exists headless, so without the autoplay override the element
+    // would never decode a frame). Kept in its own project rather than shared
+    // with chromium-loopback because the two suites need different projects to
+    // be selectable independently, and appending args to the shared `use`
+    // would change how config-dial's browser starts.
+    //
+    // trace/screenshot on failure: the nightly job has no human watching, so a
+    // failure must leave behind enough to diagnose it without a rerun.
+    {
+      name: 'chromium-tier-b',
+      testMatch: ['**/tier-b-visual.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        trace: 'retain-on-failure',
+        screenshot: 'only-on-failure',
         launchOptions: {
           args: [
             '--disable-features=WebRtcHideLocalIpsWithMdns',

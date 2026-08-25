@@ -1,6 +1,6 @@
 # TEST.md
 
-**114 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **77 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **7 Playwright** (tier-1 browser e2e -- config dial + status states, `test/e2e/`, run in the `e2e-test` extra stage).
+**115 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **77 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **8 Playwright** (browser e2e, `test/e2e/`: **7 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner).
 
 Layout follows base #473 (`test/<category>/<tool>/` for the multi-tool repo level; each npm package carries its own single-tool `test/`).
 
@@ -62,9 +62,12 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 
 `resolveTarget.test.js`: target fallback, query override, `?media=` override, unsubstituted media sentinel -> null, server sentinel pass-through. (The example's `buildStreamConfig` tests moved to `stream-core` in S1/S3.)
 
-## test/e2e/ (7, Playwright + headless Chromium)
+## test/e2e/ (8, Playwright + headless Chromium)
 
-Two suites, two Playwright projects, one gate. Standalone and `@nvidia`-free (outside the npm workspaces). Both drive the REAL dist served by the `runtime` image: `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it.
+Three suites, three Playwright projects, two gates. Standalone and `@nvidia`-free (outside the npm workspaces). All drive the REAL dist served by the `runtime` image.
+
+- **Tier 1 (7, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate.
+- **Tier B (1, nightly, self-hosted GPU)** -- `tier-b-visual.spec.ts`. `run-tier-b.sh` serves `stream-only` pointed at a REAL Kit producer and asserts real frames render.
 
 ### `config-dial.spec.ts` (2) -- project `chromium`
 
@@ -91,11 +94,32 @@ Its own project because the loopback needs two Chromium switches (`--disable-fea
 
 `run-in-image.sh` is the in-image gate runner (not a counted spec); a non-zero Playwright exit fails the `e2e-test` stage build.
 
-Still NOT covered here: that a real Kit produces a real, non-black picture. That needs a producer and stays with Tier B (#48, isaac#223, isaac#173).
+### `tier-b-visual.spec.ts` (1) -- project `chromium-tier-b`
+
+Tier B visual acceptance (#48): the gate that finally proves there is actually a picture, so a human never has to look at the browser again. The media comes from `ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1` (isaac#223 / isaac PR #243) -- a pinned Kit streaming experience rendering a deterministic scene (DomeLight + DistantLight over a 12x12 procedurally built checkerboard floor, fixed camera, RTX auto-exposure disabled) chosen precisely so a connecting browser always gets a non-black frame. A black frame here is a real failure, not scene luck.
+
+ONE test that owns ONE session, asserting five properties of it in order. It wraps `window.RTCPeerConnection` via `addInitScript` to observe the connection the streaming library owns and exposes nothing of.
+
+| # | Assertion | Description |
+|---|-----------|-------------|
+| 1 | connected peer connection | Polls the recorded `connectionState` until `connected`; logs the full state sequence |
+| 2 | a remote media track arrives | A `track` event fired on the library's own peer connection |
+| 3 | real dimensions, decoding | `videoWidth > 0` and `getVideoPlaybackQuality().totalVideoFrames > 0` |
+| 4 | **the frame is NOT BLACK** | `drawImage` the element into a canvas downscaled to 320 px wide, reduce every 7th pixel to Rec.709 luma: mean >= 8, brightest >= 32, >= 10% of samples above the black floor. Every sample is logged; the frame PNG + stats JSON are saved as evidence |
+| 5 | the readout cleared (#53 end-to-end) | `#stream-status` computed `display: none` -- the #53 path closed against a real stream instead of a synthetic one |
+
+**Why one test and not five.** It was five specs in a `describe.serial` sharing a page from `beforeAll`, which reads better but does not work: the stream froze after a single frame every time, while a standalone single-test probe against the same producer, image and flags streamed 3500 frames at 1920x1080 with a mean luma of 152 for a full minute. The page cannot hold a live WebRTC session across test boundaries, so the structure that demonstrably holds a stream is the one used.
+
+**Session warm-up.** `beforeAll`-style warm-up inside the test reloads (each reload is a new session) until frames are *advancing*, up to 4 attempts of 30 s, logging each attempt. This works around isaac#245: the producer's FIRST session after boot never delivers video while the 2nd+ do (measured: 0 frames vs 3521 vs 3525 in 60 s on one producer). The gate requires frames to ADVANCE rather than `totalVideoFrames > 0`, because a single frozen frame satisfies the latter -- exactly the false green this tier exists to eliminate. A producer that never streams exhausts the attempts and fails the run, so the warm-up cannot mask a regression.
+
+`stream-only` ONLY, deliberately. #48's acceptance criteria ask for both viewer modes; that is wrong against an Isaac-family producer, because #18 established that `usd-viewer` (the upstream sample, built UNMODIFIED per D2) only works with the kit-app-template USD Viewer and blanks against Isaac Sim BY DESIGN -- asserting a picture there would fail forever. `usd-viewer` keeps its existing per-PR config-dial cover.
+
+`run-tier-b.sh` (in-container) and `script/ci/tier_b_visual_e2e.sh` (host orchestrator) are runners, not counted specs.
 
 ## Where they run
 
 - bats: `devel-test` stage (`/smoke_test/`, alongside `.base/test/smoke/` shared specs).
 - node: each package's build stage (`stream-only-build` runs stream-core + stream-only tests; the `example` stage runs stream-core + example tests) and locally via `npm -w <pkg> test`.
 - runtime smoke: `runtime-test` stage serves BOTH app dists and curls each for 200 (not counted above; it is a stage gate, not a spec file).
-- Playwright e2e: `e2e-test` extra stage (`FROM runtime`, built via the build-worker `extra_stages` input, per-PR, no GPU / Isaac / self-hosted runner). Installs Playwright + Chromium at build time and runs `run-in-image.sh` against the served dists. Both projects run in both modes; the mode each suite does not apply to is skipped.
+- Playwright e2e, tier 1: `e2e-test` extra stage (`FROM runtime`, built via the build-worker `extra_stages` input, per-PR, no GPU / Isaac / self-hosted runner). Installs Playwright + Chromium at build time and runs `run-in-image.sh` against the served dists. Both tier-1 projects run in both modes; the mode each suite does not apply to is skipped.
+- Playwright e2e, tier B: the `tier-b-visual-e2e` job in `.github/workflows/main.yaml` -- `runs-on: [self-hosted, gpu]`, nightly `schedule` plus a `workflow_dispatch` opt-in input, never per-PR (the producer boots Kit, which is minutes, and contends for the GPU). A `concurrency` group serialises it and never cancels mid-teardown. `script/ci/tier_b_visual_e2e.sh` boots the producer with `--ipc=host` (required: Kit boots fine on the default 64 MB `/dev/shm`, but the media pipeline allocates on client ATTACH, so its absence is invisible to any check that stops at "the port is up" -- adding it took time-to-first-frame from ~16 s to 1.9 s; same root cause isaac#233 records), waits for the producer's own `[PRODUCER] empty lit stage streaming` scene-ready marker (NOT `Streaming server started.`, which fires ~11 s earlier, before the scene exists -- "the port is listening" is not "streaming works", the reusable lesson of isaac#233), then runs the SAME `e2e-test` image at container runtime (it is `FROM runtime`, so one container is both the viewer and the browser) via `run-tier-b.sh`. Isolation, per #48's acceptance criterion and the isaac#237 / #239 / #240 / #241 incident class: every container is named `owv-tierb-<instance>-*` and the teardown refuses any name outside that prefix and removes only those two names (no compose project, no `down --remove-orphans`), ports are probed free with bash `/dev/tcp` starting well away from the dev/demo ranges (5173/49100, 5174/49200), and nothing touches a compose project or a shared name. The browser container runs `--rm`; the producer deliberately does not, so its log survives for diagnosis and is saved before the container is removed. Evidence (frame PNG, luma stats, browser trace, producer log) uploads on failure. The producer is started with `--user 0:0` (knob `TIER_B_PRODUCER_USER`) to work around isaac#244, in which the published `:0.0.1` image cannot read its own baked driver as its non-root `USER`.
