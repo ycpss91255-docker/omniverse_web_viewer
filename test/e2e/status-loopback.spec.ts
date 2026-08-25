@@ -270,7 +270,7 @@ test('stalled frames announce the recoverable state, resumed frames clear it (#6
   expect(await statusDisplay(page)).toBe('none');
 });
 
-test('an unrecovered stall escalates to a distinct, latched terminal state (#57, #58, #62)', async ({
+test('an unrecovered stall escalates to a distinct terminal state, which a real stream then clears (#57, #58, #62, #73)', async ({
   page,
 }) => {
   test.setTimeout(120_000);
@@ -300,21 +300,59 @@ test('an unrecovered stall escalates to a distinct, latched terminal state (#57,
   // is a separate state rather than a longer wait.
   expect(terminalColor).not.toBe(recoverableColor);
 
-  // Latched (#57): real frames really do arrive again here -- a whole new
-  // stream, with the loadeddata / playing events that normally clear the
-  // readout (#53) -- and the terminal state must survive them. Only a reload
-  // clears it, which is exactly what the copy tells the user.
+  // Nothing has come back, so nothing may clear it: the state holds on its own
+  // for as long as the picture stays frozen. This is the half of #57 that is
+  // still true after #73 -- the readout does not time out, drift or get talked
+  // out of itself by the library's retries.
+  await page.waitForTimeout(3_000);
+  await expect(status).toBeVisible();
+  await expect(status).toContainText(/source is gone/i);
+  await expect(status).toHaveClass(/error/);
+
+  // And then real frames arrive again (#73). This used to assert the opposite
+  // -- that a whole new stream, with the loadeddata / playing events that
+  // normally clear the readout, could not clear it -- which is the defect
+  // v0.3.0-rc2 hit: a red error over a picture that was visibly playing. The
+  // latch outranks the library's CLAIMS, not the media itself.
   //
   // It is a NEW loopback rather than a resumed one on purpose: putting the
   // original track back after it had been cut for the entire escalation window
   // did not restart decoding in the element (observed, not assumed -- the frame
-  // counter stayed at zero for 20 s). Handing the page a fresh stream is both
-  // the stronger latch test and the case that actually occurs.
+  // counter stayed at zero for 20 s). Handing the page a fresh stream is also
+  // the case that actually occurs.
   await startLoopback(page);
   await expectFramesFlowing(page);
-  await page.waitForTimeout(3_000);
 
-  await expect(status).toBeVisible();
-  await expect(status).toContainText(/source is gone/i);
+  await expect(status).toBeHidden({ timeout: RECOVERABLE_TIMEOUT_MS });
+  expect(await statusDisplay(page)).toBe('none');
+});
+
+// The exact shape of the v0.3.0-rc2 failure, at browser level: the producer is
+// not there when the page loads, the app's connect window (#63) elapses and
+// declares the attempt failed -- and THEN the producer starts delivering. The
+// picture was never in doubt in that run (1920x1080, meanLuma 151.99); only the
+// readout was wrong, and it was wrong permanently.
+//
+// This is the class the loopback harness exists for: real frames on the real
+// element, after a real escalation on the app's own clock, with no GPU, no Kit
+// and no Tier B runner involved.
+test('a producer that starts after the connect window has elapsed clears the readout (#73)', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const status = page.locator('#stream-status');
+
+  // No loopback yet: the served app is dialing the dead test host, so the
+  // connect window runs out exactly as it did on the tag run.
+  await expect(status).toContainText(/no video/i, { timeout: NEVER_STARTED_TIMEOUT_MS });
   await expect(status).toHaveClass(/error/);
+  expect(await statusColor(page)).toBe(ERROR_COLOR);
+
+  // The stream starts late. Nothing else changes -- no reload, no retry driven
+  // from the test, just media arriving on the element.
+  await startLoopback(page);
+  await expectFramesFlowing(page);
+
+  await expect(status).toBeHidden({ timeout: RECOVERABLE_TIMEOUT_MS });
+  expect(await statusDisplay(page)).toBe('none');
 });
