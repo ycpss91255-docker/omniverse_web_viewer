@@ -55,6 +55,24 @@
 // and arms a bounded window from the attempt, which a real first frame cancels
 // through the same hide() path. Same lesson as #58, on a different callback --
 // state is derived from observable media, never from what a callback is named.
+//
+// The latch outranks CLAIMS, not OBSERVATION (issue #73). #63's reasoning above
+// is sound and stands; what it over-reached into is the media. hide() cancelled
+// the escalation, cleared lossAnnounced and then returned early on `terminal`,
+// so a rendered frame -- the strongest evidence available that the stream works
+// -- was discarded in favour of a verdict this file had INFERRED from a timer.
+// A producer that came up 2 s after the connect window closed therefore left a
+// red "no video from the source" permanently on top of a playing picture
+// (v0.3.0-rc2 tag run: terminal at 06:19:48.863, frames advancing at
+// 06:19:50.997 at 1920x1080 meanLuma 151.99, readout still there at 06:20:21).
+// So the terminal state stays latched against everything DERIVED FROM THE
+// LIBRARY'S CALLBACKS -- show() from `onStart`, connecting(), stopped(), whose
+// unreliability is the reason this state machine exists at all -- and it is
+// reopened by exactly one thing: frame progress that has ADVANCED past where it
+// stood when the latch closed. "Advanced past" is what keeps a stream that
+// never delivers a frame terminal (the #63 case): an element that reports no
+// progress at all, or reports the same reading forever, produces no evidence,
+// and a bare `playing` event with no frame behind it is a claim like any other.
 
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
@@ -106,6 +124,15 @@ export const TERMINAL_ESCALATION_MS = 15_000;
  * the config-dial e2e dials a DEAD host and asserts `#stream-status` carries no
  * `error` class -- that suite finishes in well under a second per mode, so the
  * margin is large, and a unit spec locks the lower bound.
+ *
+ * Left at 20 s by #73, deliberately rather than by default. Lengthening it
+ * would trade a shorter false message for a slower true one, and #73 changes
+ * which side of that trade matters: a window that now ends in a verdict a real
+ * frame can WITHDRAW costs, when it fires early, a message that clears itself
+ * as soon as the picture arrives -- while every second added to it is a second
+ * a genuinely dead producer goes unreported. The rc2 producer's first frame was
+ * ~22 s after page load, so the message does still appear briefly against a
+ * cold producer; that is the intended remaining cost.
  */
 export const CONNECT_ESCALATION_MS = 20_000;
 
@@ -174,14 +201,21 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     clearTimer = (id) => clearTimeout(id),
   } = options;
 
-  // Once terminal, nothing may quietly clear or downgrade the readout: neither
-  // a trailing onStop nor a stray video event may leave the user with a silent
-  // frozen frame again (#56).
+  // Once terminal, nothing DERIVED FROM A CALLBACK may quietly clear or
+  // downgrade the readout: neither a trailing onStop nor a session-start retry
+  // may leave the user with a silent frozen frame again (#56, #63).
   let terminal = false;
+  // Frame progress as of the instant the latch closed, or null if the element
+  // could not report any (#73). It is the baseline the one permitted way OUT of
+  // the terminal state is measured against: media that has advanced past it is
+  // observation, and observation outranks a verdict inferred from a timer. Null
+  // means no such evidence can exist here, so nothing reopens the state.
+  let terminalProgress = null;
   // Pending stopped() -> terminated() escalation, if any (#58).
   let escalation = null;
   // Pending frame-progress sample, if any (#62). Armed by the first rendered
-  // frame, disarmed for good by the terminal state.
+  // frame; the terminal state repurposes it into a recovery watch rather than
+  // disarming it (#73), and only an element that reports no progress stops it.
   let sampler = null;
   // Last frame-progress reading and how many consecutive samples have matched
   // it (#62).
@@ -226,6 +260,18 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     (isError ? logger.error : logger.info)(`[stream] ${text}`);
   }
 
+  // Frames on the element have moved past where they stood when the terminal
+  // state latched (#73) -- the one piece of evidence allowed to reopen it. No
+  // baseline (the element cannot report progress) or an unchanged reading is
+  // not evidence: a stream that never delivers a frame must stay terminal.
+  function framesAdvancedSinceTerminal() {
+    if (terminalProgress === null) {
+      return false;
+    }
+    const progress = readFrameProgress(videoEl);
+    return progress !== null && progress !== terminalProgress;
+  }
+
   function hide() {
     // A rendered frame is the proof that the stream is alive, so it also
     // disarms any pending producer-loss escalation (#58). This runs before the
@@ -233,7 +279,18 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     cancelEscalation();
     lossAnnounced = false;
     if (terminal) {
-      return;
+      if (!framesAdvancedSinceTerminal()) {
+        return;
+      }
+      // The frames this controller declared missing did arrive, so the verdict
+      // is withdrawn entirely -- error styling and all -- and the machine is
+      // live again (#73). Silently: the user is looking at a working picture
+      // and does not need to be told about a verdict that turned out wrong.
+      terminal = false;
+      terminalProgress = null;
+      if (statusEl) {
+        statusEl.classList.remove('error');
+      }
     }
     if (statusEl) {
       statusEl.classList.add(HIDDEN_CLASS);
@@ -289,11 +346,22 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
   // allowed through it.
   function terminate(text) {
     cancelEscalation();
-    // Nothing left to watch for: the state is latched, so a frame that turns up
-    // afterwards must not clear it and there is no reason to keep sampling.
-    cancelSampler();
     show(text, true);
     terminal = true;
+    // What the watchdog is watching for changes here; it does not stop (#73).
+    // Until now it was looking for a stall, and there is no stall left to find.
+    // From now on the only transition available is OUT -- frame progress moving
+    // past this instant's reading -- and the poll is how a stream that comes
+    // back is noticed when no video event announces it (after a stall long
+    // enough to escalate, `playing` does not necessarily re-fire). An element
+    // that cannot report progress can never produce that evidence, so for it
+    // there really is nothing left to watch and the sampler stops.
+    terminalProgress = readFrameProgress(videoEl);
+    if (terminalProgress === null) {
+      cancelSampler();
+    } else {
+      scheduleSample();
+    }
   }
 
   // The stream is over for good: the escalation window elapsed with no frame
@@ -336,12 +404,23 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
 
   function sampleFrameProgress() {
     sampler = null;
-    if (terminal) {
-      return;
-    }
     const progress = readFrameProgress(videoEl);
     if (progress === null) {
       return; // the element stopped reporting: fall back to onStop, stop polling
+    }
+    if (terminal) {
+      // The recovery watch (#73). Nothing escalates from here -- the state is
+      // already terminal -- so the only reading that means anything is one that
+      // has moved. hide() re-checks it and un-latches on it; armWatchdog() then
+      // re-baselines the ordinary stall watch on the stream that is now
+      // running. A picture that stays frozen just keeps the watch going.
+      if (progress !== terminalProgress) {
+        hide();
+        armWatchdog();
+      } else {
+        scheduleSample();
+      }
+      return;
     }
     if (progress !== lastProgress) {
       lastProgress = progress;
