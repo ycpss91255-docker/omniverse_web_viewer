@@ -346,9 +346,15 @@ COPY script/*.sh /lint/
 # live under lib/; the wrappers themselves under wrapper/.
 COPY .base/script/docker/lib /lint/lib
 COPY .base/script/docker/wrapper /lint/wrapper
+# CI helpers (#66): script/ci/ lands at /ci/ rather than /lint/ because it is
+# also EXECUTED here -- derive_image_tag.bats runs the deriver in-image, which
+# is the only proof of the tag -> image-tag mapping available without pushing
+# a tag. Copied before the lint RUN so one copy serves both purposes.
+COPY --chmod=0755 script/ci/ /ci/
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
-# top of the template's wrapper + lib coverage.
-RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh
+# top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
+# helpers, which nothing else was linting.
+RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh
 WORKDIR /lint
 RUN hadolint Dockerfile
 

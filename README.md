@@ -56,6 +56,38 @@ VIEWER_UI_MODE = usd-viewer
 
 Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 
+## Released image
+
+Every git tag publishes a GitHub Release **and** a matching container image, from the same commit in the same CI run, so the two always exist as a pair — given an image you can find its source release, and given a release you can find its image:
+
+```
+ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+The image tag is the release version with the leading `v` removed. CI derives it from the git tag; nobody types it in, which is what keeps a release and its image from drifting apart:
+
+| Git tag | Image |
+|---------|-------|
+| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+
+Release candidates are published as well, since the rc is what gets verified before the final tag is cut.
+
+Publishing happens **on a tag only** (plus a maintainer-only manual dispatch for a republish). A pull request or a `main` push publishes nothing. There is deliberately no `:latest`: pin a version, so a later release — or an rc — can never silently replace what you are running.
+
+The published image is the lean `runtime` stage, built for `linux/amd64` (the one platform CI builds and gates). For other architectures, build locally with `just build`.
+
+```bash
+docker run --rm -d --name owv \
+  -e SIGNALING_SERVER=<host-ip> \
+  -e SIGNALING_PORT=49100 \
+  -e VIEWER_UI_MODE=stream-only \
+  -p 5173:5173 \
+  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+Then open Chrome at `http://<host-ip>:5173`. The knobs are the environment variables documented below.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

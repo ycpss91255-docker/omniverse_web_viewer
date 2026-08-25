@@ -56,6 +56,38 @@ VIEWER_UI_MODE = usd-viewer
 
 その後 `./script/setup.sh apply` を実行して `compose.yaml` を再生成します。
 
+## 公開イメージ
+
+git tag を打つたびに、同じ commit から同じ CI run のなかで GitHub Release **と**対応するコンテナイメージの両方が公開されます。したがって両者は常に対で存在します — イメージからその元になった release をたどれますし、release からそのイメージも分かります：
+
+```
+ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+イメージの tag は release のバージョンから先頭の `v` を除いたものです。この値は CI が git tag から導出するもので、人が入力することはありません。だからこそ release とイメージがずれることがありません：
+
+| Git tag | イメージ |
+|---------|----------|
+| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+
+リリース候補も公開されます。正式な tag を切る前に実際に検証されるのは rc だからです。
+
+公開は **tag のときだけ**行われます（ほかに、メンテナが手動で再公開するための経路があります）。pull request や `main` への push では何も公開されません。`:latest` は意図的に用意していません。バージョンを固定してください。そうすれば、後続の release や rc が動作中のものを黙って置き換えることはありません。
+
+公開されるのは軽量な `runtime` stage で、アーキテクチャは `linux/amd64`（CI がビルドして検証している唯一のプラットフォーム）です。ほかのアーキテクチャは `just build` でローカルにビルドしてください。
+
+```bash
+docker run --rm -d --name owv \
+  -e SIGNALING_SERVER=<host-ip> \
+  -e SIGNALING_PORT=49100 \
+  -e VIEWER_UI_MODE=stream-only \
+  -p 5173:5173 \
+  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+そのうえで Chrome から `http://<host-ip>:5173` を開きます。設定できる項目は下記の環境変数の表のとおりです。
+
 ## 環境変数
 
 | 変数 | デフォルト値 | 用途 |

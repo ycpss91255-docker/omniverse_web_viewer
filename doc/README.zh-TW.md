@@ -56,6 +56,38 @@ VIEWER_UI_MODE = usd-viewer
 
 然後執行 `./script/setup.sh apply` 以重新產生 `compose.yaml`。
 
+## 發佈的映像檔
+
+每個 git tag 都會在同一次 CI run、以同一個 commit，同時發佈 GitHub Release **與**對應的容器映像檔，兩者永遠成對存在 — 拿到映像檔可以回推它的 release，拿到 release 也找得到它的映像檔：
+
+```
+ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+映像檔的 tag 就是 release 版號去掉開頭的 `v`。這個值由 CI 從 git tag 推導而來，不是人工填寫，release 與映像檔因此不可能對不上：
+
+| Git tag | 映像檔 |
+|---------|--------|
+| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+
+Release candidate 同樣會發佈：正式 tag 出來之前，真正被驗證的就是 rc。
+
+發佈**只在 tag 時發生**（外加維護者手動觸發的重新發佈管道）。Pull request 或 `main` push 都不會發佈任何東西。刻意不提供 `:latest`：請釘住版號，才不會被之後的 release 或某個 rc 悄悄換掉正在跑的東西。
+
+發佈的是精簡的 `runtime` stage，架構為 `linux/amd64`（CI 唯一會建置並把關的平台）。其他架構請用 `just build` 在本機自行建置。
+
+```bash
+docker run --rm -d --name owv \
+  -e SIGNALING_SERVER=<host-ip> \
+  -e SIGNALING_PORT=49100 \
+  -e VIEWER_UI_MODE=stream-only \
+  -p 5173:5173 \
+  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+```
+
+接著用 Chrome 開啟 `http://<host-ip>:5173`。可調參數即下方環境變數表所列。
+
 ## 環境變數
 
 | 變數 | 預設值 | 用途 |
