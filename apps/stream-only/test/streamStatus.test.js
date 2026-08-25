@@ -146,6 +146,14 @@ function watchdogOptions(clock) {
   };
 }
 
+// Both windows plus the watchdog knobs, which is what the recovery specs (#73)
+// need: a terminal state produced by the CONNECT window, and a video element
+// whose frame progress can then advance past where it stood when that state
+// latched.
+function recoveryOptions(clock) {
+  return { ...watchdogOptions(clock), connectDelayMs: FAKE_CONNECT_MS };
+}
+
 // "Another `stallPollMs` elapsed", n times.
 function pollTimes(clock, n) {
   for (let i = 0; i < n; i += 1) {
@@ -636,12 +644,17 @@ test('onStop stays an accelerator: a stall after it neither re-announces nor re-
   assert.equal(still[0].id, armed.id);
 });
 
-test('the terminal state latches the watchdog: nothing stays armed, frames cannot clear it (#57, #62)', () => {
+// This spec used to assert the opposite of its second half -- that frames after
+// the terminal state could not clear it, and that no poll was left running.
+// That was the #73 defect, written down: see the #73 block at the end of this
+// file for why observed media outranks the verdict a timer produced.
+test('the terminal state keeps a recovery watch: a frozen picture holds it, advancing frames clear it (#62, #73)', () => {
   const statusEl = fakeStatusEl();
   const clock = fakeClock();
   const videoEl = fakeStreamingVideoEl();
   // No handle needed: everything below is driven through the element and the
-  // clock, which is the point -- no caller announced this loss.
+  // clock, which is the point -- no caller announced this loss, and no caller
+  // clears it either.
   createStatusController(statusEl, videoEl, silentLogger, watchdogOptions(clock));
   videoEl.renderFrame();
   videoEl.emit('playing');
@@ -649,15 +662,28 @@ test('the terminal state latches the watchdog: nothing stays armed, frames canno
   clock.fireEvery(FAKE_DELAY_MS);
   const terminalText = statusEl.textContent;
 
-  assert.equal(clock.pending.length, 0); // no poll left running either
+  // The poll survives the transition, because there is still something worth
+  // watching for -- but what it watches for is now a recovery, not a stall.
+  assert.deepEqual(
+    clock.pending.map((t) => t.ms),
+    [FAKE_POLL_MS],
+  );
 
-  videoEl.renderFrame();
-  videoEl.emit('playing');
-
+  // The picture is still frozen: the watch finds nothing and the terminal state
+  // is exactly where it was, poll after poll.
+  pollTimes(clock, FAKE_SAMPLES * 2);
   assert.equal(statusEl.textContent, terminalText);
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.equal(statusEl.classList.contains('error'), true);
-  assert.equal(clock.pending.length, 0);
+
+  // Frames advance again. No video event is involved here on purpose: after a
+  // stall long enough to escalate, `playing` does not necessarily re-fire, so
+  // the watchdog has to be able to notice the recovery on its own.
+  videoEl.renderFrame();
+  pollTimes(clock, 1);
+
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
 });
 
 test('the exported stall window is long enough to ride out a brief hiccup (#62)', () => {
@@ -844,4 +870,128 @@ test('the connect escalation tolerates null status / video elements (#63)', () =
 test('the default connect window is exported and outlasts the config-dial e2e (#63)', () => {
   assert.equal(typeof CONNECT_ESCALATION_MS, 'number');
   assert.ok(CONNECT_ESCALATION_MS >= 15_000, `too short: ${CONNECT_ESCALATION_MS}`);
+});
+
+// --- a real frame outranks the timer's verdict (issue #73) -----------------
+// #63 latched the terminal state for a reason that still holds: `onStart`
+// re-fires on every session-start retry, so a retry could otherwise repaint
+// `streaming <server>:<port>` over a genuine failure and re-assert a connection
+// that does not exist. What that latch over-reached into is OBSERVATION. It
+// also discarded the one signal that cannot lie -- frames advancing on the
+// video element, the signal #62 deliberately moved this whole state machine
+// onto -- so a producer that came up 2 s after the connect window closed left a
+// red `no video from the source` permanently on top of a picture that was
+// demonstrably playing (v0.3.0-rc2 tag run: terminal at 06:19:48.863, frames
+// advancing at 06:19:50.997, meanLuma 151.99, readout still there 30 s later).
+//
+// So the latch outranks CLAIMS and not OBSERVATION:
+//   - claims  -- show() from `onStart`, connecting(), stopped(): still blocked
+//   - media   -- hide() from a video event, and the watchdog seeing progress
+//                advance past where it stood when the latch closed: clears it
+//
+// "Advanced past" is the whole distinction, and it is what keeps the #56 / #57
+// stray-video-event specs above true on the progress-free fake: a `playing`
+// event from an element that reports no frame progress at all is a claim like
+// any other, and cannot reopen anything.
+
+test('frames that arrive after the connect window elapsed clear the terminal state (#73)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+
+  clock.fireEvery(FAKE_CONNECT_MS); // the window elapsed with no picture
+  assert.match(statusEl.textContent, /no video/i);
+  assert.equal(statusEl.classList.contains('error'), true);
+
+  videoEl.renderFrame(); // ... and then the producer finally came up
+  videoEl.emit('playing');
+
+  // Silently, deliberately: the user is looking at a working picture and does
+  // not need to be told about a verdict that turned out to be wrong.
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+});
+
+test('a session-start retry still cannot touch the terminal state, even once frames advance (#63, #73)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  clock.fireEvery(FAKE_CONNECT_MS);
+  const terminalText = statusEl.textContent;
+
+  videoEl.renderFrame(); // the media now says the stream is alive ...
+  ctl.connecting('connecting to 1.2.3.4:49100...'); // ... a claim still says nothing
+  ctl.show('streaming 1.2.3.4:49100');
+
+  // #63 intact: the retry neither overwrites the readout nor arms a window.
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_CONNECT_MS).length, 0);
+
+  // The media path, on the same controller and the same frames, still can.
+  videoEl.emit('playing');
+  assert.equal(statusEl.classList.contains('hidden'), true);
+});
+
+test('stopped() cannot touch the terminal state either, even once frames advance (#57, #73)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  clock.fireEvery(FAKE_CONNECT_MS);
+  const terminalText = statusEl.textContent;
+
+  videoEl.renderFrame();
+  ctl.stopped(); // the library's onStop, arriving after the fact
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 0);
+});
+
+test('a terminal state with no frames stays terminal, poll after poll (#63, #73)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  clock.fireEvery(FAKE_CONNECT_MS);
+  const terminalText = statusEl.textContent;
+
+  // The #63 case: the producer really is not there. Nothing renders, ever.
+  pollTimes(clock, FAKE_SAMPLES * 4);
+  videoEl.emit('playing'); // a video event with no frame behind it is not evidence
+
+  assert.equal(statusEl.textContent, terminalText);
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+});
+
+test('a recovered viewer is a live viewer again: a later stall re-announces and re-escalates (#73)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  clock.fireEvery(FAKE_CONNECT_MS);
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  // Un-latching is a real state change, not just a hidden element: the whole
+  // machine works again from here, including the states that produced the
+  // wrong verdict in the first place.
+  pollTimes(clock, FAKE_SAMPLES);
+  assert.match(statusEl.textContent, /waiting/i);
+  assert.equal(statusEl.classList.contains('error'), false);
+
+  clock.fireEvery(FAKE_DELAY_MS);
+  assert.match(statusEl.textContent, /ended|gone/i);
+  assert.equal(statusEl.classList.contains('error'), true);
 });
