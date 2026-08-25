@@ -6,7 +6,20 @@ on:
     tags:
       - 'v*'
   pull_request:
+  # Nightly, for the Tier B visual acceptance ONLY (#48). Every other job in
+  # this workflow is gated off `schedule` below -- a scheduled run must not
+  # rebuild and re-release the image, it exists to answer one question: does a
+  # real Kit producer's picture still reach a real browser?
+  schedule:
+    - cron: '0 20 * * *'
   workflow_dispatch:
+    inputs:
+      run_tier_b:
+        description: >-
+          Also run the Tier B visual acceptance (self-hosted GPU runner,
+          boots a real Kit producer; minutes, and contends for the GPU).
+        type: boolean
+        default: false
 
 # call-release uses softprops/action-gh-release@v2 which needs
 # contents: write to create a GitHub Release. Reusable workflow
@@ -18,6 +31,8 @@ permissions:
 
 jobs:
   call-docker-build:
+    # Not on the nightly schedule: that trigger is for tier-b-visual-e2e only.
+    if: github.event_name != 'schedule'
     uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v0.41.0
     with:
       image_name: omniverse_web_viewer
@@ -44,3 +59,79 @@ jobs:
     uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.41.0
     with:
       archive_name_prefix: omniverse_web_viewer
+
+  # ------------------------- Tier B visual acceptance (#48) -----------------
+  # The gate that finally answers "is there actually a picture?" without a
+  # human in front of a browser: a REAL Kit producer (the pinned deterministic
+  # ghcr.io/ycpss91255-docker/isaac-stream-source image, isaac#223) -> the REAL
+  # served stream-only dist -> headless Chromium, asserting a connected
+  # RTCPeerConnection, a remote track, videoWidth > 0 and a NON-BLACK sampled
+  # frame. Everything per-PR stops one step short of that (config dial against
+  # a dead host; status states against a canvas the spec paints itself).
+  #
+  # NOT per-PR, on purpose: the producer boots Kit (minutes) and needs the GPU.
+  # Nightly + explicit manual opt-in only. `runs-on: [self-hosted, gpu]` because
+  # no hosted runner has NVENC.
+  #
+  # stream-only ONLY. #48's acceptance criteria ask for both viewer modes, which
+  # is wrong against an Isaac-family producer: #18 established that `usd-viewer`
+  # (the upstream sample, built UNMODIFIED per D2) only works with the
+  # kit-app-template USD Viewer and blanks against Isaac Sim BY DESIGN, so
+  # asserting a picture there would fail forever. usd-viewer keeps its existing
+  # per-PR config-dial cover.
+  tier-b-visual-e2e:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_tier_b)
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    # One Kit on the GPU at a time, and never cancel mid-teardown -- a killed
+    # run would orphan a GPU-holding container. Mirrors isaac's stream-smoke.
+    concurrency:
+      group: owv-tier-b-visual-e2e
+      cancel-in-progress: false
+    steps:
+      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in
+      # the workspace that breaks the non-root runner's checkout clean step.
+      # Mirrors isaac's stream-smoke; refs ycpss91255-docker/github_runner#77.
+      - name: Pre-checkout cleanup (clear stale root-owned residue)
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/w -w /w busybox:1 sh -c '
+            rm -rf .tier-b-artifacts 2>/dev/null
+            true'
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # base detect_ws_path mis-detects the self-CI _work/<repo>/<repo> layout;
+      # pin WS_PATH to the checkout root in the derived cache so the compose
+      # build resolves. Same fix isaac applies in stream-smoke (base#586).
+      - name: Generate .env + compose.yaml (pin WS_PATH)
+        run: |
+          ./script/setup.sh apply
+          sed -i "s|^WS_PATH=.*|WS_PATH=${GITHUB_WORKSPACE}|" .env.generated
+
+      # The same stage the per-PR gate builds. Building it here also re-runs the
+      # tier-1 in-image gate, so a Tier B run can never pass on a stale image.
+      - name: Build the e2e-test image (viewer + browser in one)
+        run: ./script/build.sh -t e2e-test
+
+      # Explicit, so a registry problem is distinguishable from an acceptance
+      # failure and a multi-GB pull does not eat the acceptance step's budget.
+      - name: Pull the pinned producer image
+        run: docker pull ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1
+
+      # Boots the producer, waits for its streaming server, drives the browser,
+      # and tears down its own instance-scoped containers on every exit path.
+      - name: Tier B visual acceptance (real producer -> real frames)
+        run: bash script/ci/tier_b_visual_e2e.sh
+
+      - name: Upload evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-b-visual-e2e-evidence
+          path: .tier-b-artifacts
+          if-no-files-found: ignore

@@ -9,3 +9,7 @@ coverage/
 .docker.xauth
 
 .env.generated
+
+# Tier B visual acceptance evidence (#48): frame PNG, luma stats, Playwright
+# trace, producer container log. Written by script/ci/tier_b_visual_e2e.sh.
+.tier-b-artifacts/
