@@ -20,6 +20,16 @@ on:
           boots a real Kit producer; minutes, and contends for the GPU).
         type: boolean
         default: false
+      # Escape hatch ONLY (#66). The tag-triggered path derives the image tag
+      # from the git ref and IGNORES this, so a release and its image cannot
+      # drift; this exists for a manual publish off a ref that is not a tag.
+      publish_image_tag:
+        description: >-
+          Publish the runtime image to GHCR under this version (e.g. 0.3.0).
+          Ignored on a tag ref -- the tag itself wins. Leave empty to publish
+          nothing.
+        type: string
+        default: ''
 
 # call-release uses softprops/action-gh-release@v2 which needs
 # contents: write to create a GitHub Release. Reusable workflow
@@ -56,9 +66,147 @@ jobs:
   call-release:
     needs: call-docker-build
     if: startsWith(github.ref, 'refs/tags/')
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.41.0
+    # TEMPORARY COMMIT-SHA PIN (#66; revert tracked by #67).
+    #
+    # Deliberately NOT a released base tag, and deliberately NOT the same ref
+    # as call-docker-build above. Both released tags break on this repo's tree,
+    # in the same way, for two different paths -- release-worker's archive step
+    # `cp -r`s a fixed list of "standard" paths and hard-fails on any the
+    # consumer lacks (upstream robustness fix: base#914):
+    #
+    #   v0.41.0  copies the five root wrappers build.sh / run.sh / exec.sh /
+    #            stop.sh / setup_tui.sh. This repo has none of them (justfile +
+    #            script/), so the cp fails and call-release dies on any tag
+    #            push. That is the original blocker; base#595 fixed it.
+    #   v0.42.0  contains that fix but base#642 then moved the test path: it
+    #            copies test/bats/smoke/, while this repo's tree is
+    #            test/smoke/bats/ (inverse nesting). Same failure, new path.
+    #            Verified path by path against this repo's main.
+    #
+    # 8f54fde is base#595's merge commit, where the list is exactly
+    # `Dockerfile script/ .hadolint.yaml test/smoke/ .base/ README.md doc/` --
+    # all seven of which exist here. Full-length SHA because only a full-length
+    # SHA is immutable (a tag can be moved); the motive is reproducibility, not
+    # supply-chain defence -- base is our own org.
+    #
+    # call-docker-build stays on v0.41.0 ON PURPOSE: it works, and moving it
+    # would swallow the ~167-commit base jump this pin exists to avoid. The
+    # mixed pinning is the whole point, not an oversight.
+    #
+    # Revert to a released tag once base ships one carrying base#914 (or at
+    # least a cp list this tree satisfies) -- #67 tracks it, including the
+    # separate decision about whether call-docker-build moves at the same time.
+    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@8f54fde0ca6232d07d4ba3e93522af08cd7cc50e
     with:
       archive_name_prefix: omniverse_web_viewer
+
+  # ------------------------- GHCR image publish (#66) -----------------------
+  # The other half of a release. A tag must emit a GitHub Release AND a GHCR
+  # image whose version strings MATCH, so the two are traceable in both
+  # directions -- given an image you can find its source release, and given a
+  # release you can find its image. Downstream consumer: isaac#173, which wants
+  # a pinned, released viewer to test against instead of whatever the
+  # `web_viewer` submodule happens to point at.
+  #
+  # Same workflow, same run, same commit as call-release: that is what makes
+  # the pairing structural rather than a convention someone has to remember.
+  #
+  # The image tag is DERIVED from the git ref by script/ci/derive_image_tag.sh
+  # (v0.3.0 -> :0.3.0, v0.3.0-rc1 -> :0.3.0-rc1), never hand-entered on this
+  # path, so it cannot drift from the release. `publish_image_tag` is an escape
+  # hatch for a manual publish off a non-tag ref and is ignored on a tag ref.
+  #
+  # No `:latest`. A moving tag is precisely what a downstream pin must not be,
+  # and an rc must never become the tag consumers get by default.
+  publish-image:
+    # Gated on BOTH: never publish an image the build/test gate rejected, and
+    # never publish an image whose Release failed to cut. A Release without an
+    # image is recoverable by dispatching this workflow; an image with no
+    # Release behind it is a dangling artifact a consumer could pin.
+    #
+    # `!cancelled()` rather than the implicit success(): a job whose `needs`
+    # include a SKIPPED job is skipped unless the condition uses a status
+    # function, and call-release is legitimately skipped on the manual
+    # escape-hatch path (no tag ref). The two explicit `needs.*.result` checks
+    # put back the strictness that buys.
+    needs: [call-docker-build, call-release]
+    if: >-
+      !cancelled()
+      && needs.call-docker-build.result == 'success'
+      && (needs.call-release.result == 'success'
+          || needs.call-release.result == 'skipped')
+      && (startsWith(github.ref, 'refs/tags/')
+          || (github.event_name == 'workflow_dispatch'
+              && inputs.publish_image_tag != ''))
+    runs-on: ubuntu-latest
+    # Job-level, so the workflow-wide `contents: write` (which call-release
+    # needs to create a Release) is not also handed to a job that pushes to a
+    # registry. This job only reads the tree and writes a package.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # The runtime stage builds both app dists, and usd-viewer builds from
+          # the upstream `src` submodule.
+          submodules: recursive
+
+      # `GITHUB_REPOSITORY` is ycpss91255-docker/omniverse_web_viewer, i.e. the
+      # ghcr.io/ycpss91255-docker/omniverse_web_viewer the READMEs document; it
+      # follows the repo automatically if it is ever renamed. The full
+      # reference is assembled here so the push step below stays a one-liner
+      # and the run summary records exactly what was published.
+      - name: Derive the image reference from the git ref
+        id: image
+        env:
+          PUBLISH_IMAGE_TAG: ${{ inputs.publish_image_tag }}
+        run: |
+          tag="$(bash script/ci/derive_image_tag.sh)"
+          ref="ghcr.io/${GITHUB_REPOSITORY}:${tag}"
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing \`${ref}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          # `runtime` is the lean deployable stage (built dists + serve, no
+          # toolchain / src / node_modules) -- what a downstream consumer runs.
+          target: runtime
+          # linux/amd64 only: the platform call-docker-build actually builds
+          # and gates (build-worker's default `platforms`). Publishing an
+          # arm64 variant nothing in CI has tested would be a claim, not a
+          # gate; arm64 users build locally, as documented in the README.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          # Reuse the runtime layers call-docker-build just built in this same
+          # run. The scope key mirrors build-worker's own computation
+          # (`${image_name}-${hardware}-runtime-cache`, base#272 / base#378);
+          # it is a pure speedup, and a miss just rebuilds from source, so an
+          # upstream change to that key degrades time, never correctness.
+          cache-from: type=gha,scope=omniverse_web_viewer-x86_64-runtime-cache
+          # The same user/uid the build-worker runtime build uses, so the
+          # published image is the one CI gated rather than a look-alike with a
+          # different ARG set (and so the cache above actually hits).
+          build-args: |
+            USER_NAME=ci
+            USER_GROUP=ci
+            USER_UID=1000
+            USER_GID=1000
 
   # ------------------------- Tier B visual acceptance (#48) -----------------
   # The gate that finally answers "is there actually a picture?" without a

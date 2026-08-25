@@ -1,6 +1,6 @@
 # TEST.md
 
-**115 tests** total: **30 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **77 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **8 Playwright** (browser e2e, `test/e2e/`: **7 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner).
+**129 tests** total: **44 bats** (repo-level smoke, `test/smoke/bats/`, run in the `devel-test` stage) + **77 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **8 Playwright** (browser e2e, `test/e2e/`: **7 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner).
 
 Layout follows base #473 (`test/<category>/<tool>/` for the multi-tool repo level; each npm package carries its own single-tool `test/`).
 
@@ -45,6 +45,27 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `example: imports the factory from stream-core (local copy deleted)` | No duplicate `buildStreamConfig` (S3 dedup) |
 | `example: streamTarget.json carries all three sentinels` | server/port/media sentinels present |
 | `example: resolveTarget unit tests pass (node --test)` | Runs the example's own glue tests in-image |
+
+## test/smoke/bats/derive_image_tag.bats (14)
+
+Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the `publish-image` job (#66). The release/image pairing only holds because that tag is DERIVED from the git ref instead of typed in, so this is the table of refs a real push produces -- and the only part of the tag-triggered publish path provable without pushing a tag. The script is copied into the image at `/ci/` by the `devel-test` stage and run there.
+
+| Test | Description |
+|------|-------------|
+| `script is present and executable` | The deriver is actually shipped into the image at `/ci/` |
+| `a release tag drops the v (v0.3.0 -> 0.3.0)` | The primary path: git ref -> image tag |
+| `an rc tag is preserved (v0.3.0-rc1 -> 0.3.0-rc1)` | Pre-releases are first-class -- the rc is what gets verified |
+| `a tag without the v prefix still resolves` | `v` is stripped, not required |
+| `the git ref wins over a differing dispatch input` | The escape hatch cannot override a tag -- that would BE the drift |
+| `workflow_dispatch input is used off a branch` | The escape hatch works where there is no tag to derive from |
+| `a v-prefixed dispatch input is tolerated` | Typing `v0.3.0` in the box still yields `0.3.0` |
+| `the resolved tag is the only thing on stdout` | The workflow captures stdout verbatim; provenance stays on stderr |
+| `provenance names the rule that fired` | The CI log records WHICH rule produced the tag |
+| `a plain main push publishes nothing` | Nothing publishes on a `main` push |
+| `a dispatch with an empty input publishes nothing` | An empty escape hatch is a no-op, not a guess |
+| `a non-version tag is refused, not published` | `on: push: tags: ['v*']` also fires for `vlatest` |
+| `a truncated version tag is refused` | `v0.3` is not MAJOR.MINOR.PATCH |
+| `a dispatch input that is not a version is refused` | Same validation on the escape-hatch path |
 
 ## packages/stream-core/test/ (20, node --test)
 
@@ -118,7 +139,7 @@ ONE test that owns ONE session, asserting five properties of it in order. It wra
 
 ## Where they run
 
-- bats: `devel-test` stage (`/smoke_test/`, alongside `.base/test/smoke/` shared specs).
+- bats: `devel-test` stage (`/smoke_test/`, alongside `.base/test/smoke/` shared specs). That stage also ShellCheck-lints `script/ci/` (copied to `/ci/`), which nothing was linting before #66.
 - node: each package's build stage (`stream-only-build` runs stream-core + stream-only tests; the `example` stage runs stream-core + example tests) and locally via `npm -w <pkg> test`.
 - runtime smoke: `runtime-test` stage serves BOTH app dists and curls each for 200 (not counted above; it is a stage gate, not a spec file).
 - Playwright e2e, tier 1: `e2e-test` extra stage (`FROM runtime`, built via the build-worker `extra_stages` input, per-PR, no GPU / Isaac / self-hosted runner). Installs Playwright + Chromium at build time and runs `run-in-image.sh` against the served dists. Both tier-1 projects run in both modes; the mode each suite does not apply to is skipped.
