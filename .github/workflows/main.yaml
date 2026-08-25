@@ -88,37 +88,20 @@ jobs:
     # on this gate would be reached for exactly when it matters most.
     needs: [call-docker-build, tier-b-visual-e2e]
     if: startsWith(github.ref, 'refs/tags/')
-    # TEMPORARY COMMIT-SHA PIN (#66; revert tracked by #67).
+    # Back on a released base tag: the temporary commit-SHA pin from #66 is
+    # gone and #67's condition is met. v0.42.0's archive step copies
+    # `Dockerfile script/ .hadolint.yaml test/bats/smoke/ .base/ README.md
+    # doc/` and hard-fails on any path the consumer lacks (upstream robustness
+    # fix base#914 is still open); this tree now satisfies all seven, the last
+    # of them because the bats specs moved to test/bats/smoke/ -- base's own
+    # ADR-00000012 layout -- rather than because the list was worked around.
     #
-    # Deliberately NOT a released base tag, and deliberately NOT the same ref
-    # as call-docker-build above. Both released tags break on this repo's tree,
-    # in the same way, for two different paths -- release-worker's archive step
-    # `cp -r`s a fixed list of "standard" paths and hard-fails on any the
-    # consumer lacks (upstream robustness fix: base#914):
-    #
-    #   v0.41.0  copies the five root wrappers build.sh / run.sh / exec.sh /
-    #            stop.sh / setup_tui.sh. This repo has none of them (justfile +
-    #            script/), so the cp fails and call-release dies on any tag
-    #            push. That is the original blocker; base#595 fixed it.
-    #   v0.42.0  contains that fix but base#642 then moved the test path: it
-    #            copies test/bats/smoke/, while this repo's tree is
-    #            test/smoke/bats/ (inverse nesting). Same failure, new path.
-    #            Verified path by path against this repo's main.
-    #
-    # 8f54fde is base#595's merge commit, where the list is exactly
-    # `Dockerfile script/ .hadolint.yaml test/smoke/ .base/ README.md doc/` --
-    # all seven of which exist here. Full-length SHA because only a full-length
-    # SHA is immutable (a tag can be moved); the motive is reproducibility, not
-    # supply-chain defence -- base is our own org.
-    #
-    # call-docker-build stays on v0.41.0 ON PURPOSE: it works, and moving it
-    # would swallow the ~167-commit base jump this pin exists to avoid. The
-    # mixed pinning is the whole point, not an oversight.
-    #
-    # Revert to a released tag once base ships one carrying base#914 (or at
-    # least a cp list this tree satisfies) -- #67 tracks it, including the
-    # separate decision about whether call-docker-build moves at the same time.
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@8f54fde0ca6232d07d4ba3e93522af08cd7cc50e
+    # call-docker-build stays on v0.41.0 ON PURPOSE. Moving the build worker is
+    # a separate change with its own verification (#37); the mixed pinning is
+    # deliberate, not an oversight. Likewise the .base subtree stays at v0.41.0
+    # -- base#915 records that the v0.42.0 upgrade path is broken for a v0.41.0
+    # consumer, and only the workflow ref moves here.
+    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.42.0
     with:
       archive_name_prefix: omniverse_web_viewer
 
