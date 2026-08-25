@@ -106,6 +106,15 @@ Per-instance port delivery rides the `.env` mechanism: each instance's `SIGNALIN
 
 See [TEST.md](doc/test/TEST.md) for details.
 
+On top of the per-PR gates, a nightly `tier-b-visual-e2e` job on a self-hosted GPU runner boots a real Kit producer and asserts in a headless browser that the `stream-only` viewer really renders a picture — a connected `RTCPeerConnection`, a remote track, `videoWidth > 0` and a sampled frame that is not black — so "there is a picture" is proven by CI instead of by someone looking at the page. On a GPU host you can run the same acceptance locally:
+
+```bash
+just build -t e2e-test               # viewer + browser in one image
+bash script/ci/tier_b_visual_e2e.sh  # boots the producer, drives the browser
+```
+
+It uses instance-scoped container names and probed-free ports, so it will not disturb a dev or demo stack running on the same host.
+
 ## License
 
 [Apache-2.0](LICENSE)
