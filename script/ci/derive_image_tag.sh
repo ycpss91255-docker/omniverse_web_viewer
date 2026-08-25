@@ -45,7 +45,7 @@ set -euo pipefail
 readonly VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([0-9A-Za-z.-]*[0-9A-Za-z])?)?$'
 
 # Emits a GitHub Actions error annotation and exits non-zero. The message is
-# kept on ONE line: a `::error::` workline is terminated by the newline, so a
+# kept on ONE line: a `::error::` workflow command ends at the newline, so a
 # wrapped message would silently drop everything after the first line out of
 # the annotation.
 #
