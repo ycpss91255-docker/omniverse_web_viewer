@@ -138,7 +138,11 @@ docker run --rm -d --name owv \
 
 詳見 [TEST.md](test/TEST.md)。
 
-除了每個 PR 都會跑的關卡之外，還有一個每晚執行的 `tier-b-visual-e2e` job，跑在自架的 GPU runner 上：它會啟動真正的 Kit 串流來源，並在無頭瀏覽器中驗證 `stream-only` 檢視器真的有畫面 — `RTCPeerConnection` 進入 connected、收到 remote track、`videoWidth > 0`，而且抽樣的畫格不是全黑 — 讓「有畫面」這件事由 CI 證明，而不是靠人盯著頁面看。在有 GPU 的主機上也可以在本機跑同一套驗收：
+除了每個 PR 都會跑的關卡之外，還有一個每晚執行的 `tier-b-visual-e2e` job，跑在自架的 GPU runner 上：它會啟動真正的 Kit 串流來源，並在無頭瀏覽器中驗證 `stream-only` 檢視器真的有畫面 — `RTCPeerConnection` 進入 connected、收到 remote track、`videoWidth > 0`，而且抽樣的畫格不是全黑 — 讓「有畫面」這件事由 CI 證明，而不是靠人盯著頁面看。
+
+同一個 job 現在**每次推 tag 也會跑**，而且 GitHub Release 與 GHCR image 都以它為前置關卡：沒有替該 commit 驗證過畫面，就不會發佈任何版本。這裡刻意沒有留任何強制放行的開關 — GPU runner 不可用時，release 會被擋下來，而不是在未驗證的情況下發佈。
+
+在有 GPU 的主機上也可以在本機跑同一套驗收：
 
 ```bash
 just build -t e2e-test               # 檢視器 + 瀏覽器打包在同一個 image

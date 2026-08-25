@@ -18,16 +18,22 @@ on:
         description: >-
           Also run the Tier B visual acceptance (self-hosted GPU runner,
           boots a real Kit producer; minutes, and contends for the GPU).
+          Not needed on a tag ref or for a publish -- both run it anyway.
         type: boolean
         default: false
       # Escape hatch ONLY (#66). The tag-triggered path derives the image tag
       # from the git ref and IGNORES this, so a release and its image cannot
       # drift; this exists for a manual publish off a ref that is not a tag.
+      #
+      # It is NOT an escape from the picture gate (#70): a non-empty value here
+      # makes tier-b-visual-e2e run for this dispatch as well, and the publish
+      # is gated on it succeeding exactly as a tag push is.
       publish_image_tag:
         description: >-
           Publish the runtime image to GHCR under this version (e.g. 0.3.0).
           Ignored on a tag ref -- the tag itself wins. Leave empty to publish
-          nothing.
+          nothing. Publishing ALWAYS runs the Tier B visual acceptance first
+          (self-hosted GPU runner), whatever the box above says.
         type: string
         default: ''
 
@@ -64,39 +70,38 @@ jobs:
         RUNTIME_SMOKE_CMD=timeout 30 bash -c 'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'
 
   call-release:
-    needs: call-docker-build
+    # THE PICTURE GATE (#70). v0.3.0-rc1 was published without the Tier B
+    # visual acceptance ever having run for that commit -- a tag push skipped
+    # it, and the Release cut anyway. Standing rule from here on: no version
+    # may be published without the picture having been verified.
+    #
+    # tier-b-visual-e2e (defined at the bottom of this file, and now triggered
+    # by tag pushes too) is therefore a hard `needs` of this job.
+    #
+    # NOTE the deliberate ABSENCE of a status function in the `if` below. With
+    # no `always()` / `!cancelled()` / `success()` anywhere in it, GitHub keeps
+    # the default rule "a job is skipped when any job it needs did not
+    # succeed", and a SKIPPED Tier B propagates as a skip to this job. That is
+    # the intended outcome: if the self-hosted GPU runner is unavailable, the
+    # release is BLOCKED, not waved through. There is no override input, no
+    # continue-on-error and no `if: always()` escape by design -- an override
+    # on this gate would be reached for exactly when it matters most.
+    needs: [call-docker-build, tier-b-visual-e2e]
     if: startsWith(github.ref, 'refs/tags/')
-    # TEMPORARY COMMIT-SHA PIN (#66; revert tracked by #67).
+    # Back on a released base tag: the temporary commit-SHA pin from #66 is
+    # gone and #67's condition is met. v0.42.0's archive step copies
+    # `Dockerfile script/ .hadolint.yaml test/bats/smoke/ .base/ README.md
+    # doc/` and hard-fails on any path the consumer lacks (upstream robustness
+    # fix base#914 is still open); this tree now satisfies all seven, the last
+    # of them because the bats specs moved to test/bats/smoke/ -- base's own
+    # ADR-00000012 layout -- rather than because the list was worked around.
     #
-    # Deliberately NOT a released base tag, and deliberately NOT the same ref
-    # as call-docker-build above. Both released tags break on this repo's tree,
-    # in the same way, for two different paths -- release-worker's archive step
-    # `cp -r`s a fixed list of "standard" paths and hard-fails on any the
-    # consumer lacks (upstream robustness fix: base#914):
-    #
-    #   v0.41.0  copies the five root wrappers build.sh / run.sh / exec.sh /
-    #            stop.sh / setup_tui.sh. This repo has none of them (justfile +
-    #            script/), so the cp fails and call-release dies on any tag
-    #            push. That is the original blocker; base#595 fixed it.
-    #   v0.42.0  contains that fix but base#642 then moved the test path: it
-    #            copies test/bats/smoke/, while this repo's tree is
-    #            test/smoke/bats/ (inverse nesting). Same failure, new path.
-    #            Verified path by path against this repo's main.
-    #
-    # 8f54fde is base#595's merge commit, where the list is exactly
-    # `Dockerfile script/ .hadolint.yaml test/smoke/ .base/ README.md doc/` --
-    # all seven of which exist here. Full-length SHA because only a full-length
-    # SHA is immutable (a tag can be moved); the motive is reproducibility, not
-    # supply-chain defence -- base is our own org.
-    #
-    # call-docker-build stays on v0.41.0 ON PURPOSE: it works, and moving it
-    # would swallow the ~167-commit base jump this pin exists to avoid. The
-    # mixed pinning is the whole point, not an oversight.
-    #
-    # Revert to a released tag once base ships one carrying base#914 (or at
-    # least a cp list this tree satisfies) -- #67 tracks it, including the
-    # separate decision about whether call-docker-build moves at the same time.
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@8f54fde0ca6232d07d4ba3e93522af08cd7cc50e
+    # call-docker-build stays on v0.41.0 ON PURPOSE. Moving the build worker is
+    # a separate change with its own verification (#37); the mixed pinning is
+    # deliberate, not an oversight. Likewise the .base subtree stays at v0.41.0
+    # -- base#915 records that the v0.42.0 upgrade path is broken for a v0.41.0
+    # consumer, and only the workflow ref moves here.
+    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.42.0
     with:
       archive_name_prefix: omniverse_web_viewer
 
@@ -119,20 +124,27 @@ jobs:
   # No `:latest`. A moving tag is precisely what a downstream pin must not be,
   # and an rc must never become the tag consumers get by default.
   publish-image:
-    # Gated on BOTH: never publish an image the build/test gate rejected, and
-    # never publish an image whose Release failed to cut. A Release without an
-    # image is recoverable by dispatching this workflow; an image with no
-    # Release behind it is a dangling artifact a consumer could pin.
+    # Gated on THREE things: never publish an image the build/test gate
+    # rejected, never publish an image whose Release failed to cut, and -- the
+    # #70 addition -- never publish an image whose picture was not verified.
+    # A Release without an image is recoverable by dispatching this workflow;
+    # an image with no Release behind it is a dangling artifact a consumer
+    # could pin; an image nobody ever saw a frame from is what v0.3.0-rc1 was.
     #
     # `!cancelled()` rather than the implicit success(): a job whose `needs`
     # include a SKIPPED job is skipped unless the condition uses a status
     # function, and call-release is legitimately skipped on the manual
-    # escape-hatch path (no tag ref). The two explicit `needs.*.result` checks
-    # put back the strictness that buys.
-    needs: [call-docker-build, call-release]
+    # escape-hatch path (no tag ref). The explicit `needs.*.result` checks put
+    # back the strictness that buys -- and note that only call-release is
+    # allowed to be 'skipped'. tier-b-visual-e2e must be 'success' outright:
+    # skipped, failed, cancelled and timed-out all block the publish, on the
+    # tag path AND on the manual escape-hatch path (which is why a non-empty
+    # publish_image_tag makes the Tier B job run for that dispatch too).
+    needs: [call-docker-build, call-release, tier-b-visual-e2e]
     if: >-
       !cancelled()
       && needs.call-docker-build.result == 'success'
+      && needs.tier-b-visual-e2e.result == 'success'
       && (needs.call-release.result == 'success'
           || needs.call-release.result == 'skipped')
       && (startsWith(github.ref, 'refs/tags/')
@@ -218,8 +230,24 @@ jobs:
   # a dead host; status states against a canvas the spec paints itself).
   #
   # NOT per-PR, on purpose: the producer boots Kit (minutes) and needs the GPU.
-  # Nightly + explicit manual opt-in only. `runs-on: [self-hosted, gpu]` because
-  # no hosted runner has NVENC.
+  # Nightly, every RELEASE path, and explicit manual opt-in. `runs-on:
+  # [self-hosted, gpu]` because no hosted runner has NVENC.
+  #
+  # The release path was added by #70. This job is the gate call-release and
+  # publish-image hang off, so it must run wherever those two could run:
+  #   - a tag ref     -> the release path itself
+  #   - a dispatch with a non-empty publish_image_tag -> the manual publish,
+  #                      which would otherwise be a hole in the same rule
+  # It deliberately has NO `needs:`. Staying dependency-free is what keeps the
+  # nightly semantics untouched (call-docker-build does not run on `schedule`,
+  # so needing it would force a status function onto the gate job itself), and
+  # this job rebuilds the e2e-test image from the checked-out tree anyway, so
+  # it can never pass against a stale artifact. The cost is that on a tag push
+  # it starts in parallel with call-docker-build rather than after it.
+  #
+  # The `concurrency` group below means a tag pushed while the nightly run is
+  # in flight QUEUES behind it instead of cancelling it. A release therefore
+  # waits for the GPU; that is the accepted price of the rule.
   #
   # stream-only ONLY. #48's acceptance criteria ask for both viewer modes, which
   # is wrong against an Isaac-family producer: #18 established that `usd-viewer`
@@ -229,8 +257,10 @@ jobs:
   # per-PR config-dial cover.
   tier-b-visual-e2e:
     if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_tier_b)
+      github.event_name == 'schedule'
+      || startsWith(github.ref, 'refs/tags/')
+      || (github.event_name == 'workflow_dispatch'
+          && (inputs.run_tier_b || inputs.publish_image_tag != ''))
     runs-on: [self-hosted, gpu]
     timeout-minutes: 60
     # One Kit on the GPU at a time, and never cancel mid-teardown -- a killed

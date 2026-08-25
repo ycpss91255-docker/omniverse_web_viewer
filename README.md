@@ -138,7 +138,11 @@ Per-instance port delivery rides the `.env` mechanism: each instance's `SIGNALIN
 
 See [TEST.md](doc/test/TEST.md) for details.
 
-On top of the per-PR gates, a nightly `tier-b-visual-e2e` job on a self-hosted GPU runner boots a real Kit producer and asserts in a headless browser that the `stream-only` viewer really renders a picture — a connected `RTCPeerConnection`, a remote track, `videoWidth > 0` and a sampled frame that is not black — so "there is a picture" is proven by CI instead of by someone looking at the page. On a GPU host you can run the same acceptance locally:
+On top of the per-PR gates, a nightly `tier-b-visual-e2e` job on a self-hosted GPU runner boots a real Kit producer and asserts in a headless browser that the `stream-only` viewer really renders a picture — a connected `RTCPeerConnection`, a remote track, `videoWidth > 0` and a sampled frame that is not black — so "there is a picture" is proven by CI instead of by someone looking at the page.
+
+The same job also runs on **every tag push**, and both the GitHub Release and the GHCR image are gated on it: no version is published unless the picture was verified for that exact commit. There is deliberately no override — if the GPU runner is unavailable, the release is blocked rather than published unverified.
+
+On a GPU host you can run the same acceptance locally:
 
 ```bash
 just build -t e2e-test               # viewer + browser in one image

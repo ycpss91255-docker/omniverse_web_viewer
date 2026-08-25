@@ -364,8 +364,21 @@ RUN ln -sf /opt/bats/bin/bats /usr/local/bin/bats
 
 ENV BATS_LIB_PATH="/usr/lib/bats"
 
+# Tool-first smoke layout, base ADR-00000012: test/bats/smoke/<stage>/ names
+# the STAGE each spec is built to run in, so the specs a stage owns are the
+# ones its COPY names -- no spec can drift into an image that cannot satisfy
+# it. All three of this repo's specs belong to `devel-test`: derive_image_tag
+# needs /ci/ and example_demo needs /examples/, which exist only here, and
+# omniverse_web_viewer_env needs /app/*/dist + /entrypoint.sh, which exist in
+# `runtime` too -- but `runtime-test` runs RUNTIME_SMOKE_CMD, not bats, so
+# there is no second consumer to justify a `shared/` tree today. The day a
+# runtime-test bats block is added, moving that one file to shared/ is the
+# whole change.
+#
+# Both trees flatten into /smoke_test/, so `load "${BATS_TEST_DIRNAME}/
+# test_helper"` keeps resolving to the shared helper from .base.
 COPY .base/test/smoke/ /smoke_test/
-COPY test/smoke/bats/ /smoke_test/
+COPY test/bats/smoke/devel-test/ /smoke_test/
 
 # Example source is checked by example_demo.bats (contract + node --test);
 # the full example build (lint / vite / serve smoke) runs in the `example`
