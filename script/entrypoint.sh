@@ -76,10 +76,31 @@ if [[ ! "${SIGNALING_SERVER}" =~ ^[A-Za-z0-9.-]+$ ]]; then
        "(allowed: hostname / IPv4 chars A-Za-z0-9.-)" >&2
   exit 1
 fi
-if [[ ! "${SIGNALING_PORT}" =~ ^[0-9]+$ ]]; then
-  echo "entrypoint: invalid signaling port '${SIGNALING_PORT}' (must be numeric)" >&2
-  exit 1
-fi
+#
+# reject_bad_port <name> <value>: exit 1 unless <value> is an integer 1..65535
+# written WITHOUT a leading zero. Both halves of that rule earn their place:
+#   - the range, because `0` and `99999` are not ports. They reach the browser
+#     otherwise -- stream-only at least throws a visible readout, but usd-viewer
+#     (upstream, unmodified) just never connects and says nothing;
+#   - the leading zero, because the port sed below replaces the QUOTED sentinel
+#     `"__OWV_PORT__"`, so the value lands in the bundle as a BARE numeric
+#     token. `SIGNALING_PORT=049100` renders `signalingPort:049100`, which is
+#     `SyntaxError: Decimals with leading zeros are not allowed in strict mode`
+#     -- the whole ES module fails to parse and the viewer is a black page,
+#     while the entrypoint exits 0, `serve` answers HTTP 200 and every gate
+#     stays green. `[ x -lt y ]` parses base 10, so a range test alone does not
+#     catch it.
+reject_bad_port() {
+  local name="$1" value="$2"
+  if [[ ! "${value}" =~ ^(0|[1-9][0-9]*)$ ]] || \
+     [ "${value}" -lt 1 ] || [ "${value}" -gt 65535 ]; then
+    echo "entrypoint: invalid ${name} '${value}'" \
+         "(must be an integer 1..65535, written without a leading zero)" >&2
+    exit 1
+  fi
+}
+
+reject_bad_port "signaling port" "${SIGNALING_PORT}"
 case "${VIEWER_UI_MODE}" in
   usd-viewer | stream-only) ;;
   *)
@@ -90,17 +111,23 @@ case "${VIEWER_UI_MODE}" in
 esac
 # MEDIA_PORT is OPTIONAL (D1): unset -> rendered as the literal `null`
 # (the stream-only app omits mediaPort and the library SDP-negotiates).
-# When set it must be an integer 1..65535.
+# When set it must be an integer 1..65535, same rule as the signaling port --
+# it is substituted for the same kind of quoted sentinel and reaches the
+# bundle as the same kind of bare numeric token.
 if [ -n "${MEDIA_PORT:-}" ]; then
-  if [[ ! "${MEDIA_PORT}" =~ ^[0-9]+$ ]] || \
-     [ "${MEDIA_PORT}" -lt 1 ] || [ "${MEDIA_PORT}" -gt 65535 ]; then
-    echo "entrypoint: invalid media port '${MEDIA_PORT}'" \
-         "(must be an integer 1..65535, or unset to negotiate)" >&2
-    exit 1
-  fi
+  reject_bad_port "media port" "${MEDIA_PORT}"
   media_value="${MEDIA_PORT}"
 else
   media_value="null"
+fi
+
+# SERVE_PORT is not rendered into any bundle -- the CMD passes it to `serve -l`
+# -- but the same rule applies for the same reason the header states: a bad
+# value must fail the container fast. `SERVE_PORT=0` otherwise starts a viewer
+# nobody can reach, on a port nobody chose. Only checked when set: the `example`
+# stage serves on EXAMPLE_PORT and leaves this unset.
+if [ -n "${SERVE_PORT:-}" ]; then
+  reject_bad_port "serve port" "${SERVE_PORT}"
 fi
 
 # VIEWER_UI_MODE selects which app dist to render + serve (D7); the CMD

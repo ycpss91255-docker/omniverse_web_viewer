@@ -204,6 +204,31 @@ teardown() {
   assert_failure
 }
 
+# The port sed replaces the QUOTED sentinel, so the value reaches the bundle as
+# a bare numeric token: `049100` renders `signalingPort:049100`, which is a
+# SyntaxError in an ES module (strict mode). The chunk then fails to parse and
+# the viewer is a black page -- from a container that started successfully and
+# answers HTTP 200, which is all the runtime smoke ever asked.
+@test "SIGNALING_PORT with a leading zero is rejected" {
+  SIGNALING_PORT="049100" run /entrypoint.sh true
+  assert_failure
+}
+
+@test "out-of-range SIGNALING_PORT is rejected" {
+  SIGNALING_PORT="99999" run /entrypoint.sh true
+  assert_failure
+}
+
+@test "MEDIA_PORT with a leading zero is rejected" {
+  VIEWER_UI_MODE="stream-only" MEDIA_PORT="047998" run /entrypoint.sh true
+  assert_failure
+}
+
+@test "out-of-range SERVE_PORT is rejected" {
+  SERVE_PORT="0" run /entrypoint.sh true
+  assert_failure
+}
+
 @test "invalid VIEWER_UI_MODE is rejected" {
   VIEWER_UI_MODE="bogus" run /entrypoint.sh true
   assert_failure

@@ -1,10 +1,10 @@
 # TEST.md
 
-**135 tests** total: **44 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**139 tests** total: **48 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
-## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (25)
+## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (29)
 
 Two-app config-injection model (S5): the build preserves sentinel-bearing chunks as `*.js.tmpl` per app dir (`/app/usd-viewer/dist`, `/app/stream-only/dist`); the entrypoint resolves `VIEWER_UI_MODE` (app selector), validates every value, and re-renders ONLY the active app's templates on every boot with 3 seds (`__OWV_SERVER__` / `"__OWV_PORT__"` / `"__OWV_MEDIA_PORT__"`).
 
@@ -31,9 +31,13 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `host.yaml viewer.ui_mode selects the served app` | App selector via host.yaml |
 | `entrypoint exports the resolved VIEWER_UI_MODE for the CMD` | Export-before-exec so the CMD serves the resolved dir |
 | `non-numeric SIGNALING_PORT is rejected` | Validation (exit 1) |
+| `SIGNALING_PORT with a leading zero is rejected` | `049100` renders as the bare token `049100`, a strict-mode SyntaxError -> black page from a container that started fine (exit 1) |
+| `out-of-range SIGNALING_PORT is rejected` | 1..65535, same rule MEDIA_PORT always had (exit 1) |
 | `invalid VIEWER_UI_MODE is rejected` | Enum validation (exit 1) |
 | `non-numeric MEDIA_PORT is rejected` | Optional-knob validation (exit 1) |
 | `out-of-range MEDIA_PORT is rejected` | 1..65535 (exit 1) |
+| `MEDIA_PORT with a leading zero is rejected` | Same bare-token substitution, same SyntaxError (exit 1) |
+| `out-of-range SERVE_PORT is rejected` | `SERVE_PORT=0` would serve the viewer on a port nobody chose (exit 1) |
 | `SIGNALING_SERVER with shell/sed metacharacters is rejected` | Validation IS the escaping (security) |
 
 ## test/bats/smoke/devel-test/example_demo.bats (5)

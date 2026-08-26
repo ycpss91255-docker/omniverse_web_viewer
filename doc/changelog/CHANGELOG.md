@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Entrypoint: `SIGNALING_PORT` is now validated on the same terms `MEDIA_PORT` always was, and both gained a no-leading-zero rule. `SIGNALING_PORT` was checked only against `^[0-9]+$` -- no range, so `0` and `99999` reached the browser, and no leading-zero rule, which is the one that actually breaks. The port sed replaces the QUOTED sentinel `"__OWV_PORT__"`, so the value lands in the bundle as a BARE numeric token: `SIGNALING_PORT=049100` renders `signalingPort:049100`, which is `SyntaxError: Decimals with leading zeros are not allowed in strict mode`. The chunk fails to parse, the viewer is a black page -- and the entrypoint exits 0, `serve` answers HTTP 200, the runtime smoke passes and the bats render assertions pass, so nothing anywhere said why. A range test alone does not catch it either, because bash `[ x -lt y ]` parses base 10. Both ports now require an integer 1..65535 written without a leading zero, which is what the entrypoint header ("a bad value must fail the container fast rather than bake malformed JS") always claimed. `SERVE_PORT` gets the same rule, checked only when set (the `example` stage serves on `EXAMPLE_PORT`): it is not rendered into a bundle, but `SERVE_PORT=0` otherwise starts a viewer on a port nobody chose. Four new bats cases lock the rejections; bats 44 -> 48.
+
 ## [0.3.0] - 2026-08-26
 
 First tagged release. Everything below shipped in it; `v0.3.0-rc1` .. `-rc3` were
