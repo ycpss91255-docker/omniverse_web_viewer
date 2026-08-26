@@ -112,7 +112,7 @@ Tier-1 browser config-dial e2e (#47). The specs wrap `window.WebSocket` / `windo
 | Test | Mode | Description |
 |------|------|-------------|
 | `stream-only dials the injected target` | stream-only | Asserts the `owv:dial` event detail (server/port/media) matches the injected values (media pinned == `MEDIA_PORT`, null when unset, D1); best-effort WS-URL corroboration; `#stream-status` not in error / no `invalid` |
-| `usd-viewer dials the injected target` | usd-viewer | BLACK BOX (upstream unmodified, no event): asserts the WebSocket dial URL carries `server:port`, with a served-JS string-presence fallback (injected server present, `__OWV_SERVER__` sentinel absent) + no uncaught page error |
+| `usd-viewer dials the injected target` | usd-viewer | BLACK BOX (upstream unmodified, no event): a short WebSocket-dial window, then a served-JS string-presence fallback -- injected server AND port present, `__OWV_SERVER__` and `__OWV_PORT__` sentinels both absent -- plus no uncaught page error. The dial branch is unreachable against the current upstream build (it starts on `Forms.AppOnly` and only connects after a Next click this spec never performs), which is exactly why the FALLBACK has to be the complete assertion; the window is kept short rather than removed so a future auto-dialing upstream still takes the stronger path |
 
 ### `status-loopback.spec.ts` (6) -- project `chromium-loopback`
 

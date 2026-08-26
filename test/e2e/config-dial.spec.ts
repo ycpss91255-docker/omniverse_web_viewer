@@ -191,12 +191,20 @@ test('usd-viewer dials the injected target', async ({ page }) => {
   await installDialRecorders(page);
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 
+  // The upstream sample does NOT auto-dial: it starts on `Forms.AppOnly` and
+  // only reaches `AppStreamer.connect` after a Next click this spec never
+  // performs, so this poll has always timed out into the fallback below and the
+  // `dialed` branch has always been dead code. The window is kept -- if a
+  // future upstream build does auto-dial, the stronger assertion should fire --
+  // but it is SHORT: fifteen seconds of guaranteed waiting was being spent on
+  // every PR run to reach a branch that cannot be taken, and the fallback is
+  // now a complete assertion rather than a partial one.
   let dialed = false;
   try {
     await expect
       .poll(() => page.evaluate(() => window.__OWV_DIALS__.ws.length), {
         message: 'usd-viewer opened no WebSocket within the window',
-        timeout: 15_000,
+        timeout: 2_000,
       })
       .toBeGreaterThan(0);
     dialed = true;
@@ -214,9 +222,17 @@ test('usd-viewer dials the injected target', async ({ page }) => {
       `no WS URL carried ${EXPECT_SERVER}:${EXPECT_PORT}; got ${JSON.stringify(wsUrls)}`,
     ).toBe(true);
   } else {
-    // FALLBACK: no auto-dial (e.g. the landing screen waits for a click). Prove
-    // the SERVED bundle still carries the injected server and that the sentinel
-    // was rendered away -- i.e. the injection reached the real dist.
+    // FALLBACK: no auto-dial (the landing screen waits for a click). Prove the
+    // SERVED bundle carries BOTH injected values and that BOTH sentinels were
+    // rendered away -- i.e. the injection reached the real dist.
+    //
+    // The port half is not decoration. This is the ONLY per-PR cover usd-viewer
+    // has, and before this the fallback checked the server alone: an entrypoint
+    // regression that dropped SIGNALING_PORT, or a build that stopped emitting
+    // `"__OWV_PORT__"` into the usd-viewer bundle, would have left this test
+    // green. It is the same gap that was closed on the stream-only side, where
+    // the injected port is now 49177 precisely so it cannot be confused with
+    // the 49100 default that every other assertion used to accept.
     const assets = await page.evaluate(async () => {
       const html = await (await fetch('/')).text();
       const srcs = Array.from(html.matchAll(/src="([^"]+\.js)"/g)).map((m) => m[1]);
@@ -231,8 +247,10 @@ test('usd-viewer dials the injected target', async ({ page }) => {
       return bodies.join('\n');
     });
     expect(assets, 'served JS assets fetched').not.toBe('');
-    expect(assets.includes(EXPECT_SERVER)).toBe(true);
-    expect(assets.includes('__OWV_SERVER__')).toBe(false);
+    expect(assets.includes(EXPECT_SERVER), `served JS carries ${EXPECT_SERVER}`).toBe(true);
+    expect(assets.includes('__OWV_SERVER__'), 'server sentinel was rendered away').toBe(false);
+    expect(assets.includes(EXPECT_PORT), `served JS carries ${EXPECT_PORT}`).toBe(true);
+    expect(assets.includes('__OWV_PORT__'), 'port sentinel was rendered away').toBe(false);
   }
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
