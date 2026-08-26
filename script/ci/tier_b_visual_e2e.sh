@@ -173,8 +173,28 @@ _log_contains() {
   [ "${hits:-0}" -gt 0 ]
 }
 
+# cleanup -- teardown, and NOTHING ELSE. It must not decide the exit status.
+#
+# It used to open with `local rc=$?` and close with `exit "${rc}"` while being
+# trapped on EXIT INT TERM, and both halves of that were wrong on a signal:
+#
+#   - on a signal path `$?` is the status of the last COMPLETED command (the
+#     `sleep 5` in the boot-wait loop, i.e. 0), not a failure. Signalling this
+#     script's pid alone therefore made it exit 0 -- and line 57 says exit 0
+#     means "a real browser saw a real, non-black frame", which the workflow's
+#     picture gate believes. A killed run reported the picture VERIFIED having
+#     asserted nothing. Only a process-GROUP signal happened to give 130/143,
+#     because there the trap never got to overwrite the status;
+#   - the same function being the INT/TERM handler AND the EXIT handler meant
+#     its own `exit` re-entered it through the EXIT trap, so teardown ran twice
+#     and producer.log was written twice.
+#
+# The sibling runners (test/e2e/run-tier-b.sh, test/e2e/run-in-image.sh) have
+# always had the right shape: a teardown function on EXIT with no `exit` in it,
+# so the status the shell was already exiting with is preserved. This follows
+# them, and the signal paths get an EXPLICIT non-zero of their own (128+signo,
+# the shell convention) so a killed run can never be read as a pass.
 cleanup() {
-  local rc=$?
   # Save the producer log BEFORE removing it -- it is the only diagnosis a
   # nightly failure leaves behind.
   if _container_exists "${PRODUCER_NAME}"; then
@@ -183,9 +203,13 @@ cleanup() {
   log "teardown: dropping ${VIEWER_NAME} + ${PRODUCER_NAME}"
   _drop "${VIEWER_NAME}"
   _drop "${PRODUCER_NAME}"
-  exit "${rc}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# `exit` here runs cleanup once, through the EXIT trap, with a status that says
+# what happened. GitHub's step timeout and the runner's job cancellation both
+# arrive as one of these.
+trap 'fail "interrupted (SIGINT) -- no picture was verified"; exit 130' INT
+trap 'fail "terminated (SIGTERM) -- no picture was verified"; exit 143' TERM
 
 # Viewer image: the e2e-test stage tag the build wrapper produces
 # (${DOCKER_HUB_USER}/${IMAGE_NAME}:e2e-test). Read from the derived .env so

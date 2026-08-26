@@ -1,6 +1,6 @@
 # TEST.md
 
-**140 tests** total: **49 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**143 tests** total: **52 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
@@ -71,6 +71,16 @@ Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the
 | `a non-version tag is refused, not published` | `on: push: tags: ['v*']` also fires for `vlatest` |
 | `a truncated version tag is refused` | `v0.3` is not MAJOR.MINOR.PATCH |
 | `a dispatch input that is not a version is refused` | Same validation on the escape-hatch path |
+
+## test/bats/smoke/devel-test/tier_b_visual_e2e.bats (3)
+
+Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. Its header says `Exit 0 = a real browser saw a real, non-black frame`, and the workflow's picture gate believes exactly that -- so exiting 0 without having asserted a picture is the one failure this script may never have. It could: `cleanup()` took `local rc=$?` and ended `exit "${rc}"` while trapped on `EXIT INT TERM`, and on a signal path `$?` is the last COMPLETED command (the boot-wait `sleep 5`, i.e. 0). No GPU, Kit or docker daemon is involved -- a stub `docker` on `PATH` answers just enough for the driver to reach its boot-wait loop and stay there, which is the state under test. The script is copied into the image at `/ci/`.
+
+| Test | Description |
+|------|-------------|
+| `SIGTERM exits non-zero, so a killed run cannot claim a picture` | A GitHub step timeout / job cancellation must not be readable as a verified picture (143) |
+| `SIGINT exits non-zero, so a killed run cannot claim a picture` | Same for an interrupt (130) |
+| `teardown runs exactly once on a signal path` | The signal handler and the EXIT handler used to be the same function, so its own `exit` re-entered it and `producer.log` was written twice |
 
 ## packages/stream-core/test/ (20, node --test)
 
@@ -145,7 +155,7 @@ ONE test that owns ONE session, asserting five properties of it in order. It wra
 
 ## Where they run
 
-- bats: `devel-test` stage. The stage `COPY`s `test/bats/smoke/devel-test/` into `/smoke_test/`, on top of `.base/test/smoke/` (the shared specs + `test_helper.bash`); both trees flatten into that one directory, so `load "${BATS_TEST_DIRNAME}/test_helper"` resolves and `bats /smoke_test/` runs repo and base specs together. The directory name IS the stage name (base ADR-00000012): all three specs sit under `devel-test/` because that is the only stage in this repo that runs bats. `derive_image_tag.bats` and `example_demo.bats` could not run anywhere else in any case (`/ci/` and `/examples/` exist only here); `omniverse_web_viewer_env.bats` asserts `/app/*/dist` + `/entrypoint.sh`, which `runtime` also has, but `runtime-test` runs `RUNTIME_SMOKE_CMD` (serve + curl) rather than bats, so a `shared/` tree would name a second consumer that does not exist -- add a runtime-test bats block first, then move that one file. That stage also ShellCheck-lints `script/ci/` (copied to `/ci/`), which nothing was linting before #66.
+- bats: `devel-test` stage. The stage `COPY`s `test/bats/smoke/devel-test/` into `/smoke_test/`, on top of `.base/test/smoke/` (the shared specs + `test_helper.bash`); both trees flatten into that one directory, so `load "${BATS_TEST_DIRNAME}/test_helper"` resolves and `bats /smoke_test/` runs repo and base specs together. The directory name IS the stage name (base ADR-00000012): all four specs sit under `devel-test/` because that is the only stage in this repo that runs bats. `derive_image_tag.bats`, `tier_b_visual_e2e.bats` and `example_demo.bats` could not run anywhere else in any case (`/ci/` and `/examples/` exist only here); `omniverse_web_viewer_env.bats` asserts `/app/*/dist` + `/entrypoint.sh`, which `runtime` also has, but `runtime-test` runs `RUNTIME_SMOKE_CMD` (serve + curl) rather than bats, so a `shared/` tree would name a second consumer that does not exist -- add a runtime-test bats block first, then move that one file. That stage also ShellCheck-lints `script/ci/` (copied to `/ci/`), which nothing was linting before #66.
 - node: each package's build stage (`stream-only-build` runs stream-core + stream-only tests; the `example` stage runs stream-core + example tests) and locally via `npm -w <pkg> test`.
 - runtime smoke: `runtime-test` stage serves BOTH app dists and curls each for 200 (not counted above; it is a stage gate, not a spec file).
 - Playwright e2e, tier 1: `e2e-test` extra stage (`FROM runtime`, built via the build-worker `extra_stages` input, per-PR, no GPU / Isaac / self-hosted runner). Installs Playwright + Chromium at build time and runs `run-in-image.sh` against the served dists. Both tier-1 projects run in both modes; the mode each suite does not apply to is skipped.
