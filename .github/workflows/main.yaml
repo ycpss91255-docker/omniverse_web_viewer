@@ -70,8 +70,10 @@ on:
 # actions/checkout persists that token into .git/config on the runner, so the
 # least-trusted job in the file (a build driven by a Dockerfile and build args
 # that come from the PR branch) sat next to a token that can push commits and
-# create tags -- and creating a `v*` tag is itself a trigger in this file, i.e.
-# directly upstream of the release path. Same-repo branch PRs get the full write
+# create tags -- and creating a VERSION-SHAPED tag (the push filter at the top
+# of this file; not every `v*`, which it stopped being when that filter was
+# narrowed) is itself a trigger here, i.e. directly upstream of the release
+# path. Same-repo branch PRs get the full write
 # token; only FORK PRs are forced read-only by GitHub, so branch protection does
 # not contain this. On the GPU host the same token would let a compromise of the
 # pulled producer image, or another tenant on that shared machine, escalate from

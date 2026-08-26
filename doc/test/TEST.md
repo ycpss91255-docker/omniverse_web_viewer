@@ -112,7 +112,7 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 
 Three suites, three Playwright projects, two gates. Standalone and `@nvidia`-free (outside the npm workspaces). All drive the REAL dist served by the `runtime` image.
 
-- **Tier 1 (8, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49177`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate.
+- **Tier 1 (8, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49177`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate — and runs them ONE PROJECT PER INVOCATION, because Playwright evaluates its "No tests found" guard over the whole selection: selecting both at once reports `1 skipped` and exit 0 for a project that matched zero spec files, so a renamed or lost spec would drop out of the gate while the runner still printed `all modes passed`.
 - **Tier B (1, nightly, self-hosted GPU)** -- `tier-b-visual.spec.ts`. `run-tier-b.sh` serves `stream-only` pointed at a REAL Kit producer and asserts real frames render.
 
 ### `config-dial.spec.ts` (2) -- project `chromium`
@@ -143,7 +143,7 @@ Its own project because the loopback needs two Chromium switches (`--disable-fea
 
 ### `tier-b-visual.spec.ts` (1) -- project `chromium-tier-b`
 
-Tier B visual acceptance (#48): the gate that finally proves there is actually a picture, so a human never has to look at the browser again. The media comes from `ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1` (isaac#223 / isaac PR #243) -- a pinned Kit streaming experience rendering a deterministic scene (DomeLight + DistantLight over a 12x12 procedurally built checkerboard floor, fixed camera, RTX auto-exposure disabled) chosen precisely so a connecting browser always gets a non-black frame. A black frame here is a real failure, not scene luck.
+Tier B visual acceptance (#48): the gate that finally proves there is actually a picture, so a human never has to look at the browser again. The media comes from `ghcr.io/ycpss91255-docker/isaac-stream-source` pinned by DIGEST (`@sha256:af1bb815...`, the current `:0.0.1` index digest; GHCR tags are mutable and that container runs as root with `--network=host --ipc=host --gpus all` on the persistent GPU runner, so the pin lives in `script/ci/tier_b_visual_e2e.sh` and moves only by a deliberate edit) (isaac#223 / isaac PR #243) -- a pinned Kit streaming experience rendering a deterministic scene (DomeLight + DistantLight over a 12x12 procedurally built checkerboard floor, fixed camera, RTX auto-exposure disabled) chosen precisely so a connecting browser always gets a non-black frame. A black frame here is a real failure, not scene luck.
 
 ONE test that owns ONE session, asserting five properties of it in order. It wraps `window.RTCPeerConnection` via `addInitScript` to observe the connection the streaming library owns and exposes nothing of.
 
