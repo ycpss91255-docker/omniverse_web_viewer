@@ -27,20 +27,40 @@ set -euo pipefail
 # shellcheck source=/dev/null
 . /usr/local/lib/base/logging.sh
 
-# yaml_value <key> <file>: extract a scalar value for a top-level-ish
-# `<key>: <value>` line. Strips surrounding quotes, a trailing inline
-# `# comment`, and trailing whitespace. Prints nothing if absent.
+# yaml_value <section> <key> <file>: extract the scalar value of
+# `<section>:` / `  <key>: <value>`. Strips surrounding quotes, a trailing
+# inline `# comment`, and surrounding whitespace. Prints nothing if absent.
+#
+# THE SECTION ARGUMENT IS THE POINT. This used to match `^[[:space:]]*<key>:`
+# -- any indentation, any section, first hit wins -- and /etc/host.yaml is BY
+# DESIGN a file shared with other containers on the host (isaac#65, cited two
+# comments down); the live isaac host.yaml already carries a second top-level
+# `livestream:` block, so a key colliding with one of ours is ordinary rather
+# than exotic. Unscoped, a foreign `ui_mode:` failed our enum and the container
+# refused to boot, and a foreign `public_ip:` in an EARLIER section won -- the
+# viewer then silently dialled the wrong host, exit 0, HTTP 200, every gate
+# green. Scoping the lookup to `network:` / `viewer:` means only the keys this
+# file's own schema defines can steer the viewer.
+#
+# A top-level key (column 0) opens or closes the section; only INDENTED keys
+# inside the requested section are considered.
 yaml_value() {
-  awk -F': *' -v key="$1" '
-    $0 ~ "^[[:space:]]*" key ":" {
-      v = $2
-      sub(/[[:space:]]*#.*$/, "", v)   # drop inline comment
-      gsub(/"/, "", v)                 # drop quotes
+  awk -v section="$1" -v key="$2" '
+    /^[^[:space:]#]/ {
+      in_section = (index($0, section ":") == 1)
+      next
+    }
+    !in_section { next }
+    $0 ~ "^[[:space:]]+" key ":" {
+      v = $0
+      sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "", v)   # drop the key
+      sub(/[[:space:]]*#.*$/, "", v)                  # drop inline comment
+      gsub(/"/, "", v)                                # drop quotes
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
       print v
       exit
     }
-  ' "$2" 2>/dev/null || true
+  ' "$3" 2>/dev/null || true
 }
 
 # Per-host config (mounted by caller from config/host.yaml). When
@@ -53,10 +73,10 @@ yaml_value() {
 # (back-compat). Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
 if [ -f /etc/host.yaml ]; then
-  host_ip="$(yaml_value public_ip /etc/host.yaml)"
+  host_ip="$(yaml_value network public_ip /etc/host.yaml)"
   if [ -n "${host_ip}" ]; then SIGNALING_SERVER="${host_ip}"; fi
 
-  yaml_ui_mode="$(yaml_value ui_mode /etc/host.yaml)"
+  yaml_ui_mode="$(yaml_value viewer ui_mode /etc/host.yaml)"
   if [ -n "${yaml_ui_mode}" ]; then VIEWER_UI_MODE="${yaml_ui_mode}"; fi
 fi
 

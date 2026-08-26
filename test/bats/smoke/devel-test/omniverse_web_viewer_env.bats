@@ -201,6 +201,35 @@ teardown() {
   assert_failure
 }
 
+# /etc/host.yaml is SHARED with other containers on the host by design (the
+# entrypoint's own comment cites isaac#65, and the live isaac host.yaml already
+# carries a second top-level `livestream:` block). The lookup used to match
+# `^[[:space:]]*<key>:` -- any indentation, any section, first hit wins -- so a
+# foreign section's key steered this viewer. The public_ip case is the bad one:
+# it does not fail the container, it silently dials the wrong host with exit 0
+# and HTTP 200.
+@test "host.yaml public_ip in a FOREIGN section does not win" {
+  printf 'livestream:\n  public_ip: "10.77.77.77"\nnetwork:\n  public_ip: "10.66.66.66"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_success
+  run grep -rF "10.66.66.66" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.77.77.77" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+}
+
+@test "host.yaml ui_mode in a FOREIGN section is ignored, not enum-checked" {
+  # Unscoped, this failed the usd-viewer|stream-only enum and the container
+  # refused to boot on a key that was never addressed to it.
+  printf 'livestream:\n  ui_mode: "bogus"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  SIGNALING_SERVER="10.55.55.55" run /entrypoint.sh true
+  assert_success
+  run grep -rF "10.55.55.55" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+}
+
 @test "entrypoint exports the resolved VIEWER_UI_MODE for the CMD" {
   # The CMD reads ${VIEWER_UI_MODE}; the entrypoint must export the
   # host.yaml/env-resolved value before exec, so a child sees it.
