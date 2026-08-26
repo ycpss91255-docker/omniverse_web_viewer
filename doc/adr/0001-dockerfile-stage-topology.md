@@ -23,7 +23,21 @@ hold:
 
 - **Lean runtime (PRD D4 / S5).** The deployable image must carry only
   `node` + `serve` (from `devel-base`) plus the two built dists -- no npm,
-  no source tree, no `node_modules`, no dev toolchain.
+  no source tree, no app `node_modules`, no dev toolchain.
+
+  Being `FROM devel-base` does not deliver that on its own, and for a long
+  time it did not: `devel-base` apt-installs `sudo git curl ca-certificates`
+  and the nodejs deb brings `npm` + `corepack` with it, so the published
+  image carried all of them while this bullet said otherwise. Anyone sizing
+  the sidecar's blast radius from this ADR was underestimating it. The
+  `runtime` stage now removes what it does not ship (`npm`, `npx`,
+  `corepack`, `git`, `sudo`) and `runtime-test` asserts their absence
+  in-image, so this bullet is enforced rather than merely stated. One
+  documented exception: **`curl` stays**, because the two `FROM runtime`
+  test stages use it as their HTTP client (`RUNTIME_SMOKE_CMD` and
+  `test/e2e/run-in-image.sh`), and removing it while `node` -- which has a
+  global `fetch` -- remains would change the contract without changing what
+  an attacker can do.
 - **Two apps with different builds.** `usd-viewer` is the upstream
   `web-viewer-sample` built UNMODIFIED (D2) from its own `src/` + `npm install`;
   `stream-only` is our own app built through the npm WORKSPACE so it resolves

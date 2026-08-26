@@ -167,11 +167,29 @@ RUN npm install && \
     sudo chown -R "${USER}":"${GROUP}" /app/stream-only
 
 ############################## runtime ##############################
-# LEAN deployed image (replaces the old `serve = FROM devel`). FROM devel-base
-# for node + serve only -- NO npm install, NO src/ submodule, NO node_modules,
-# NO build toolchain. Both built dists are COPY'd in from the build stages so
-# the uniform entrypoint can serve either app by VIEWER_UI_MODE. This is the
-# image Isaac runs (omniverse_web_viewer:runtime).
+# LEAN deployed image (replaces the old `serve = FROM devel`). This is the image
+# Isaac runs (omniverse_web_viewer:runtime) and the one published to GHCR.
+#
+# WHAT IT ACTUALLY SHIPS, stated exactly, because the previous wording ("node +
+# serve only ... NO build toolchain") was not true of the built image and
+# ADR-0001 repeated the claim: `devel-base` apt-installs sudo/git/curl and the
+# nodejs deb brings npm + corepack along with node, and ALL of that was
+# inherited here. What ships now is node + serve + curl + the two built dists,
+# and nothing else from the build:
+#   - npm / npx / corepack are DELETED. They are only reachable via node's own
+#     package tree, never installed by apt, so they have to be removed rather
+#     than not-installed;
+#   - git and sudo are PURGED. Nothing in the runtime, or in any stage built
+#     FROM it, uses either;
+#   - curl STAYS, deliberately. It is the HTTP client the two FROM-runtime test
+#     stages use -- runtime-test's RUNTIME_SMOKE_CMD and test/e2e/run-in-image.sh
+#     -- and removing it while `node` (which has global fetch) remains would buy
+#     no real containment, only a rewrite of that contract.
+# Also: NO src/ submodule, NO app node_modules, NO source tree.
+#
+# Removed HERE rather than never-installed because devel-base must have curl to
+# fetch nodesource, and the two build stages need the toolchain; this stage is
+# the first point downstream of them where the deployable set is knowable.
 FROM devel-base AS runtime
 
 ARG USER_NAME="user"
@@ -179,6 +197,17 @@ ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
+
+# First layer of the stage, so it caches independently of the dists below.
+# SUDO_FORCE_REMOVE: sudo's prerm refuses to uninstall itself when no root
+# password is set, on the reasoning that an interactive host would lock itself
+# out of administration. For a single-purpose container image with no root
+# password and no administrator, having no path to root is the goal, not the
+# accident it warns about.
+RUN SUDO_FORCE_REMOVE=yes apt-get purge -y git sudo && \
+    rm -rf /usr/lib/node_modules/npm /usr/lib/node_modules/corepack \
+           /usr/bin/npm /usr/bin/npx /usr/bin/corepack && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
 # Host-side log tee helper (base#328 / base#368). No-op when [logging]
@@ -300,6 +329,19 @@ RUN bash -c "${RUNTIME_SMOKE_CMD}"
 # password? A `sudo` that is absent, or present and refuses, both pass.
 RUN if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then \
         echo "runtime-test: the shipped image grants passwordless root to $(id -un)" >&2; \
+        exit 1; \
+    fi
+
+# REGRESSION GUARD for what the `runtime` stage says it ships. ADR-0001 has an
+# invariant ("no npm ... no dev toolchain") that the built image did not hold
+# for its whole life, because nothing ever checked. `curl` is deliberately NOT
+# in this list -- see the runtime stage header for why it stays.
+RUN present=""; \
+    for b in git npm npx corepack sudo; do \
+        if command -v "${b}" >/dev/null 2>&1; then present="${present} ${b}"; fi; \
+    done; \
+    if [ -n "${present}" ]; then \
+        echo "runtime-test: the shipped image still carries:${present}" >&2; \
         exit 1; \
     fi
 
@@ -458,6 +500,14 @@ ENV PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
 
 # Root for the apt install Playwright's `install --with-deps chromium` performs.
 USER root
+
+# `runtime` deletes npm/npx so the SHIPPED image does not carry a package
+# manager. This stage is never pushed and needs one to install Playwright, so it
+# takes npm back from `devel-base` rather than the shipped image keeping it for
+# everyone's benefit. `node` itself comes from runtime's FROM chain, as before.
+COPY --from=devel-base /usr/lib/node_modules/npm /usr/lib/node_modules/npm
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx
 
 WORKDIR /e2e
 COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
