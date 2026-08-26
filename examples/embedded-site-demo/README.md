@@ -87,12 +87,18 @@ connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 ### iframe alternative
 
 If you do not want to bundle the streaming library into your own app, embed the
-main viewer in an `<iframe>` instead. With auto-launch (#14) it boots straight
-into the stream with no selection screen:
+main viewer in an `<iframe>` instead:
 
 ```html
 <iframe src="http://<viewer-host>:5173/" allow="autoplay" style="width:100%;height:60vh;border:0"></iframe>
 ```
+
+Run that viewer with **`VIEWER_UI_MODE=stream-only`** (or `viewer.ui_mode` in
+`host.yaml`) for the iframe to boot straight into the stream. The default mode is
+the interactive `usd-viewer`, which shows its landing / "UI Option" screen and,
+against an Isaac-family Kit app, blanks by design (#18). The `VIEWER_AUTO_LAUNCH`
+knob this section used to name was removed entirely (BREAKING, D7);
+`VIEWER_UI_MODE=stream-only` is how auto-entry into a bare stream is selected now.
 
 The direct-connect approach in this example gives you full control over layout
 and lifecycle; the iframe is the zero-code option.

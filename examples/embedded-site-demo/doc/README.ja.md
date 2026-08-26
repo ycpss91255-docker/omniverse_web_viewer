@@ -67,11 +67,13 @@ connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 
 ### iframe による代替手段
 
-ストリーミングライブラリを自分のアプリにバンドルしたくない場合は、代わりにメインビューアを `<iframe>` に埋め込みます。自動起動（#14）を使えば、選択画面なしで直接ストリームへ起動します:
+ストリーミングライブラリを自分のアプリにバンドルしたくない場合は、代わりにメインビューアを `<iframe>` に埋め込みます:
 
 ```html
 <iframe src="http://<viewer-host>:5173/" allow="autoplay" style="width:100%;height:60vh;border:0"></iframe>
 ```
+
+iframe が直接ストリームへ入るには、埋め込む側のビューアを **`VIEWER_UI_MODE=stream-only`**（または `host.yaml` の `viewer.ui_mode`）で実行してください。既定のモードは対話的な `usd-viewer` で、landing /「UI Option」画面を表示し、Isaac 系の Kit アプリに対しては設計上ブランクになります（#18）。本節がかつて挙げていた `VIEWER_AUTO_LAUNCH` は完全に削除されました（BREAKING、D7）。ストリームだけの画面へ直接入る動作は、現在は `VIEWER_UI_MODE=stream-only` で選択します。
 
 このサンプルの直接接続のアプローチは、レイアウトとライフサイクルを完全に制御できます。iframe はコード不要の選択肢です。
 

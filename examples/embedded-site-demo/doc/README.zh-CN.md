@@ -67,11 +67,13 @@ connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 
 ### iframe 替代方案
 
-如果你不想把串流 library 打包进自己的应用，可以改用 `<iframe>` 嵌入主查看器。启用 auto-launch（#14）后，它会直接启动进入串流，没有选择界面：
+如果你不想把串流 library 打包进自己的应用，可以改用 `<iframe>` 嵌入主查看器：
 
 ```html
 <iframe src="http://<viewer-host>:5173/" allow="autoplay" style="width:100%;height:60vh;border:0"></iframe>
 ```
+
+被嵌入的那个 viewer 必须以 **`VIEWER_UI_MODE=stream-only`**（或 `host.yaml` 的 `viewer.ui_mode`）运行，iframe 才会直接进入串流。默认模式是交互式的 `usd-viewer`，它会显示 landing／“UI Option”选择界面，并且对 Isaac 系列的 Kit app 会按设计显示空白（#18）。本节原本提到的 `VIEWER_AUTO_LAUNCH` 已被完全移除（BREAKING，D7）；现在改用 `VIEWER_UI_MODE=stream-only` 选择直接进入纯串流。
 
 本示例采用的直接连接方式可让你完全掌控布局与生命周期；iframe 则是零代码的方案。
 
