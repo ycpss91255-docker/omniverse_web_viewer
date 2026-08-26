@@ -94,8 +94,13 @@ Benefits (why dedicated builders beat devel-as-builder):
 
 Costs (accepted):
 
-- `devel` and the `*-build` stages each run `npm install` (NOT each run a
-  build). This duplicate install is the unavoidable price of keeping a separate
+- `devel` and the `*-build` stages each run an install (NOT each run a build).
+  Which install differs, and the difference is deliberate: `stream-only-build`
+  (and the `example` stage) run `npm ci` from the committed workspace lockfile,
+  because the bundle they emit is what ships; `usd-viewer-build` and `devel`
+  run `npm install`, because that tree is the upstream `web-viewer-sample`
+  submodule, which ships no lockfile and which D2 says is built UNMODIFIED.
+  This duplicate install is the unavoidable price of keeping a separate
   interactive dev image AND dedicated builders; it buys all the benefits above.
 
 ## Alternatives considered
