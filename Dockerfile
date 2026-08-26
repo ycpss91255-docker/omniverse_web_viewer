@@ -509,8 +509,9 @@ ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 
 # Browsers go to a world-readable path so the non-root USER can run them in the
-# gate RUN below (Chromium refuses its sandbox as root). node + npm come from
-# devel-base (carried via runtime's FROM chain).
+# gate RUN below (Chromium refuses its sandbox as root). `node` comes from
+# devel-base via runtime's FROM chain; `npm` does NOT -- `runtime` deletes it,
+# so this stage COPYs it back from devel-base a few lines below.
 ENV PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
 
 # Root for the apt install Playwright's `install --with-deps chromium` performs.
