@@ -551,6 +551,13 @@ jobs:
   # concurrency comment would reasonably conclude "it is queued, it will run",
   # and the release quietly never happens.
   #
+  # Its CONDITION, however, is `!= 'success'`, which is wider than the silent
+  # case it was written for: `failure` -- a genuine picture regression -- lands
+  # here too. That is correct (a failed gate on a tag ref is also a blocked
+  # release worth naming), but it means the report must not assume the silent
+  # case, so the step below picks its message from the result rather than
+  # telling every reader to wait for the GPU runner.
+  #
   # Tag refs only: on the nightly and on dispatches there is no release to
   # block, and a failing Tier B there is already red on its own.
   release-blocked-report:
@@ -563,9 +570,31 @@ jobs:
     permissions:
       contents: read
     steps:
+      # The message is chosen by the RESULT. The condition is `!= 'success'`,
+      # which includes `failure` -- a genuine picture regression -- and the one
+      # message this step used to print was written for the cancelled case:
+      # it told the maintainer to "re-run once the GPU runner is free", i.e.
+      # pointed at scheduling when the actual answer was that a real browser
+      # did not see a real frame on that commit. Same job, same exit 1; only
+      # the sentence changes, so this stays a report and never a gate.
       - name: Fail loudly, so a blocked release is red rather than grey
         env:
           TIER_B_RESULT: ${{ needs.tier-b-visual-e2e.result }}
         run: |
-          echo "::error::tier-b-visual-e2e ended '${TIER_B_RESULT}' on ${GITHUB_REF}. No Release and no image were published for this tag, by design -- no version publishes without the picture gate. Re-run this workflow for the tag once the GPU runner is free; if the result is 'cancelled', the job was most likely a pending member of the owv-tier-b-visual-e2e concurrency group when another run entered it."
+          set -euo pipefail
+          blocked="tier-b-visual-e2e ended '${TIER_B_RESULT}' on ${GITHUB_REF}. No Release and no image were published for this tag, by design -- no version publishes without the picture gate."
+          case "${TIER_B_RESULT}" in
+            failure)
+              echo "::error::${blocked} This is a FAILED gate, not a scheduling problem: on this commit a real browser did not render a real, non-black frame from a real producer. Read the job log and the uploaded evidence (frame PNG, luma stats, browser trace, producer log) first -- re-running is the answer only if you have reason to believe the failure was environmental."
+              ;;
+            cancelled)
+              echo "::error::${blocked} 'cancelled' usually means the job was a PENDING member of the owv-tier-b-visual-e2e concurrency group when another run entered it (GitHub cancels the previously pending member; cancel-in-progress: false only protects a RUNNING job). Re-run this workflow for the tag once the GPU runner is free."
+              ;;
+            skipped)
+              echo "::error::${blocked} 'skipped' means the job never started -- an unavailable self-hosted GPU runner, or a need of its own that did not succeed (verify-tag-shape refuses a tag whose shape cannot be published). Fix that, then re-run this workflow for the tag."
+              ;;
+            *)
+              echo "::error::${blocked} Result '${TIER_B_RESULT}' is not one this report knows how to explain; read the tier-b-visual-e2e job log."
+              ;;
+          esac
           exit 1
