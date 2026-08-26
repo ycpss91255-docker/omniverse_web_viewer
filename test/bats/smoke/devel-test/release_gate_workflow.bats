@@ -26,6 +26,24 @@
 # nothing, so a mutation that silently stops applying -- because the workflow
 # was reworded -- fails the test instead of passing vacuously.
 #
+# WHY THE PASSING CASES. Two cases here assert the checker SUCCEEDS, on
+# workflows rewritten in a semantically identical way. That is not padding: a
+# checker that reports a correct edit as a violation teaches maintainers it is
+# noise, and a gate people have learned to work around is the same board of
+# green checks with extra ceremony. Each is paired with a failing case using
+# the same spelling, so the acceptance cannot widen into a blanket pass.
+#
+# WHAT IS NOT COVERED HERE. The first version of this file promised to turn
+# red for "`|| github.event_name == 'workflow_dispatch'` added to a gate while
+# debugging" and did not -- an independent reviewer walked twelve mutations
+# past the whole suite, four of which published or released with no picture
+# verified. Those twelve are cases below. The limits that remain are listed in
+# script/ci/check_release_gates.sh's own header (one file, text not
+# expression semantics, `script/ci/` as the marker of gate work,
+# PUBLISH_SIGNALS as the marker of publishing, nothing about repo settings)
+# and repeated in doc/test/TEST.md, so the boundary is stated wherever the
+# capability is.
+#
 # No GPU, no tag push, no GitHub, no network: it is bash + awk over a file.
 # script/ci/check_release_gates.sh is copied to /ci/ and the workflow to
 # /workflows/ by the `devel-test` stage.

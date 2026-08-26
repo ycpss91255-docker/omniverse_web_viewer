@@ -140,7 +140,7 @@ docker run --rm -d --name owv \
 
 除了每个 PR 都会运行的关卡之外，还有一个每晚执行的 `tier-b-visual-e2e` job，运行在自建的 GPU runner 上：它会启动真正的 Kit 流媒体来源，并在无头浏览器中验证 `stream-only` 查看器确实有画面 — `RTCPeerConnection` 进入 connected、收到 remote track、`videoWidth > 0`，并且抽样的帧不是全黑 — 让「有画面」这件事由 CI 证明，而不是靠人盯着页面看。
 
-这个 job 同时也是发布关卡：任何版本都必须在该 commit 上通过它才能发布，没有 override、没有 `continue-on-error`，因此 GPU runner 不可用时发布会被挡下而不是放行。这套接线本身也在测试覆盖范围内 — `release_gate_workflow.bats` 会读取 `.github/workflows/main.yaml`，只要关卡的 `if:` / `needs:` 结构被拿掉就会失败；而且它会对「只删掉该项性质」的工作流副本再跑一次检查器，证明每条断言真的会红。
+这个 job 同时也是发布关卡：任何版本都必须在该 commit 上通过它才能发布，没有 override、没有 `continue-on-error`，因此 GPU runner 不可用时发布会被挡下而不是放行。这套接线本身也在测试覆盖范围内 — `release_gate_workflow.bats` 会读取 `.github/workflows/main.yaml`，只要关卡的 `if:` / `needs:` 结构被拿掉就会失败；而且它会对「只删掉该项性质」的工作流副本再跑一次检查器，证明每条断言真的会红。 这个检查涵盖 job 层级、step 层级（gate job 的工作 step 被跳过时，job 仍然回报 `success`，而那正是 `needs:` 唯一看得到的东西），以及从文件本身推导出来的「会发布东西的 job」集合，而不是一份写死的名单。它也把自己的边界讲清楚：它只读一个 workflow 文件，而且是拿表达式的文本去比对已知写法，所以搬进 reusable workflow 的关卡、或写成 inline `run:` 块的关卡工作，都在它看不到的范围内；branch protection 与 required checks 属于 repo 设置，没有任何地方在检查。
 
 同一个 job 现在**每次推 tag 也会运行**，而且 GitHub Release 与 GHCR image 都以它作为前置关卡：没有为该 commit 验证过画面，就不会发布任何版本。这里刻意没有保留任何强制放行的开关 — GPU runner 不可用时，release 会被拦下来，而不是在未验证的情况下发布。
 

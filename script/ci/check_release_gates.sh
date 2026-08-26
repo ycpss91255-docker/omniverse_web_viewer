@@ -33,6 +33,38 @@
 # mutates the real workflow once per id and asserts THAT id is reported, so an
 # assertion here that cannot fail is itself caught -- the failure mode this
 # repo has been bitten by three times.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS CANNOT SEE. Stated here, in the file that does the checking,
+# because the first version of it PROMISED to turn red for "`||
+# github.event_name == 'workflow_dispatch'` added while debugging" and did
+# not: property 2 was a substring test, and a reviewer walked twelve mutations
+# past the whole suite. An over-claimed gate is worse than a narrow one,
+# because it stops people looking. The claims above are now true; these are
+# the holes that remain:
+#
+#   - It reads ONE FILE. A gate moved into a reusable workflow, a composite
+#     action, or a second workflow file is not examined -- only the `uses:`
+#     line naming it, and only for the strings in PUBLISH_SIGNALS.
+#   - It reads TEXT, not GitHub's expression semantics. Terms are split at
+#     parenthesis depth 0 and compared against closed sets of spellings
+#     (is_tag_ref_test, is_tier_b_success_test). A semantically equivalent
+#     expression written some other way is reported as a violation -- a false
+#     positive, whose fix is to add the spelling to those sets -- and an
+#     inequivalent one that happens to match a set member is not.
+#   - Gate WORK is recognised as "a step running one of this repo's
+#     `script/ci/` helpers". A gate whose work is an inline `run:` block or a
+#     third-party action can still be given a step-level `if:` unseen.
+#   - Publishing is recognised by the strings in PUBLISH_SIGNALS. A job that
+#     publishes some other way (a `curl -T` with a secret, an unfamiliar
+#     action) is not derived and is therefore not required to carry the gate.
+#   - It says nothing about what the gate ASSERTS. That a picture was really
+#     looked at is tier_b_visual_e2e.sh's job and its own spec's; this file
+#     only guarantees that job ran, on the GPU, and that nothing published
+#     without it succeeding.
+#   - Branch protection, required checks, and who can dispatch a workflow are
+#     repo SETTINGS. They are not in this file and are not checked anywhere.
+# ---------------------------------------------------------------------------
 set -euo pipefail
 
 WORKFLOW="${1:-.github/workflows/main.yaml}"
