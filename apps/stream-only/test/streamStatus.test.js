@@ -995,3 +995,169 @@ test('a recovered viewer is a live viewer again: a later stall re-announces and 
   assert.match(statusEl.textContent, /ended|gone/i);
   assert.equal(statusEl.classList.contains('error'), true);
 });
+
+// --- claims may not speak over a LIVE picture either (issue #75) -----------
+// #73 applied "observed media outranks callback claims" to the TERMINAL state.
+// The live state never got it. Everything a callback says is still gated on two
+// booleans -- `terminal` and `lossAnnounced` -- and a recovery clears both, so
+// the very next session-start retry walked straight through connecting(),
+// repainted `connecting to <server>:<port>...` over a picture that was playing
+// and armed a fresh connect window. Nothing cancelled that window: hide() runs
+// off the element's `playing` / `loadeddata` events, which fired once when
+// playback began and do NOT re-fire while frames keep flowing steadily. So the
+// window ran to its end and painted a red `no video from the source` over the
+// same working stream, which #73's recovery watch then withdrew one poll later.
+//
+// Measured in the browser against a real WebRTC picture (see the #75 spec in
+// test/e2e/status-loopback.spec.ts): the false `connecting` readout stood for
+// 20.0 s -- one whole connect window, not the sub-second flicker it was taken
+// for when it was spotted during #73 -- the false terminal for a further ~1 s,
+// and the cycle repeated on the next retry, roughly every 30 s, while the
+// element decoded ~30 frames a second throughout.
+//
+// The fix is the same rule once more, and deliberately NOT a third boolean:
+// the readout is guarded on the OBSERVATION the controller already takes.
+// Frame progress that has moved since the watchdog's last reading is a picture
+// that is playing, and a claim does not speak over it. Belt and braces, since
+// no guard on a point sample can be perfect: an armed window is also withdrawn
+// by the next sample that sees the picture move, rather than waiting for a
+// `playing` event that will not come.
+
+test('a session-start retry does not repaint over a picture that is playing (#75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.renderFrame();
+  videoEl.emit('playing'); // the stream is up: the readout cleared (#53)
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  videoEl.renderFrame(); // frames keep arriving ...
+  ctl.connecting('connecting to 1.2.3.4:49100...'); // ... and `onStart` re-fires
+
+  // The claim is not news over media that is advancing, so nothing is written
+  // and nothing is armed -- there is no window left to end in a false verdict.
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_CONNECT_MS).length, 0);
+});
+
+test('no window armed over a live picture means no terminal state follows it (#75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  // Five retries, exactly as the library makes against a producer it cannot
+  // reach, with the picture advancing between each.
+  for (let i = 0; i < 5; i += 1) {
+    videoEl.renderFrame();
+    ctl.connecting('connecting to 1.2.3.4:49100...');
+  }
+  clock.fireEvery(FAKE_CONNECT_MS); // whatever a connect window would have done
+
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.doesNotMatch(statusEl.textContent, /no video/i);
+});
+
+test('a window armed between two frames is withdrawn by the next observation (#75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  // A retry landing in the instant between two frames: nothing has moved since
+  // the watchdog's last reading, so the guard cannot yet tell -- a point sample
+  // never can, and pretending otherwise would be the flag-shaped mistake the
+  // first three of these bugs were made of.
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_CONNECT_MS).length, 1);
+
+  // The next sample DOES see the picture move, and that observation withdraws
+  // both the readout and the window -- without a `playing` event, which does
+  // not re-fire while frames simply keep arriving.
+  videoEl.renderFrame();
+  pollTimes(clock, 1);
+
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_CONNECT_MS).length, 0);
+});
+
+test('an escalation armed by a claim cannot declare a live picture dead (#75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+
+  ctl.stopped(); // the library's `onStop`, over a picture that is still playing
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 1);
+
+  videoEl.renderFrame();
+  clock.fireEvery(FAKE_DELAY_MS); // that window elapses
+
+  // A verdict is a conclusion ABOUT the media, so the media outranks it: no
+  // error is painted and nothing latches. The readout goes away instead.
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.doesNotMatch(statusEl.textContent, /ended|gone/i);
+});
+
+test('the guard is not a mute: a picture that stops after a retry still escalates (#62, #75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.renderFrame();
+  videoEl.emit('playing');
+  videoEl.renderFrame();
+  ctl.connecting('connecting to 1.2.3.4:49100...'); // ignored: the picture is live
+  assert.equal(statusEl.classList.contains('hidden'), true);
+
+  // And then the frames stop. The guard suppressed a claim; it did not take the
+  // machine out of service -- the media path still announces and still escalates
+  // (#57 / #58 / #62 intact).
+  pollTimes(clock, FAKE_SAMPLES + 1);
+  assert.match(statusEl.textContent, /waiting/i);
+  assert.equal(statusEl.classList.contains('error'), false);
+
+  clock.fireEvery(FAKE_DELAY_MS);
+  assert.match(statusEl.textContent, /ended|gone/i);
+  assert.equal(statusEl.classList.contains('error'), true);
+});
+
+test('dead from the start: an element that reports progress but never advances still escalates (#63, #75)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  // Reports frame progress, so the guard is live -- and reports the same
+  // reading forever, because nothing ever renders. That is the #63 case, and
+  // it is the one the guard must never swallow.
+  const videoEl = fakeStreamingVideoEl();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, recoveryOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  const armed = clock.pending.find((t) => t.ms === FAKE_CONNECT_MS);
+  assert.ok(armed, 'the connect window must still be armed for a producer that never answers');
+  ctl.connecting('connecting to 1.2.3.4:49100...'); // the retries change nothing
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  assert.equal(clock.pending.filter((t) => t.ms === FAKE_CONNECT_MS).length, 1);
+  assert.equal(clock.pending.find((t) => t.ms === FAKE_CONNECT_MS).id, armed.id);
+
+  clock.fireEvery(FAKE_CONNECT_MS); // the window elapses on its original deadline
+
+  assert.equal(statusEl.classList.contains('hidden'), false);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.match(statusEl.textContent, /no video/i);
+  assert.match(statusEl.textContent, /reload/i);
+});
