@@ -25,8 +25,17 @@ E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Distinctive injected values -- chosen so they cannot collide with any baked
 # default (127.0.0.1 / 49100), proving the rendered bundle, not a default, wins.
+#
+# TEST_SIGNALING_PORT USED TO BE 49100, i.e. exactly the default this comment
+# claims it cannot collide with (Dockerfile ENV, entrypoint fallback and
+# overlay/stream.config.json all say 49100). The port assertion in
+# config-dial.spec.ts therefore passed identically whether SIGNALING_PORT was
+# honoured or the entrypoint had fallen back to its own default -- and no other
+# per-PR test rendered a non-default port either, so a regression that dropped
+# SIGNALING_PORT would have shipped on a green PR and been caught only by the
+# nightly GPU job. 49177 cannot be a default of anything here.
 TEST_SERVER="10.20.30.40"
-TEST_SIGNALING_PORT="49100"
+TEST_SIGNALING_PORT="49177"
 TEST_MEDIA_PORT="47998"
 
 server_pid=""

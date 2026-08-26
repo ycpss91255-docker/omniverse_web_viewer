@@ -112,6 +112,18 @@ teardown() {
   assert_success
 }
 
+# The server override above had a port-shaped sibling missing: every render
+# assertion in this file, and the tier-1 e2e, used 49100 -- which is the baked
+# default (Dockerfile ENV, entrypoint fallback, overlay/stream.config.json), so
+# none of them could tell a rendered port from a fallback. 49277 can only get
+# into the bundle through the sed.
+@test "usd-viewer applies SIGNALING_PORT env override" {
+  SIGNALING_PORT="49277" run /entrypoint.sh true
+  assert_success
+  run grep -rF "49277" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+}
+
 @test "VIEWER_UI_MODE=stream-only renders the stream-only dir" {
   VIEWER_UI_MODE="stream-only" SIGNALING_SERVER="10.2.2.2" run /entrypoint.sh true
   assert_success

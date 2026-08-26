@@ -1,10 +1,10 @@
 # TEST.md
 
-**139 tests** total: **48 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**140 tests** total: **49 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
-## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (29)
+## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (30)
 
 Two-app config-injection model (S5): the build preserves sentinel-bearing chunks as `*.js.tmpl` per app dir (`/app/usd-viewer/dist`, `/app/stream-only/dist`); the entrypoint resolves `VIEWER_UI_MODE` (app selector), validates every value, and re-renders ONLY the active app's templates on every boot with 3 seds (`__OWV_SERVER__` / `"__OWV_PORT__"` / `"__OWV_MEDIA_PORT__"`).
 
@@ -22,6 +22,7 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `default mode (usd-viewer) renders defaults + clears sentinels` | Render path: sentinels gone from `*.js`, kept in `*.js.tmpl` |
 | `default mode renders ONLY the usd-viewer dir, not stream-only` | Mode isolation -- inactive app untouched |
 | `usd-viewer applies SIGNALING_SERVER env override` | Distinctive-IP render proof |
+| `usd-viewer applies SIGNALING_PORT env override` | Distinctive-PORT render proof -- every other port assertion used 49100, which is the baked default |
 | `VIEWER_UI_MODE=stream-only renders the stream-only dir` | App selector switches the render target |
 | `stream-only unset MEDIA_PORT renders literal null (negotiate, D1)` | Media default = null = SDP negotiation |
 | `stream-only MEDIA_PORT=47998 pins the media port` | Media knob pinned when set (D1) |
@@ -91,7 +92,7 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 
 Three suites, three Playwright projects, two gates. Standalone and `@nvidia`-free (outside the npm workspaces). All drive the REAL dist served by the `runtime` image.
 
-- **Tier 1 (8, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate.
+- **Tier 1 (8, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49177`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate.
 - **Tier B (1, nightly, self-hosted GPU)** -- `tier-b-visual.spec.ts`. `run-tier-b.sh` serves `stream-only` pointed at a REAL Kit producer and asserts real frames render.
 
 ### `config-dial.spec.ts` (2) -- project `chromium`
