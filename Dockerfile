@@ -448,6 +448,13 @@ COPY .base/script/docker/wrapper /lint/wrapper
 # is the only proof of the tag -> image-tag mapping available without pushing
 # a tag. Copied before the lint RUN so one copy serves both purposes.
 COPY --chmod=0755 script/ci/ /ci/
+# /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
+# top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
+# helpers, which nothing else was linting.
+RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh
+WORKDIR /lint
+RUN hadolint Dockerfile
+
 # The WORKFLOW ITSELF, because the release invariant is now under test rather
 # than merely argued for. The picture gate (#70) lives entirely in `if:` /
 # `needs:` expressions in .github/workflows/main.yaml and nothing read them, so
@@ -456,13 +463,14 @@ COPY --chmod=0755 script/ci/ /ci/
 # /ci/check_release_gates.sh over this file (and over mutated copies of it), so
 # the file has to be in the image the bats run in. Same mechanism the specs
 # already use for their inputs -- a COPY naming exactly what the stage owns.
+#
+# AFTER the two lint RUNs, not before. Neither of them reads this file --
+# shellcheck takes /lint/ and /ci/, hadolint takes the Dockerfile -- but a
+# COPY placed above them invalidates their layers, so editing a COMMENT in the
+# workflow re-ran shellcheck, hadolint and all of the bats below (~30 s) for a
+# change none of them can see. Nothing in `runtime` is FROM this stage, so the
+# ordering has no effect on the published image.
 COPY .github/workflows/main.yaml /workflows/main.yaml
-# /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
-# top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
-# helpers, which nothing else was linting.
-RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh
-WORKDIR /lint
-RUN hadolint Dockerfile
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats
