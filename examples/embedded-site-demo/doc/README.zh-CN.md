@@ -8,7 +8,7 @@
 
 ## 布局
 
-| File | Role |
+| 文件 | 角色 |
 |------|------|
 | `index.html` | 站点框架（header / nav / hero）+ 串流面板（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM 与 library 的胶水代码：解析目标、连接、呈现状态。 |
