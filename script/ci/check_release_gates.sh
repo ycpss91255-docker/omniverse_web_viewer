@@ -637,6 +637,19 @@ EOF
   fi
 done
 
+# --- 10b. the picture gate runs where a picture can be taken --------------
+# `runs-on: [self-hosted, gpu]` is not a performance choice. The whole job is
+# "boot a real Kit producer and assert a browser renders a non-black frame
+# from it", and no hosted runner has NVENC -- so `runs-on: ubuntu-latest` here
+# does not slow the gate down, it removes it: the job cannot do its work, and
+# whatever it then reports is not a picture. Nothing pinned it.
+tier_b_runs_on="$(job_key tier-b-visual-e2e runs-on)"
+if ! contains_word 'self-hosted' "${tier_b_runs_on}" \
+   || ! contains_word 'gpu' "${tier_b_runs_on}"; then
+  violation tier-b-runs-on-the-gpu-runner \
+    "tier-b-visual-e2e must run on [self-hosted, gpu]: it boots a real Kit producer and asserts a real browser renders a real frame, and no hosted runner has NVENC. Moving it off the GPU does not slow the gate down, it removes it. runs-on: ${tier_b_runs_on:-<absent>}"
+fi
+
 # --- 11. EVERY job that can publish stands behind the picture gate --------
 # Properties 1-4 name call-release and publish-image, because those are the
 # two jobs that published anything when they were written. That is an

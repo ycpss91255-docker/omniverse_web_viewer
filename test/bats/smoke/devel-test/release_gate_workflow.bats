@@ -282,6 +282,17 @@ _mutate() {
   assert_output --partial "[publishing-jobs-are-identifiable]"
 }
 
+# M52. The gate's whole job is to boot a real Kit producer and assert a real
+# browser renders a non-black frame from it, and no hosted runner has NVENC --
+# so moving it to ubuntu-latest does not make the gate slower, it removes it.
+# Nothing pinned the runner.
+@test "gates: moving the picture gate off the GPU runner is caught" {
+  _mutate 's/^    runs-on: \[self-hosted, gpu\]$/    runs-on: ubuntu-latest/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
+}
+
 # ------------------------------------------------------- tag reachability --
 
 @test "gates: removing the tag push trigger is caught" {
