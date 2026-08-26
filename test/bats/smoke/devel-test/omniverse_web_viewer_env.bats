@@ -270,6 +270,24 @@ teardown() {
   assert_failure
 }
 
+# `serve -l` takes an ENDPOINT, not only a port, and that is the only way to
+# scope the listen ADDRESS. Requiring a bare integer removed the ability to
+# bind loopback only, leaving the published image able to listen on every
+# interface and nothing else.
+@test "SERVE_PORT accepts a tcp:// listen endpoint" {
+  SERVE_PORT="tcp://127.0.0.1:5173" run /entrypoint.sh true
+  assert_success
+}
+
+@test "a malformed tcp:// serve endpoint is rejected" {
+  # Host but no port.
+  SERVE_PORT="tcp://127.0.0.1" run /entrypoint.sh true
+  assert_failure
+  # Port present but not a port.
+  SERVE_PORT="tcp://127.0.0.1:0" run /entrypoint.sh true
+  assert_failure
+}
+
 @test "invalid VIEWER_UI_MODE is rejected" {
   VIEWER_UI_MODE="bogus" run /entrypoint.sh true
   assert_failure

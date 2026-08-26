@@ -146,8 +146,33 @@ fi
 # value must fail the container fast. `SERVE_PORT=0` otherwise starts a viewer
 # nobody can reach, on a port nobody chose. Only checked when set: the `example`
 # stage serves on EXAMPLE_PORT and leaves this unset.
+#
+# BOTH FORMS ARE ACCEPTED, because `serve -l` takes an ENDPOINT, not only a
+# port, and that endpoint is the only way to scope the listen ADDRESS:
+# `SERVE_PORT=tcp://127.0.0.1:5173` binds loopback only. Validating a bare
+# integer alone (as the first version of this check did) silently removed that
+# -- the published image could then only listen on every interface, so a viewer
+# meant for the local browser is reachable by any LAN peer, and a URL handed to
+# its user is a URL handed to the viewer. The port half is validated in both
+# forms, which is what the fast-fail was actually for.
 if [ -n "${SERVE_PORT:-}" ]; then
-  reject_bad_port "serve port" "${SERVE_PORT}"
+  case "${SERVE_PORT}" in
+    tcp://*)
+      serve_endpoint="${SERVE_PORT#tcp://}"
+      serve_host="${serve_endpoint%:*}"
+      # No colon -> `%:*` returns the whole string; that is a host with no port.
+      if [ "${serve_host}" = "${serve_endpoint}" ] || \
+         [[ ! "${serve_host}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "entrypoint: invalid serve endpoint '${SERVE_PORT}'" \
+             "(expected tcp://<host>:<port>, host from A-Za-z0-9.-)" >&2
+        exit 1
+      fi
+      reject_bad_port "serve port" "${serve_endpoint##*:}"
+      ;;
+    *)
+      reject_bad_port "serve port" "${SERVE_PORT}"
+      ;;
+  esac
 fi
 
 # VIEWER_UI_MODE selects which app dist to render + serve (D7); the CMD
