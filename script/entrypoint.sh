@@ -60,7 +60,7 @@ yaml_value() {
       print v
       exit
     }
-  ' "$3" 2>/dev/null || true
+  ' "$3"
 }
 
 # Per-host config (mounted by caller from config/host.yaml). When
@@ -73,6 +73,20 @@ yaml_value() {
 # (back-compat). Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
 if [ -f /etc/host.yaml ]; then
+  # An UNREADABLE host.yaml is an operator mistake, not an absent file, and it
+  # must not be treated as one. awk's failure used to be swallowed
+  # (`2>/dev/null || true`), so a mode-000 or wrong-owner /etc/host.yaml booted
+  # silently on env/defaults -- i.e. dialled whatever address the operator had
+  # just moved OUT of the env into that file, with exit 0 and HTTP 200. Both
+  # the suppression and the guess are gone: the file is checked here, and awk's
+  # exit status now reaches `set -e` if anything else goes wrong reading it.
+  if [ ! -r /etc/host.yaml ]; then
+    echo "entrypoint: /etc/host.yaml exists but is not readable by" \
+         "$(id -un) (uid $(id -u)); refusing to fall back to env/defaults" \
+         "and dial an address nobody chose" >&2
+    exit 1
+  fi
+
   host_ip="$(yaml_value network public_ip /etc/host.yaml)"
   if [ -n "${host_ip}" ]; then SIGNALING_SERVER="${host_ip}"; fi
 

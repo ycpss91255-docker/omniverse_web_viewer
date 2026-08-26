@@ -230,6 +230,20 @@ teardown() {
   assert_success
 }
 
+# An unreadable host.yaml is an operator mistake, not an absent file. awk's
+# failure was swallowed, so the container booted on env/defaults and dialled
+# whatever address the operator had just moved OUT of the env and INTO that
+# file -- exit 0, HTTP 200, nothing said. This stage runs as the non-root image
+# USER, which is what makes mode 000 mean anything here.
+@test "an unreadable host.yaml fails the container, not falls back" {
+  printf 'network:\n  public_ip: "10.44.44.44"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  sudo chmod 000 /etc/host.yaml
+  run /entrypoint.sh true
+  assert_failure
+  assert_output --partial 'not readable'
+}
+
 @test "entrypoint exports the resolved VIEWER_UI_MODE for the CMD" {
   # The CMD reads ${VIEWER_UI_MODE}; the entrypoint must export the
   # host.yaml/env-resolved value before exec, so a child sees it.
