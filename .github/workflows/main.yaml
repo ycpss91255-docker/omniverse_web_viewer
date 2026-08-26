@@ -187,6 +187,15 @@ jobs:
     # carrying publish_image_tag is asking for an IMAGE; the Release is already
     # there, so this job stands down. Note this is still a plain condition,
     # with no status function in it -- the picture-gate rule above is intact.
+    #
+    # "The Release is already there" is an ASSUMPTION, and standing down is
+    # only safe because something else verifies it: publish-image's Release
+    # guard runs on this exact path (its condition covers any dispatch carrying
+    # publish_image_tag, tag ref included) and refuses the publish when no
+    # published Release v<version> exists. Without that, this stand-down turned
+    # "call-release failed, so no Release was cut" into "the recovery dispatch
+    # publishes the image anyway". Do not narrow that guard's condition without
+    # revisiting this one.
     needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e]
     if: >-
       startsWith(github.ref, 'refs/tags/')
@@ -311,11 +320,32 @@ jobs:
       # v<version>, and its tag must point at the commit this run is building.
       # The documented recovery case still works -- a Release whose image push
       # failed is republished by dispatching with the TAG selected as the ref,
-      # where derive_image_tag uses the ref and this check is satisfied by
-      # construction -- while publishing branch code under a released version is
-      # refused. Skipped entirely on the tag path, which cannot drift by design.
-      - name: Refuse a hand-typed version that is not this commit's own tag
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      # where derive_image_tag uses the ref and the COMMIT half of the check is
+      # satisfied by construction -- while publishing branch code under a
+      # released version is refused.
+      #
+      # THIS STEP RUNS ON EVERY DISPATCH-DRIVEN PUBLISH, TAG REF INCLUDED. The
+      # condition used to be `!startsWith(github.ref, 'refs/tags/')` alone, on
+      # the reasoning that the tag path cannot drift. That is true of a tag
+      # PUSH, but the documented recovery gesture is a workflow_dispatch whose
+      # REF IS THE TAG -- and once call-release began standing down for a
+      # dispatch carrying publish_image_tag, nothing on that path checked the
+      # Release any more. The traced hole: push v0.4.0 -> call-release FAILS ->
+      # no Release and no image -> operator runs the documented recovery
+      # dispatch (tag as the ref, publish_image_tag=0.4.0) -> call-release
+      # stands down, this guard skipped because the ref is a tag -> an image
+      # published with NO RELEASE BEHIND IT, which is precisely the dangling
+      # artifact this job's header names as the state to avoid.
+      #
+      # A tag PUSH still skips it, deliberately: there call-release cuts the
+      # Release inside this same run, so querying the API for a Release created
+      # seconds earlier would swap a real hole for a flaky gate on the one path
+      # that cannot drift.
+      - name: Refuse to publish a version with no Release behind it
+        if: >-
+          ${{ !startsWith(github.ref, 'refs/tags/')
+              || (github.event_name == 'workflow_dispatch'
+                  && inputs.publish_image_tag != '') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_REF: ${{ steps.image.outputs.ref }}
