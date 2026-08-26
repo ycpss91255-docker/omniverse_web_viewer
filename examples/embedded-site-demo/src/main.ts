@@ -16,7 +16,17 @@ function showStatus(text: string, isError = false): void {
 }
 
 function start(): void {
-  const { server, port, mediaPort } = resolveTarget(window.location.search, target);
+  // The `?server=&port=&media=` override exists for `npm run dev`, where no
+  // entrypoint has substituted the sentinels (this is the query string the
+  // README's "Run it (dev)" section documents). `import.meta.env.DEV` is true
+  // only under the Vite dev server -- `vite build` replaces it with `false` --
+  // so the BUILT demo ignores the query and the operator-configured target is
+  // the only target. See the note in resolveTarget.js for why that matters.
+  const { server, port, mediaPort } = resolveTarget(
+    window.location.search,
+    target,
+    import.meta.env.DEV,
+  );
 
   let streamConfig;
   try {
@@ -24,8 +34,10 @@ function start(): void {
   } catch (err) {
     showStatus(
       `${(err as Error).message}\n` +
-        'Set the target: open ?server=<ip>&port=<port>, or run the container ' +
-        'with SIGNALING_SERVER / host.yaml configured.',
+        (import.meta.env.DEV
+          ? 'Set the target: open ?server=<ip>&port=<port> (dev server only).'
+          : 'Set the target: run the container with SIGNALING_SERVER / ' +
+            'host.yaml configured.'),
       true,
     );
     return;

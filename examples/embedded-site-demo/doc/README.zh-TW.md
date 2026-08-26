@@ -12,7 +12,7 @@
 |------|------|
 | `index.html` | 網站外框（header / nav / hero）+ 串流面板（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM + library 接合：解析 target、連線、呈現狀態。 |
-| `src/resolveTarget.js` | 純粹、不依賴 DOM 的 target 解析：以 build-time 代入的 sentinel 為底，可用 `?server=&port=&media=` 覆蓋。 |
+| `src/resolveTarget.js` | 純粹、不依賴 DOM 的 target 解析：以 build-time 代入的 sentinel 為底；`?server=&port=&media=` 覆蓋需要呼叫端明確啟用，`main.ts` 只在 Vite dev server 下啟用，因此 build 出來的 bundle 會忽略該 query。 |
 | `test/resolveTarget.test.js` | resolver 的 `node --test` unit tests。 |
 | `src/streamTarget.json` | build-time 的 `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` placeholder。 |
 

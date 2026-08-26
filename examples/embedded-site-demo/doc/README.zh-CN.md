@@ -12,7 +12,7 @@
 |------|------|
 | `index.html` | 站点框架（header / nav / hero）+ 串流面板（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM 与 library 的胶水代码：解析目标、连接、呈现状态。 |
-| `src/resolveTarget.js` | 纯粹、无 DOM 依赖的目标解析：以构建期代入的 sentinel 为底，可用 `?server=&port=&media=` 覆盖。 |
+| `src/resolveTarget.js` | 纯粹、无 DOM 依赖的目标解析：以构建期代入的 sentinel 为底；`?server=&port=&media=` 覆盖需要调用方显式启用，`main.ts` 只在 Vite dev server 下启用，因此构建出来的 bundle 会忽略该 query。 |
 | `test/resolveTarget.test.js` | resolver 的 `node --test` 单元测试。 |
 | `src/streamTarget.json` | 构建期的 `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` 占位符。 |
 

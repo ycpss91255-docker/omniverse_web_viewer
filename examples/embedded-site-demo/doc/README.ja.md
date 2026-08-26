@@ -12,7 +12,7 @@
 |------|------|
 | `index.html` | サイトの外枠（ヘッダー / ナビ / ヒーロー）+ ストリームパネル（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM + ライブラリの接着部: ターゲットの解決、接続、ステータスの表示。 |
-| `src/resolveTarget.js` | 純粋で DOM 非依存のターゲット解決: ビルド時に差し込まれた sentinel を既定とし、`?server=&port=&media=` で上書きできます。 |
+| `src/resolveTarget.js` | 純粋で DOM 非依存のターゲット解決: ビルド時に差し込まれた sentinel を既定とし、`?server=&port=&media=` による上書きは呼び出し側の明示的なオプトインが必要です。`main.ts` は Vite dev server のときだけオプトインするため、ビルド済みバンドルはクエリを無視します。 |
 | `test/resolveTarget.test.js` | resolver 向けの `node --test` ユニットテスト。 |
 | `src/streamTarget.json` | ビルド時の `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` プレースホルダー。 |
 

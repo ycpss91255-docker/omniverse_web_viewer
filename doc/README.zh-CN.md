@@ -98,7 +98,7 @@ docker run --rm -d --name owv \
 | `SERVE_PORT` | `5173` | 静态文件服务器监听的端口 |
 | `VIEWER_UI_MODE` | `usd-viewer` | 应用选择器：`usd-viewer`（上游 sample，交互式）或 `stream-only`（我们自家的全屏自动连接应用，用于 Isaac Sim / 无头消费端） |
 
-`VIEWER_UI_MODE` 选择 entrypoint 提供哪个应用，它不会被注入到资源中。`SIGNALING_SERVER`、`SIGNALING_PORT` 与 `MEDIA_PORT` 是被注入的 sentinel：构建会将每个带有 sentinel 的 chunk 保存为 `*.js.tmpl`，entrypoint 在每次启动时重新渲染 `*.js.tmpl -> *.js`（具幂等性 — 重启或值变更会在下次启动被采用）。校验即是转义处理：无效值（含非法字符的 `SIGNALING_SERVER`、非数字的端口）会让容器失败（`exit 1`），而非烤进损坏的 JS。媒体 sentinel 仅存在于 `stream-only` bundle（其 `streamTarget.json`）；`usd-viewer` 仅带 server + port，并通过 SDP 协商媒体。
+`VIEWER_UI_MODE` 选择 entrypoint 提供哪个应用，它不会被注入到资源中。`SIGNALING_SERVER`、`SIGNALING_PORT` 与 `MEDIA_PORT` 是被注入的 sentinel：构建会将每个带有 sentinel 的 chunk 保存为 `*.js.tmpl`，entrypoint 在每次启动时重新渲染 `*.js.tmpl -> *.js`（具幂等性 — 重启或值变更会在下次启动被采用）。校验即是转义处理：无效值（含非法字符的 `SIGNALING_SERVER`、非数字的端口）会让容器失败（`exit 1`），而非烤进损坏的 JS。媒体 sentinel 仅存在于 `stream-only` bundle（其 `streamTarget.json`）；`usd-viewer` 仅带 server + port，并通过 SDP 协商媒体。已提供服务的 bundle 只以该次渲染为目标来源：`?server=`/`?port=`/`?media=` query string 仅是 `npm run dev` 的便利功能，build 出来的 bundle 会忽略它，因此无法用一条链接把运行中的 viewer 指向别的主机。
 
 端口（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）通过 `.env` 机制（`[environment]` 表 / `setup.conf`）递送，而非 `host.yaml`，也非硬编的 `-e`。`config/host.yaml` 仅承载 `public_ip`（并可选择性带 `viewer.ui_mode`）。优先级：`public_ip` / `ui_mode` -> `host.yaml` > env > 默认；端口 -> `.env`。见 `config/host.yaml.example`。
 

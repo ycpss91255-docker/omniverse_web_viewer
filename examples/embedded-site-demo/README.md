@@ -18,7 +18,7 @@ bootstrap, no selection screen: it does a stream-only direct connect.
 |------|------|
 | `index.html` | Site chrome (header / nav / hero) + the stream panel (`<video id="remote-video">`). |
 | `src/main.ts` | DOM + library glue: resolve the target, connect, surface status. |
-| `src/resolveTarget.js` | Pure, DOM-free target resolution: the baked sentinels, overridden by `?server=&port=&media=`. |
+| `src/resolveTarget.js` | Pure, DOM-free target resolution: the baked sentinels, with a `?server=&port=&media=` override the caller must opt into -- `main.ts` opts in only under the Vite dev server, so built bundles ignore the query. |
 | `test/resolveTarget.test.js` | `node --test` unit tests for the resolver. |
 | `src/streamTarget.json` | Build-time `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` placeholders. |
 

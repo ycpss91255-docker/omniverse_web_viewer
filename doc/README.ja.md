@@ -98,7 +98,7 @@ docker run --rm -d --name owv \
 | `SERVE_PORT` | `5173` | 静的ファイルサーバーがリッスンするポート |
 | `VIEWER_UI_MODE` | `usd-viewer` | アプリセレクタ：`usd-viewer`（上流 sample、インタラクティブ）または `stream-only`（自前のフルスクリーン自動接続アプリ。Isaac Sim / ヘッドレス利用者向け） |
 
-`VIEWER_UI_MODE` は entrypoint がどのアプリを配信するかを選択するもので、アセットには注入されません。`SIGNALING_SERVER`、`SIGNALING_PORT`、`MEDIA_PORT` は注入されるセンチネルです: ビルドはセンチネルを含む各チャンクを `*.js.tmpl` として保存し、entrypoint は起動のたびに `*.js.tmpl -> *.js` を再レンダリングします（冪等 — 再起動や値の変更は次回起動時に反映）。バリデーションがエスケープそのものです: 無効な値（不正文字を含む `SIGNALING_SERVER`、数値でないポート）はコンテナを失敗させ（`exit 1`）、壊れた JS を焼き込みません。メディアセンチネルは `stream-only` バンドル（その `streamTarget.json`）にのみ存在し、`usd-viewer` は server + port のみを持ち、メディアは SDP でネゴシエーションします。
+`VIEWER_UI_MODE` は entrypoint がどのアプリを配信するかを選択するもので、アセットには注入されません。`SIGNALING_SERVER`、`SIGNALING_PORT`、`MEDIA_PORT` は注入されるセンチネルです: ビルドはセンチネルを含む各チャンクを `*.js.tmpl` として保存し、entrypoint は起動のたびに `*.js.tmpl -> *.js` を再レンダリングします（冪等 — 再起動や値の変更は次回起動時に反映）。バリデーションがエスケープそのものです: 無効な値（不正文字を含む `SIGNALING_SERVER`、数値でないポート）はコンテナを失敗させ（`exit 1`）、壊れた JS を焼き込みません。メディアセンチネルは `stream-only` バンドル（その `streamTarget.json`）にのみ存在し、`usd-viewer` は server + port のみを持ち、メディアは SDP でネゴシエーションします。配信されるバンドルはそのレンダリング結果のみをターゲットとします: `?server=`/`?port=`/`?media=` のクエリ文字列は `npm run dev` 用の利便機能であり、ビルドされたバンドルでは無視されるため、リンク 1 本で稼働中のビューアを別のホストへ向け直すことはできません。
 
 ポート（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）は `.env` メカニズム（`[environment]` テーブル / `setup.conf`）で配送され、`host.yaml` でもハードコードの `-e` でもありません。`config/host.yaml` は `public_ip`（および任意で `viewer.ui_mode`）のみを保持します。優先順位: `public_ip` / `ui_mode` -> `host.yaml` > env > デフォルト、ポート -> `.env`。`config/host.yaml.example` を参照。
 
