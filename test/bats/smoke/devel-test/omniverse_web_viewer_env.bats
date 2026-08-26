@@ -313,6 +313,43 @@ teardown() {
   assert_success
 }
 
+# Both flat-key messages used to say "but no '<section>:' section supplying
+# it", which is only one of the two cases the scoped lookup can come back
+# empty for -- and it is FALSE in the other. An operator reading "no 'viewer:'
+# section" against a file whose second line is `viewer:` learns the message is
+# guesswork, and discounts the next true thing it says. The two cases also
+# want different fixes: add the section, or add the key to the one already
+# there.
+@test "a present-but-incomplete section is described as present, not missing" {
+  printf 'viewer:\n  theme: "dark"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "there IS a 'viewer:' section in it"
+  refute_output --partial "no 'viewer:' section"
+}
+
+# refuse_flat_key shares the phrasing and predates the warning, so it is fixed
+# in the same change rather than left as the odd one out.
+@test "the refusal describes a present-but-incomplete section correctly" {
+  printf 'network:\n  gateway: "10.0.0.1"\npublic_ip: "10.9.9.9"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "there IS a 'network:' section in it"
+  refute_output --partial "no 'network:' section"
+}
+
+# ... and the genuinely-absent case still says so, so the fix above did not
+# just swap one wrong sentence for another.
+@test "a genuinely absent section is still described as absent" {
+  printf 'public_ip: "10.9.9.9"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "there is no 'network:' section in it"
+}
+
 # The supplier variable was never initialised, and it is read in a script that
 # is the container ENTRYPOINT -- so its environment is operator- and
 # compose-controlled, and an unset shell variable read out of the environment

@@ -117,11 +117,31 @@ yaml_top_level_key() {
 # ignored. Called only after the scoped lookup came back empty, and only for
 # network.public_ip -- see the asymmetry note above yaml_top_level_key for why
 # viewer.ui_mode uses warn_flat_key instead.
+# flat_key_reason <key> <section> <file>: the clause naming WHY our scoped
+# lookup came back empty. Both messages below used to say "but no '<section>:'
+# section supplying it", which is only one of the two cases and is FALSE in
+# the other: `viewer:` / `  theme: "dark"` / `ui_mode: "x"` has a viewer
+# section, it just has no ui_mode in it. An operator reading "no 'viewer:'
+# section" against a file whose second line is `viewer:` learns that the
+# message is guesswork, and the next true thing it says gets discounted too.
+# The two cases also need different fixes -- add the section, or add the key
+# to the section that is already there.
+flat_key_reason() {
+  local key="$1" section="$2" file="$3"
+  if yaml_top_level_key "${section}" "${file}"; then
+    printf "%s" "there IS a '${section}:' section in it, but that section" \
+                " does not supply '${key}'"
+  else
+    printf "%s" "there is no '${section}:' section in it to supply it"
+  fi
+}
+
 refuse_flat_key() {
   local key="$1" section="$2" file="$3"
   if yaml_top_level_key "${key}" "${file}"; then
-    echo "entrypoint: ${file} has a top-level '${key}:' but no '${section}:'" \
-         "section supplying it; this file's keys are read from their own" \
+    echo "entrypoint: ${file} has a top-level '${key}:' and" \
+         "$(flat_key_reason "${key}" "${section}" "${file}");" \
+         "this file's keys are read from their own" \
          "section only, so that value would be silently ignored and the" \
          "viewer would boot on env/defaults. Indent it under '${section}:'" \
          "(see config/host.yaml.example). If that key belongs to another" \
@@ -143,8 +163,9 @@ refuse_flat_key() {
 # operator whose neighbour owns that key still boots.
 warn_flat_key() {
   local key="$1" section="$2" file="$3" effective="$4" supplier="$5"
-  echo "entrypoint: ${file} has a top-level '${key}:' but no '${section}:'" \
-       "section supplying it; this file's keys are read from their own" \
+  echo "entrypoint: ${file} has a top-level '${key}:' and" \
+       "$(flat_key_reason "${key}" "${section}" "${file}");" \
+       "this file's keys are read from their own" \
        "section only, so that value was NOT read. In effect: '${effective}'" \
        "(from ${supplier}). If that key was meant for this viewer, indent it" \
        "under '${section}:' (see config/host.yaml.example) and it wins. If it" \
