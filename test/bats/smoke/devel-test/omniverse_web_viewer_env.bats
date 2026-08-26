@@ -333,6 +333,22 @@ teardown() {
   assert_failure
 }
 
+# `serve --help` documents four endpoint forms. Only the two NETWORK ones are
+# supported, and the refusal of the other two is a decision, not an oversight:
+# a UNIX socket is unreachable by the browser and by every HTTP gate in this
+# repo (and would widen a charset the CMD's `sh -c` expands), and a Windows
+# named pipe cannot exist in the linux/amd64 image that gets published. The
+# message must say so rather than report a bad integer.
+@test "a unix:/pipe: serve endpoint is refused by name" {
+  SERVE_PORT="unix:/tmp/owv.sock" run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "unsupported serve endpoint"
+  assert_output --partial "tcp://<host>:<port>"
+  SERVE_PORT='pipe:\\.\pipe\owv' run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "unsupported serve endpoint"
+}
+
 @test "invalid VIEWER_UI_MODE is rejected" {
   VIEWER_UI_MODE="bogus" run /entrypoint.sh true
   assert_failure

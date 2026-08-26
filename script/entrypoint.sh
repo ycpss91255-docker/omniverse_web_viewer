@@ -214,14 +214,31 @@ fi
 # nobody can reach, on a port nobody chose. Only checked when set: the `example`
 # stage serves on EXAMPLE_PORT and leaves this unset.
 #
-# BOTH FORMS ARE ACCEPTED, because `serve -l` takes an ENDPOINT, not only a
-# port, and that endpoint is the only way to scope the listen ADDRESS:
+# BOTH NETWORK FORMS ARE ACCEPTED, because `serve -l` takes an ENDPOINT, not
+# only a port, and that endpoint is the only way to scope the listen ADDRESS:
 # `SERVE_PORT=tcp://127.0.0.1:5173` binds loopback only. Validating a bare
 # integer alone (as the first version of this check did) silently removed that
 # -- the published image could then only listen on every interface, so a viewer
 # meant for the local browser is reachable by any LAN peer, and a URL handed to
 # its user is a URL handed to the viewer. The port half is validated in both
 # forms, which is what the fast-fail was actually for.
+#
+# `serve --help` (14.2.6) documents FOUR endpoint forms; the other two are
+# REFUSED here, deliberately and by name rather than by accident:
+#   - `pipe:\\.\pipe\Name` is a WINDOWS named pipe. The published image is
+#     linux/amd64 (the only platform CI builds and gates), so this form cannot
+#     work in it at all -- accepting it would only move the failure from a
+#     named entrypoint error to an obscure one from `serve` after boot.
+#   - `unix:/path/to/socket.sock` is a UNIX domain socket, and NOTHING that
+#     consumes this container can address one: the browser dials a URL, the
+#     runtime-test smoke and both e2e runners curl `http://127.0.0.1:<port>`,
+#     and compose delivers `SERVE_PORT` as a port. A socket would also widen
+#     the charset this value is allowed to carry, and that charset is load
+#     bearing: the CMD is `sh -c "serve -s ... -l ${SERVE_PORT}"`, so the value
+#     is expanded BY A SHELL -- validation is the escaping here exactly as it
+#     is for the sentinels above.
+# If a socket endpoint is ever wanted, it needs its own path containment rule
+# and a consumer that can reach it; it is not a one-line widening of this case.
 if [ -n "${SERVE_PORT:-}" ]; then
   case "${SERVE_PORT}" in
     tcp://*)
@@ -235,6 +252,16 @@ if [ -n "${SERVE_PORT:-}" ]; then
         exit 1
       fi
       reject_bad_port "serve port" "${serve_endpoint##*:}"
+      ;;
+    unix:* | pipe:*)
+      # Refused with the reason, not with the port message: `unix:/x.sock` is a
+      # real `serve -l` form, so "must be an integer 1..65535" would read as a
+      # typo report rather than as the deliberate decision it is.
+      echo "entrypoint: unsupported serve endpoint '${SERVE_PORT}'" \
+           "(supported: <port> or tcp://<host>:<port>; a UNIX socket cannot be" \
+           "reached by the browser or by any of this repo's HTTP gates, and a" \
+           "Windows named pipe cannot exist in a linux/amd64 image)" >&2
+      exit 1
       ;;
     *)
       reject_bad_port "serve port" "${SERVE_PORT}"
