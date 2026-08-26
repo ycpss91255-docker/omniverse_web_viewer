@@ -127,6 +127,64 @@ job_key() {
   '
 }
 
+# job_steps <job>: one line per step of <job>, as
+#
+#     <step-level if:><SOH><the whole step, folded onto one line>
+#
+# Nothing below job level was examined before this existed, and that was a
+# hole the size of the gate itself: a gate job whose WORK STEP is skipped
+# still concludes `success`, which is all any `needs:` / `result` check
+# downstream can see. `if: github.event_name == 'schedule'` on the Tier B
+# acceptance STEP (not the job) publishes an image with no picture ever taken,
+# and `if: false` on verify-tag-shape's only step lets a malformed tag through
+# to the Release -- both under a green board.
+#
+# A step opens at 6-space `- `; its own keys are at 8; a folded `if: >-`
+# continues at 10. An 8-space key ends any folded value being accumulated, so
+# a `run: |` block body can never be mistaken for more of an `if:`.
+job_steps() {
+  job_body "$1" | awk '
+    # A step `if:` reaches here as GitHub would evaluate it: the block marker
+    # of a folded `>-` scalar and a `${{ }}` wrapper are notation, not part of
+    # the expression, so both are stripped before any caller compares it.
+    function unwrap(v) {
+      sub(/^[|>][-+]?[[:space:]]*/, "", v)
+      sub(/^[$][{][{][[:space:]]*/, "", v)
+      sub(/[[:space:]]*[}][}]$/, "", v)
+      return v
+    }
+    function flush() {
+      if (instep) { printf "%s\001%s\n", unwrap(ifv), body }
+      instep = 0; inif = 0; ifv = ""; body = ""
+    }
+    /^    steps:[[:space:]]*$/ { insteps = 1; next }
+    insteps && /^    [^[:space:]]/ { flush(); insteps = 0 }
+    !insteps { next }
+    /^      - / {
+      flush()
+      instep = 1
+      line = $0; sub(/^      - /, "", line); body = line
+      if (line ~ /^if:/) {
+        ifv = line; sub(/^if:[[:space:]]*/, "", ifv); inif = 1
+      }
+      next
+    }
+    instep {
+      if ($0 ~ /^        [A-Za-z0-9_-]+:/) {
+        inif = 0
+        if ($0 ~ /^        if:/) {
+          ifv = $0; sub(/^        if:[[:space:]]*/, "", ifv); inif = 1
+        }
+      } else if (inif && $0 ~ /^          /) {
+        l = $0; sub(/^[[:space:]]+/, "", l); ifv = ifv " " l
+      }
+      l = $0; sub(/^[[:space:]]+/, "", l); body = body " " l
+      next
+    }
+    END { flush() }
+  '
+}
+
 # top_terms <op-char>: split the expression on stdin at every doubled
 # <op-char> (`||` or `&&`) that sits at parenthesis depth 0, one term per
 # line, trimmed. Depth is what makes this structural rather than a grep: the
@@ -184,6 +242,23 @@ contains_word() {
 # it. A closed SET of spellings rather than one literal, so an equivalent
 # rewrite is not reported as a bypass; the violation message names the set, so
 # a maintainer who wants a sixth spelling knows what to add here.
+# is_tag_ref_test <term>: true when <term> is a test for "this ref is a tag".
+# A closed SET of spellings for the same reason as is_tier_b_success_test --
+# and this repo already uses two of them ten lines apart, so accepting only
+# one would report the shipped workflow's own verify-tag-shape step guard as a
+# violation.
+is_tag_ref_test() {
+  case "$1" in
+    "startsWith(github.ref, 'refs/tags/')") return 0 ;;
+    "(startsWith(github.ref, 'refs/tags/'))") return 0 ;;
+    "github.ref_type == 'tag'") return 0 ;;
+    "(github.ref_type == 'tag')") return 0 ;;
+    "'tag' == github.ref_type") return 0 ;;
+    "('tag' == github.ref_type)") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_tier_b_success_test() {
   case "$1" in
     "needs.tier-b-visual-e2e.result == 'success'") return 0 ;;
@@ -344,6 +419,68 @@ if [ -n "$(job_key verify-tag-shape if)" ]; then
   violation verify-tag-shape-has-no-job-level-if \
     "verify-tag-shape has a job-level 'if:'. It is a need of the picture gate, and a skipped need skips its dependent, so this job must always run. Guard the tag check per-step instead."
 fi
+
+# --- 10. a gate job's WORK may not be conditionally skipped ---------------
+# Everything above reads job level, and a job's `result` is all a `needs:` or
+# a `needs.*.result` check can see -- so a job that RUNS but does NOTHING
+# reports `success` and satisfies every property above it. Two mutations do
+# exactly that, with no override input and no status function anywhere:
+#
+#   `if: github.event_name == 'schedule'` on the Tier B acceptance STEP: the
+#   gate job runs, the one step that boots a producer and looks at a frame is
+#   skipped, the job concludes `success`, publish-image is satisfied, and the
+#   image publishes with no picture ever taken.
+#
+#   `if: false` on verify-tag-shape's only step: the shape check never runs,
+#   the job succeeds, and a tag the image-tag deriver cannot publish reaches
+#   call-release -- the exact ordering failure that job was created to stop.
+#
+# The rule: in a gate job, a step that runs one of this repo's `script/ci/`
+# helpers IS the job's work and must be unconditional. The one exception is
+# declared rather than inferred -- verify-tag-shape's deriver step is the
+# per-step tag guard property 9 requires it to have INSTEAD of a job-level
+# `if:`, so it may carry a condition, but only a tag-ref test.
+#
+# WHAT THIS DOES NOT SEE: a gate job's work that is not a `script/ci/` call
+# (an inline `run:` block, a third-party action) can still be given an `if:`
+# and this check will not notice. It is the strongest derivation available
+# from the file without evaluating what a step does.
+for job in "${GATE_JOBS[@]}"; do
+  [ -n "$(job_body "${job}")" ] || continue
+  work_steps=0
+  while IFS="$(printf '\001')" read -r step_if step_body; do
+    [ -n "${step_body}" ] || continue
+    case "${step_body}" in
+      *script/ci/*) ;;
+      *) continue ;;
+    esac
+    # A `--print-<something>` invocation asks the helper a question (the Tier B
+    # driver is asked for the producer image reference so the digest is not
+    # copied into this file twice); it is not the job's work, so it does not
+    # satisfy the "there is still work here" count below. It is still required
+    # to be unconditional -- a skipped query fails the step that uses it.
+    case "${step_body}" in
+      *--print-*) ;;
+      *) work_steps=$((work_steps + 1)) ;;
+    esac
+    [ -n "${step_if}" ] || continue
+    if [ "${job}" = "verify-tag-shape" ] && is_tag_ref_test "${step_if}"; then
+      continue
+    fi
+    violation gate-job-work-step-is-unconditional \
+      "gate job '${job}' has a step guarded by 'if: ${step_if}' that runs one of this repo's script/ci/ helpers. A gate job whose work step is skipped still concludes 'success', which is all any downstream needs/result check can see -- so this publishes with the gate never having run. Step: ${step_body}"
+  done <<EOF
+$(job_steps "${job}")
+EOF
+  if [ "${work_steps}" -eq 0 ]; then
+    case "${job}" in
+      tier-b-visual-e2e | verify-tag-shape)
+        violation gate-job-work-step-is-unconditional \
+          "gate job '${job}' no longer runs any script/ci/ helper, so there is nothing left in it for this check -- or for the gate -- to be about"
+        ;;
+    esac
+  fi
+done
 
 if [ "${violations}" -gt 0 ]; then
   printf 'check_release_gates: %s violation(s) in %s\n' \

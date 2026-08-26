@@ -157,6 +157,42 @@ _mutate() {
   assert_output --partial "[gate-job-has-no-continue-on-error]"
 }
 
+# Everything above reads JOB level, and a job's `result` is the only thing a
+# `needs:` or a `needs.*.result` check can see -- so a gate job that runs but
+# does NOTHING satisfies every one of them. These two mutations do that, with
+# no override input and no status function anywhere in the file.
+#
+# M9: the Tier B acceptance STEP (not the job) is given
+# `if: github.event_name == 'schedule'`. On a tag push the job runs, the one
+# step that boots a producer and looks at a frame is skipped, the job
+# concludes `success`, publish-image is satisfied and the image is published
+# with no picture ever taken.
+@test "gates: an if: on the Tier B acceptance STEP is caught" {
+  _mutate "/^      - name: Tier B visual acceptance/a\\        if: github.event_name == 'schedule'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-work-step-is-unconditional]"
+}
+
+# M54: the same shape on verify-tag-shape's only working step. The shape check
+# never runs, the job succeeds, and a tag the image-tag deriver cannot publish
+# reaches call-release -- the exact ordering failure that job exists to stop.
+@test "gates: if: false on verify-tag-shape's only step is caught" {
+  _mutate "s#^        if: \${{ github.ref_type == 'tag' }}\$#        if: false#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-work-step-is-unconditional]"
+}
+
+# The other half of that property: deleting the work step entirely must not be
+# a pass either. A gate job with nothing in it is a gate in name only.
+@test "gates: deleting the Tier B acceptance step is caught" {
+  _mutate '/^      - name: Tier B visual acceptance/,/^      - name: Upload evidence/{/^      - name: Upload evidence/!d}'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-work-step-is-unconditional]"
+}
+
 # release-blocked-report / nightly-tier-b-report use `always()` and exist only
 # to turn a silently blocked release into a red run. Nothing may need one: a
 # job that waits on them would inherit an always()-gated dependency, which is
