@@ -261,6 +261,58 @@ teardown() {
   assert_failure
 }
 
+# The ui_mode half of the case above, which nothing covered -- and that gap is
+# exactly why the refusal shipped over-firing. For public_ip the refusal
+# precondition ("our own section supplied nothing") is anomalous; for ui_mode a
+# missing `viewer:` section is the NORMAL documented state, because the mode is
+# routinely supplied by env. So the refusal fired on ordinary correct files and
+# the container would not boot -- a narrower restatement of the foreign-key bug
+# two cases up. This is the reviewer's exact reproduction.
+@test "a top-level ui_mode does not block a viewer the env configures" {
+  printf 'network:\n  public_ip: "10.50.50.1"\nui_mode: "stream-only"\nlivestream:\n  enabled: true\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="stream-only" run /entrypoint.sh true
+  assert_success
+  # Not silent either: the key is named, with the mode actually in effect.
+  assert_output --partial "top-level 'ui_mode:'"
+  assert_output --partial "In effect: 'stream-only'"
+  assert_output --partial "the VIEWER_UI_MODE env"
+  # And the env-chosen app is the one that got rendered.
+  run grep -rF "10.50.50.1" "${STREAM_ASSETS}/" --include="*.js"
+  assert_success
+}
+
+# The other half of the same decision: when NOTHING else supplies a mode, the
+# operator who wrote `ui_mode:` at column 0 meaning it for us is the likeliest
+# reader of this line, so it still gets said -- but it is said, not enforced.
+# The built-in default is itself a supported configuration (the entrypoint's
+# own back-compat note), so refusing here would block a valid boot too.
+@test "a top-level ui_mode is named when nothing else supplies a mode" {
+  printf 'network:\n  public_ip: "10.51.51.1"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  assert_output --partial "nothing else supplied one"
+  # The misplaced key did NOT select the app: the built-in default is served.
+  run grep -rF "10.51.51.1" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.51.51.1" "${STREAM_ASSETS}/" --include="*.js"
+  assert_failure
+}
+
+# And when our own section DOES supply the value there is nothing to report:
+# the note must not become background noise on a correctly written file.
+@test "a top-level ui_mode is not reported when the viewer section supplies it" {
+  printf 'viewer:\n  ui_mode: "stream-only"\nui_mode: "usd-viewer"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  SIGNALING_SERVER="10.52.52.1" run /entrypoint.sh true
+  assert_success
+  refute_output --partial "top-level 'ui_mode:'"
+  run grep -rF "10.52.52.1" "${STREAM_ASSETS}/" --include="*.js"
+  assert_success
+}
+
 # An unreadable host.yaml is an operator mistake, not an absent file. awk's
 # failure was swallowed, so the container booted on env/defaults and dialled
 # whatever address the operator had just moved OUT of the env and INTO that

@@ -79,11 +79,32 @@ yaml_value() {
 # Refused, not accepted, because the shared-file argument still applies: a key
 # at column 0 in a file shared with other containers (isaac#65) is addressed to
 # nobody in particular, and quietly steering the viewer from it is what the
-# scoping fix exists to prevent. The refusal fires only when our own section
-# produced NO value, so a file that configures the viewer properly is never
-# blocked by a stray top-level key someone else's container reads -- and adding
-# our section is the escape hatch for that case, which is also the fix the
-# error message asks for.
+# scoping fix exists to prevent.
+#
+# THE TWO KEYS ARE NOT SYMMETRIC, and treating them as one rule was a bug of
+# its own. `refuse_flat_key` fires when OUR OWN SCOPED LOOKUP produced no
+# value, and that precondition means opposite things for the two keys:
+#
+#   - public_ip: a missing `network:` section is anomalous. That section is
+#     the whole reason this file is read, so a file with none of it, plus a
+#     column-0 `public_ip:`, is a file someone wrote FOR us and mis-shaped.
+#     Refusing is right, and the failure it prevents is the bad one -- a
+#     plausible page dialling an address nobody chose, exit 0 and HTTP 200.
+#
+#   - ui_mode: a missing `viewer:` section is the NORMAL, DOCUMENTED state
+#     ("A host.yaml with only a network section leaves the viewer value
+#     untouched", below), because VIEWER_UI_MODE is routinely supplied by env
+#     instead. So the precondition is met on ordinary, correct files, and
+#     refusing there blocks a properly configured viewer from booting over a
+#     key another container owns -- a narrower restatement of the very bug the
+#     scoping fix above was written for.
+#
+# It cannot be made precise, either. `network:` + `public_ip:` + a column-0
+# `ui_mode:` is BYTE-FOR-BYTE the file an operator writes when they meant that
+# key for us and got the shape wrong, AND the file that results when another
+# container simply owns a top-level `ui_mode:`. Nothing in the file separates
+# them, so any refusal rule necessarily blocks the innocent one. ui_mode is
+# therefore TOLD, not refused: see warn_flat_key. Not silent, and not fatal.
 yaml_top_level_key() {
   awk -v key="$1" '
     $0 ~ "^" key ":" { found = 1; exit }
@@ -93,7 +114,9 @@ yaml_top_level_key() {
 
 # refuse_flat_key <key> <section> <file>: exit 1 when <key> is at column 0 and
 # the scoped lookup found nothing, so a misplaced key is never silently
-# ignored. Called only after the scoped lookup came back empty.
+# ignored. Called only after the scoped lookup came back empty, and only for
+# network.public_ip -- see the asymmetry note above yaml_top_level_key for why
+# viewer.ui_mode uses warn_flat_key instead.
 refuse_flat_key() {
   local key="$1" section="$2" file="$3"
   if yaml_top_level_key "${key}" "${file}"; then
@@ -108,6 +131,27 @@ refuse_flat_key() {
   fi
 }
 
+# warn_flat_key <key> <section> <file> <effective> <supplier>: say on STDERR
+# that a column-0 <key> was not read, and name the value actually in effect
+# plus where it came from. NEVER exits -- that is the whole point, and the
+# reason it exists next to refuse_flat_key rather than as a flag on it. See
+# the asymmetry note above yaml_top_level_key: for ui_mode the refusal
+# precondition is met by ordinary correct files, so refusing blocks a properly
+# configured viewer over a key another container owns. Naming the key and the
+# value actually in effect is the strongest thing that is still safe: the
+# operator who mis-shaped their own file reads one line and fixes it, and the
+# operator whose neighbour owns that key still boots.
+warn_flat_key() {
+  local key="$1" section="$2" file="$3" effective="$4" supplier="$5"
+  echo "entrypoint: ${file} has a top-level '${key}:' but no '${section}:'" \
+       "section supplying it; this file's keys are read from their own" \
+       "section only, so that value was NOT read. In effect: '${effective}'" \
+       "(from ${supplier}). If that key was meant for this viewer, indent it" \
+       "under '${section}:' (see config/host.yaml.example) and it wins. If it" \
+       "belongs to another container sharing this file (isaac#65), nothing" \
+       "needs doing -- this line is the only trace either way" >&2
+}
+
 # Per-host config (mounted by caller from config/host.yaml). When
 # present, network.public_ip overrides the SIGNALING_SERVER env var --
 # keeps a single source of truth for the host IP across all containers
@@ -115,7 +159,10 @@ refuse_flat_key() {
 # viewer.ui_mode follows the same precedence as public_ip: host.yaml
 # viewer.ui_mode > VIEWER_UI_MODE env > built-in default. A host.yaml
 # with only a network section leaves the viewer value untouched
-# (back-compat). Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
+# (back-compat) -- and, because that is NORMAL rather than anomalous, a
+# column-0 `ui_mode:` is reported and ignored where a column-0 `public_ip:` is
+# refused; see the asymmetry note above yaml_top_level_key.
+# Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
 if [ -f /etc/host.yaml ]; then
   # An UNREADABLE host.yaml is an operator mistake, not an absent file, and it
@@ -142,8 +189,21 @@ if [ -f /etc/host.yaml ]; then
   yaml_ui_mode="$(yaml_value viewer ui_mode /etc/host.yaml)"
   if [ -n "${yaml_ui_mode}" ]; then
     VIEWER_UI_MODE="${yaml_ui_mode}"
-  else
-    refuse_flat_key ui_mode viewer /etc/host.yaml
+  elif yaml_top_level_key ui_mode /etc/host.yaml; then
+    # Deferred to after the default is applied below, so the warning can name
+    # the mode ACTUALLY in effect without duplicating the default literal. The
+    # supplier is decided here, while VIEWER_UI_MODE still holds only what the
+    # environment gave us: non-empty means an operator (or the image ENV) chose
+    # a mode for THIS container, empty means nothing did and the built-in
+    # default is about to. That difference does not change whether we boot --
+    # the built-in default is itself a supported configuration, per the
+    # back-compat note above -- it changes what the operator is told, which is
+    # where it is actually useful.
+    if [ -n "${VIEWER_UI_MODE:-}" ]; then
+      flat_ui_mode_supplier="the VIEWER_UI_MODE env"
+    else
+      flat_ui_mode_supplier="the built-in default; nothing else supplied one"
+    fi
   fi
 fi
 
@@ -152,6 +212,14 @@ fi
 SIGNALING_SERVER="${SIGNALING_SERVER:-127.0.0.1}"
 SIGNALING_PORT="${SIGNALING_PORT:-49100}"
 VIEWER_UI_MODE="${VIEWER_UI_MODE:-usd-viewer}"
+
+# The deferred half of the flat-ui_mode note above: emitted here so it can name
+# the resolved mode. Fires only when /etc/host.yaml carried a column-0
+# `ui_mode:` AND our own `viewer:` section supplied nothing.
+if [ -n "${flat_ui_mode_supplier:-}" ]; then
+  warn_flat_key ui_mode viewer /etc/host.yaml \
+    "${VIEWER_UI_MODE}" "${flat_ui_mode_supplier}"
+fi
 
 # Validate before substituting. Each value lands in a browser-executed
 # JS bundle via sed, so a bad value must fail the container fast rather
