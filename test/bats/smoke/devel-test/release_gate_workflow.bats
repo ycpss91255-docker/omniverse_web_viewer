@@ -282,6 +282,26 @@ _mutate() {
   assert_output --partial "[publishing-jobs-are-identifiable]"
 }
 
+# M50. Property 6 forbids DEPENDING on the report-only jobs. It said nothing
+# about them existing, so deleting both was invisible here -- and nothing else
+# in the repo would notice either, because by design nothing depends on them.
+# Round 3 added them to end a silence; removing them restores it.
+@test "gates: deleting the report-only jobs is caught" {
+  _mutate '/^  release-blocked-report:$/,$d'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[report-only-jobs-still-exist]"
+}
+
+# Half a deletion is the same loss: a report that can no longer observe a need
+# which did not succeed reports nothing.
+@test "gates: a report-only job that can no longer observe the gate is caught" {
+  _mutate "s/^      && needs.tier-b-visual-e2e.result != 'success'\$/      \&\& needs.tier-b-visual-e2e.result == 'failure'/"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[report-only-jobs-still-exist]"
+}
+
 # M52. The gate's whole job is to boot a real Kit producer and assert a real
 # browser renders a non-black frame from it, and no hosted runner has NVENC --
 # so moving it to ubuntu-latest does not make the gate slower, it removes it.

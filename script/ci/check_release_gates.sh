@@ -637,6 +637,33 @@ EOF
   fi
 done
 
+# --- 6c. the report-only jobs still exist ---------------------------------
+# Property 6 says nothing may DEPEND on these two. It said nothing about them
+# being there at all, so deleting both was a silent no-op to this checker --
+# and silence is the entire failure they were added to fix. A blocked release
+# (a Tier B evicted from the concurrency group as a pending member, or a
+# checkout flake in verify-tag-shape skipping the nightly) then produces no
+# Release, no image, and a grey cancelled job on a green-looking run.
+#
+# They can only ADD a failure, so requiring them costs nothing and asserting
+# their shape keeps them able to observe the case: `always()` is what lets a
+# job read a need that did not succeed, and `!= 'success'` is what makes it
+# fire for skipped/cancelled/failure alike.
+for job in "${REPORT_ONLY_JOBS[@]}"; do
+  if [ -z "$(job_body "${job}")" ]; then
+    violation report-only-jobs-still-exist \
+      "report-only job '${job}' is gone. Nothing depends on it -- that is the point -- so deleting it breaks no other check and reverses nothing visibly, while restoring the silence it exists to end: a release blocked by a cancelled or skipped picture gate becomes a grey job on a green-looking run"
+    continue
+  fi
+  report_if="$(job_key "${job}" if)"
+  if ! needs_job "${job}" tier-b-visual-e2e \
+     || ! contains_word 'always(' "${report_if}" \
+     || ! contains_word "needs.tier-b-visual-e2e.result != 'success'" "${report_if}"; then
+    violation report-only-jobs-still-exist \
+      "report-only job '${job}' can no longer observe a picture gate that did not succeed. It must need tier-b-visual-e2e, and its condition must carry always() (which is what lets a job read a need that did not succeed) and \"needs.tier-b-visual-e2e.result != 'success'\" (which is what makes it fire for skipped, cancelled and failure alike). if: ${report_if:-<absent>}"
+  fi
+done
+
 # --- 10b. the picture gate runs where a picture can be taken --------------
 # `runs-on: [self-hosted, gpu]` is not a performance choice. The whole job is
 # "boot a real Kit producer and assert a browser renders a non-black frame
