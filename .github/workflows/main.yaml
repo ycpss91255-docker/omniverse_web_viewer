@@ -502,16 +502,36 @@ jobs:
 
       # Boots the producer, waits for its streaming server, drives the browser,
       # and tears down its own instance-scoped containers on every exit path.
+      #
+      # STEP-level timeout, inside the job's 60-minute budget. An overrun is
+      # then a step FAILURE -- the job ends `failure`, the upload below runs,
+      # and the driver is signalled (it exits 130/143 and writes producer.log
+      # on the way out). A job-level `timeout-minutes` overrun instead CANCELS
+      # the job, and `if: failure()` does not run in a cancelled job, so the
+      # single most expensive failure mode used to leave nothing behind. The
+      # job's own 60 stays as the backstop the orphan reaper's default
+      # (TIER_B_ORPHAN_MAX_AGE_MIN=120, twice the budget) is calibrated against.
       - name: Tier B visual acceptance (real producer -> real frames)
+        timeout-minutes: 45
         run: bash script/ci/tier_b_visual_e2e.sh
 
-      - name: Upload evidence on failure
-        if: failure()
+      # `cancelled()` as well as `failure()`: the job can still be cancelled
+      # from outside (the concurrency group, a manual cancel, the job backstop),
+      # and a cancelled Tier B is exactly the run whose evidence is worth having
+      # -- the next run's pre-checkout step deletes .tier-b-artifacts, so
+      # anything not uploaded here is gone.
+      #
+      # `if-no-files-found: warn` (the default) rather than `ignore`: the driver
+      # always writes producer.log, which it calls "the only diagnosis a nightly
+      # failure leaves behind", so an EMPTY upload means something went wrong
+      # before that and should not look identical to a real one.
+      - name: Upload evidence on failure or cancellation
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tier-b-visual-e2e-evidence
           path: .tier-b-artifacts
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   # ------------------- blocked-release visibility (report only) -------------
   # NOT A GATE, and deliberately incapable of being one: nothing `needs` this
