@@ -25,16 +25,20 @@ DIRECT 設定のファクトリ自体はこのサンプルには**ありませ�
 イメージをビルドし、動作中のストリームを指定して host ネットワークで実行します（`SIGNALING_SERVER` は Kit/Isaac ストリームを実行しているホストです）:
 
 ```bash
-make build -- -t example
-docker run --rm -d --network=host \
-  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
-  local/omniverse_web_viewer:example
+just build -t example
+just run -t example -d
 # then open http://<host-ip>:8080
 ```
 
-エントリポイントは起動のたびに、`SIGNALING_SERVER` / `SIGNALING_PORT`（env）または `/etc/host.yaml`（`network.public_ip`）から `__OWV_SERVER__` / `__OWV_PORT__` を、ビルド済みバンドルへ差し込みます。
+エントリポイントは起動のたびに、`SIGNALING_SERVER` / `SIGNALING_PORT` / `MEDIA_PORT`（env）または `/etc/host.yaml`（`network.public_ip`）から `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` を、ビルド済みバンドルへ差し込みます。`just run` はこれらを生成された `.env` から読み取ります -- `setup.conf` の `[environment]` を編集し、`./script/setup.sh apply` を再実行してください。
 
-> 注意: `make run -- -t example -d` はまだ使用できません -- `example`（および `serve`）compose サービスは `devel` から `/dev:/dev` のデバイスマウントを継承しており、起動時に `/dev/pts` エラーで失敗します（#26 で追跡中）。修正されるまでは上記の `docker run` の形式を使用してください。（また `make run` はデタッチモードで `-e` の env 変数を転送しません。）
+その 2 つを変更せずに 1 回だけターゲットを指定したい場合は、コンテナを直接起動します（`just run` はデタッチモードで `-e` を転送しません）:
+
+```bash
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+```
 
 ## 実行する（開発）
 

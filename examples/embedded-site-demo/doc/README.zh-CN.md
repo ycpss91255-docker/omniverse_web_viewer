@@ -25,16 +25,20 @@ DIRECT 配置工厂本身**不在**本示例中：`buildStreamConfig` 位于 `st
 先构建镜像，然后用 host networking 运行它，并将其指向一个正在运行的串流（`SIGNALING_SERVER` 是运行 Kit/Isaac 串流的主机）：
 
 ```bash
-make build -- -t example
-docker run --rm -d --network=host \
-  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
-  local/omniverse_web_viewer:example
+just build -t example
+just run -t example -d
 # then open http://<host-ip>:8080
 ```
 
-entrypoint 会在每次启动时，从 `SIGNALING_SERVER` / `SIGNALING_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）将 `__OWV_SERVER__` / `__OWV_PORT__` 替换进构建好的 bundle 中。
+entrypoint 会在每次启动时，从 `SIGNALING_SERVER` / `SIGNALING_PORT` / `MEDIA_PORT`（env）或 `/etc/host.yaml`（`network.public_ip`）将 `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` 替换进构建好的 bundle 中。`just run` 是从生成的 `.env` 读取这些值 -- 请修改 `setup.conf` 的 `[environment]`，然后重新运行 `./script/setup.sh apply`。
 
-> 注意：`make run -- -t example -d` 目前还无法使用 -- `example`（以及 `serve`）compose service 从 `devel` 继承了 `/dev:/dev` 设备挂载，启动时会因 `/dev/pts` 错误而失败（追踪于 #26）。在修复之前，请使用上面的 `docker run` 写法。（`make run` 在 detached 模式下也不会转发 `-e` 环境变量。）
+若只想为单次运行指定目标而不改动上述两者，就直接启动容器（`just run` 在 detached 模式下不会转发 `-e`）：
+
+```bash
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+```
 
 ## 运行（开发模式）
 

@@ -38,22 +38,25 @@ Build the image, then run it with host networking, pointing it at a running
 stream (`SIGNALING_SERVER` is the host running the Kit/Isaac stream):
 
 ```bash
-make build -- -t example
-docker run --rm -d --network=host \
-  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
-  local/omniverse_web_viewer:example
+just build -t example
+just run -t example -d
 # then open http://<host-ip>:8080
 ```
 
-The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` from
-`SIGNALING_SERVER` / `SIGNALING_PORT` (env) or `/etc/host.yaml`
-(`network.public_ip`) into the built bundle on every boot.
+The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` /
+`__OWV_MEDIA_PORT__` from `SIGNALING_SERVER` / `SIGNALING_PORT` / `MEDIA_PORT`
+(env) or `/etc/host.yaml` (`network.public_ip`) into the built bundle on every
+boot. `just run` reads those from the generated `.env` -- set them in
+`setup.conf` `[environment]` and re-run `./script/setup.sh apply`.
 
-> Note: `make run -- -t example -d` is not usable yet -- the `example` (and
-> `serve`) compose service inherits a `/dev:/dev` device mount from `devel` and
-> fails at start with a `/dev/pts` error (tracked in #26). Use the `docker run`
-> form above until that is fixed. (`make run` also does not forward `-e` env
-> vars in detached mode.)
+To point the container somewhere for a single run without touching either,
+start it directly instead (`just run` does not forward `-e` in detached mode):
+
+```bash
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+```
 
 ## Run it (dev)
 
