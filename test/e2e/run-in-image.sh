@@ -15,6 +15,9 @@
 # The two per-PR projects are named EXPLICITLY: the Tier B visual acceptance
 # (#48, project chromium-tier-b) lives in the same directory but needs a real
 # GPU producer, so it must never be picked up by this gate. See run-tier-b.sh.
+# They are also run ONE PER INVOCATION rather than in a single multi-project
+# selection, so Playwright's "No tests found" guard applies to each suite
+# individually -- see the note above the loop in run_mode.
 # A non-zero Playwright exit fails the build (RUN propagates the exit code).
 #
 # The entrypoint itself backgrounds nothing; it exec's the CMD. We therefore run
@@ -37,6 +40,11 @@ E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_SERVER="10.20.30.40"
 TEST_SIGNALING_PORT="49177"
 TEST_MEDIA_PORT="47998"
+
+# The per-PR projects, named EXPLICITLY so the Tier B visual acceptance (#48,
+# project chromium-tier-b) can share this directory without ever being picked
+# up here. Run ONE AT A TIME -- see run_mode below for why that matters.
+E2E_PROJECTS=(chromium chromium-loopback)
 
 server_pid=""
 
@@ -93,16 +101,32 @@ run_mode() {
     return 1
   fi
 
+  # ONE PROJECT PER INVOCATION, deliberately. Playwright's "No tests found"
+  # guard is evaluated over the WHOLE selection, so
+  # `--project=chromium --project=chromium-loopback` in a single run is silent
+  # about a project that matched zero spec files: verified against the pinned
+  # @playwright/test 1.62.1, selecting the loopback project ALONE with its spec
+  # absent gives `Error: No tests found` and exit 1, while selecting both gives
+  # `1 skipped` and exit 0. Renaming or losing a spec file would therefore drop
+  # it from the per-PR gate while this script still printed
+  # `=== e2e: all modes passed ===`. Selecting one project at a time puts each
+  # suite back under that guard individually.
   local rc=0
-  (
-    cd "${E2E_DIR}"
-    OWV_BASE_URL="${base_url}" \
-    OWV_MODE="${mode}" \
-    OWV_EXPECT_SERVER="${TEST_SERVER}" \
-    OWV_EXPECT_PORT="${TEST_SIGNALING_PORT}" \
-    OWV_EXPECT_MEDIA="${media_port}" \
-      npx playwright test --project=chromium --project=chromium-loopback
-  ) || rc=$?
+  local project
+  for project in "${E2E_PROJECTS[@]}"; do
+    (
+      cd "${E2E_DIR}"
+      OWV_BASE_URL="${base_url}" \
+      OWV_MODE="${mode}" \
+      OWV_EXPECT_SERVER="${TEST_SERVER}" \
+      OWV_EXPECT_PORT="${TEST_SIGNALING_PORT}" \
+      OWV_EXPECT_MEDIA="${media_port}" \
+        npx playwright test --project="${project}"
+    ) || rc=$?
+    if [ "${rc}" -ne 0 ]; then
+      break
+    fi
+  done
 
   stop_server
   return "${rc}"
