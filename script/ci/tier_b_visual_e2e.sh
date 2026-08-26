@@ -242,15 +242,36 @@ trap cleanup EXIT
 trap 'fail "interrupted (SIGINT) -- no picture was verified"; exit 130' INT
 trap 'fail "terminated (SIGTERM) -- no picture was verified"; exit 143' TERM
 
+# _env_value NAME DEFAULT -- read one variable from the derived .env files
+# WITHOUT letting them into this shell.
+#
+# They used to be sourced wholesale, and by the time that happened this script
+# had already resolved INSTANCE, PRODUCER_NAME, VIEWER_NAME, PUBLIC_IP,
+# BOOT_TIMEOUT, ARTIFACT_DIR and more -- so any of those names appearing in the
+# hand-authored .env silently replaced them. PRODUCER_NAME is the dangerous
+# one: `_drop` REFUSES a name outside the owv-tierb-* prefix (that refusal is
+# the isolation guarantee and must stay), so teardown would decline to remove
+# the container this script had just started under the overridden name, and the
+# script would exit 0 leaving a `--gpus all` Kit container running on the
+# shared host. Exactly two values are wanted from those files, so exactly two
+# are taken, and the sourcing happens in a subshell that dies with the
+# substitution.
+_env_value() {
+  local name="$1" default="$2"
+  (
+    # shellcheck source=/dev/null
+    if [ -f "${REPO_ROOT}/.env.generated" ]; then . "${REPO_ROOT}/.env.generated"; fi
+    # shellcheck source=/dev/null
+    if [ -f "${REPO_ROOT}/.env" ]; then . "${REPO_ROOT}/.env"; fi
+    printf '%s\n' "${!name:-${default}}"
+  )
+}
+
 # Viewer image: the e2e-test stage tag the build wrapper produces
 # (${DOCKER_HUB_USER}/${IMAGE_NAME}:e2e-test). Read from the derived .env so
 # this follows whatever the repo is configured as, with a plain default.
-DOCKER_HUB_USER="local"
-IMAGE_NAME="omniverse_web_viewer"
-# shellcheck source=/dev/null
-[ -f "${REPO_ROOT}/.env.generated" ] && . "${REPO_ROOT}/.env.generated"
-# shellcheck source=/dev/null
-[ -f "${REPO_ROOT}/.env" ] && . "${REPO_ROOT}/.env"
+DOCKER_HUB_USER="$(_env_value DOCKER_HUB_USER local)"
+IMAGE_NAME="$(_env_value IMAGE_NAME omniverse_web_viewer)"
 VIEWER_IMAGE="${TIER_B_VIEWER_IMAGE:-${DOCKER_HUB_USER}/${IMAGE_NAME}:e2e-test}"
 
 SERVE_PORT="${TIER_B_SERVE_PORT:-$(_pick_port "${SERVE_PORT_BASE}")}"
