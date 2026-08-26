@@ -209,6 +209,32 @@ top_terms() {
   ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+# needs_list <job>: the job names in <job>'s `needs:`, one per line.
+#
+# A SUBSTRING TEST IS NOT MEMBERSHIP, and the difference publishes releases.
+# `contains_word 'tier-b-visual-e2e' "${release_needs}"` is satisfied by a job
+# merely NAMED after the gate: add an `always()`-gated
+# `tier-b-visual-e2e-summary` and point call-release at that, and a Release is
+# cut for a commit whose Tier B failed while every check here passes. Both the
+# flow (`[a, b]`) and block (`- a`) sequence spellings are accepted, as is a
+# bare scalar.
+needs_list() {
+  job_key "$1" needs | awk '
+    {
+      gsub(/[][,]/, " ")
+      n = split($0, a, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (a[i] != "" && a[i] != "-") { print a[i] }
+      }
+    }
+  '
+}
+
+# needs_job <job> <needed>: true when <needed> is an ITEM of <job>'s needs.
+needs_job() {
+  needs_list "$1" | grep -qxF "$2"
+}
+
 # tag_trigger_globs: the `on.push.tags` sequence items.
 tag_trigger_globs() {
   normalize | awk '
@@ -288,9 +314,10 @@ release_if="$(job_key call-release if)"
 tier_b_if="$(job_key tier-b-visual-e2e if)"
 
 # --- 1. the publish is wired to the picture gate --------------------------
-if ! contains_word 'tier-b-visual-e2e' "${publish_needs}"; then
+# MEMBERSHIP, not substring: see needs_list.
+if ! needs_job publish-image tier-b-visual-e2e; then
   violation publish-image-needs-tier-b \
-    "publish-image does not need tier-b-visual-e2e, so an image can be pushed for a commit whose picture was never verified. needs: ${publish_needs:-<absent>}"
+    "publish-image does not have tier-b-visual-e2e as an ITEM of its needs, so an image can be pushed for a commit whose picture was never verified. A job merely named after the gate does not count. needs: ${publish_needs:-<absent>}"
 fi
 
 # --- 2. ... and requires it to have SUCCEEDED, not merely not-failed ------
@@ -336,9 +363,13 @@ if [ "${tier_b_success_conjunct}" -eq 0 ]; then
 fi
 
 # --- 3. the Release is wired to the picture gate too ----------------------
-if ! contains_word 'tier-b-visual-e2e' "${release_needs}"; then
+# MEMBERSHIP again, and here it is load-bearing in the most direct way: a
+# substring test is satisfied by an `always()`-gated job called
+# `tier-b-visual-e2e-summary`, which cuts a Release for a commit whose Tier B
+# failed.
+if ! needs_job call-release tier-b-visual-e2e; then
   violation call-release-needs-tier-b \
-    "call-release does not need tier-b-visual-e2e, so a GitHub Release can be cut for a commit whose picture was never verified. needs: ${release_needs:-<absent>}"
+    "call-release does not have tier-b-visual-e2e as an ITEM of its needs, so a GitHub Release can be cut for a commit whose picture was never verified. A job merely named after the gate does not count. needs: ${release_needs:-<absent>}"
 fi
 
 # --- 4. ... by DEFAULT skip propagation, which a status function disables --
@@ -375,13 +406,50 @@ while read -r job; do
   job_needs="$(job_key "${job}" needs)"
   [ -n "${job_needs}" ] || continue
   for report in "${REPORT_ONLY_JOBS[@]}"; do
-    if contains_word "${report}" "${job_needs}"; then
+    if needs_job "${job}" "${report}"; then
       violation no-job-needs-a-report-only-job \
         "job '${job}' needs the report-only job '${report}'. Report-only jobs use always() and exist to add a failure; nothing may depend on one."
     fi
   done
 done <<EOF
 $(list_jobs)
+EOF
+
+# --- 6b. ... and neither may anything else that carries a status function --
+# Property 6 is a NAME LIST, so it only knows the two report jobs that exist
+# today. The rule underneath it is not about their names: a job whose own `if:`
+# carries always()/success()/failure()/cancelled() runs on paths where its
+# needs did not succeed, so depending on one imports exactly the escape the
+# picture-gate rule forbids -- and a NEW such job is invisible to a name list.
+# That is the second half of the decoy: `tier-b-visual-e2e-summary`, `if:
+# always()`, needed by call-release.
+#
+# The same loop refuses a `needs:` naming a job that does not exist. GitHub
+# errors on that, but this checker would otherwise read the dangling name's
+# absent `if:` as "no status function" and report the invariant as held for a
+# workflow that cannot run at all.
+all_jobs="$(list_jobs)"
+while IFS= read -r job; do
+  [ -n "${job}" ] || continue
+  while IFS= read -r need; do
+    [ -n "${need}" ] || continue
+    if ! printf '%s\n' "${all_jobs}" | grep -qxF "${need}"; then
+      violation needs-name-a-job-that-exists \
+        "job '${job}' needs '${need}', which is not a job in ${WORKFLOW}"
+      continue
+    fi
+    need_if="$(job_key "${need}" if)"
+    for fn in 'always(' 'success(' 'failure(' 'cancelled('; do
+      if contains_word "${fn}" "${need_if}"; then
+        violation no-job-needs-a-status-gated-job \
+          "job '${job}' needs '${need}', whose own condition contains '${fn}'. A status function makes that job run on paths where ITS needs did not succeed, so waiting on it imports the escape the picture-gate rule forbids. if: ${need_if}"
+      fi
+    done
+  done <<NEEDS
+$(needs_list "${job}")
+NEEDS
+done <<EOF
+${all_jobs}
 EOF
 
 # --- 7. a tag push starts this workflow at all ----------------------------

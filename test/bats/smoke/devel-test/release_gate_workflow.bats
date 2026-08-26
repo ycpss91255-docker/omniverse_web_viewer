@@ -204,6 +204,44 @@ _mutate() {
   assert_output --partial "[no-job-needs-a-report-only-job]"
 }
 
+# M33. `needs:` was read as a STRING and searched for a substring, so a job
+# merely NAMED after the gate satisfied it. Append an `always()`-gated
+# `tier-b-visual-e2e-summary` and point call-release at it: the substring
+# `tier-b-visual-e2e` is present in the needs list, and a Release is cut for a
+# commit whose Tier B failed. Two independent properties must now catch this --
+# needs is a LIST and membership is exact, and nothing may need a job whose own
+# condition carries a status function.
+@test "gates: a decoy job named after the gate does not satisfy a needs" {
+  {
+    sed 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e-summary]/' \
+      "${WORKFLOW}"
+    printf '%s\n' \
+      "  tier-b-visual-e2e-summary:" \
+      "    needs: [tier-b-visual-e2e]" \
+      "    if: always()" \
+      "    runs-on: ubuntu-latest" \
+      "    steps:" \
+      "      - name: Summarise" \
+      "        run: echo done"
+  } > "${MUTATED}"
+  run grep -qF 'tier-b-visual-e2e-summary]' "${MUTATED}"
+  assert_success
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[call-release-needs-tier-b]"
+  assert_output --partial "[no-job-needs-a-status-gated-job]"
+}
+
+# A `needs:` naming a job that is not in the file is a workflow GitHub refuses
+# to run; this checker must not read the dangling name's absent condition as
+# "no status function" and report the invariant as held.
+@test "gates: a needs naming a job that does not exist is caught" {
+  _mutate 's/needs: \[verify-tag-shape\]$/needs: [verify-tag-shape-v2]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[needs-name-a-job-that-exists]"
+}
+
 # ------------------------------------------------------- tag reachability --
 
 @test "gates: removing the tag push trigger is caught" {
