@@ -62,13 +62,17 @@ const FRAME_TIMEOUT_MS = 120_000;
 // Same producer, same flags, only the ordinal differs -- and it is the same
 // family isaac#233 opened ("a Kit that boots, opens the signaling socket, and
 // then dies the moment a real client attaches"). Filed upstream; tracked in the
-// PR. So `beforeAll` reloads -- each reload is a NEW session -- until frames
-// actually flow, then the five specs assert against that session.
+// PR. So the single test below reloads -- each reload is a NEW session --
+// until frames actually flow, then asserts against that session.
 //
 // This CANNOT hide a real regression: a producer that never delivers a picture
-// exhausts the attempts and fails beforeAll, which fails every spec. It only
+// exhausts the attempts and fails that test, which IS the whole gate. It only
 // declines to call the known first-session defect a viewer bug. Every attempt
 // is logged so a run that suddenly needs more of them is visible.
+//
+// (The warm-up was a `beforeAll` fixture over five specs once; it is now inline
+// in one test, for the reason recorded above the test itself -- this page
+// cannot hold a live WebRTC session across test boundaries.)
 const MAX_SESSION_ATTEMPTS = 4;
 const SESSION_ATTEMPT_TIMEOUT_MS = 30_000;
 // Gap between the two frame-counter reads that decide whether frames are
