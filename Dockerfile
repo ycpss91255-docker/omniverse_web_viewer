@@ -516,7 +516,7 @@ COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
 # browser plus its OS deps. `--with-deps` apt-installs the headless libs.
 # Browsers land in the world-readable PLAYWRIGHT_BROWSERS_PATH so the non-root
 # user can launch them. hadolint ignore=DL3016
-RUN npm install --no-audit --no-fund && \
+RUN npm ci --no-audit --no-fund && \
     npx playwright install --with-deps chromium && \
     chmod -R a+rx "${PLAYWRIGHT_BROWSERS_PATH}" && \
     chown -R "${USER}":"${GROUP}" /e2e
