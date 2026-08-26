@@ -289,9 +289,9 @@ jobs:
       # -- "a dangling artifact a consumer could pin", which the comment block
       # above this job names as the state to avoid.
       #
-      # Rule: the requested version must ALREADY exist as the tag v<version>,
-      # and that tag must point at the commit this run is building. The
-      # documented recovery case still works -- a Release whose image push
+      # Rule: the requested version must ALREADY have a published Release
+      # v<version>, and its tag must point at the commit this run is building.
+      # The documented recovery case still works -- a Release whose image push
       # failed is republished by dispatching with the TAG selected as the ref,
       # where derive_image_tag uses the ref and this check is satisfied by
       # construction -- while publishing branch code under a released version is
@@ -305,12 +305,35 @@ jobs:
           set -euo pipefail
           version="${IMAGE_REF##*:}"
           sha_re='^[0-9a-f]{40}$'
-          # A miss prints an error BODY rather than failing quietly, so the
-          # answer is validated by shape, not by exit status.
+
+          # CHECK THE RELEASE, because that is what the error message promises.
+          # This step used to resolve /git/ref/tags/ alone and then say "no tag
+          # ... so this image would have no Release behind it" -- but a tag can
+          # exist with NO Release behind it, when its own run's call-release
+          # failed. Concrete path: push v0.4.0, call-release fails, then
+          # dispatch from main (whose head is still the tagged commit) with
+          # publish_image_tag=0.4.0. The tag check passed, call-release is
+          # skipped on a non-tag ref, and the image published with no Release
+          # behind it -- precisely the dangling artifact this job's header
+          # names as the state to avoid. /releases/tags/ 404s on a draft too,
+          # which is the right answer here: a draft is not something a consumer
+          # can find their way back to.
+          #
+          # A miss prints an error BODY rather than failing quietly, so every
+          # answer below is validated by shape, not by exit status.
+          release_id="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/v${version}" \
+                          -q '.id' 2>/dev/null || true)"
+          if [[ ! "${release_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: no published Release v${version} exists, so this image would have no Release behind it"
+            exit 1
+          fi
+
+          # And the tag, because the commit comparison below is what stops a
+          # released version being re-pointed at different code.
           object="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/v${version}" \
                       -q '.object.sha' 2>/dev/null || true)"
           if [[ ! "${object}" =~ ${sha_re} ]]; then
-            echo "::error::refusing to publish ${IMAGE_REF}: no tag v${version} exists, so this image would have no Release behind it"
+            echo "::error::refusing to publish ${IMAGE_REF}: Release v${version} exists but the tag v${version} does not resolve, so this run cannot be checked against the released commit"
             exit 1
           fi
           # Lightweight tags point straight at a commit; annotated tags (what
