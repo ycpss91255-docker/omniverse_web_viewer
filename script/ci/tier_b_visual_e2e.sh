@@ -22,6 +22,11 @@
 #     the teardown into someone else's outage;
 #   - teardown removes ONLY those two names -- no compose project, no
 #     `down --remove-orphans`, nothing that reconciles anything it does not own;
+#   - startup additionally reaps `owv-tierb-*` containers left by a HARD-KILLED
+#     earlier run (the producer is not `--rm`, so only the trap removes it, and
+#     the trap does not run on SIGKILL). Still prefix-guarded through `_drop`,
+#     and only for containers older than TIER_B_ORPHAN_MAX_AGE_MIN, so a live
+#     instance is never touched;
 #   - ports are PROBED free before use, starting well away from the ports the
 #     dev/demo stacks have historically held (5173/49100, 5174/49200);
 #   - nothing here touches a compose project, an image tag or a shared name.
@@ -44,6 +49,10 @@
 #   TIER_B_PUBLIC_IP       publicEndpointAddress (default: 127.0.0.1)
 #   TIER_B_BOOT_TIMEOUT    seconds to wait for the producer (default: 900)
 #   TIER_B_ARTIFACT_DIR    evidence dir (default: <repo>/.tier-b-artifacts)
+#   TIER_B_ORPHAN_MAX_AGE_MIN
+#                          minutes before an owv-tierb-* container from ANOTHER
+#                          instance counts as orphaned and is reaped
+#                          (default: 120, i.e. twice the job's timeout-minutes)
 #
 # Exit 0 = a real browser saw a real, non-black frame from a real producer.
 set -euo pipefail
@@ -56,6 +65,7 @@ INSTANCE="${TIER_B_INSTANCE:-${GITHUB_RUN_ID:-$$}}"
 PUBLIC_IP="${TIER_B_PUBLIC_IP:-127.0.0.1}"
 BOOT_TIMEOUT="${TIER_B_BOOT_TIMEOUT:-900}"
 ARTIFACT_DIR="${TIER_B_ARTIFACT_DIR:-${REPO_ROOT}/.tier-b-artifacts}"
+ORPHAN_MAX_AGE_MIN="${TIER_B_ORPHAN_MAX_AGE_MIN:-120}"
 
 # The name prefix is the isolation guarantee; keep it in ONE place.
 NAME_PREFIX="owv-tierb-${INSTANCE}"
@@ -205,6 +215,51 @@ if ! docker image inspect "${VIEWER_IMAGE}" >/dev/null 2>&1; then
   fail "viewer image ${VIEWER_IMAGE} is not present -- build it first (just build -t e2e-test)"
   exit 1
 fi
+
+# Reap STALE containers from the whole owv-tierb-* namespace first. The
+# producer is deliberately not --rm and is removed only by the EXIT/INT/TERM
+# trap, so a SIGKILLed run (runner reboot, docker daemon restart, the GHA hard
+# kill after the grace period, the job's own timeout-minutes) leaves a Kit
+# container alive holding `--gpus all` and the host network. INSTANCE is
+# GITHUB_RUN_ID, which differs on every run, so the per-instance pre-clean
+# below walks straight past it and nothing else in the repo removes it either
+# -- the workflow's pre-checkout step only deletes .tier-b-artifacts. The next
+# Tier B then contends with a stale Kit for GPU memory and can fail for reasons
+# that have nothing to do with the viewer, which by the release invariant is a
+# blocked release with a misleading symptom.
+#
+# Two guards keep this from becoming the outage it is meant to prevent:
+#   - the names come from a `^owv-tierb-` docker filter and still go through
+#     `_drop`, which refuses anything outside that prefix, so the isolation
+#     guarantee is exactly as strong as before;
+#   - only containers OLDER than ORPHAN_MAX_AGE_MIN are touched. The job's
+#     budget is `timeout-minutes: 60`, so at twice that nothing reaped here can
+#     belong to a live run -- a concurrent instance (TIER_B_INSTANCE override,
+#     local dev) is left alone even though the `concurrency` group already
+#     serialises the CI ones.
+_reap_orphans() {
+  local names name created started now age
+  now="$(date -u +%s)"
+  mapfile -t names < <(
+    docker ps -a --filter 'name=^owv-tierb-' --format '{{.Names}}' 2>/dev/null || true
+  )
+  for name in "${names[@]}"; do
+    [ -n "${name}" ] || continue
+    case "${name}" in
+      "${PRODUCER_NAME}" | "${VIEWER_NAME}") continue ;;
+    esac
+    created="$(docker inspect -f '{{.Created}}' "${name}" 2>/dev/null || true)"
+    started="$(date -u -d "${created}" +%s 2>/dev/null || echo 0)"
+    age=$((now - started))
+    if [ "${age}" -lt $((ORPHAN_MAX_AGE_MIN * 60)) ]; then
+      log "leaving ${name} alone (age ${age}s < ${ORPHAN_MAX_AGE_MIN}m; another instance may own it)"
+      continue
+    fi
+    log "reaping orphaned ${name} (age ${age}s) -- a hard-killed run left it holding the GPU"
+    _drop "${name}"
+  done
+}
+_reap_orphans
 
 # Pre-clean OUR OWN names only: a hard-killed earlier run of the same instance
 # can leave the (non---rm) producer behind, and `docker run --name` would then
