@@ -128,11 +128,46 @@ _drop() {
   docker rm -f "${name}" >/dev/null 2>&1 || true
 }
 
+# THE `grep -q` TRAP, and why every check below counts instead.
+#
+# This script runs under `set -o pipefail`. `docker ... | grep -q PATTERN`
+# exits grep on its FIRST match, which closes the pipe while docker is still
+# writing; docker then dies of SIGPIPE (141), and pipefail hands that 141 up as
+# the pipeline's status. The `if` therefore reads "not found" for something that
+# is plainly there -- and it does so only once the output is long enough for
+# docker to still be writing when grep leaves, i.e. it passes in every small
+# reproduction and fails against a real multi-megabyte Kit log.
+#
+# `grep -c` reads to EOF, so docker always finishes writing and never gets the
+# signal; the count is what decides. `|| true` absorbs grep's exit 1 on zero
+# matches so the count, not an exit status, is the answer in that case too.
+#
+# _container_exists NAME  -- a container with exactly NAME exists (any state).
+_container_exists() {
+  local hits
+  hits="$(docker ps -a --format '{{.Names}}' | grep -cxF -- "$1" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
+# _container_running NAME -- a container with exactly NAME is currently up.
+_container_running() {
+  local hits
+  hits="$(docker ps --format '{{.Names}}' | grep -cxF -- "$1" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
+# _log_contains NAME MARKER -- NAME's log (stdout+stderr) contains MARKER.
+_log_contains() {
+  local hits
+  hits="$(docker logs "$1" 2>&1 | grep -cF -- "$2" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
 cleanup() {
   local rc=$?
   # Save the producer log BEFORE removing it -- it is the only diagnosis a
   # nightly failure leaves behind.
-  if docker ps -a --format '{{.Names}}' | grep -qx "${PRODUCER_NAME}"; then
+  if _container_exists "${PRODUCER_NAME}"; then
     docker logs "${PRODUCER_NAME}" >"${ARTIFACT_DIR}/producer.log" 2>&1 || true
   fi
   log "teardown: dropping ${VIEWER_NAME} + ${PRODUCER_NAME}"
@@ -213,12 +248,12 @@ log "waiting up to ${BOOT_TIMEOUT}s for: ${READY_MARKER}"
 deadline=$((SECONDS + BOOT_TIMEOUT))
 ready=false
 while [ "${SECONDS}" -lt "${deadline}" ]; do
-  if ! docker ps --format '{{.Names}}' | grep -qx "${PRODUCER_NAME}"; then
+  if ! _container_running "${PRODUCER_NAME}"; then
     fail "producer container exited before the streaming server started"
     docker logs "${PRODUCER_NAME}" 2>&1 | tail -n 60 || true
     exit 1
   fi
-  if docker logs "${PRODUCER_NAME}" 2>&1 | grep -qF "${READY_MARKER}"; then
+  if _log_contains "${PRODUCER_NAME}" "${READY_MARKER}"; then
     ready=true
     break
   fi
