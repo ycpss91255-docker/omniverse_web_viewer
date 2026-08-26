@@ -56,13 +56,31 @@ build path.
 Use the multi-stage builder pattern with DEDICATED build stages:
 
 ```
-                  +- usd-viewer-build  --+
-  devel-base -----+                      +-(COPY dist)-> runtime  (ship, lean)
-       |          +- stream-only-build --+                  +- runtime-test
-       |                                                    +- e2e-test
-       +-------------------------------------(COPY dist)-> devel
-                                                              +- devel-test
+  sys -> devel-base
+            |
+            +- usd-viewer-build  --+
+            |                      +-(COPY dist)-> runtime  (ship, lean)
+            +- stream-only-build --+                  |
+            |                                         +- runtime-test
+            |                                         +- e2e-test
+            |
+            +- example        (demo site on EXAMPLE_PORT; never shipped)
+            |
+            +---------------------(COPY dist)-> devel
+                                                  |
+                                                  +- devel-test
+                                                     ^
+                                                     | COPY bats / shellcheck /
+                                                     | hadolint
+                                                     |
+                                            test-tools-stage
+                                            (FROM ${TEST_TOOLS_IMAGE};
+                                             a pull-only source stage)
 ```
+
+All ELEVEN stages in the Dockerfile appear above. The diagram is the map
+someone reads before touching the file, so a stage missing from it is a stage
+they do not know exists.
 
 - `sys -> devel-base` is the shared foundation (`devel-base` installs `node` +
   `serve`).
@@ -74,6 +92,12 @@ Use the multi-stage builder pattern with DEDICATED build stages:
   `COPY --from` both dists so the uniform entrypoint (`serve /app/$mode/dist`)
   behaves identically to `runtime` for `devel-test`.
 - `runtime-test` / `e2e-test` are `FROM runtime`; `devel-test` is `FROM devel`.
+- `example` is a fourth `FROM devel-base` sibling: it builds and serves
+  `examples/embedded-site-demo` on `EXAMPLE_PORT`, independent of the viewer so
+  both can run at once. It ships nothing and is never pushed.
+- `test-tools-stage` is `FROM ${TEST_TOOLS_IMAGE}` and builds nothing: it exists
+  only so `devel-test` can `COPY --from` bats / shellcheck / hadolint out of a
+  pinned image instead of installing them.
 
 ## Consequences
 
