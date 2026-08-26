@@ -204,6 +204,20 @@ _mutate() {
   assert_output --partial "[no-job-needs-a-report-only-job]"
 }
 
+# M16. Property 4 checks call-release for status functions and never looked at
+# publish-image, which carries `!cancelled()` deliberately. `always()` is not
+# the same tool: it also runs the job in a CANCELLED run, and a cancelled Tier
+# B -- evicted from the GPU concurrency group as a pending member -- is a
+# documented, recurring case in this workflow. Not a bypass on its own, since
+# the explicit `result == 'success'` conjunct still holds; it removes the
+# second of the two independent things stopping the push.
+@test "gates: always() in place of publish-image's !cancelled() is caught" {
+  _mutate 's/^      !cancelled()$/      always()/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publish-image-carries-no-always]"
+}
+
 # M33. `needs:` was read as a STRING and searched for a substring, so a job
 # merely NAMED after the gate satisfied it. Append an `always()`-gated
 # `tier-b-visual-e2e-summary` and point call-release at it: the substring

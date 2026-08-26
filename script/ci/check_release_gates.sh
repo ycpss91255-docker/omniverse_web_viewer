@@ -494,6 +494,21 @@ if ! has_tier_b_success_conjunct "${publish_if}"; then
     "publish-image's condition has no MANDATORY top-level conjunct requiring the picture gate to have succeeded; with its !cancelled() a SKIPPED gate would no longer stop the push. Write it as one top-level '&&' term spelled \"needs.tier-b-visual-e2e.result == 'success'\" (or that with the operands reversed, or either wrapped in parentheses) -- a term nested inside a '||' is an alternative, not a requirement. if: ${publish_if:-<absent>}"
 fi
 
+# --- 2b. and the one status function it carries is the narrow one ---------
+# publish-image needs `!cancelled()` -- call-release is legitimately skipped on
+# both dispatch paths, and without a status function a skipped need would skip
+# this job. `always()` is not the same tool: `!cancelled()` still lets a
+# cancelled run stop the push, and a cancelled Tier B (evicted from the GPU
+# concurrency group as a pending member) is a documented, recurring case here.
+# Swapping one for the other is not a bypass on its own -- the explicit
+# `result == 'success'` conjunct still holds -- but it removes the second of
+# the two independent things stopping a publish, and every other mutation in
+# this file gets easier once it is gone.
+if contains_word 'always(' "${publish_if}"; then
+  violation publish-image-carries-no-always \
+    "publish-image's condition contains always(), where it needs only !cancelled(). always() also runs the job in a CANCELLED run, and a cancelled picture gate -- evicted from the GPU concurrency group as a pending member -- is a documented case here. if: ${publish_if}"
+fi
+
 # --- 3. the Release is wired to the picture gate too ----------------------
 # MEMBERSHIP again, and here it is load-bearing in the most direct way: a
 # substring test is satisfied by an `always()`-gated job called
