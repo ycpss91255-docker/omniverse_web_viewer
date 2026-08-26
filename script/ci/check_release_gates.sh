@@ -336,6 +336,58 @@ tag_trigger_globs() {
   '
 }
 
+# tag_glob_matches <tag>: true when at least one `on.push.tags` pattern would
+# match <tag>.
+#
+# PRESENCE IS NOT REACHABILITY. Property 7 only asked whether the sequence had
+# any items in it, so replacing both patterns with `- 'never-matches-anything'`
+# passed: a real version tag then starts no workflow, reaches no picture gate,
+# and cuts no release. That fails safe -- nothing publishes -- but it fails
+# SILENTLY, which is the class of failure this whole file exists to end.
+#
+# GitHub's tag filter patterns are not shell globs and not regexes: `*` is any
+# run of non-`/` characters, `?` is one, `+` means one-or-more of the
+# preceding character, `[]` is a character class, and `.` is a LITERAL dot.
+# Converted to an ERE here so a real tag can actually be tried against them.
+glob_to_ere() {
+  awk '
+    {
+      out = "^"; inclass = 0; n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (inclass) {
+          out = out c
+          if (c == "]") { inclass = 0 }
+          continue
+        }
+        if (c == "[")      { inclass = 1; out = out c }
+        else if (c == "*") { out = out "[^/]*" }
+        else if (c == "?") { out = out "[^/]" }
+        else if (c == "+") { out = out "+" }
+        else if (index(".(){}|^$\\", c) > 0) { out = out "\\" c }
+        else { out = out c }
+      }
+      print out "$"
+    }
+  '
+}
+
+tag_glob_matches() {
+  local glob ere
+  while IFS= read -r glob; do
+    [ -n "${glob}" ] || continue
+    glob="$(printf '%s\n' "${glob}" | sed -e 's/^[[:space:]]*-[[:space:]]*//' \
+              -e "s/^['\"]//" -e "s/['\"]$//")"
+    ere="$(printf '%s\n' "${glob}" | glob_to_ere)"
+    if printf '%s\n' "$1" | grep -qE "${ere}"; then
+      return 0
+    fi
+  done <<EOF
+$(tag_trigger_globs)
+EOF
+  return 1
+}
+
 # contains_word <needle> <haystack>: substring test, kept as one named idea so
 # the checks below read as assertions rather than as bracket soup.
 #
@@ -543,6 +595,17 @@ EOF
 if [ -z "$(tag_trigger_globs)" ]; then
   violation workflow-triggers-on-tag-push \
     "on.push.tags declares no patterns, so a tag push does not start this workflow and the picture gate never runs for a release"
+else
+  # ... and the patterns match a REAL version tag. Presence was all this
+  # checked, so `- 'never-matches-anything'` passed while no release tag
+  # started the workflow at all. Both shapes this repo cuts are tried, because
+  # the incident that created this rule (#70) was an rc.
+  for probe in v1.2.3 v1.2.3-rc1; do
+    if ! tag_glob_matches "${probe}"; then
+      violation tag-globs-match-a-real-version \
+        "no on.push.tags pattern matches '${probe}', so pushing that tag starts no workflow: no picture gate, no Release, no image, and no signal that anything was meant to happen. Patterns: $(tag_trigger_globs | tr -d ' ' | tr '\n' ' ')"
+    fi
+  done
 fi
 
 # --- 8. ... and reaches the picture gate on EVERY tag push ----------------

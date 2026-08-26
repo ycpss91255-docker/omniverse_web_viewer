@@ -322,6 +322,27 @@ _mutate() {
   assert_output --partial "[workflow-triggers-on-tag-push]"
 }
 
+# M20. Property 7 asked whether `on.push.tags` had any items in it, not
+# whether a real version tag matches one -- so replacing both patterns with a
+# string nothing will ever be called passed. It fails SAFE (nothing publishes)
+# and it fails SILENTLY (pushing v1.2.3 starts no workflow, and no run appears
+# to explain why), which is the pairing this file exists to end. Both shapes
+# this repo cuts are probed, because the incident behind the rule was an rc.
+@test "gates: tag globs that match no real version are caught" {
+  _mutate "s/^      - 'v\[0-9\].*\$/      - 'never-matches-anything'/"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tag-globs-match-a-real-version]"
+}
+
+@test "gates: tag globs that stop matching pre-release tags are caught" {
+  _mutate "/^      - 'v\[0-9\]+.\[0-9\]+.\[0-9\]+-\*'\$/d"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tag-globs-match-a-real-version]"
+  assert_output --partial "v1.2.3-rc1"
+}
+
 @test "gates: tier-b losing its bare tag-push alternative is caught" {
   _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || startsWith(github.ref, 'refs/heads/')#"
   run bash "${CHECK}" "${MUTATED}"
