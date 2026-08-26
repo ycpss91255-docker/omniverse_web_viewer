@@ -4,7 +4,7 @@
 
 一個自包含的範例網站，直接將即時的 Isaac Sim / Kit 串流嵌入到「真實網站」頁面中。它同時是一個 **showcase**（含 header + layout 與即時串流面板），也是一份 **developer reference**（乾淨、可直接複製貼上的整合程式碼）。
 
-與主檢視器不同，此範例是純 **vanilla TypeScript + Vite**，只有 **一個 runtime dependency** -- `@nvidia/omniverse-webrtc-streaming-library`。沒有 React、沒有 bootstrap、沒有選擇畫面：它採用 stream-only 的直接連線。
+與主檢視器不同，此範例是純 **vanilla TypeScript + Vite**，只有 **兩個 runtime dependency** -- `stream-core`（共用的連線核心，npm workspace 的 sibling package）與 `@nvidia/omniverse-webrtc-streaming-library`。沒有 React、沒有 bootstrap、沒有選擇畫面：它採用 stream-only 的直接連線。
 
 ## 檔案結構
 
@@ -12,9 +12,11 @@
 |------|------|
 | `index.html` | 網站外框（header / nav / hero）+ 串流面板（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM + library 接合：解析 target、連線、呈現狀態。 |
-| `src/buildStreamConfig.js` | 純粹、不依賴 DOM 的 DIRECT 串流設定 factory。已驗證並有 unit test。 |
-| `src/buildStreamConfig.test.js` | factory 的 `node --test` unit tests。 |
-| `src/streamTarget.json` | build-time 的 `__OWV_SERVER__` / `__OWV_PORT__` placeholder。 |
+| `src/resolveTarget.js` | 純粹、不依賴 DOM 的 target 解析：以 build-time 代入的 sentinel 為底，可用 `?server=&port=&media=` 覆蓋。 |
+| `test/resolveTarget.test.js` | resolver 的 `node --test` unit tests。 |
+| `src/streamTarget.json` | build-time 的 `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` placeholder。 |
+
+DIRECT config factory 本身**不在**這個範例裡：`buildStreamConfig` 住在 `stream-core` workspace package，與主檢視器共用，本地副本已刪除。
 
 ## 執行（容器）
 
@@ -52,11 +54,10 @@ http://localhost:8080/?server=<host-ip>&port=49100
 整個整合只有三個步驟（見 `src/main.ts`）：
 
 ```ts
-import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
-import { buildStreamConfig } from './buildStreamConfig.js';
+import { buildStreamConfig, connectStream } from 'stream-core';
 
 const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
-AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
+connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
 
@@ -73,7 +74,7 @@ AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 ## 測試 / lint
 
 ```bash
-npm test           # node --test (buildStreamConfig unit tests)
+npm test           # node --test (resolveTarget unit tests)
 npm run lint       # eslint
 npm run build      # vite build -> dist/
 ```

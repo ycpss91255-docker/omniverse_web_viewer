@@ -4,7 +4,7 @@
 
 ライブの Isaac Sim / Kit ストリームを「実際のウェブサイト」ページに直接埋め込む、自己完結型のサンプルサイトです。これは **ショーケース**（ヘッダー + レイアウトとライブストリームパネル）であると同時に、**開発者向けリファレンス**（クリーンでコピー&ペーストできる統合コード）でもあります。
 
-メインビューアとは異なり、このサンプルは純粋な **vanilla TypeScript + Vite** であり、**ランタイム依存は 1 つだけ**です -- `@nvidia/omniverse-webrtc-streaming-library`。React も bootstrap も選択画面もありません。ストリーム専用の直接接続を行います。
+メインビューアとは異なり、このサンプルは純粋な **vanilla TypeScript + Vite** であり、**ランタイム依存は 2 つ**です -- `stream-core`（共有の接続カーネル。npm workspace の sibling パッケージ）と `@nvidia/omniverse-webrtc-streaming-library`。React も bootstrap も選択画面もありません。ストリーム専用の直接接続を行います。
 
 ## レイアウト
 
@@ -12,9 +12,11 @@
 |------|------|
 | `index.html` | サイトの外枠（ヘッダー / ナビ / ヒーロー）+ ストリームパネル（`<video id="remote-video">`）。 |
 | `src/main.ts` | DOM + ライブラリの接着部: ターゲットの解決、接続、ステータスの表示。 |
-| `src/buildStreamConfig.js` | DIRECT ストリーム設定を生成する、純粋で DOM 非依存のファクトリ。検証済みかつユニットテスト済み。 |
-| `src/buildStreamConfig.test.js` | ファクトリ向けの `node --test` ユニットテスト。 |
-| `src/streamTarget.json` | ビルド時の `__OWV_SERVER__` / `__OWV_PORT__` プレースホルダー。 |
+| `src/resolveTarget.js` | 純粋で DOM 非依存のターゲット解決: ビルド時に差し込まれた sentinel を既定とし、`?server=&port=&media=` で上書きできます。 |
+| `test/resolveTarget.test.js` | resolver 向けの `node --test` ユニットテスト。 |
+| `src/streamTarget.json` | ビルド時の `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` プレースホルダー。 |
+
+DIRECT 設定のファクトリ自体はこのサンプルには**ありません**: `buildStreamConfig` は `stream-core` workspace パッケージにあり、メインビューアと共有されています（ローカルの複製は削除済み）。
 
 ## 実行する（コンテナ）
 
@@ -52,11 +54,10 @@ http://localhost:8080/?server=<host-ip>&port=49100
 統合全体は 3 ステップです（`src/main.ts` を参照）:
 
 ```ts
-import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
-import { buildStreamConfig } from './buildStreamConfig.js';
+import { buildStreamConfig, connectStream } from 'stream-core';
 
 const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
-AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
+connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
 
@@ -73,7 +74,7 @@ AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
 ## テスト / lint
 
 ```bash
-npm test           # node --test (buildStreamConfig unit tests)
+npm test           # node --test (resolveTarget unit tests)
 npm run lint       # eslint
 npm run build      # vite build -> dist/
 ```
