@@ -20,8 +20,14 @@
 # red for that.
 #
 # It runs anywhere with bash + awk: no GPU, no tag push, no GitHub, no network,
-# no YAML dependency (the test image has neither python3 nor yq -- see
-# release_gate_workflow.bats, which is the caller on every PR).
+# no YAML dependency. This file used to justify that by saying the test image
+# "has neither python3 nor yq", which is not true: `command -v python3` in the
+# devel-test image answers /usr/bin/python3. What is actually the case is that
+# `yq` is absent AND that python3 has no PyYAML (`import yaml` ->
+# ModuleNotFoundError), so parsing the workflow properly would mean adding a
+# dependency to the image. The conclusion is unchanged; the stated reason for
+# it now matches the image. See release_gate_workflow.bats, the caller on
+# every PR.
 #
 # Every violation is printed with a stable [id]. release_gate_workflow.bats
 # mutates the real workflow once per id and asserts THAT id is reported, so an
