@@ -87,6 +87,15 @@ _write_docker_stub() {
 _signal_driver() {
   local signal="$1" rc=0 pid waited=0
 
+  # JOB CONTROL ON for the launch, and it is not optional. POSIX says a command
+  # started asynchronously (`&`) from a shell WITHOUT job control has SIGINT
+  # and SIGQUIT set to IGNORE, so under bats the SIGINT case would measure
+  # bash's inherited disposition rather than the driver's trap -- observed
+  # here: the driver ignored the signal outright and ran to its boot timeout.
+  # `set -m` gives the child its own process group and the default
+  # dispositions. The kill below still targets the PID, not the group, which is
+  # the case that matters: a process-group signal was never the broken one.
+  set -m
   env \
     PATH="${STUB_BIN}:${PATH}" \
     OWV_STUB_NAME="${STUB_PRODUCER}" \
@@ -100,6 +109,7 @@ _signal_driver() {
     TIER_B_BOOT_TIMEOUT="120" \
     bash "${DRIVER}" >"${DRIVER_LOG}" 2>&1 &
   pid="$!"
+  set +m
 
   # The stub touches this the moment the driver starts the producer, which is
   # immediately before the boot-wait loop.
