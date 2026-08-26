@@ -165,9 +165,31 @@ tag_trigger_globs() {
 
 # contains_word <needle> <haystack>: substring test, kept as one named idea so
 # the checks below read as assertions rather than as bracket soup.
+#
+# SUBSTRING IS NOT A STRUCTURAL TEST, and the checks below use this only where
+# a substring is genuinely the property (a `continue-on-error` anywhere in a
+# job body, a status function anywhere in a condition -- both are "this token
+# must not appear"). Where the property is "this term must be REQUIRED", a
+# substring is a bypass: `(X || Y)` still contains X. Those checks split the
+# expression instead; see is_tier_b_success_test and top_terms.
 contains_word() {
   case "$2" in
     *"$1"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# is_tier_b_success_test <term>: true when <term>, one top-level conjunct of a
+# condition, IS the tier-b success requirement rather than merely containing
+# it. A closed SET of spellings rather than one literal, so an equivalent
+# rewrite is not reported as a bypass; the violation message names the set, so
+# a maintainer who wants a sixth spelling knows what to add here.
+is_tier_b_success_test() {
+  case "$1" in
+    "needs.tier-b-visual-e2e.result == 'success'") return 0 ;;
+    "(needs.tier-b-visual-e2e.result == 'success')") return 0 ;;
+    "'success' == needs.tier-b-visual-e2e.result") return 0 ;;
+    "('success' == needs.tier-b-visual-e2e.result)") return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -200,9 +222,42 @@ fi
 # skipped / cancelled / failure must all block. `!cancelled()` in this job's
 # condition means a skipped need does not skip it, so the explicit result
 # check is the only thing left holding the line.
-if ! contains_word "needs.tier-b-visual-e2e.result == 'success'" "${publish_if}"; then
+#
+# STRUCTURAL, NOT A SUBSTRING. This check used to be `contains_word`, which is
+# exactly the threat this file's own header names -- and two one-line edits
+# walked straight through it while every test stayed green:
+#
+#   (needs.tier-b-visual-e2e.result == 'success' || inputs.publish_image_tag != '')
+#     the required string is still present, but it is now an ALTERNATIVE: a
+#     hand-typed publish_image_tag satisfies the condition with the gate
+#     skipped, failed or never run.
+#
+#   ... && (...) || inputs.publish_image_tag != ''
+#     one `||` appended at the END of the whole condition. `&&` binds tighter
+#     than `||`, so the entire gate chain becomes one alternative of a
+#     disjunction and the other alternative publishes on its own.
+#
+# So both halves are asserted, the same shape property 8 already applies to
+# tier-b's own condition: the requirement must be a MANDATORY TOP-LEVEL
+# CONJUNCT, and the condition must have no top-level `||` for it to be an
+# alternative of.
+if [ "$(printf '%s\n' "${publish_if}" | top_terms '|' | wc -l)" -ne 1 ]; then
+  violation publish-image-gate-is-not-optional \
+    "publish-image's condition has a top-level '||', so every gate in it is merely one ALTERNATIVE -- '&&' binds tighter, and the other side of that '||' publishes on its own. if: ${publish_if:-<absent>}"
+fi
+
+tier_b_success_conjunct=0
+while IFS= read -r term; do
+  if is_tier_b_success_test "${term}"; then
+    tier_b_success_conjunct=1
+  fi
+done <<EOF
+$(printf '%s\n' "${publish_if}" | top_terms '&')
+EOF
+
+if [ "${tier_b_success_conjunct}" -eq 0 ]; then
   violation publish-image-requires-tier-b-success \
-    "publish-image's condition does not require needs.tier-b-visual-e2e.result == 'success'; with its !cancelled() a SKIPPED gate would no longer stop the push. if: ${publish_if:-<absent>}"
+    "publish-image's condition has no MANDATORY top-level conjunct requiring the picture gate to have succeeded; with its !cancelled() a SKIPPED gate would no longer stop the push. Write it as one top-level '&&' term spelled \"needs.tier-b-visual-e2e.result == 'success'\" (or that with the operands reversed, or either wrapped in parentheses) -- a term nested inside a '||' is an alternative, not a requirement. if: ${publish_if:-<absent>}"
 fi
 
 # --- 3. the Release is wired to the picture gate too ----------------------

@@ -100,6 +100,32 @@ _mutate() {
   assert_output --partial "[publish-image-requires-tier-b-success]"
 }
 
+# The two mutations that walked through the substring version of the check
+# above, both of which publish with no picture verified while every test in
+# this repo stays green. They are the named threat model of this whole file
+# ("`|| github.event_name == 'workflow_dispatch'` added to a gate while
+# debugging"), and until now nothing turned red for either.
+#
+# M1: the requirement is still THERE, character for character, but it is now
+# one alternative of a disjunction -- a hand-typed publish_image_tag satisfies
+# it with the gate skipped, failed, or never run.
+@test "gates: the tier-b success requirement demoted to an alternative is caught" {
+  _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& (needs.tier-b-visual-e2e.result == 'success' || inputs.publish_image_tag != '')#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publish-image-requires-tier-b-success]"
+}
+
+# M55: nothing is removed and nothing is wrapped -- one `||` is appended to the
+# END of the condition. `&&` binds tighter than `||`, so the whole gate chain
+# collapses into one side of a disjunction and the other side publishes alone.
+@test "gates: a top-level || appended to publish-image's whole condition is caught" {
+  _mutate "/^              && inputs.publish_image_tag != ''))\$/a\\      || inputs.publish_image_tag != ''"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publish-image-gate-is-not-optional]"
+}
+
 # ---------------------------------------------------------------- release --
 
 @test "gates: dropping tier-b from call-release's needs is caught" {
