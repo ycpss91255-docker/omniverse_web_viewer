@@ -98,8 +98,31 @@ derive_run() {
 }
 
 @test "derive_image_tag: a non-version tag is refused, not published" {
-  # `on: push: tags: ['v*']` would happily fire for this.
+  # This one can no longer reach the workflow -- the push trigger matches the
+  # version SHAPE now, not `v*` -- but the rejection still has to hold here:
+  # the workflow_dispatch escape hatch types a version by hand, and no glob
+  # ever sees that value.
   derive_run tag vlatest push ''
+  assert_failure
+  assert_output --partial 'is not a MAJOR.MINOR.PATCH'
+}
+
+# The refs that DO still slip past the trigger. GitHub's tag filters have no
+# alternation and no anchored character classes, so the pre-release glob
+# `v[0-9]+.[0-9]+.[0-9]+-*` accepts ANY suffix, including these. They reach the
+# workflow and are stopped by its `verify-tag-shape` job, which runs this
+# script before call-release cuts a Release and before the GPU job starts --
+# so this is the assertion that job's correctness rests on.
+@test "derive_image_tag: a malformed pre-release suffix is refused" {
+  derive_run tag v1.2.3-rc_1 push ''
+  assert_failure
+  assert_output --partial 'is not a MAJOR.MINOR.PATCH'
+
+  derive_run tag v1.2.3- push ''
+  assert_failure
+  assert_output --partial 'is not a MAJOR.MINOR.PATCH'
+
+  derive_run tag v1.2.3-rc1+b push ''
   assert_failure
   assert_output --partial 'is not a MAJOR.MINOR.PATCH'
 }

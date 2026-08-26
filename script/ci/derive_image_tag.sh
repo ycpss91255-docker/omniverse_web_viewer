@@ -25,10 +25,20 @@
 # final tag is cut, so `v0.3.0-rc1` must produce a matching `:0.3.0-rc1` image.
 #
 # The accepted shape is semver-ish -- MAJOR.MINOR.PATCH with an optional
-# pre-release suffix. A ref that does not match is a hard failure rather than a
-# best-effort publish: `.github/workflows/main.yaml` triggers on `v*`, so a
-# stray non-version tag would otherwise push a garbage image tag that a
-# consumer could pin and that nothing would ever supersede.
+# pre-release suffix -- and a ref that does not match is a hard failure rather
+# than a best-effort publish, because a garbage image tag is one a consumer can
+# pin and nothing will ever supersede.
+#
+# THIS SCRIPT IS THE GRAMMAR; the workflow's tag globs are only a prefilter.
+# `.github/workflows/main.yaml` no longer triggers on `v*` (so `vlatest` and
+# friends never start a run at all), but GitHub's tag filters have no
+# alternation and no anchored character classes, so its pre-release glob
+# `v[0-9]+.[0-9]+.[0-9]+-*` still admits suffixes VERSION_RE refuses --
+# `v1.2.3-`, `v1.2.3--`, `v1.2.3-rc_1`, `v1.2.3-rc1.`, `v1.2.3-rc1+b`. Those
+# reach the workflow and are stopped by its `verify-tag-shape` job, which runs
+# THIS script before call-release cuts anything and before the GPU job starts.
+# The same rejection also has to hold here for the workflow_dispatch escape
+# hatch, where the version is typed by hand and no glob has seen it.
 #
 # Env (all read from the GitHub Actions context; overridable for testing):
 #   GITHUB_REF_TYPE      "tag" | "branch"

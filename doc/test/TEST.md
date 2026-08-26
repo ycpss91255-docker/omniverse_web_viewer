@@ -1,6 +1,6 @@
 # TEST.md
 
-**150 tests** total: **55 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **86 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**151 tests** total: **56 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **86 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
@@ -53,7 +53,7 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `example: streamTarget.json carries all three sentinels` | server/port/media sentinels present |
 | `example: resolveTarget unit tests pass (node --test)` | Runs the example's own glue tests in-image |
 
-## test/bats/smoke/devel-test/derive_image_tag.bats (14)
+## test/bats/smoke/devel-test/derive_image_tag.bats (15)
 
 Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the `publish-image` job (#66). The release/image pairing only holds because that tag is DERIVED from the git ref instead of typed in, so this is the table of refs a real push produces -- and the only part of the tag-triggered publish path provable without pushing a tag. The script is copied into the image at `/ci/` by the `devel-test` stage and run there.
 
@@ -70,7 +70,8 @@ Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the
 | `provenance names the rule that fired` | The CI log records WHICH rule produced the tag |
 | `a plain main push publishes nothing` | Nothing publishes on a `main` push |
 | `a dispatch with an empty input publishes nothing` | An empty escape hatch is a no-op, not a guess |
-| `a non-version tag is refused, not published` | `on: push: tags: ['v*']` also fires for `vlatest` |
+| `a non-version tag is refused, not published` | `vlatest` can no longer reach the workflow (the push trigger matches the version SHAPE, not `v*`), but the dispatch escape hatch types a version by hand and no glob sees it |
+| `a malformed pre-release suffix is refused` | The refs that DO still slip past the trigger: GitHub's tag filters have no alternation or anchored classes, so `v[0-9]+.[0-9]+.[0-9]+-*` accepts `v1.2.3-`, `v1.2.3-rc_1`, `v1.2.3-rc1+b`. The `verify-tag-shape` job stops them by running this script before anything irreversible, so this is the assertion that job rests on |
 | `a truncated version tag is refused` | `v0.3` is not MAJOR.MINOR.PATCH |
 | `a dispatch input that is not a version is refused` | Same validation on the escape-hatch path |
 
