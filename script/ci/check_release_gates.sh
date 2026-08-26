@@ -158,7 +158,18 @@ job_key() {
       exit
     }
     END {
-      if (found) { sub(/^[|>][-+]?[[:space:]]*/, "", acc); print acc }
+      if (!found) { exit }
+      sub(/^[|>][-+]?[[:space:]]*/, "", acc)
+      # A `${{ }}` wrapper is YAML/Actions notation, not part of the
+      # expression GitHub evaluates -- both spellings of an `if:` are legal
+      # and identical in meaning. Stripping it here is what stops a
+      # re-wrapped-but-unchanged condition being reported as a violation, and
+      # what stops the wrapper hiding a term from the callers that split the
+      # expression (the trailing ` }}` used to be glued to the last term, so
+      # only the term written LAST was unrecognisable).
+      sub(/^[$][{][{][[:space:]]*/, "", acc)
+      sub(/[[:space:]]*[}][}]$/, "", acc)
+      print acc
     }
   '
 }
@@ -628,6 +639,13 @@ fi
 # one of its top-level alternatives, AND must have no top-level `&&` -- an
 # added `&& github.event_name != 'schedule'` would leave the alternative
 # present while making the whole condition false for a tag push.
+#
+# The alternative is matched against a SET of spellings (is_tag_ref_test), not
+# one literal. `github.ref_type == 'tag'` was reported as a violation even
+# though verify-tag-shape ten lines away in the same file guards its own step
+# with exactly that spelling -- a false positive on a correct edit, which
+# teaches a maintainer that the gate is noise and is how a real violation gets
+# waved past next time.
 if [ -z "${tier_b_if}" ]; then
   violation tier-b-reachable-on-every-tag-push \
     "tier-b-visual-e2e has no job-level condition to check; is the job still there?"
@@ -636,10 +654,17 @@ else
     violation tier-b-reachable-on-every-tag-push \
       "tier-b-visual-e2e's condition has a top-level '&&', so it is no longer true for every tag push. if: ${tier_b_if}"
   fi
-  if ! printf '%s\n' "${tier_b_if}" | top_terms '|' \
-      | grep -qxF "startsWith(github.ref, 'refs/tags/')"; then
+  tier_b_tag_alternative=0
+  while IFS= read -r term; do
+    if is_tag_ref_test "${term}"; then
+      tier_b_tag_alternative=1
+    fi
+  done <<EOF
+$(printf '%s\n' "${tier_b_if}" | top_terms '|')
+EOF
+  if [ "${tier_b_tag_alternative}" -eq 0 ]; then
     violation tier-b-reachable-on-every-tag-push \
-      "tier-b-visual-e2e's condition has no bare \"startsWith(github.ref, 'refs/tags/')\" alternative, so a tag push can reach the Release without the picture gate. if: ${tier_b_if}"
+      "tier-b-visual-e2e's condition has no bare tag-ref test as a top-level alternative, so a tag push can reach the Release without the picture gate. Accepted spellings are \"startsWith(github.ref, 'refs/tags/')\", \"github.ref_type == 'tag'\" and that with the operands reversed, each optionally parenthesised; anything else must be added to is_tag_ref_test so this stays a check on MEANING rather than on wording. if: ${tier_b_if}"
   fi
 fi
 

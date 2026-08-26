@@ -374,6 +374,63 @@ _mutate() {
   assert_output --partial "[tier-b-reachable-on-every-tag-push]"
 }
 
+# ------------------------------------------- equivalent spellings pass -----
+#
+# The other half of a structural check, and the half this repo keeps getting
+# wrong in the opposite direction. A checker that reports a CORRECT edit as a
+# violation teaches maintainers that it is noise, and a gate people have
+# learned to work around is worse than no gate -- it is the same board of
+# green checks with an extra step of ceremony. Both of these are semantically
+# identical to what ships, and both were rejected.
+#
+# M22: `github.ref_type == 'tag'` -- rejected even though verify-tag-shape ten
+# lines away in the same file guards its own step with exactly that spelling.
+@test "gates: github.ref_type == 'tag' is accepted as the tag-ref test" {
+  _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || github.ref_type == 'tag'#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# M6: the same condition written as one `${{ }}`-wrapped line with the tag
+# alternative LAST. The wrapper is Actions notation, not part of the
+# expression, and order does not change a disjunction -- but the trailing
+# ` }}` used to be glued onto whichever term was written last, so only that
+# term became unrecognisable.
+@test "gates: a \${{ }}-wrapped tier-b condition with the tag test last passes" {
+  new_if="    if: \${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.run_tier_b || inputs.publish_image_tag != '')) || startsWith(github.ref, 'refs/tags/') }}"
+  awk -v repl="${new_if}" '
+    /^  tier-b-visual-e2e:$/ { intb = 1 }
+    intb && !done && /^    if: >-$/ { print repl; skip = 1; done = 1; next }
+    skip && /^    runs-on:/ { skip = 0 }
+    skip { next }
+    { print }
+  ' "${WORKFLOW}" > "${MUTATED}"
+  if cmp -s "${MUTATED}" "${WORKFLOW}"; then
+    echo "rewrite matched nothing, so this case proves nothing" >&2
+    return 1
+  fi
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# And the rewrite above must not have become a blanket pass: the SAME `${{ }}`
+# spelling with the tag alternative removed is still caught.
+@test "gates: a \${{ }}-wrapped tier-b condition missing the tag test is caught" {
+  new_if="    if: \${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.run_tier_b || inputs.publish_image_tag != '')) }}"
+  awk -v repl="${new_if}" '
+    /^  tier-b-visual-e2e:$/ { intb = 1 }
+    intb && !done && /^    if: >-$/ { print repl; skip = 1; done = 1; next }
+    skip && /^    runs-on:/ { skip = 0 }
+    skip { next }
+    { print }
+  ' "${WORKFLOW}" > "${MUTATED}"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-reachable-on-every-tag-push]"
+}
+
 # tier-b-visual-e2e needs verify-tag-shape, and a SKIPPED need skips its
 # dependent. verify-tag-shape carries no job-level `if:` for exactly that
 # reason -- the tag check is guarded per-step instead -- so an `if:` added here
