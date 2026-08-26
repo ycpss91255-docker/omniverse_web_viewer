@@ -28,12 +28,19 @@ on:
       # It is NOT an escape from the picture gate (#70): a non-empty value here
       # makes tier-b-visual-e2e run for this dispatch as well, and the publish
       # is gated on it succeeding exactly as a tag push is.
+      #
+      # Nor is it an escape from the release/image pairing: this value is only
+      # SHAPE-checked by derive_image_tag.sh, and GHCR tags are mutable, so
+      # publish-image additionally requires the version to already exist as the
+      # tag v<version> AT THIS EXACT COMMIT. See the guard step in that job.
       publish_image_tag:
         description: >-
           Publish the runtime image to GHCR under this version (e.g. 0.3.0).
           Ignored on a tag ref -- the tag itself wins. Leave empty to publish
           nothing. Publishing ALWAYS runs the Tier B visual acceptance first
-          (self-hosted GPU runner), whatever the box above says.
+          (self-hosted GPU runner), whatever the box above says. Off a non-tag
+          ref the version must already be a tag pointing at the commit being
+          built, or the publish is refused.
         type: string
         default: ''
 
@@ -223,6 +230,56 @@ jobs:
           ref="ghcr.io/${GITHUB_REPOSITORY}:${tag}"
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
           echo "Publishing \`${ref}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+      # THE ESCAPE HATCH'S MISSING GUARD.
+      #
+      # On a tag ref the version is DERIVED and cannot drift. On the dispatch
+      # path it is typed by hand, derive_image_tag.sh checks only its SHAPE, and
+      # GHCR tags are MUTABLE -- so a single dispatch from main with
+      # publish_image_tag=0.3.0 would have replaced the image behind the v0.3.0
+      # Release with a build of arbitrary branch code, silently. The downstream
+      # consumer that pins :0.3.0 (isaac#173) would then be running code no
+      # Release points at, with no signal that anything moved. The same input
+      # could also mint a version-tagged image with no Release behind it at all
+      # -- "a dangling artifact a consumer could pin", which the comment block
+      # above this job names as the state to avoid.
+      #
+      # Rule: the requested version must ALREADY exist as the tag v<version>,
+      # and that tag must point at the commit this run is building. The
+      # documented recovery case still works -- a Release whose image push
+      # failed is republished by dispatching with the TAG selected as the ref,
+      # where derive_image_tag uses the ref and this check is satisfied by
+      # construction -- while publishing branch code under a released version is
+      # refused. Skipped entirely on the tag path, which cannot drift by design.
+      - name: Refuse a hand-typed version that is not this commit's own tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          version="${IMAGE_REF##*:}"
+          sha_re='^[0-9a-f]{40}$'
+          # A miss prints an error BODY rather than failing quietly, so the
+          # answer is validated by shape, not by exit status.
+          object="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/v${version}" \
+                      -q '.object.sha' 2>/dev/null || true)"
+          if [[ ! "${object}" =~ ${sha_re} ]]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: no tag v${version} exists, so this image would have no Release behind it"
+            exit 1
+          fi
+          # Lightweight tags point straight at a commit; annotated tags (what
+          # this repo cuts) point at a tag object that must be dereferenced.
+          commit="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${object}" \
+                      -q '.object.sha' 2>/dev/null || true)"
+          if [[ ! "${commit}" =~ ${sha_re} ]]; then
+            commit="${object}"
+          fi
+          if [ "${commit}" != "${GITHUB_SHA}" ]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: tag v${version} is ${commit}, but this run builds ${GITHUB_SHA} -- publishing would re-point a released image at different code"
+            exit 1
+          fi
+          echo "v${version} resolves to ${commit}, which is this run's commit."
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
