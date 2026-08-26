@@ -13,3 +13,9 @@ coverage/
 # Tier B visual acceptance evidence (#48): frame PNG, luma stats, Playwright
 # trace, producer container log. Written by script/ci/tier_b_visual_e2e.sh.
 .tier-b-artifacts/
+
+# Per-host runtime config (config/host.yaml.example says "gitignored,
+# per-host", and until now nothing made that true). It carries this host's
+# public_ip / ui_mode and is mounted into the container at /etc/host.yaml;
+# committing one machine's copy would silently repoint everyone else's viewer.
+config/host.yaml
