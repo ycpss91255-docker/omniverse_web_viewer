@@ -164,6 +164,18 @@ warn_flat_key() {
 # refused; see the asymmetry note above yaml_top_level_key.
 # Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
+# Initialised HERE, not left to `${flat_ui_mode_supplier:-}` at the point of
+# use. This script is the container ENTRYPOINT, so its environment is
+# operator- and compose-controlled: an unset shell variable read out of the
+# environment is an operator-supplied value. With `docker run -e
+# flat_ui_mode_supplier=...` and NO /etc/host.yaml mounted at all, the block
+# below never runs, the deferred warning fires anyway, and the boot log states
+# that a file which does not exist carries a key it does not have -- with the
+# operator's own text spliced in as the supplier. Nothing behaves differently,
+# so it is not a bypass; it is the log saying something that is not true,
+# which is the class of failure every fix in this file is about.
+flat_ui_mode_supplier=""
+
 if [ -f /etc/host.yaml ]; then
   # An UNREADABLE host.yaml is an operator mistake, not an absent file, and it
   # must not be treated as one. awk's failure used to be swallowed
@@ -216,7 +228,7 @@ VIEWER_UI_MODE="${VIEWER_UI_MODE:-usd-viewer}"
 # The deferred half of the flat-ui_mode note above: emitted here so it can name
 # the resolved mode. Fires only when /etc/host.yaml carried a column-0
 # `ui_mode:` AND our own `viewer:` section supplied nothing.
-if [ -n "${flat_ui_mode_supplier:-}" ]; then
+if [ -n "${flat_ui_mode_supplier}" ]; then
   warn_flat_key ui_mode viewer /etc/host.yaml \
     "${VIEWER_UI_MODE}" "${flat_ui_mode_supplier}"
 fi

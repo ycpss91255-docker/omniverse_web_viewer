@@ -313,6 +313,23 @@ teardown() {
   assert_success
 }
 
+# The supplier variable was never initialised, and it is read in a script that
+# is the container ENTRYPOINT -- so its environment is operator- and
+# compose-controlled, and an unset shell variable read out of the environment
+# is an operator-supplied value. With no /etc/host.yaml mounted AT ALL, the
+# deferred warning fired anyway and the boot log described a key in a file
+# that does not exist, with the operator's own text spliced in as the source.
+# Behaviour was unaffected -- so not a bypass, but a log saying something that
+# is not true, which is the class every other fix in this file is about.
+@test "a flat_ui_mode_supplier in the environment invents no host.yaml note" {
+  run test -f /etc/host.yaml
+  assert_failure
+  flat_ui_mode_supplier="ghost-supplier-text" run /entrypoint.sh true
+  assert_success
+  refute_output --partial "top-level 'ui_mode:'"
+  refute_output --partial "ghost-supplier-text"
+}
+
 # An unreadable host.yaml is an operator mistake, not an absent file. awk's
 # failure was swallowed, so the container booted on env/defaults and dialled
 # whatever address the operator had just moved OUT of the env and INTO that
