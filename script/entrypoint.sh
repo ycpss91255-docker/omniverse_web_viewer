@@ -43,7 +43,9 @@ set -euo pipefail
 # file's own schema defines can steer the viewer.
 #
 # A top-level key (column 0) opens or closes the section; only INDENTED keys
-# inside the requested section are considered.
+# inside the requested section are considered. A key written AT column 0 is
+# therefore not a value of ours -- see yaml_top_level_key below, which refuses
+# to let that be silent.
 yaml_value() {
   awk -v section="$1" -v key="$2" '
     /^[^[:space:]#]/ {
@@ -61,6 +63,49 @@ yaml_value() {
       exit
     }
   ' "$3"
+}
+
+# yaml_top_level_key <key> <file>: true when `<key>:` appears at COLUMN 0.
+#
+# Scoping the lookup above to `network:` / `viewer:` closed a real hole (a
+# foreign section's key steering this viewer) but opened a quieter one: before
+# it, `^[[:space:]]*key:` also matched column 0, so a FLAT host.yaml --
+# `public_ip: "10.9.9.9"` with no `network:` above it -- used to work. After
+# it, that file resolves nothing and the container boots on env/defaults,
+# dialling an address nobody chose with exit 0 and HTTP 200. That is the exact
+# failure mode the unreadable-host.yaml fix declared unacceptable, so a flat
+# key is REFUSED rather than accepted-as-fallback or ignored.
+#
+# Refused, not accepted, because the shared-file argument still applies: a key
+# at column 0 in a file shared with other containers (isaac#65) is addressed to
+# nobody in particular, and quietly steering the viewer from it is what the
+# scoping fix exists to prevent. The refusal fires only when our own section
+# produced NO value, so a file that configures the viewer properly is never
+# blocked by a stray top-level key someone else's container reads -- and adding
+# our section is the escape hatch for that case, which is also the fix the
+# error message asks for.
+yaml_top_level_key() {
+  awk -v key="$1" '
+    $0 ~ "^" key ":" { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$2"
+}
+
+# refuse_flat_key <key> <section> <file>: exit 1 when <key> is at column 0 and
+# the scoped lookup found nothing, so a misplaced key is never silently
+# ignored. Called only after the scoped lookup came back empty.
+refuse_flat_key() {
+  local key="$1" section="$2" file="$3"
+  if yaml_top_level_key "${key}" "${file}"; then
+    echo "entrypoint: ${file} has a top-level '${key}:' but no '${section}:'" \
+         "section supplying it; this file's keys are read from their own" \
+         "section only, so that value would be silently ignored and the" \
+         "viewer would boot on env/defaults. Indent it under '${section}:'" \
+         "(see config/host.yaml.example). If that key belongs to another" \
+         "container, give the viewer its own '${section}: ${key}: ...' and" \
+         "that value wins" >&2
+    exit 1
+  fi
 }
 
 # Per-host config (mounted by caller from config/host.yaml). When
@@ -88,10 +133,18 @@ if [ -f /etc/host.yaml ]; then
   fi
 
   host_ip="$(yaml_value network public_ip /etc/host.yaml)"
-  if [ -n "${host_ip}" ]; then SIGNALING_SERVER="${host_ip}"; fi
+  if [ -n "${host_ip}" ]; then
+    SIGNALING_SERVER="${host_ip}"
+  else
+    refuse_flat_key public_ip network /etc/host.yaml
+  fi
 
   yaml_ui_mode="$(yaml_value viewer ui_mode /etc/host.yaml)"
-  if [ -n "${yaml_ui_mode}" ]; then VIEWER_UI_MODE="${yaml_ui_mode}"; fi
+  if [ -n "${yaml_ui_mode}" ]; then
+    VIEWER_UI_MODE="${yaml_ui_mode}"
+  else
+    refuse_flat_key ui_mode viewer /etc/host.yaml
+  fi
 fi
 
 # Resolve final values (built-in defaults). MEDIA_PORT has NO default:

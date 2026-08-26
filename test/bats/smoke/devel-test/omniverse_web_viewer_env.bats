@@ -230,6 +230,37 @@ teardown() {
   assert_success
 }
 
+# Scoping the lookup to `network:` / `viewer:` also stopped matching column 0,
+# which the old `^[[:space:]]*<key>:` did match -- so a FLAT host.yaml went from
+# working to being silently ignored: exit 0, HTTP 200, dialling whatever the env
+# default is instead of the address in the file the operator just wrote. That is
+# the same silent-wrong-address failure the unreadable-file case refuses, so a
+# misplaced key is refused too, not guessed at and not ignored.
+@test "a FLAT host.yaml key is refused, not silently ignored" {
+  printf 'public_ip: "10.9.9.9"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "top-level 'public_ip:'"
+  # And it must not have quietly dialled the default instead.
+  run grep -rF "10.9.9.9" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+}
+
+# The refusal must not fire on a file that configures the viewer properly: a
+# top-level key someone else's container reads is exactly what /etc/host.yaml
+# being SHARED means, and our own section is the answer to it.
+@test "a top-level key does not refuse when the section supplies the value" {
+  printf 'network:\n  public_ip: "10.22.22.22"\npublic_ip: "10.9.9.9"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_success
+  run grep -rF "10.22.22.22" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.9.9.9" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+}
+
 # An unreadable host.yaml is an operator mistake, not an absent file. awk's
 # failure was swallowed, so the container booted on env/defaults and dialled
 # whatever address the operator had just moved OUT of the env and INTO that
