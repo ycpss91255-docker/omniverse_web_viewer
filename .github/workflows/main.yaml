@@ -175,8 +175,23 @@ jobs:
     # release is BLOCKED, not waved through. There is no override input, no
     # continue-on-error and no `if: always()` escape by design -- an override
     # on this gate would be reached for exactly when it matters most.
+    #
+    # The second clause below carves out the IMAGE-ONLY RECOVERY DISPATCH. The
+    # documented way to republish an image whose push failed is to dispatch
+    # this workflow with the TAG selected as the ref (see the publish guard's
+    # note), and the gate here was ref-shape only -- so that dispatch also
+    # re-ran call-release against a Release that already exists, having first
+    # spent a fresh Tier B run on the shared GPU. If the re-cut errored,
+    # publish-image's `needs.call-release.result` condition then blocked the
+    # image republish, defeating the whole point of the dispatch. A dispatch
+    # carrying publish_image_tag is asking for an IMAGE; the Release is already
+    # there, so this job stands down. Note this is still a plain condition,
+    # with no status function in it -- the picture-gate rule above is intact.
     needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: >-
+      startsWith(github.ref, 'refs/tags/')
+      && !(github.event_name == 'workflow_dispatch'
+           && inputs.publish_image_tag != '')
     # Back on a released base tag: the temporary commit-SHA pin from #66 is
     # gone and #67's condition is met. v0.42.0's archive step copies
     # `Dockerfile script/ .hadolint.yaml test/bats/smoke/ .base/ README.md
@@ -229,8 +244,11 @@ jobs:
     #
     # `!cancelled()` rather than the implicit success(): a job whose `needs`
     # include a SKIPPED job is skipped unless the condition uses a status
-    # function, and call-release is legitimately skipped on the manual
-    # escape-hatch path (no tag ref). The explicit `needs.*.result` checks put
+    # function, and call-release is legitimately skipped on BOTH dispatch
+    # paths -- the manual escape hatch off a branch (no tag ref) and the
+    # image-only recovery dispatch off a tag ref, which stands down rather than
+    # re-cutting a Release that already exists. The explicit `needs.*.result`
+    # checks put
     # back the strictness that buys -- and note that only call-release is
     # allowed to be 'skipped'. tier-b-visual-e2e must be 'success' outright:
     # skipped, failed, cancelled and timed-out all block the publish, on the
