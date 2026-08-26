@@ -166,6 +166,16 @@ test('stream-only dials the injected target', async ({ page }) => {
   const status = page.locator('#stream-status');
   await expect(status).not.toHaveClass(/error/);
   await expect(status).not.toContainText(/invalid/i);
+
+  // The collector above was registered and then never read, so an uncaught
+  // exception in OUR OWN bundle passed this gate silently -- while the sibling
+  // usd-viewer test, for the app we do NOT control, asserted it. The dial event
+  // is dispatched BEFORE the streaming library is wired, so main.ts could throw
+  // while wiring the status callbacks and the primary assertion above would
+  // still pass, with #stream-status neither in `error` nor reading `invalid`.
+  // Dying against the dead test host is expected and is not an uncaught error:
+  // the connect rejection is caught in main.ts.
+  expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
 test('usd-viewer dials the injected target', async ({ page }) => {
