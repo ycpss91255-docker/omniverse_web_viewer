@@ -242,6 +242,46 @@ _mutate() {
   assert_output --partial "[needs-name-a-job-that-exists]"
 }
 
+# M2. Every property above names call-release and publish-image, because those
+# were the two jobs that published anything when they were written. A name list
+# cannot see a new entry: this job logs in to GHCR and pushes an image, needs
+# only the build, and is behind no gate whatsoever -- and nothing in this file
+# looked at it. The set of jobs that can publish is now DERIVED from the file.
+@test "gates: a NEW publishing job with no picture gate is caught" {
+  {
+    cat "${WORKFLOW}"
+    printf '%s\n' \
+      "  publish-image-hotfix:" \
+      "    needs: [call-docker-build]" \
+      "    runs-on: ubuntu-latest" \
+      "    permissions:" \
+      "      contents: read" \
+      "      packages: write" \
+      "    steps:" \
+      "      - name: Log in to GHCR" \
+      "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0" \
+      "      - name: Build and push the runtime image" \
+      "        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0" \
+      "        with:" \
+      "          push: true"
+  } > "${MUTATED}"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publishing-job-is-behind-the-picture-gate]"
+  assert_output --partial "publish-image-hotfix"
+}
+
+# The vacuity guard for that derivation: a checker that can no longer find
+# ANYTHING that publishes must say so rather than report an invariant holding
+# over a workflow it has stopped understanding.
+@test "gates: a workflow whose jobs publish nothing is an error, not a pass" {
+  printf 'name: X\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' \
+    > "${TMP}/nopub.yaml"
+  run bash "${CHECK}" "${TMP}/nopub.yaml"
+  assert_failure 1
+  assert_output --partial "[publishing-jobs-are-identifiable]"
+}
+
 # ------------------------------------------------------- tag reachability --
 
 @test "gates: removing the tag push trigger is caught" {

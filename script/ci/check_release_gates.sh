@@ -33,12 +33,48 @@ WORKFLOW="${1:-.github/workflows/main.yaml}"
 
 # The jobs on the publish path. A `continue-on-error` on any of these turns a
 # gate into a suggestion, at job level or on any step inside one.
+#
+# This is a NAME LIST, and a name list only knows the jobs that existed when
+# it was written. It is not what decides which jobs must carry the picture
+# gate -- that set is DERIVED from the file by publishing_jobs() below,
+# because a job added tomorrow is invisible here. Keep this list for the jobs
+# whose ROLE is not derivable (verify-tag-shape and tier-b-visual-e2e publish
+# nothing; they are gates), and let the derivation cover the rest.
 GATE_JOBS=(
   call-docker-build
   verify-tag-shape
   call-release
   publish-image
   tier-b-visual-e2e
+)
+
+# Textual evidence that a job can put something PERMANENT somewhere: a
+# registry login, a pushing build, a Release action, or a token scope that
+# only a publishing job needs.
+#
+# WHY DERIVED. GATE_JOBS above is an allowlist, so a NEW publishing job is
+# invisible to every check keyed off it: a `publish-image-hotfix:` job that
+# logs in to GHCR and pushes, with `needs: [call-docker-build]` and no picture
+# gate at all, was caught by nothing. The rule is not about the five names
+# anyone happened to write down -- it is that anything which publishes stands
+# behind the gate.
+#
+# WHAT IT CANNOT SEE (stated because an over-claimed gate is worse than a
+# named-scope one): a job that publishes through a mechanism none of these
+# strings name -- a `curl -T` to some registry with a secret, a third-party
+# action nobody here has heard of, an inline `docker` invocation spelled
+# differently -- is not derived and is therefore not required to carry the
+# gate. Widening this list is the whole cost of closing that.
+PUBLISH_SIGNALS=(
+  'packages: write'
+  'contents: write'
+  'docker/login-action'
+  'push: true'
+  'action-gh-release'
+  'release-worker'
+  'gh release create'
+  'docker push'
+  'npm publish'
 )
 
 # Report-only jobs. They exist to ADD a failure (a blocked release that would
@@ -235,6 +271,59 @@ needs_job() {
   needs_list "$1" | grep -qxF "$2"
 }
 
+# publishing_jobs: every job whose body carries one of PUBLISH_SIGNALS, in
+# file order. Derived rather than listed; see PUBLISH_SIGNALS for what that
+# buys and what it still cannot see.
+publishing_jobs() {
+  local job body signal
+  while IFS= read -r job; do
+    [ -n "${job}" ] || continue
+    body="$(job_body "${job}")"
+    for signal in "${PUBLISH_SIGNALS[@]}"; do
+      if contains_word "${signal}" "${body}"; then
+        printf '%s\n' "${job}"
+        break
+      fi
+    done
+  done <<EOF
+$(list_jobs)
+EOF
+}
+
+# has_top_level_or <expr>: true when <expr> has a `||` at parenthesis depth 0,
+# i.e. when everything else in it is merely one ALTERNATIVE (`&&` binds
+# tighter than `||`).
+has_top_level_or() {
+  [ "$(printf '%s\n' "$1" | top_terms '|' | wc -l)" -ne 1 ]
+}
+
+# has_tier_b_success_conjunct <expr>: true when one top-level `&&` term of
+# <expr> IS the tier-b success test (not merely contains it).
+has_tier_b_success_conjunct() {
+  local term
+  while IFS= read -r term; do
+    if is_tier_b_success_test "${term}"; then
+      return 0
+    fi
+  done <<EOF
+$(printf '%s\n' "$1" | top_terms '&')
+EOF
+  return 1
+}
+
+# has_status_function <expr>: true when <expr> contains always() / success() /
+# failure() / cancelled(). Substring IS the property here: the rule is that
+# the token must not appear anywhere.
+has_status_function() {
+  local fn
+  for fn in 'always(' 'success(' 'failure(' 'cancelled('; do
+    if contains_word "${fn}" "$1"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # tag_trigger_globs: the `on.push.tags` sequence items.
 tag_trigger_globs() {
   normalize | awk '
@@ -343,21 +432,12 @@ fi
 # tier-b's own condition: the requirement must be a MANDATORY TOP-LEVEL
 # CONJUNCT, and the condition must have no top-level `||` for it to be an
 # alternative of.
-if [ "$(printf '%s\n' "${publish_if}" | top_terms '|' | wc -l)" -ne 1 ]; then
+if has_top_level_or "${publish_if}"; then
   violation publish-image-gate-is-not-optional \
     "publish-image's condition has a top-level '||', so every gate in it is merely one ALTERNATIVE -- '&&' binds tighter, and the other side of that '||' publishes on its own. if: ${publish_if:-<absent>}"
 fi
 
-tier_b_success_conjunct=0
-while IFS= read -r term; do
-  if is_tier_b_success_test "${term}"; then
-    tier_b_success_conjunct=1
-  fi
-done <<EOF
-$(printf '%s\n' "${publish_if}" | top_terms '&')
-EOF
-
-if [ "${tier_b_success_conjunct}" -eq 0 ]; then
+if ! has_tier_b_success_conjunct "${publish_if}"; then
   violation publish-image-requires-tier-b-success \
     "publish-image's condition has no MANDATORY top-level conjunct requiring the picture gate to have succeeded; with its !cancelled() a SKIPPED gate would no longer stop the push. Write it as one top-level '&&' term spelled \"needs.tier-b-visual-e2e.result == 'success'\" (or that with the operands reversed, or either wrapped in parentheses) -- a term nested inside a '||' is an alternative, not a requirement. if: ${publish_if:-<absent>}"
 fi
@@ -387,7 +467,12 @@ for fn in 'always(' 'success(' 'failure(' 'cancelled('; do
 done
 
 # --- 5. no gate may be advisory ------------------------------------------
-for job in "${GATE_JOBS[@]}"; do
+# Over the named gate jobs AND every derived publishing job, so a job invented
+# after this list was written cannot opt out of the rule by not being on it.
+PUBLISHING_JOBS="$(publishing_jobs)"
+
+while IFS= read -r job; do
+  [ -n "${job}" ] || continue
   body="$(job_body "${job}")"
   if [ -z "${body}" ]; then
     violation gate-job-has-no-continue-on-error \
@@ -398,7 +483,9 @@ for job in "${GATE_JOBS[@]}"; do
     violation gate-job-has-no-continue-on-error \
       "gate job '${job}' carries continue-on-error, which turns a gate into a suggestion"
   fi
-done
+done <<EOF
+$(printf '%s\n' "${GATE_JOBS[@]}" "${PUBLISHING_JOBS}" | grep -v '^$' | sort -u)
+EOF
 
 # --- 6. a report-only job may only ADD a failure --------------------------
 while read -r job; do
@@ -549,6 +636,59 @@ EOF
     esac
   fi
 done
+
+# --- 11. EVERY job that can publish stands behind the picture gate --------
+# Properties 1-4 name call-release and publish-image, because those are the
+# two jobs that published anything when they were written. That is an
+# allowlist, and an allowlist cannot see a new entry: a `publish-image-hotfix:`
+# job that logs in to GHCR and pushes with `needs: [call-docker-build]` and no
+# gate at all was caught by nothing in this file.
+#
+# So the set is DERIVED (publishing_jobs / PUBLISH_SIGNALS) and each member
+# must be behind the gate by ONE OF THE TWO MECHANISMS this workflow uses --
+# they are not interchangeable and each is only safe on its own terms:
+#
+#   A. no status function in the job's condition. GitHub's default rule ("a
+#      job is skipped when a job it needs did not succeed") then applies, and
+#      that default is what makes an unavailable GPU runner block the release.
+#      This is call-release.
+#
+#   B. a status function, plus an explicit MANDATORY top-level conjunct
+#      requiring the gate to have succeeded, and no top-level `||` for that
+#      conjunct to be an alternative of. This is publish-image, whose
+#      `!cancelled()` it needs because call-release is legitimately skipped on
+#      both dispatch paths.
+#
+# Either way, `needs:` must have the gate as an item -- without that the
+# condition has no result to read and GitHub evaluates `needs.<job>.result` to
+# the empty string.
+if [ -z "${PUBLISHING_JOBS}" ]; then
+  violation publishing-jobs-are-identifiable \
+    "no job in ${WORKFLOW} carries any evidence of publishing (registry login, push: true, a Release action, packages/contents write). Either the publish path was removed, or it is now spelled in a way this checker cannot see -- and a gate that cannot find the thing it gates reports an invariant that protects nothing"
+fi
+
+while IFS= read -r job; do
+  [ -n "${job}" ] || continue
+  # The gate cannot be required to stand behind itself.
+  if [ "${job}" = "tier-b-visual-e2e" ]; then
+    continue
+  fi
+  if ! needs_job "${job}" tier-b-visual-e2e; then
+    job_needs="$(job_key "${job}" needs)"
+    violation publishing-job-is-behind-the-picture-gate \
+      "job '${job}' can publish (it carries a registry login, a pushing build, a Release action or a write token scope) but does not have tier-b-visual-e2e as an item of its needs, so it can publish for a commit whose picture was never verified. needs: ${job_needs:-<absent>}"
+    continue
+  fi
+  job_if="$(job_key "${job}" if)"
+  if has_status_function "${job_if}" \
+     && ! { has_tier_b_success_conjunct "${job_if}" \
+            && ! has_top_level_or "${job_if}"; }; then
+    violation publishing-job-is-behind-the-picture-gate \
+      "job '${job}' can publish and its condition carries a status function, which overrides GitHub's default skip propagation -- so a SKIPPED picture gate no longer stops it. A job in that position must ALSO require the gate explicitly, as a mandatory top-level conjunct \"needs.tier-b-visual-e2e.result == 'success'\" with no top-level '||' in the condition. if: ${job_if:-<absent>}"
+  fi
+done <<EOF
+${PUBLISHING_JOBS}
+EOF
 
 if [ "${violations}" -gt 0 ]; then
   printf 'check_release_gates: %s violation(s) in %s\n' \
