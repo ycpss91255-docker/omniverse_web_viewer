@@ -47,8 +47,19 @@ RUN if getent group "${USER_GID}" >/dev/null; then \
             "$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
     else \
         useradd -m -l -s /bin/bash -u "${USER_UID}" -g "${USER_GID}" "${USER_NAME}"; \
-    fi && \
-    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    fi
+
+# NOTE: `sys` deliberately grants NO sudo. It used to end with
+# `echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers`, and since
+# `runtime` is FROM devel-base is FROM sys, that line was INHERITED BY THE
+# PUBLISHED IMAGE -- making its "non-root" USER root-equivalent with a single
+# `sudo`, on an image that is pushed publicly to GHCR, pinned by downstream
+# consumers (isaac#173), and run there on a network port with --network=host.
+# The non-root USER is the containment story for that exposure; nothing in the
+# runtime needs privilege (see the runtime-test guard at the bottom of this
+# file). The grant now lives ONLY in the stages that actually use it --
+# usd-viewer-build, stream-only-build and devel -- all of which are either
+# discarded after their build or interactive-only.
 
 ############################## devel-base ##############################
 FROM sys AS devel-base
@@ -89,6 +100,12 @@ ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 
+# Per-stage sudo grant (see the note in `sys`): this stage stages its dist
+# under /app with sudo so the build itself stays as the non-root USER. The
+# stage is discarded once `runtime` has COPY'd the dist out of it.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
 
@@ -123,6 +140,11 @@ ARG USER_NAME="user"
 ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
+
+# Per-stage sudo grant (see the note in `sys`): same reason as
+# usd-viewer-build, and this stage is likewise discarded after the dist COPY.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
 
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
@@ -203,6 +225,14 @@ COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/log
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/config "${CONFIG_DIR}"
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
 
+# Per-stage sudo grant (see the note in `sys`). Passwordless sudo in an
+# INTERACTIVE dev container is by design (it is why .hadolint.yaml ignores
+# DL3004); the defect was that `sys` handed the same grant to the published
+# runtime image. devel needs it for `sudo rm -rf "${CONFIG_DIR}"` below, and
+# devel-test (FROM devel) needs it for the bats specs that write /etc/host.yaml.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
 USER "${USER}"
 
 ENV HOME="/home/${USER_NAME}"
@@ -261,6 +291,17 @@ FROM runtime AS runtime-test
 ARG RUNTIME_SMOKE_CMD='timeout 30 bash -c '"'"'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'"'"''
 # Inherit USER from runtime (non-root). The smoke does not need privilege.
 RUN bash -c "${RUNTIME_SMOKE_CMD}"
+
+# REGRESSION GUARD for the line above. Asserting the posture is the only thing
+# that keeps it true: the `sys` sudoers grant was inherited all the way into the
+# published GHCR image for its whole life, and nothing anywhere noticed. This
+# runs as the runtime USER, so it asks exactly the question an attacker with a
+# foothold in the shipped container would: can this user become root without a
+# password? A `sudo` that is absent, or present and refuses, both pass.
+RUN if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then \
+        echo "runtime-test: the shipped image grants passwordless root to $(id -un)" >&2; \
+        exit 1; \
+    fi
 
 ############################## example ##############################
 # Embeddable stream demo site (examples/embedded-site-demo). Vanilla
