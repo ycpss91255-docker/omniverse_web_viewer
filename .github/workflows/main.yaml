@@ -4,7 +4,16 @@ on:
   push:
     branches: [main, master]
     tags:
-      - 'v*'
+      # VERSION SHAPE, not 'v*'. The old glob accepted names
+      # script/ci/derive_image_tag.sh hard-rejects (`v2`, `vnext`, `vlatest`),
+      # and that rejection lives in publish-image, the LAST job in the chain --
+      # so such a tag cut a real GitHub Release first and only then failed,
+      # producing exactly the Release-without-an-image state this file argues
+      # against, after spending a full Tier B run on the shared GPU. Matching
+      # the deriver's grammar here means an unpublishable ref never reaches the
+      # Release step or the runner.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
   # Nightly, for the Tier B visual acceptance ONLY (#48). Every other job in
   # this workflow is gated off `schedule` below -- a scheduled run must not
