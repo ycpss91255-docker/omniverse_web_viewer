@@ -4,14 +4,23 @@ on:
   push:
     branches: [main, master]
     tags:
-      # VERSION SHAPE, not 'v*'. The old glob accepted names
+      # VERSION SHAPE, not 'v*'. `v*` accepted names
       # script/ci/derive_image_tag.sh hard-rejects (`v2`, `vnext`, `vlatest`),
-      # and that rejection lives in publish-image, the LAST job in the chain --
+      # and that rejection lived in publish-image, the LAST job in the chain --
       # so such a tag cut a real GitHub Release first and only then failed,
       # producing exactly the Release-without-an-image state this file argues
-      # against, after spending a full Tier B run on the shared GPU. Matching
-      # the deriver's grammar here means an unpublishable ref never reaches the
-      # Release step or the runner.
+      # against, after spending a full Tier B run on the shared GPU.
+      #
+      # These globs are a COARSE PREFILTER, not the grammar, and the difference
+      # matters. GitHub's tag filter patterns have no alternation and no
+      # anchored character classes, so the pre-release glob below accepts ANY
+      # suffix: `v1.2.3-`, `v1.2.3--`, `v1.2.3-rc_1`, `v1.2.3-rc1.` and
+      # `v1.2.3-rc1+b` all start this workflow and are all rejected by the
+      # deriver's VERSION_RE. Narrowing the glob further would trade that for
+      # the opposite failure -- a legitimate `v1.2.3-rc.1` silently not
+      # triggering at all -- so the authoritative check is a JOB instead: see
+      # verify-tag-shape, which runs the deriver before anything irreversible
+      # and is a `needs` of both the Release and the GPU gate.
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
@@ -122,6 +131,33 @@ jobs:
       build_args: |
         RUNTIME_SMOKE_CMD=timeout 30 bash -c 'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'
 
+  # ------------------- version-shape gate, before the damage ----------------
+  # The authoritative answer to "can this ref be published?", placed BEFORE
+  # anything irreversible happens. It runs script/ci/derive_image_tag.sh -- the
+  # same script publish-image uses, so there is one grammar and not two -- and
+  # a ref that script refuses fails here, before call-release cuts a Release
+  # and before the GPU job spends up to an hour of shared-runner time.
+  #
+  # NO `if:` ON PURPOSE. This job must never be SKIPPED, because a skipped need
+  # skips its dependents, and tier-b-visual-e2e's condition deliberately
+  # carries no status function (see its own note). With no `if:` the job always
+  # runs and always succeeds off a tag ref, so needing it costs the nightly one
+  # cheap hosted job and changes nothing else. The tag check itself is guarded
+  # per-step instead.
+  verify-tag-shape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Off a tag ref there is no version to check: publish-image runs the same
+      # deriver on the hand-typed input, behind its own tag-exists guard.
+      - name: Refuse a tag the image-tag deriver cannot publish
+        if: ${{ github.ref_type == 'tag' }}
+        run: bash script/ci/derive_image_tag.sh
+
   call-release:
     # THE PICTURE GATE (#70). v0.3.0-rc1 was published without the Tier B
     # visual acceptance ever having run for that commit -- a tag push skipped
@@ -139,7 +175,7 @@ jobs:
     # release is BLOCKED, not waved through. There is no override input, no
     # continue-on-error and no `if: always()` escape by design -- an override
     # on this gate would be reached for exactly when it matters most.
-    needs: [call-docker-build, tier-b-visual-e2e]
+    needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e]
     if: startsWith(github.ref, 'refs/tags/')
     # Back on a released base tag: the temporary commit-SHA pin from #66 is
     # gone and #67's condition is met. v0.42.0's archive step copies
@@ -348,12 +384,17 @@ jobs:
   #   - a tag ref     -> the release path itself
   #   - a dispatch with a non-empty publish_image_tag -> the manual publish,
   #                      which would otherwise be a hole in the same rule
-  # It deliberately has NO `needs:`. Staying dependency-free is what keeps the
-  # nightly semantics untouched (call-docker-build does not run on `schedule`,
-  # so needing it would force a status function onto the gate job itself), and
-  # this job rebuilds the e2e-test image from the checked-out tree anyway, so
-  # it can never pass against a stale artifact. The cost is that on a tag push
-  # it starts in parallel with call-docker-build rather than after it.
+  # Its ONLY `needs:` is verify-tag-shape, and that one is deliberately a job
+  # with no `if:` -- it always runs and therefore can never be SKIPPED, which
+  # is what lets this job keep a condition with no status function in it (a
+  # skipped need would otherwise skip this job). It buys the thing the trigger
+  # globs cannot express: a tag whose shape the image-tag deriver rejects never
+  # reaches the GPU at all. Nothing else is a need. call-docker-build in
+  # particular is NOT, because it does not run on `schedule` and needing it
+  # would force a status function onto this gate's own condition; this job
+  # rebuilds the e2e-test image from the checked-out tree anyway, so it can
+  # never pass against a stale artifact. The cost is that on a tag push it
+  # starts in parallel with call-docker-build rather than after it.
   #
   # The `concurrency` group below serialises the GPU: `cancel-in-progress:
   # false` means a tag pushed while the nightly run is in flight QUEUES behind
@@ -378,6 +419,7 @@ jobs:
   # asserting a picture there would fail forever. usd-viewer keeps its existing
   # per-PR config-dial cover.
   tier-b-visual-e2e:
+    needs: [verify-tag-shape]
     if: >-
       github.event_name == 'schedule'
       || startsWith(github.ref, 'refs/tags/')
