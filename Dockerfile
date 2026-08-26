@@ -111,6 +111,12 @@ ENV HOME="/home/${USER_NAME}"
 
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
+# `npm install`, NOT `npm ci`: this tree is the upstream web-viewer-sample
+# submodule, which ships no package-lock.json, and D2 says it is built
+# UNMODIFIED. Our own code is installed with `npm ci` from a committed lockfile
+# (stream-only-build / example / e2e-test); this one stage's dependency tree is
+# still resolved fresh on every build. Closing that needs either an upstream
+# lockfile or a decision to layer one of ours onto the sample.
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
@@ -150,10 +156,15 @@ USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
 
 WORKDIR /build
-COPY --chown="${USER}":"${GROUP}" package.json .npmrc /build/
+COPY --chown="${USER}":"${GROUP}" package.json package-lock.json .npmrc /build/
 COPY --chown="${USER}":"${GROUP}" packages/stream-core /build/packages/stream-core
 COPY --chown="${USER}":"${GROUP}" apps/stream-only /build/apps/stream-only
-RUN npm install && \
+# `npm ci`, not `npm install`: the bundle this stage emits is what ships in the
+# public image, so the tree that produces it must be the COMMITTED one, not
+# whatever the ranges resolve to today. `npm ci` also fails loudly on lock drift
+# instead of silently rewriting the lockfile. The workspace is deliberately
+# PARTIAL here (no examples/) and npm ci simply skips the absent member.
+RUN npm ci && \
     npm -w stream-core test && \
     npm -w stream-only run lint && \
     npm -w stream-only test && \
@@ -280,6 +291,7 @@ RUN cat "${CONFIG_DIR}"/shell/bashrc >> "${HOME}/.bashrc" && \
 # Full workspace + upstream submodule for in-place dev builds.
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
+# `npm install` for the same reason as usd-viewer-build: no upstream lockfile.
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
@@ -372,10 +384,12 @@ WORKDIR /app
 # install of only the example can no longer resolve stream-core). The built
 # example dist is served via the usd-viewer mode dir so the generic entrypoint
 # renders it (VIEWER_UI_MODE=usd-viewer).
-COPY --chown="${USER}":"${GROUP}" package.json .npmrc /app/
+COPY --chown="${USER}":"${GROUP}" package.json package-lock.json .npmrc /app/
 COPY --chown="${USER}":"${GROUP}" packages/stream-core /app/packages/stream-core
 COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo /app/examples/embedded-site-demo
-RUN npm install && \
+# Same committed lockfile as stream-only-build; the workspace is partial here
+# too (no apps/), which npm ci tolerates.
+RUN npm ci && \
     npm -w stream-core test && \
     npm -w embedded-site-demo run lint && \
     npm -w embedded-site-demo test && \
