@@ -1,0 +1,180 @@
+#!/usr/bin/env bats
+#
+# Structural lock on the RELEASE INVARIANT, read off .github/workflows/main.yaml
+# itself.
+#
+# The rule is absolute (#70, after v0.3.0-rc1 published with no picture ever
+# verified for it): no version may publish without the Tier B picture gate
+# having passed on that commit -- no override, no `continue-on-error`, no
+# `if: always()` escape, and an unavailable GPU runner BLOCKS the release.
+#
+# Until this file existed the rule was defended by prose. It lived in `if:` /
+# `needs:` expressions and comments in one workflow, and NOTHING read them:
+# every gate this repo has -- bats, node, both e2e tiers, hadolint, shellcheck
+# -- stays green while the protection is deleted. `|| github.event_name ==
+# 'workflow_dispatch'` added to a gate while debugging, or `tier-b-visual-e2e`
+# dropped from a `needs:` list, and the next tag publishes blind under a full
+# board of green checks. Three audit rounds named that as the largest
+# structural risk in the repo and none of them closed it.
+#
+# WHY THE MUTATIONS. A structural test that reads a file it can only agree with
+# is the exact failure this repo has been bitten by three times -- an assertion
+# that cannot fail is worse than no assertion, because it also stops anyone
+# looking. So every property is proved twice: once against the shipped
+# workflow (it must hold) and once against a workflow with that ONE property
+# removed (the checker must name it). `_mutate` hard-fails when its sed matches
+# nothing, so a mutation that silently stops applying -- because the workflow
+# was reworded -- fails the test instead of passing vacuously.
+#
+# No GPU, no tag push, no GitHub, no network: it is bash + awk over a file.
+# script/ci/check_release_gates.sh is copied to /ci/ and the workflow to
+# /workflows/ by the `devel-test` stage.
+
+CHECK="/ci/check_release_gates.sh"
+WORKFLOW="/workflows/main.yaml"
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  TMP="${BATS_TEST_TMPDIR:-$(mktemp -d)}"
+  MUTATED="${TMP}/mutated.yaml"
+}
+
+# _mutate <sed-expr>: write the shipped workflow through <sed-expr> to
+# "${MUTATED}". Fails the test if the expression matched nothing -- an
+# unapplied mutation would make the case below assert on the UNMODIFIED
+# workflow, which is precisely the test-that-cannot-fail this file exists to
+# avoid.
+_mutate() {
+  sed "$1" "${WORKFLOW}" > "${MUTATED}"
+  if cmp -s "${MUTATED}" "${WORKFLOW}"; then
+    echo "mutation matched nothing, so this case proves nothing: $1" >&2
+    return 1
+  fi
+}
+
+@test "gates: the checker and the workflow are both in the image" {
+  assert_file_exists "${CHECK}"
+  assert_file_exists "${WORKFLOW}"
+}
+
+@test "gates: the shipped workflow holds the release invariant" {
+  run bash "${CHECK}" "${WORKFLOW}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# Two vacuity guards. A checker that passes on a file it never read, or on a
+# file with no jobs in it, reports "invariant holds" for a workflow that
+# protects nothing -- so both are exit 2, distinct from a violation's exit 1.
+@test "gates: a workflow that cannot be read is an error, not a pass" {
+  run bash "${CHECK}" "${TMP}/does-not-exist.yaml"
+  assert_failure 2
+  assert_output --partial "cannot read workflow"
+}
+
+@test "gates: a workflow with no jobs is an error, not a vacuous pass" {
+  printf 'name: Empty\non:\n  push:\njobs:\n' > "${TMP}/empty.yaml"
+  run bash "${CHECK}" "${TMP}/empty.yaml"
+  assert_failure 2
+  assert_output --partial "declares no jobs"
+}
+
+# ---------------------------------------------------------------- publish --
+
+@test "gates: dropping tier-b from publish-image's needs is caught" {
+  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e\]/needs: [call-docker-build, call-release]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publish-image-needs-tier-b]"
+}
+
+# publish-image's condition opens with `!cancelled()`, which it needs because
+# call-release is legitimately skipped on both dispatch paths. That status
+# function also stops a SKIPPED need from skipping this job -- so the explicit
+# `result == 'success'` is the only thing left blocking an image whose picture
+# gate never ran.
+@test "gates: dropping publish-image's tier-b success requirement is caught" {
+  _mutate '/&& needs\.tier-b-visual-e2e\.result == /d'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publish-image-requires-tier-b-success]"
+}
+
+# ---------------------------------------------------------------- release --
+
+@test "gates: dropping tier-b from call-release's needs is caught" {
+  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: [verify-tag-shape, call-docker-build]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[call-release-needs-tier-b]"
+}
+
+# The load-bearing ABSENCE. call-release carries no always()/success()/
+# failure()/cancelled(), which is what keeps GitHub's default rule ("a job is
+# skipped when a job it needs did not succeed") in force -- and that default is
+# the entire mechanism by which an unavailable GPU runner blocks a release.
+# Adding a status function here reads like a harmless robustness tweak and
+# quietly converts a blocked release into a published one.
+@test "gates: adding a status function to call-release's if is caught" {
+  _mutate "s#^      startsWith(github.ref, 'refs/tags/')\$#      always() \&\& startsWith(github.ref, 'refs/tags/')#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[call-release-carries-no-status-function]"
+}
+
+# ------------------------------------------------------------------ gates --
+
+@test "gates: continue-on-error on a gate job is caught" {
+  _mutate '/^  tier-b-visual-e2e:$/a\    continue-on-error: true'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-has-no-continue-on-error]"
+}
+
+# release-blocked-report / nightly-tier-b-report use `always()` and exist only
+# to turn a silently blocked release into a red run. Nothing may need one: a
+# job that waits on them would inherit an always()-gated dependency, which is
+# the escape the picture-gate rule forbids.
+@test "gates: making a report-only job a dependency is caught" {
+  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e\]/needs: [call-docker-build, call-release, tier-b-visual-e2e, release-blocked-report]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[no-job-needs-a-report-only-job]"
+}
+
+# ------------------------------------------------------- tag reachability --
+
+@test "gates: removing the tag push trigger is caught" {
+  _mutate "/^      - 'v\[0-9\]/d"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[workflow-triggers-on-tag-push]"
+}
+
+@test "gates: tier-b losing its bare tag-push alternative is caught" {
+  _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || startsWith(github.ref, 'refs/heads/')#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-reachable-on-every-tag-push]"
+}
+
+# The subtler half: the tag alternative is still THERE, but ANDed instead of
+# ORed, so the condition is false for an ordinary tag push. A substring grep
+# would pass this; splitting the expression at parenthesis depth 0 does not.
+@test "gates: tier-b's tag alternative becoming a top-level AND is caught" {
+  _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      \&\& startsWith(github.ref, 'refs/tags/')#"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-reachable-on-every-tag-push]"
+}
+
+# tier-b-visual-e2e needs verify-tag-shape, and a SKIPPED need skips its
+# dependent. verify-tag-shape carries no job-level `if:` for exactly that
+# reason -- the tag check is guarded per-step instead -- so an `if:` added here
+# makes the picture gate skippable on paths nobody intended.
+@test "gates: giving verify-tag-shape a job-level if is caught" {
+  _mutate "/^  verify-tag-shape:\$/a\\    if: \${{ github.ref_type == 'tag' }}"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[verify-tag-shape-has-no-job-level-if]"
+}

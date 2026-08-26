@@ -140,6 +140,8 @@ See [TEST.md](doc/test/TEST.md) for details.
 
 On top of the per-PR gates, a nightly `tier-b-visual-e2e` job on a self-hosted GPU runner boots a real Kit producer and asserts in a headless browser that the `stream-only` viewer really renders a picture — a connected `RTCPeerConnection`, a remote track, `videoWidth > 0` and a sampled frame that is not black — so "there is a picture" is proven by CI instead of by someone looking at the page.
 
+That job is also the release gate: no version publishes without it passing on the commit being released, with no override and no `continue-on-error`, so an unavailable GPU runner blocks the release. That wiring is itself under test — `release_gate_workflow.bats` reads `.github/workflows/main.yaml` and fails when any of the gate's `if:` / `needs:` structure is removed, and it proves each assertion can fail by re-running the checker against a workflow copy with that one property deleted.
+
 The same job also runs on **every tag push**, and both the GitHub Release and the GHCR image are gated on it: no version is published unless the picture was verified for that exact commit. There is deliberately no override — if the GPU runner is unavailable, the release is blocked rather than published unverified.
 
 On a GPU host you can run the same acceptance locally:

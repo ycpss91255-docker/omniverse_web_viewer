@@ -448,6 +448,15 @@ COPY .base/script/docker/wrapper /lint/wrapper
 # is the only proof of the tag -> image-tag mapping available without pushing
 # a tag. Copied before the lint RUN so one copy serves both purposes.
 COPY --chmod=0755 script/ci/ /ci/
+# The WORKFLOW ITSELF, because the release invariant is now under test rather
+# than merely argued for. The picture gate (#70) lives entirely in `if:` /
+# `needs:` expressions in .github/workflows/main.yaml and nothing read them, so
+# an edit that drops `tier-b-visual-e2e` from a `needs:` list left every gate
+# green with the protection gone. release_gate_workflow.bats runs
+# /ci/check_release_gates.sh over this file (and over mutated copies of it), so
+# the file has to be in the image the bats run in. Same mechanism the specs
+# already use for their inputs -- a COPY naming exactly what the stage owns.
+COPY .github/workflows/main.yaml /workflows/main.yaml
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
 # helpers, which nothing else was linting.
@@ -464,9 +473,10 @@ ENV BATS_LIB_PATH="/usr/lib/bats"
 # Tool-first smoke layout, base ADR-00000012: test/bats/smoke/<stage>/ names
 # the STAGE each spec is built to run in, so the specs a stage owns are the
 # ones its COPY names -- no spec can drift into an image that cannot satisfy
-# it. All four of this repo's specs belong to `devel-test`: derive_image_tag
-# and tier_b_visual_e2e need /ci/ and example_demo needs /examples/, which
-# exist only here, and omniverse_web_viewer_env needs /app/*/dist +
+# it. All five of this repo's specs belong to `devel-test`: derive_image_tag
+# and tier_b_visual_e2e need /ci/, release_gate_workflow needs /ci/ plus
+# /workflows/, and example_demo needs /examples/, all of which exist only
+# here, and omniverse_web_viewer_env needs /app/*/dist +
 # /entrypoint.sh, which exist in
 # `runtime` too -- but `runtime-test` runs RUNTIME_SMOKE_CMD, not bats, so
 # there is no second consumer to justify a `shared/` tree today. The day a
