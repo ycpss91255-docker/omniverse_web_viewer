@@ -264,6 +264,18 @@ _mutate() {
   assert_output --partial "[no-job-needs-a-status-gated-job]"
 }
 
+# Reading `needs:` as a list rather than a string is only an improvement if it
+# still reads the OTHER valid spellings of the same list. `["a", "b"]` is the
+# same list as `[a, b]`, and a membership test that keeps the quotes reports a
+# correctly written workflow as missing its gate -- the false-positive half of
+# the very mistake this file is trying to stop making.
+@test "gates: a quoted needs list is read as the same list" {
+  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: ["verify-tag-shape", "call-docker-build", "tier-b-visual-e2e"]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
 # A `needs:` naming a job that is not in the file is a workflow GitHub refuses
 # to run; this checker must not read the dangling name's absent condition as
 # "no status function" and report the invariant as held.

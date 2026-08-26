@@ -303,10 +303,15 @@ top_terms() {
 # cut for a commit whose Tier B failed while every check here passes. Both the
 # flow (`[a, b]`) and block (`- a`) sequence spellings are accepted, as is a
 # bare scalar.
+# Quotes are stripped because `needs: ["a", "b"]` is valid YAML for the same
+# list. Membership is exact, so leaving them on would report a correctly
+# quoted needs list as a missing gate -- the false-positive half of the same
+# mistake, and the one that teaches maintainers to ignore this checker.
 needs_list() {
   job_key "$1" needs | awk '
     {
       gsub(/[][,]/, " ")
+      gsub(/["'"'"']/, "")
       n = split($0, a, /[[:space:]]+/)
       for (i = 1; i <= n; i++) {
         if (a[i] != "" && a[i] != "-") { print a[i] }
