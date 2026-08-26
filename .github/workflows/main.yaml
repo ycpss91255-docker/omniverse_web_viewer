@@ -425,8 +425,15 @@ jobs:
 
       # Explicit, so a registry problem is distinguishable from an acceptance
       # failure and a multi-GB pull does not eat the acceptance step's budget.
+      #
+      # The reference comes FROM the driver rather than being repeated here:
+      # the producer is pinned by DIGEST (it runs as root with
+      # `--network=host --ipc=host --gpus all` on this persistent shared GPU
+      # host, and GHCR tags are mutable -- see the driver's own note and the
+      # busybox pin above), and a second copy of that digest in this file is a
+      # thing that can drift from the one actually run.
       - name: Pull the pinned producer image
-        run: docker pull ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1
+        run: docker pull "$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)"
 
       # Boots the producer, waits for its streaming server, drives the browser,
       # and tears down its own instance-scoped containers on every exit path.

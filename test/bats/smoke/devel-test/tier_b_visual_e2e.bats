@@ -113,6 +113,18 @@ _signal_driver() {
   return "${rc}"
 }
 
+# The producer runs as root with --network=host --ipc=host --gpus all on a
+# PERSISTENT self-hosted GPU runner, and GHCR tags are mutable -- the workflow
+# says so itself, and pins its busybox by digest for the weaker case. isaac#244
+# is an open defect in this image, so a re-push under the same tag is likely.
+# The workflow's pull step asks this script for the reference, so this one
+# assertion covers both the run and the pull.
+@test "tier_b: the producer image is pinned by digest, not by a mutable tag" {
+  run bash "${DRIVER}" --print-producer-image
+  assert_success
+  assert_output --regexp '^ghcr\.io/.+@sha256:[0-9a-f]{64}$'
+}
+
 @test "tier_b: SIGTERM exits non-zero, so a killed run cannot claim a picture" {
   run _signal_driver TERM
   assert [ "${status}" -ne 0 ]

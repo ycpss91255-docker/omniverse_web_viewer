@@ -39,8 +39,12 @@
 # directory mode; verified working end to end on an RTX 5090. Overridable via
 # TIER_B_PRODUCER_USER, so set it empty once a fixed tag is published.
 #
+# Usage:
+#   tier_b_visual_e2e.sh                          run the acceptance
+#   tier_b_visual_e2e.sh --print-producer-image   print the pinned producer ref
+#
 # Env knobs (all optional):
-#   TIER_B_PRODUCER_IMAGE  producer image (default: the pinned 0.0.1 tag)
+#   TIER_B_PRODUCER_IMAGE  producer image (default: 0.0.1 pinned BY DIGEST)
 #   TIER_B_PRODUCER_USER   --user for the producer (default: 0:0, isaac#244)
 #   TIER_B_VIEWER_IMAGE    e2e-test image (default: from .env.generated)
 #   TIER_B_INSTANCE        instance scope (default: GITHUB_RUN_ID, else $$)
@@ -59,7 +63,34 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1}"
+# PINNED BY DIGEST, not by the mutable `:0.0.1` tag.
+#
+# This container is the strongest thing this repo runs: root (isaac#244, see
+# below), `--network=host --ipc=host --gpus all`, on a PERSISTENT self-hosted
+# GPU runner. The busybox in the same workflow job is pinned by digest and
+# .github/workflows/main.yaml states the reason ("runs as root with the
+# workspace bind-mounted, BEFORE checkout, on a persistent self-hosted GPU
+# host"); the same file separately states that "GHCR tags are MUTABLE". The
+# producer was the one container left resolving through a tag, and isaac#244 is
+# an OPEN defect in that image, so a re-push under the same tag is likely
+# rather than hypothetical.
+#
+# The digest below is the current `:0.0.1` OCI index digest, re-resolved from
+# the registry (`docker buildx imagetools inspect`). Moving the pin is a
+# deliberate edit here (or a TIER_B_PRODUCER_IMAGE override for a one-off), not
+# something a registry push can do on our behalf.
+PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-docker/isaac-stream-source@sha256:af1bb815142f190b7e08c402f4dd8b47b69332937b12ff2ca85d45c1fced7318"
+PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-${PRODUCER_IMAGE_DEFAULT}}"
+
+# `--print-producer-image` prints the resolved producer reference and exits, so
+# the workflow's separate pull step (kept so a registry problem is
+# distinguishable from an acceptance failure, and so a multi-GB pull does not
+# eat the acceptance step's budget) pulls exactly what this script will run
+# instead of carrying a second copy of the pin that can drift from it.
+if [ "${1:-}" = "--print-producer-image" ]; then
+  printf '%s\n' "${PRODUCER_IMAGE}"
+  exit 0
+fi
 PRODUCER_USER="${TIER_B_PRODUCER_USER-0:0}"
 INSTANCE="${TIER_B_INSTANCE:-${GITHUB_RUN_ID:-$$}}"
 PUBLIC_IP="${TIER_B_PUBLIC_IP:-127.0.0.1}"

@@ -1,6 +1,6 @@
 # TEST.md
 
-**145 tests** total: **54 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**146 tests** total: **55 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **82 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
@@ -74,12 +74,13 @@ Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the
 | `a truncated version tag is refused` | `v0.3` is not MAJOR.MINOR.PATCH |
 | `a dispatch input that is not a version is refused` | Same validation on the escape-hatch path |
 
-## test/bats/smoke/devel-test/tier_b_visual_e2e.bats (3)
+## test/bats/smoke/devel-test/tier_b_visual_e2e.bats (4)
 
 Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. Its header says `Exit 0 = a real browser saw a real, non-black frame`, and the workflow's picture gate believes exactly that -- so exiting 0 without having asserted a picture is the one failure this script may never have. It could: `cleanup()` took `local rc=$?` and ended `exit "${rc}"` while trapped on `EXIT INT TERM`, and on a signal path `$?` is the last COMPLETED command (the boot-wait `sleep 5`, i.e. 0). No GPU, Kit or docker daemon is involved -- a stub `docker` on `PATH` answers just enough for the driver to reach its boot-wait loop and stay there, which is the state under test. The script is copied into the image at `/ci/`.
 
 | Test | Description |
 |------|-------------|
+| `the producer image is pinned by digest, not by a mutable tag` | The producer runs as root with `--network=host --ipc=host --gpus all` on the persistent GPU runner, and GHCR tags are mutable; the workflow's pull step asks the driver for the reference, so this covers the pull too |
 | `SIGTERM exits non-zero, so a killed run cannot claim a picture` | A GitHub step timeout / job cancellation must not be readable as a verified picture (143) |
 | `SIGINT exits non-zero, so a killed run cannot claim a picture` | Same for an interrupt (130) |
 | `teardown runs exactly once on a signal path` | The signal handler and the EXIT handler used to be the same function, so its own `exit` re-entered it and `producer.log` was written twice |
