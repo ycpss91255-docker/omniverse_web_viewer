@@ -355,9 +355,21 @@ jobs:
   # it can never pass against a stale artifact. The cost is that on a tag push
   # it starts in parallel with call-docker-build rather than after it.
   #
-  # The `concurrency` group below means a tag pushed while the nightly run is
-  # in flight QUEUES behind it instead of cancelling it. A release therefore
-  # waits for the GPU; that is the accepted price of the rule.
+  # The `concurrency` group below serialises the GPU: `cancel-in-progress:
+  # false` means a tag pushed while the nightly run is in flight QUEUES behind
+  # it instead of cancelling it. A release therefore waits for the GPU; that is
+  # the accepted price of the rule.
+  #
+  # What `cancel-in-progress: false` does NOT protect is a job that is still
+  # PENDING. GitHub cancels the previously pending member of a group when a new
+  # run enters it, so with the nightly running and a tag queued behind it, a
+  # third entrant (a dispatch with run_tier_b, another tag) cancels the tag's
+  # Tier B outright. The consequence fails CLOSED -- call-release skips on a
+  # non-success need and publish-image requires `result == 'success'`, so
+  # nothing unsafe publishes -- but the pushed tag then produces no Release and
+  # no image, and the only trace is a GREY cancelled job. That is why
+  # `release-blocked-report` below exists: it turns that silence into a red
+  # run. Do not read it as an override; it can only ADD a failure.
   #
   # stream-only ONLY. #48's acceptance criteria ask for both viewer modes, which
   # is wrong against an Isaac-family producer: #18 established that `usd-viewer`
@@ -428,3 +440,40 @@ jobs:
           name: tier-b-visual-e2e-evidence
           path: .tier-b-artifacts
           if-no-files-found: ignore
+
+  # ------------------- blocked-release visibility (report only) -------------
+  # NOT A GATE, and deliberately incapable of being one: nothing `needs` this
+  # job, so it can only ADD a failure to a run and can never allow a publish.
+  # The `always()` here is what lets it observe a need that did not succeed; it
+  # is not the `if: always()` the picture-gate rule forbids, which would be one
+  # that lets a release THROUGH.
+  #
+  # It exists because the gate can fail SILENTLY. A tag's Tier B that is still
+  # queued behind the nightly is cancelled outright when a third run enters the
+  # shared concurrency group (GitHub cancels the previously pending member;
+  # `cancel-in-progress: false` only protects a RUNNING job). Everything
+  # downstream then fails closed and simply does not run: call-release skips on
+  # a non-success need, publish-image requires `result == 'success'`. Correct --
+  # but the pushed tag produces no Release and no image, and the only signal is
+  # a grey cancelled job on a green-looking run. A maintainer reading the
+  # concurrency comment would reasonably conclude "it is queued, it will run",
+  # and the release quietly never happens.
+  #
+  # Tag refs only: on the nightly and on dispatches there is no release to
+  # block, and a failing Tier B there is already red on its own.
+  release-blocked-report:
+    needs: [tier-b-visual-e2e]
+    if: >-
+      always()
+      && startsWith(github.ref, 'refs/tags/')
+      && needs.tier-b-visual-e2e.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fail loudly, so a blocked release is red rather than grey
+        env:
+          TIER_B_RESULT: ${{ needs.tier-b-visual-e2e.result }}
+        run: |
+          echo "::error::tier-b-visual-e2e ended '${TIER_B_RESULT}' on ${GITHUB_REF}. No Release and no image were published for this tag, by design -- no version publishes without the picture gate. Re-run this workflow for the tag once the GPU runner is free; if the result is 'cancelled', the job was most likely a pending member of the owv-tier-b-visual-e2e concurrency group when another run entered it."
+          exit 1
