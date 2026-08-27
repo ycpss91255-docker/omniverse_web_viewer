@@ -277,6 +277,10 @@ teardown() {
   assert_output --partial "top-level 'ui_mode:'"
   assert_output --partial "In effect: 'stream-only'"
   assert_output --partial "the VIEWER_UI_MODE env"
+  # This file has no `viewer:` at all, so the absent-section clause and the
+  # add-the-section remedy are the pair that belongs here.
+  assert_output --partial "there is no 'viewer:' section in it"
+  assert_output --partial "add a 'viewer:' section"
   # And the env-chosen app is the one that got rendered.
   run grep -rF "10.50.50.1" "${STREAM_ASSETS}/" --include="*.js"
   assert_success
@@ -326,7 +330,12 @@ teardown() {
   VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
   assert_success
   assert_output --partial "there IS a 'viewer:' section in it"
+  assert_output --partial "does not supply 'ui_mode'"
   refute_output --partial "no 'viewer:' section"
+  # The remedy for THIS state is the indent one, and it must stay attached to
+  # this state alone -- the four states below each want a different fix, so a
+  # single blanket sentence would be wrong in three of them.
+  assert_output --partial "indent it under 'viewer:'"
 }
 
 # refuse_flat_key shares the phrasing and predates the warning, so it is fixed
@@ -337,7 +346,9 @@ teardown() {
   run /entrypoint.sh true
   assert_failure
   assert_output --partial "there IS a 'network:' section in it"
+  assert_output --partial "does not supply 'public_ip'"
   refute_output --partial "no 'network:' section"
+  assert_output --partial "indent it under 'network:'"
 }
 
 # ... and the genuinely-absent case still says so, so the fix above did not
@@ -348,6 +359,72 @@ teardown() {
   run /entrypoint.sh true
   assert_failure
   assert_output --partial "there is no 'network:' section in it"
+  # Nothing to indent under yet, so the remedy for this state is the section
+  # itself -- not the indent sentence the present-but-incomplete state gets.
+  assert_output --partial "add a 'network:' section"
+  refute_output --partial "indent it under 'network:'"
+}
+
+# The reason clause had exactly two branches -- section present, section absent
+# -- and the file has more states than that. A section that DOES carry our key
+# with an empty value hits the flat-key path (the scoped lookup returns
+# nothing), and was then told that the section "does not supply 'ui_mode'"
+# about a `ui_mode:` sitting plainly inside it, and told to indent a key that
+# is already indented. Both halves of that are false, and a diagnostic that is
+# provably false about the file in front of the operator is not worth the line
+# it costs.
+@test "an empty key inside the section is not reported as a missing key" {
+  printf 'network:\n  public_ip: "10.53.53.1"\nviewer:\n  ui_mode:\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  assert_output --partial "it does carry a 'ui_mode:', but that key has no value"
+  refute_output --partial "does not supply 'ui_mode'"
+  refute_output --partial "no 'viewer:' section"
+  # The fix is to fill that key in, NOT to indent something already indented.
+  refute_output --partial "indent it under 'viewer:'"
+  assert_output --partial "give the empty 'ui_mode:' already inside 'viewer:' a value"
+}
+
+# The same shape on the public_ip side reaches the REFUSAL, so the container
+# does not boot and the stated reason is the only thing the operator has. It
+# must stay a refusal -- an empty `public_ip:` plus a column-0 one is still a
+# file that would otherwise dial an address nobody chose -- but the reason it
+# gives has to be the true one.
+@test "the refusal names an empty key rather than a missing one" {
+  printf 'network:\n  public_ip:\npublic_ip: "10.9.9.9"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  run /entrypoint.sh true
+  assert_failure
+  assert_output --partial "it does carry a 'public_ip:', but that key has no value"
+  refute_output --partial "does not supply 'public_ip'"
+  refute_output --partial "no 'network:' section"
+  refute_output --partial "indent it under 'network:'"
+  assert_output --partial "give the empty 'public_ip:' already inside 'network:' a value"
+  # And it must not have quietly dialled anything from the column-0 key.
+  run grep -rF "10.9.9.9" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+}
+
+# `viewer: "not-a-section"` is a top-level SCALAR, but the presence probe only
+# matches `^viewer:` and so reported it as a section that exists -- and the
+# remedy that follows from that ("indent it under 'viewer:'") produces invalid
+# YAML, a mapping key indented under a scalar value. An operator who does what
+# the message says ends up with a file that is worse than the one they had.
+@test "a section key that is really a scalar is not called a section" {
+  printf 'network:\n  public_ip: "10.54.54.1"\nviewer: "not-a-section"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  assert_output --partial "'viewer:' is set to a value rather than opening a section"
+  refute_output --partial "there IS a 'viewer:' section in it"
+  refute_output --partial "indent it under 'viewer:'"
+  assert_output --partial "make 'viewer:' open a section rather than carry a value"
+  # The scalar did not select an app either: the env-chosen mode is served.
+  run grep -rF "10.54.54.1" "${USD_ASSETS}/" --include="*.js"
+  assert_success
 }
 
 # The supplier variable was never initialised, and it is read in a script that
@@ -365,6 +442,41 @@ teardown() {
   assert_success
   refute_output --partial "top-level 'ui_mode:'"
   refute_output --partial "ghost-supplier-text"
+}
+
+# Initialising the variable stopped the fabricated note, but under the OBVIOUS
+# name, and the commit that did it claimed "nothing behaves differently". That
+# is untrue for the process this script execs. The assignment does not create a
+# fresh shell-local: an inherited variable keeps its export attribute, so
+# `docker run -e flat_ui_mode_supplier=x` handed the CMD an EMPTIED variable it
+# had set itself. The entrypoint is the last thing between compose and the
+# workload; quietly rewriting part of the environment it passes on is the one
+# thing it must not do. The name it works with is internal now, so neither read
+# nor write touches the operator's.
+@test "an inherited flat_ui_mode_supplier reaches the exec'd command intact" {
+  run test -f /etc/host.yaml
+  assert_failure
+  flat_ui_mode_supplier="operator-owned-value" \
+    run /entrypoint.sh sh -c 'printf "%s" "${flat_ui_mode_supplier-UNSET}"'
+  assert_success
+  assert [ "${output}" = "operator-owned-value" ]
+}
+
+# ... including on the path that actually uses the supplier, which is where an
+# assignment to the obvious name would definitely have fired: the warning is
+# still emitted, from the internal name, and the operator's variable passes
+# through untouched.
+@test "the flat-ui_mode warning does not rewrite the operator's variable" {
+  printf 'network:\n  public_ip: "10.57.57.1"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  flat_ui_mode_supplier="operator-owned-value" VIEWER_UI_MODE="stream-only" \
+    run /entrypoint.sh sh -c 'printf "%s" "${flat_ui_mode_supplier-UNSET}"'
+  assert_success
+  # The warning still fires, and still names the real supplier.
+  assert_output --partial "top-level 'ui_mode:'"
+  assert_output --partial "the VIEWER_UI_MODE env"
+  # And the exec'd command still sees what the operator set.
+  assert_output --partial "operator-owned-value"
 }
 
 # An unreadable host.yaml is an operator mistake, not an absent file. awk's
