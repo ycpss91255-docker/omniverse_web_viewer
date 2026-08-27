@@ -103,8 +103,15 @@ _append_job() {
 # The checker is Python now, and shellcheck's `/ci/*.sh` glob cannot lint it.
 # A syntax error would otherwise reach a maintainer as "exit 2 on every
 # workflow", which reads like a broken input rather than a broken checker.
+#
+# `compile()` rather than `python3 -m py_compile`: the latter writes a
+# `__pycache__` beside the source, and /ci/ is root-owned while these specs
+# run as the non-root user. That is a permission error dressed as a syntax
+# error -- the test would fail for a reason that has nothing to do with the
+# checker. This compiles in memory and touches no filesystem.
 @test "gates: the checker byte-compiles" {
-  run python3 -m py_compile "${CHECKER_PY}"
+  run python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+    "${CHECKER_PY}"
   assert_success
 }
 

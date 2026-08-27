@@ -474,9 +474,9 @@ COPY .base/script/docker/wrapper /lint/wrapper
 #
 # The directory now also carries check_release_gates.py, which the shellcheck
 # RUN below does not and cannot lint (`/ci/*.sh` is a shell glob). Its
-# stand-in is release_gate_workflow.bats, which byte-compiles it with
-# `python3 -m py_compile` before running it -- a syntax error there would
-# otherwise surface as a checker that exits 2 on every workflow.
+# stand-in is release_gate_workflow.bats, which byte-compiles it in memory
+# before running it -- a syntax error there would otherwise surface as a
+# checker that exits 2 on every workflow, which reads like a broken input.
 COPY --chmod=0755 script/ci/ /ci/
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
