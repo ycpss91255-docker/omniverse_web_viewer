@@ -468,6 +468,28 @@ teardown() {
   assert_output --partial "there IS a 'viewer:' section in it"
 }
 
+# THE ANCHOR'S DIRECT COMPANION, which the round that added anchor handling
+# did not cover. `viewer: *v` is an ALIAS: a reference to a node defined
+# somewhere else in the same document, which PyYAML (and every other parser)
+# resolves to that node -- so the file is VALID and `viewer:` really does
+# supply a mapping. Calling it "set to a value rather than opening a section"
+# is provably false about the file on the screen, and the remedy that follows
+# ("make it open a section") describes work already done. What is TRUE is
+# that this line-based reader does not follow the reference: the keys are not
+# below the header, they are wherever the anchor is.
+@test "an aliased section header is not called a scalar" {
+  printf 'defaults: &v\n  ui_mode: "stream-only"\nnetwork:\n  public_ip: "10.54.54.1"\nviewer: *v\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  refute_output --partial "is set to a value rather than opening a section"
+  refute_output --partial "make 'viewer:' open a section rather than carry a value"
+  refute_output --partial "flow collection"
+  assert_output --partial "'viewer:' is an alias"
+  assert_output --partial "replace the alias"
+}
+
 # The supplier variable was never initialised, and it is read in a script that
 # is the container ENTRYPOINT -- so its environment is operator- and
 # compose-controlled, and an unset shell variable read out of the environment

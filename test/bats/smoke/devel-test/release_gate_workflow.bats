@@ -109,6 +109,27 @@ _append_job() {
   assert_file_exists "${WORKFLOW}"
 }
 
+# LIMITATION 1, MADE LOUD.
+#
+# The checker reads ONE file, and until now nothing enumerated
+# `.github/workflows/`: the Dockerfile copied `main.yaml` by name. A SECOND
+# workflow file carrying `on: push: tags: ['v*']` and a `docker push`
+# therefore published with no picture gate while EVERY check in this repo --
+# this one included -- stayed green. That is the cheapest bypass the repo has
+# had, and it needed no edit to any file anyone was watching.
+#
+# The `devel-test` stage now copies the DIRECTORY, and this case asserts it
+# holds exactly the files the checker above was run against. It does NOT make
+# the checker read a second workflow -- limitation 1 stands -- it makes ADDING
+# one a decision somebody has to take deliberately, in a red test, instead of
+# a silence. Whoever adds a workflow here chooses: defend the invariant in it
+# too and extend the checker, or say in this list why it cannot publish.
+@test "gates: /workflows/ holds exactly the workflows the checker was run against" {
+  run bash -c "find /workflows -mindepth 1 -printf '%P\n' | LC_ALL=C sort"
+  assert_success
+  assert_output "main.yaml"
+}
+
 # The checker is Python now, and shellcheck's `/ci/*.sh` glob cannot lint it.
 # A syntax error would otherwise reach a maintainer as "exit 2 on every
 # workflow", which reads like a broken input rather than a broken checker.
@@ -1134,6 +1155,148 @@ JOB
   assert_output --partial "holds the release invariant"
 }
 
+# --- root cause 7b: the driver was pinned as a STRING, not as an INVOCATION -
+#
+# `gate-job-runs-its-driver-verbatim` compared the collapsed `run:` text to
+# one command. FOUR SIBLING KEYS decide what that string actually does, and
+# the checker read none of them -- so six mutations published with no picture
+# while it printed "holds the release invariant", and in three of them the
+# PINNED LINE IS UNTOUCHED and the diff shows only a `defaults:` block.
+#
+# The answer is `gate-driver-runs-unmodified`: on a step that invokes one of
+# GATE_WORK_DRIVERS, `shell:`, `working-directory:` and `env:` are refused;
+# and `defaults.run` and `env:` are refused at job level on those jobs and at
+# workflow level, where they reach them. The acceptance cases below bound
+# that: the same keys elsewhere in the same file are not violations.
+
+# GitHub's documented custom-shell form is `command [...options] {0}`, so the
+# driver is PRINTED and never runs, while the step and the job report success.
+@test "gates: shell: cat {0} on the Tier B work step is caught" {
+  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: cat {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# The same hole spelled as something that reads like a lint tweak in review.
+@test "gates: shell: bash -n {0} on the Tier B work step is caught" {
+  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: bash -n {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# The verbatim string, resolved against another tree -- a fixture holding a
+# stub of the same path.
+@test "gates: working-directory: on the Tier B work step is caught" {
+  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        working-directory: test/fixtures/stub-tree\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# The driver reads TIER_B_PRODUCER_IMAGE, TIER_B_VIEWER_IMAGE and
+# TIER_B_BOOT_TIMEOUT from its environment (script/ci/tier_b_visual_e2e.sh),
+# so a step-level env: makes the "picture" one of whatever image the editor
+# chose -- with the pinned line, and the gate's own name, intact.
+@test "gates: env: on the Tier B work step is caught" {
+  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        env:\n          TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# ... and the same variable one level up, which no step-level rule can see.
+@test "gates: a job-level env: on the picture gate is caught" {
+  _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    env:\n      TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# ... and two levels up, where it reaches every job in the file including
+# this one.
+@test "gates: a workflow-level env: reaching the picture gate is caught" {
+  _mutate "s@^jobs:\$@env:\n  TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\njobs:@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# THE THREE THAT NEVER TOUCH THE PINNED LINE. A reviewer reading the diff
+# sees a `defaults:` block and a `run:` line that still says exactly what it
+# always said.
+@test "gates: a job-level defaults.run.shell on the picture gate is caught" {
+  _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    defaults:\n      run:\n        shell: cat {0}@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: a workflow-level defaults.run.shell is caught" {
+  _mutate "s@^jobs:\$@defaults:\n  run:\n    shell: cat {0}\njobs:@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: a workflow-level defaults.run.working-directory is caught" {
+  _mutate "s@^jobs:\$@defaults:\n  run:\n    working-directory: test/fixtures/stub-tree\njobs:@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# --- root cause 7c: clause (c) was a SUBSTRING test ------------------------
+#
+# `if "--print-" in run and not step_if: continue` granted ANY unconditional
+# step containing that literal a free pass to invoke the driver in any
+# spelling. There is a case for an unconditional, GENUINE `--print-<x>`
+# query -- this repo pulls the producer image the driver names -- and none
+# for a decoy that merely carries the substring somewhere in the same body
+# while invoking the driver as `--help`.
+@test "gates: a --print- decoy carrying a --help invocation is caught" {
+  _mutate "s@^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$@        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\n      - name: Warm the driver up\n        run: echo --print-nothing \&\& bash script/ci/tier_b_visual_e2e.sh --help || true@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+# --- the acceptance half of all of the above ------------------------------
+#
+# Each refusal above is bounded by a case proving it did not become a blanket
+# ban on the key. Without these, "no shell:, no env:, no defaults:" would be
+# a rule about the whole workflow rather than about the two pinned drivers.
+
+# A SECOND genuine query is still a query. This is the acceptance pair for
+# the decoy case above: what makes that one a violation is the `--help`
+# invocation, not the presence of a second step.
+@test "gates: a second genuine --print- query on the driver still passes" {
+  _mutate "s@^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$@        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\n      - name: Record the producer this run will use\n        run: echo \"producer=\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\" >> \"\${GITHUB_STEP_SUMMARY}\"@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# An env: on a step of the gate job that does NOT invoke the driver cannot
+# change what the driver does: it is a different process.
+@test "gates: env: on a non-driver step of the gate job still passes" {
+  _mutate "s@^        run: ./script/build.sh -t e2e-test\$@        env:\n          DOCKER_BUILDKIT: '1'\n        run: ./script/build.sh -t e2e-test@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# `defaults:` on a job that runs no pinned driver is an ordinary edit. The
+# refusal is scoped to the two GATE_WORK_DRIVERS jobs and to the workflow
+# level, which reaches them.
+@test "gates: defaults.run.shell on a job with no pinned driver still passes" {
+  _mutate "s@^  publish-image:\$@  publish-image:\n    defaults:\n      run:\n        shell: bash@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
 # --- root cause 8: shell-comment stripping applied to PUBLISHING ----------
 #
 # `_strip_shell_comments` ends a line at a whitespace-preceded `#`. That is
@@ -1198,6 +1361,57 @@ JOB
   assert_failure 1
   assert_output --partial "[publishing-job-is-behind-the-picture-gate]"
   assert_output --partial "publish-image-subcommand"
+}
+
+# `regctl` had a ROW IN THE TABLE THAT MATCHED NOTHING REAL: the pattern was
+# `regctl (push|copy)`, and regctl has neither subcommand -- the real spelling
+# is `regctl image copy`. A row that looks like coverage and provides none is
+# worse than an admitted gap, because the name appearing in the table is what
+# stops anyone checking.
+@test "gates: regctl image copy is publishing" {
+  _append_job <<'JOB'
+  publish-regctl:
+    needs: [call-docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ship
+        run: regctl image copy ghcr.io/x/y:z ghcr.io/x/y:latest
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publishing-job-is-behind-the-picture-gate]"
+  assert_output --partial "publish-regctl"
+}
+
+@test "gates: regctl artifact put is publishing" {
+  _append_job <<'JOB'
+  publish-regctl-artifact:
+    needs: [call-docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ship
+        run: regctl artifact put --artifact-type application/x ghcr.io/x/y:z
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publishing-job-is-behind-the-picture-gate]"
+  assert_output --partial "publish-regctl-artifact"
+}
+
+# ... and the acceptance half: a regctl READ is not a publish. Without this,
+# widening the row to `regctl <anything>` would report every registry query
+# as a job that must stand behind the picture gate.
+@test "gates: regctl image digest is not publishing" {
+  _append_job <<'JOB'
+  inspect-regctl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Look
+        run: regctl image digest ghcr.io/x/y:z
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
 }
 
 @test "gates: buildah push is publishing" {
@@ -1368,6 +1582,27 @@ JOB
 # moves into a runner group -- was reported as a gate that had left the GPU.
 # So was a matrix-driven `runs-on`. A check that reports valid edits as
 # violations is one people learn to switch off.
+# GitHub matches runner LABELS case-insensitively, and this file matched them
+# case-sensitively while matching expressions case-insensitively -- the exact
+# inconsistency the expression change argued against, one round earlier. It
+# failed CLOSED (a correct edit reported as a violation), so it was noise
+# rather than a hole; noise is still how a check gets switched off.
+@test "gates: runner labels in mixed case are the same runner" {
+  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, GPU]|"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# ... and its failing half, so case-insensitivity did not become "any label
+# set will do": the GPU label still has to be there, in some case.
+@test "gates: a mixed-case label set that has lost the GPU is still caught" {
+  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, Ubuntu-Latest]|"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
+}
+
 @test "gates: a runner group that still declares the labels passes" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: {group: gpu-hosts, labels: [self-hosted, gpu]}|"
   run bash "${CHECK}" "${MUTATED}"

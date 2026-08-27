@@ -1,10 +1,10 @@
 # TEST.md
 
-**276 tests** total: **181 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **86 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**296 tests** total: **201 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **86 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **9 Playwright** (browser e2e, `test/e2e/`: **8 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
-## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (53)
+## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (54)
 
 Two-app config-injection model (S5): the build preserves sentinel-bearing chunks as `*.js.tmpl` per app dir (`/app/usd-viewer/dist`, `/app/stream-only/dist`); the entrypoint resolves `VIEWER_UI_MODE` (app selector), validates every value, and re-renders ONLY the active app's templates on every boot with 3 seds (`__OWV_SERVER__` / `"__OWV_PORT__"` / `"__OWV_MEDIA_PORT__"`).
 
@@ -63,6 +63,7 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `a flow mapping is not called a scalar` | `viewer: {ui_mode: "stream-only"}` is a real mapping written on one line. Deciding "scalar" from "there is text after the colon" reported it as a section set to a value, which is provably false about the file on the operator's screen -- the exact class of diagnostic these helpers exist to end. It now gets its own true reason and its own true remedy |
 | `an anchored section header is not called a scalar` | `viewer: &anchor` with an indented body: a YAML ANCHOR is a node property, not the value, and the section below it is an ordinary block mapping |
 | `a tagged section header is not called a scalar` | `viewer: !!map` with an indented body: same, for a TAG |
+| `an aliased section header is not called a scalar` | The anchor's direct companion, missed by the round that added anchor handling. `viewer: *v` is an ALIAS: every parser resolves it to the anchored node, so the file is valid and `viewer:` really does supply a mapping. "Set to a value rather than opening a section" is provably false about it, and the remedy that follows describes work already done. What is true is that this line-based reader does not FOLLOW the reference |
 ## test/bats/smoke/devel-test/example_demo.bats (5)
 
 | Test | Description |
@@ -106,7 +107,7 @@ Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. I
 | `SIGINT exits non-zero, so a killed run cannot claim a picture` | Same for an interrupt (130) |
 | `teardown runs exactly once on a signal path` | The signal handler and the EXIT handler used to be the same function, so its own `exit` re-entered it and `producer.log` was written twice |
 
-## test/bats/smoke/devel-test/release_gate_workflow.bats (104)
+## test/bats/smoke/devel-test/release_gate_workflow.bats (123)
 
 Structural lock on the RELEASE INVARIANT, read off `.github/workflows/main.yaml` itself. The rule (#70, after `v0.3.0-rc1` published with no picture ever verified for it) is absolute: no version may publish without the Tier B picture gate having passed on that commit -- no override, no `continue-on-error`, no status-function escape, and an unavailable GPU runner BLOCKS the release. Until this file existed that rule was defended by prose: it lived in `if:` / `needs:` expressions and comments in one workflow and nothing read them, so `|| github.event_name == 'workflow_dispatch'` added to a gate while debugging, or `tier-b-visual-e2e` dropped from a `needs:` list, left every other gate green with the protection gone. The reading is done by `script/ci/check_release_gates.py`, a real YAML parse (PyYAML), fronted by `script/ci/check_release_gates.sh`, which verifies the one dependency out loud and refuses with exit 2 -- never a skip -- when `python3` or PyYAML is missing. PyYAML is added by the `devel-test` Dockerfile stage as `python3-yaml` and never ships: `runtime` is `FROM devel-base`, `devel-test` is `FROM devel`, and nothing is `FROM devel-test`. The workflow is `COPY`d to `/workflows/main.yaml` and `script/ci/` to `/ci/`, the same mechanism the other specs use for their inputs. No GPU, no tag push, no GitHub, no network: it runs on every PR.
 
@@ -221,6 +222,25 @@ Every property is proved TWICE -- once against the shipped workflow (it must hol
 | `a runner group with no labels is not proof of a GPU runner` | `[tier-b-runs-on-the-gpu-runner]` -- the failing half. Which machines are in a group is a repo SETTING, which the checker cannot read, so a group with no labels comes back as unresolved rather than as a silent pass |
 | `a matrix with one hosted runner is caught` | Same id: EVERY value the matrix could take must satisfy the requirement, or the gate runs off the GPU for half its variants |
 | `a runs-on expression from outside this file is caught` | Same id: an expression whose value is decided by an input or a caller is not determined here, and is reported rather than guessed |
+| `/workflows/ holds exactly the workflows the checker was run against` | Limitation 1, made LOUD. The checker reads ONE file and nothing enumerated `.github/workflows/`, so a SECOND workflow with `on: push: tags: ['v*']` and a `docker push` published with no gate while every check here stayed green. The stage now `COPY`s the DIRECTORY and this case asserts its contents. It does not make the checker read a second file -- it makes adding one a decision in a red test instead of a silence |
+| `shell: cat {0} on the Tier B work step is caught` | `[gate-driver-runs-unmodified]` -- GitHub's documented custom-shell form is `command [...options] {0}`, so the pinned driver is PRINTED and never runs while the step and the job report success. The pin compared a STRING; four sibling keys decide what that string does |
+| `shell: bash -n {0} on the Tier B work step is caught` | Same id: syntax-check only, and it reads as a lint tweak in review |
+| `working-directory: on the Tier B work step is caught` | Same id: the verbatim string resolved against another tree -- a fixture holding a stub of the same path |
+| `env: on the Tier B work step is caught` | Same id: the driver reads `TIER_B_PRODUCER_IMAGE` / `TIER_B_VIEWER_IMAGE` / `TIER_B_BOOT_TIMEOUT` from its environment, so the "picture" becomes one of whatever image the editor chose, with the pinned line intact |
+| `a job-level env: on the picture gate is caught` | Same id, one level up, where no step-level rule can see it |
+| `a workflow-level env: reaching the picture gate is caught` | Same id, two levels up, where it reaches every job in the file including this one |
+| `a job-level defaults.run.shell on the picture gate is caught` | Same id. THE PINNED LINE IS UNTOUCHED: the diff shows only a `defaults:` block |
+| `a workflow-level defaults.run.shell is caught` | Same id, and it is one block at the top of the file |
+| `a workflow-level defaults.run.working-directory is caught` | Same id: the driver resolved from another tree, again with no edit to the step |
+| `a --print- decoy carrying a --help invocation is caught` | `[gate-job-runs-its-driver-verbatim]` -- clause (c) was `"--print-" in run`, a SUBSTRING test, so any unconditional step containing that literal anywhere got a free pass to invoke the driver in any spelling. Now every occurrence of the script in the step must itself be a `--print-<x>` query |
+| `a second genuine --print- query on the driver still passes` | The acceptance pair for it: what makes the case above a violation is the `--help` invocation, not the presence of a second step |
+| `env: on a non-driver step of the gate job still passes` | Acceptance pair for the `env:` refusal: a step that does not invoke the driver is a different process and cannot change what the driver does |
+| `defaults.run.shell on a job with no pinned driver still passes` | Acceptance pair for the `defaults:` refusal, which is scoped to the two `GATE_WORK_DRIVERS` jobs and to the workflow level that reaches them -- not to the file |
+| `runner labels in mixed case are the same runner` | GitHub matches runner labels case-insensitively and this file did not, while matching expressions case-insensitively -- the exact inconsistency the expression change argued against one round earlier. It failed CLOSED, so noise rather than a hole; noise is still how a check gets switched off |
+| `a mixed-case label set that has lost the GPU is still caught` | `[tier-b-runs-on-the-gpu-runner]` -- the failing half, so case-insensitivity did not become "any label set will do" |
+| `regctl image copy is publishing` | `[publishing-job-is-behind-the-picture-gate]` -- `PUBLISH_RUN_RE` carried a row that matched NOTHING REAL: `regctl (push\|copy)`, and regctl has neither subcommand. A row that looks like coverage and provides none is worse than an admitted gap, because the name in the table is what stops anyone checking |
+| `regctl artifact put is publishing` | Same id, the other real spelling |
+| `regctl image digest is not publishing` | Acceptance pair: a registry READ is not a publish, so the corrected rows did not widen into `regctl <anything>` |
 | `the checker never exits without saying why` | The awk implementation this replaced could die with status 141 and NO OUTPUT AT ALL -- a SIGPIPE between two of its own helpers, deterministic on the J1 input above. A checker that says nothing and exits non-zero teaches a maintainer to re-run it until it is quiet, which is a gate with a retry button. Every exit says something, and only 0, 1 and 2 are defined |
 
 `script/ci/check_release_gates.sh` and `script/ci/check_release_gates.py` are the checker, not counted specs.
