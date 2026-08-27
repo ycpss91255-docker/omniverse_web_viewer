@@ -112,27 +112,125 @@ yaml_top_level_key() {
   ' "$2"
 }
 
+# yaml_section_scalar <section> <file>: true when the COLUMN-0 `<section>:`
+# line carries a non-empty scalar of its own -- `viewer: "not-a-section"` --
+# instead of opening a section.
+#
+# yaml_top_level_key cannot tell that from a real section: it matches
+# `^<section>:` either way, so on its own it reports a scalar as "a section
+# that exists", and the remedy that follows from that -- indent the key under
+# it -- yields invalid YAML, a mapping key indented under a scalar value. An
+# operator who does what the message says ends up worse off than before.
+#
+# Reads the HEADER LINE ONLY, then exits. yaml_value's scan treats a
+# scalar-bearing header as opening a section (its `index($0, section ":") == 1`
+# ignores whatever follows the colon), and this probe must not inherit that:
+# it never looks below the header, so nothing yaml_value would have mis-scanned
+# there can reach the answer.
+yaml_section_scalar() {
+  awk -v section="$1" '
+    index($0, section ":") != 1 { next }
+    {
+      v = $0
+      sub(/^[^:]*:[[:space:]]*/, "", v)   # drop the section name
+      sub(/[[:space:]]*#.*$/, "", v)      # drop inline comment
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      found = (v != "")
+      exit
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$2"
+}
+
+# yaml_section_has_key <section> <key> <file>: true when the body of
+# `<section>:` carries an indented `<key>:` LINE AT ALL, whatever its value.
+#
+# Called only after the scoped lookup came back empty, so a hit here means the
+# key IS there with an empty value -- the state the old two-way reason reported
+# as "that section does not supply '<key>'" about a key sitting plainly in the
+# section, before telling the operator to indent something already indented.
+#
+# Mirrors yaml_value's scan deliberately: the question being answered is what
+# THAT scan saw, so an answer from a different scan would describe a different
+# file. It therefore shares yaml_value's quirk (a scalar-bearing header still
+# opens a section) -- unreachable through this path, because every caller tests
+# yaml_section_scalar first and stops there.
+yaml_section_has_key() {
+  awk -v section="$1" -v key="$2" '
+    /^[^[:space:]#]/ {
+      in_section = (index($0, section ":") == 1)
+      next
+    }
+    !in_section { next }
+    $0 ~ "^[[:space:]]+" key ":" { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$3"
+}
+
 # refuse_flat_key <key> <section> <file>: exit 1 when <key> is at column 0 and
 # the scoped lookup found nothing, so a misplaced key is never silently
 # ignored. Called only after the scoped lookup came back empty, and only for
 # network.public_ip -- see the asymmetry note above yaml_top_level_key for why
 # viewer.ui_mode uses warn_flat_key instead.
 # flat_key_reason <key> <section> <file>: the clause naming WHY our scoped
-# lookup came back empty. Both messages below used to say "but no '<section>:'
-# section supplying it", which is only one of the two cases and is FALSE in
-# the other: `viewer:` / `  theme: "dark"` / `ui_mode: "x"` has a viewer
-# section, it just has no ui_mode in it. An operator reading "no 'viewer:'
-# section" against a file whose second line is `viewer:` learns that the
-# message is guesswork, and the next true thing it says gets discounted too.
-# The two cases also need different fixes -- add the section, or add the key
-# to the section that is already there.
+# lookup came back empty. It used to say "but no '<section>:' section supplying
+# it", which is FALSE whenever the section is there and merely lacks the key,
+# and "two cases" was itself an undercount -- FOUR states end with the scoped
+# lookup empty, and the old branch reported two of them wrongly:
+#
+#   1. no `<section>:` at all;
+#   2. `<section>:` carrying a SCALAR, so it opens no section to read from --
+#      reported as a section that exists, with a remedy (indent under it) that
+#      makes the file invalid YAML if followed;
+#   3. `<section>:` a real section that has no `<key>:` in it;
+#   4. `<section>:` a real section whose `<key>:` IS there with an empty value
+#      -- reported as "does not supply '<key>'" about a key on the screen in
+#      front of the operator, with a remedy telling them to indent it when it
+#      is already indented.
+#
+# An operator who catches the message being provably wrong about the file they
+# are looking at discounts the next true thing it says, which is the whole
+# value of these lines.
 flat_key_reason() {
   local key="$1" section="$2" file="$3"
-  if yaml_top_level_key "${section}" "${file}"; then
+  if ! yaml_top_level_key "${section}" "${file}"; then
+    printf "%s" "there is no '${section}:' section in it to supply it"
+  elif yaml_section_scalar "${section}" "${file}"; then
+    printf "%s" "'${section}:' is set to a value rather than opening a" \
+                " section, so nothing can be read out of it"
+  elif yaml_section_has_key "${section}" "${key}" "${file}"; then
+    printf "%s" "there IS a '${section}:' section in it and it does carry a" \
+                " '${key}:', but that key has no value"
+  else
     printf "%s" "there IS a '${section}:' section in it, but that section" \
                 " does not supply '${key}'"
+  fi
+}
+
+# flat_key_fix <key> <section> <file>: the REMEDY for the same four states, as
+# a lower-case imperative clause both messages splice into their own sentence.
+#
+# Kept separate from flat_key_reason rather than folded into it because the
+# callers place the two halves differently -- the refusal states the fix as its
+# own sentence, the warning hangs it off "If that key was meant for this
+# viewer, ..." -- and because a shared, state-INDEPENDENT remedy is exactly the
+# bug being fixed here: the old fixed sentence said "Indent it under
+# '<section>:'" in all four states, which is wrong in three of them (there is
+# nothing to indent under in state 1, indenting under a scalar is invalid YAML
+# in state 2, and the key is already indented in state 4). Varying the reason
+# while leaving the remedy fixed would have kept the operator doing the wrong
+# thing, just with a better explanation of why they were there.
+flat_key_fix() {
+  local key="$1" section="$2" file="$3"
+  if ! yaml_top_level_key "${section}" "${file}"; then
+    printf "%s" "add a '${section}:' section and put '${key}:' in its body"
+  elif yaml_section_scalar "${section}" "${file}"; then
+    printf "%s" "make '${section}:' open a section rather than carry a" \
+                " value, and put '${key}:' in its body"
+  elif yaml_section_has_key "${section}" "${key}" "${file}"; then
+    printf "%s" "give the empty '${key}:' already inside '${section}:' a value"
   else
-    printf "%s" "there is no '${section}:' section in it to supply it"
+    printf "%s" "indent it under '${section}:'"
   fi
 }
 
@@ -143,7 +241,8 @@ refuse_flat_key() {
          "$(flat_key_reason "${key}" "${section}" "${file}");" \
          "this file's keys are read from their own" \
          "section only, so that value would be silently ignored and the" \
-         "viewer would boot on env/defaults. Indent it under '${section}:'" \
+         "viewer would boot on env/defaults. To fix it," \
+         "$(flat_key_fix "${key}" "${section}" "${file}")" \
          "(see config/host.yaml.example). If that key belongs to another" \
          "container, give the viewer its own '${section}: ${key}: ...' and" \
          "that value wins" >&2
@@ -167,8 +266,9 @@ warn_flat_key() {
        "$(flat_key_reason "${key}" "${section}" "${file}");" \
        "this file's keys are read from their own" \
        "section only, so that value was NOT read. In effect: '${effective}'" \
-       "(from ${supplier}). If that key was meant for this viewer, indent it" \
-       "under '${section}:' (see config/host.yaml.example) and it wins. If it" \
+       "(from ${supplier}). If that key was meant for this viewer," \
+       "$(flat_key_fix "${key}" "${section}" "${file}")" \
+       "(see config/host.yaml.example) and it wins. If it" \
        "belongs to another container sharing this file (isaac#65), nothing" \
        "needs doing -- this line is the only trace either way" >&2
 }
@@ -185,17 +285,27 @@ warn_flat_key() {
 # refused; see the asymmetry note above yaml_top_level_key.
 # Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
-# Initialised HERE, not left to `${flat_ui_mode_supplier:-}` at the point of
-# use. This script is the container ENTRYPOINT, so its environment is
-# operator- and compose-controlled: an unset shell variable read out of the
-# environment is an operator-supplied value. With `docker run -e
+# Initialised HERE so `set -u` has something to read, and under a
+# LEADING-UNDERSCORE, INTERNAL name because this script is the container
+# ENTRYPOINT: its environment is operator- and compose-controlled on the way
+# in, and it ends in `exec "${@}"` on the way out, so a bare name is both read
+# from and handed to somebody else's environment.
+#
+# Reading the obvious name was the first half of that: with `docker run -e
 # flat_ui_mode_supplier=...` and NO /etc/host.yaml mounted at all, the block
 # below never runs, the deferred warning fires anyway, and the boot log states
-# that a file which does not exist carries a key it does not have -- with the
-# operator's own text spliced in as the supplier. Nothing behaves differently,
-# so it is not a bypass; it is the log saying something that is not true,
-# which is the class of failure every fix in this file is about.
-flat_ui_mode_supplier=""
+# that a file which does not exist carries a key it does not have, with the
+# operator's own text spliced in as the supplier.
+#
+# ASSIGNING the obvious name is the other half, and initialising it did not
+# fix that -- it introduced it. The assignment does not create a fresh
+# shell-local: an inherited variable keeps its export attribute, so this line
+# would EMPTY a variable the operator set and hand that emptied version to the
+# exec'd process. The environment this entrypoint passes on is not its to
+# edit. Under the `_` prefix neither half can happen: nothing named
+# `flat_ui_mode_supplier` is read here, and nothing of that name is altered in
+# what the CMD inherits.
+_flat_ui_mode_supplier=""
 
 if [ -f /etc/host.yaml ]; then
   # An UNREADABLE host.yaml is an operator mistake, not an absent file, and it
@@ -233,9 +343,9 @@ if [ -f /etc/host.yaml ]; then
     # back-compat note above -- it changes what the operator is told, which is
     # where it is actually useful.
     if [ -n "${VIEWER_UI_MODE:-}" ]; then
-      flat_ui_mode_supplier="the VIEWER_UI_MODE env"
+      _flat_ui_mode_supplier="the VIEWER_UI_MODE env"
     else
-      flat_ui_mode_supplier="the built-in default; nothing else supplied one"
+      _flat_ui_mode_supplier="the built-in default; nothing else supplied one"
     fi
   fi
 fi
@@ -249,9 +359,9 @@ VIEWER_UI_MODE="${VIEWER_UI_MODE:-usd-viewer}"
 # The deferred half of the flat-ui_mode note above: emitted here so it can name
 # the resolved mode. Fires only when /etc/host.yaml carried a column-0
 # `ui_mode:` AND our own `viewer:` section supplied nothing.
-if [ -n "${flat_ui_mode_supplier}" ]; then
+if [ -n "${_flat_ui_mode_supplier}" ]; then
   warn_flat_key ui_mode viewer /etc/host.yaml \
-    "${VIEWER_UI_MODE}" "${flat_ui_mode_supplier}"
+    "${VIEWER_UI_MODE}" "${_flat_ui_mode_supplier}"
 fi
 
 # Validate before substituting. Each value lands in a browser-executed
