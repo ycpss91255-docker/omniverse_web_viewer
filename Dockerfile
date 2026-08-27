@@ -431,6 +431,30 @@ FROM devel AS devel-test
 
 USER root
 
+# PyYAML, for script/ci/check_release_gates.py -- the release-invariant
+# checker, run by release_gate_workflow.bats below. It parses
+# .github/workflows/main.yaml rather than pattern-matching its text, because
+# two text-matching versions were walked past by a reviewer (12 mutations,
+# then 21) on things a parser handles for free: trailing comments, `"if":` /
+# `'if':` / `if :` as four spellings of one key, a `(` inside a quoted string
+# breaking parenthesis depth, and a job header with a trailing comment not
+# being a job.
+#
+# python3 is ALREADY here (it comes with the Ubuntu base; `command -v python3`
+# answers /usr/bin/python3) -- only the YAML module is missing, so this is one
+# apt package and no interpreter.
+#
+# IT NEVER SHIPS. This stage is a leaf: `runtime` is `FROM devel-base`,
+# `runtime-test` and `e2e-test` are `FROM runtime`, `devel-test` is `FROM
+# devel`, and nothing anywhere is `FROM devel-test`. No published image gains
+# a package from this line. `python3-yaml` rather than pip: this base has no
+# pip and PEP 668 marks the interpreter externally managed, so apt is both the
+# smaller and the supported route.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-yaml && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=test-tools-stage /usr/local/bin/shellcheck /usr/local/bin/shellcheck
 COPY --from=test-tools-stage /usr/local/bin/hadolint /usr/local/bin/hadolint
 
@@ -447,6 +471,12 @@ COPY .base/script/docker/wrapper /lint/wrapper
 # also EXECUTED here -- derive_image_tag.bats runs the deriver in-image, which
 # is the only proof of the tag -> image-tag mapping available without pushing
 # a tag. Copied before the lint RUN so one copy serves both purposes.
+#
+# The directory now also carries check_release_gates.py, which the shellcheck
+# RUN below does not and cannot lint (`/ci/*.sh` is a shell glob). Its
+# stand-in is release_gate_workflow.bats, which byte-compiles it with
+# `python3 -m py_compile` before running it -- a syntax error there would
+# otherwise surface as a checker that exits 2 on every workflow.
 COPY --chmod=0755 script/ci/ /ci/
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
