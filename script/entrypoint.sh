@@ -112,22 +112,42 @@ yaml_top_level_key() {
   ' "$2"
 }
 
-# yaml_section_scalar <section> <file>: true when the COLUMN-0 `<section>:`
-# line carries a non-empty scalar of its own -- `viewer: "not-a-section"` --
-# instead of opening a section.
+# yaml_section_kind <section> <file>: print what the COLUMN-0 `<section>:`
+# line actually does -- `section`, `scalar` or `flow`.
 #
-# yaml_top_level_key cannot tell that from a real section: it matches
-# `^<section>:` either way, so on its own it reports a scalar as "a section
-# that exists", and the remedy that follows from that -- indent the key under
-# it -- yields invalid YAML, a mapping key indented under a scalar value. An
-# operator who does what the message says ends up worse off than before.
+# yaml_top_level_key cannot tell those apart: it matches `^<section>:` every
+# way, so on its own it reports a scalar as "a section that exists", and the
+# remedy that follows from that -- indent the key under it -- yields invalid
+# YAML, a mapping key indented under a scalar value. An operator who does what
+# the message says ends up worse off than before.
+#
+# THREE KINDS, NOT TWO. Deciding "scalar" from "there is text after the colon"
+# was itself provably wrong about three VALID files, and told the operator to
+# fix something already correct:
+#
+#   viewer: {ui_mode: "stream-only"}   a FLOW MAPPING. It is a real mapping
+#                                      supplying the key -- just written on
+#                                      one line, which this line-based reader
+#                                      does not scan. Saying it "is set to a
+#                                      value rather than opening a section" is
+#                                      false about the file on the screen.
+#   viewer: &anchor  + indented body   an ANCHOR is a node PROPERTY, not the
+#   viewer: !!map    + indented body   value; so is a TAG. The section below
+#                                      is a perfectly ordinary block mapping.
+#
+# So node properties are stripped first, and a remaining `{`/`[` is reported
+# as `flow` -- which gets its own true reason and its own true remedy -- while
+# only real leftover text is `scalar`. This is the exact class of bug this
+# whole group of helpers exists to end: a diagnostic that is provably false
+# about the file in front of the operator gets the next true thing it says
+# discounted too.
 #
 # Reads the HEADER LINE ONLY, then exits. yaml_value's scan treats a
 # scalar-bearing header as opening a section (its `index($0, section ":") == 1`
 # ignores whatever follows the colon), and this probe must not inherit that:
 # it never looks below the header, so nothing yaml_value would have mis-scanned
 # there can reach the answer.
-yaml_section_scalar() {
+yaml_section_kind() {
   awk -v section="$1" '
     index($0, section ":") != 1 { next }
     {
@@ -135,10 +155,21 @@ yaml_section_scalar() {
       sub(/^[^:]*:[[:space:]]*/, "", v)   # drop the section name
       sub(/[[:space:]]*#.*$/, "", v)      # drop inline comment
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-      found = (v != "")
+      # An anchor and a tag may BOTH be present, in either order, and neither
+      # is the value.
+      for (i = 0; i < 2; i++) {
+        if (v ~ /^&[^[:space:]]+/) {
+          sub(/^&[^[:space:]]+[[:space:]]*/, "", v)
+        } else if (v ~ /^![^[:space:]]*/) {
+          sub(/^![^[:space:]]*[[:space:]]*/, "", v)
+        }
+      }
+      if (v == "")            { kind = "section" }
+      else if (v ~ /^[{[]/)   { kind = "flow" }
+      else                    { kind = "scalar" }
       exit
     }
-    END { exit(found ? 0 : 1) }
+    END { print (kind == "" ? "section" : kind) }
   ' "$2"
 }
 
@@ -154,7 +185,7 @@ yaml_section_scalar() {
 # THAT scan saw, so an answer from a different scan would describe a different
 # file. It therefore shares yaml_value's quirk (a scalar-bearing header still
 # opens a section) -- unreachable through this path, because every caller tests
-# yaml_section_scalar first and stops there.
+# yaml_section_kind first and stops there.
 yaml_section_has_key() {
   awk -v section="$1" -v key="$2" '
     /^[^[:space:]#]/ {
@@ -195,9 +226,13 @@ flat_key_reason() {
   local key="$1" section="$2" file="$3"
   if ! yaml_top_level_key "${section}" "${file}"; then
     printf "%s" "there is no '${section}:' section in it to supply it"
-  elif yaml_section_scalar "${section}" "${file}"; then
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "scalar" ]; then
     printf "%s" "'${section}:' is set to a value rather than opening a" \
                 " section, so nothing can be read out of it"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "flow" ]; then
+    printf "%s" "'${section}:' is written as a one-line flow collection," \
+                " which this reader does not scan -- it reads keys from" \
+                " INDENTED lines below the section header"
   elif yaml_section_has_key "${section}" "${key}" "${file}"; then
     printf "%s" "there IS a '${section}:' section in it and it does carry a" \
                 " '${key}:', but that key has no value"
@@ -224,9 +259,12 @@ flat_key_fix() {
   local key="$1" section="$2" file="$3"
   if ! yaml_top_level_key "${section}" "${file}"; then
     printf "%s" "add a '${section}:' section and put '${key}:' in its body"
-  elif yaml_section_scalar "${section}" "${file}"; then
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "scalar" ]; then
     printf "%s" "make '${section}:' open a section rather than carry a" \
                 " value, and put '${key}:' in its body"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "flow" ]; then
+    printf "%s" "rewrite '${section}:' as an indented block mapping, with" \
+                " '${key}:' on its own line below it"
   elif yaml_section_has_key "${section}" "${key}" "${file}"; then
     printf "%s" "give the empty '${key}:' already inside '${section}:' a value"
   else
