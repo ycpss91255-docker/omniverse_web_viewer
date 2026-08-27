@@ -1409,6 +1409,26 @@ JOB
   assert_output --partial "publish-regctl-artifact"
 }
 
+# A registry login in a job that publishes nothing is not a normal pattern
+# -- the same reasoning that puts docker/login-action in PUBLISH_USES rather
+# than leaving it to whichever spelling the push happens to use. Added with
+# the row it tests, because a row nothing exercises is precisely the failure
+# the two cases above exist to correct.
+@test "gates: regctl registry login is publishing" {
+  _append_job <<'JOB'
+  login-regctl:
+    needs: [call-docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in
+        run: regctl registry login ghcr.io
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[publishing-job-is-behind-the-picture-gate]"
+  assert_output --partial "login-regctl"
+}
+
 # ... and the acceptance half: a regctl READ is not a publish. Without this,
 # widening the row to `regctl <anything>` would report every registry query
 # as a job that must stand behind the picture gate.
