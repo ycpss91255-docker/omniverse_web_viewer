@@ -110,6 +110,7 @@ people looking.
 
 import re
 import sys
+import traceback
 
 import yaml
 
@@ -176,7 +177,9 @@ PUBLISH_USES = (
 PUBLISH_RUN_RE = (
     re.compile(r"\bdocker\s+push\b"),
     re.compile(r"\bdocker\s+compose\s+push\b"),
-    re.compile(r"\bdocker\s+(?:buildx\s+)?(?:build|bake)\b[^\n]*(?:\s|^)--push\b"),
+    re.compile(
+        r"\bdocker\s+(?:buildx\s+)?(?:build|bake)\b[^\n]*(?:\s|^)--push\b"
+    ),
     re.compile(r"\bgh\s+release\s+(?:create|upload)\b"),
     re.compile(r"\bnpm\s+publish\b"),
     re.compile(r"\byarn\s+publish\b"),
@@ -212,7 +215,9 @@ _violations = []
 def violation(vid, message):
     """Record a violation under its stable id and print it to stderr."""
     _violations.append(vid)
-    sys.stderr.write("check_release_gates: VIOLATION [%s] %s\n" % (vid, message))
+    sys.stderr.write(
+        "check_release_gates: VIOLATION [%s] %s\n" % (vid, message)
+    )
 
 
 def refuse(message):
@@ -274,7 +279,10 @@ def load_workflow(path):
     try:
         doc = yaml.load(text, Loader=_StrictLoader)
     except yaml.YAMLError as exc:
-        refuse("cannot parse workflow %s as YAML: %s" % (path, str(exc).replace("\n", " ")))
+        refuse(
+            "cannot parse workflow %s as YAML: %s"
+            % (path, str(exc).replace("\n", " "))
+        )
     if not isinstance(doc, dict):
         refuse("%s is not a YAML mapping, so it is not a workflow" % path)
     return doc
@@ -499,7 +507,7 @@ def has_top_level_or(expr):
 
 
 def has_tier_b_success_conjunct(expr):
-    """True when one top-level `&&` term of <expr> IS the tier-b success test."""
+    """True when a top-level `&&` term of <expr> IS the tier-b success test."""
     return any(is_tier_b_success_test(term) for term in top_terms(expr, "&"))
 
 
@@ -646,7 +654,9 @@ def publishing_reason(wf, job):
             if marker in uses:
                 return "step '%s' uses %s" % (step_label(step), marker)
         with_block = step.get("with")
-        if isinstance(with_block, dict) and _truthy_push(with_block.get("push")):
+        if isinstance(with_block, dict) and _truthy_push(
+            with_block.get("push")
+        ):
             return "step '%s' passes push: %s" % (
                 step_label(step),
                 as_text(with_block.get("push")),
@@ -699,7 +709,9 @@ def carries_continue_on_error(wf, job):
     """
     body = wf.body(job)
     if _truthy_push(body.get("continue-on-error")):
-        return "job-level continue-on-error: %s" % as_text(body.get("continue-on-error"))
+        return "job-level continue-on-error: %s" % as_text(
+            body.get("continue-on-error")
+        )
     for step in wf.steps(job):
         if _truthy_push(step.get("continue-on-error")):
             return "step '%s' carries continue-on-error: %s" % (
@@ -799,7 +811,8 @@ def check(wf):
             "publish-image-needs-tier-b",
             "publish-image does not have %s as an ITEM of its needs, so an "
             "image can be pushed for a commit whose picture was never "
-            "verified. needs: %s" % (TIER_B, wf.needs("publish-image") or "<absent>"),
+            "verified. needs: %s"
+            % (TIER_B, wf.needs("publish-image") or "<absent>"),
         )
 
     # --- 2. ... and requires it to have SUCCEEDED, not merely not-failed --
@@ -837,7 +850,9 @@ def check(wf):
     # must not appear". `!failure()` is also true in a cancelled run, and
     # banning always() BY NAME let it through under another name.
     narrow = [
-        term for term in top_terms(publish_if, "&") if canon(term) in NOT_CANCELLED_TESTS
+        term
+        for term in top_terms(publish_if, "&")
+        if canon(term) in NOT_CANCELLED_TESTS
     ]
     wide = [
         term
@@ -859,7 +874,8 @@ def check(wf):
         violation(
             "publish-image-status-function-is-narrow",
             "publish-image's condition carries a status function that is not a "
-            "mandatory top-level !cancelled(). if: %s" % (publish_if or "<absent>"),
+            "mandatory top-level !cancelled(). if: %s"
+            % (publish_if or "<absent>"),
         )
 
     # --- 3. the Release is wired to the picture gate too ------------------
@@ -868,7 +884,8 @@ def check(wf):
             "call-release-needs-tier-b",
             "call-release does not have %s as an ITEM of its needs, so a "
             "GitHub Release can be cut for a commit whose picture was never "
-            "verified. needs: %s" % (TIER_B, wf.needs("call-release") or "<absent>"),
+            "verified. needs: %s"
+            % (TIER_B, wf.needs("call-release") or "<absent>"),
         )
 
     # --- 4. ... by DEFAULT skip propagation, which a status function kills -
@@ -881,7 +898,8 @@ def check(wf):
             "call-release-carries-no-status-function",
             "call-release's condition contains '%s()'. A status function "
             "overrides GitHub's default skip propagation, so a SKIPPED %s "
-            "would stop blocking the Release. if: %s" % (name, TIER_B, release_if),
+            "would stop blocking the Release. if: %s"
+            % (name, TIER_B, release_if),
         )
 
     # --- 5. no gate may be advisory ---------------------------------------
@@ -958,9 +976,9 @@ def check(wf):
                 violation(
                     "tag-globs-match-a-real-version",
                     "no on.push.tags pattern matches '%s', so pushing that tag "
-                    "starts no workflow: no picture gate, no Release, no image, "
-                    "and no signal that anything was meant to happen. Patterns: "
-                    "%s" % (probe, " ".join(globs)),
+                    "starts no workflow: no picture gate, no Release, no "
+                    "image, and no signal that anything was meant to "
+                    "happen. Patterns: %s" % (probe, " ".join(globs)),
                 )
 
     # --- 8. ... and reaches the picture gate on EVERY tag push ------------
@@ -1040,9 +1058,10 @@ def check(wf):
                 "gate-job-work-step-is-unconditional",
                 "gate job '%s' has a step guarded by 'if: %s' that runs one of "
                 "this repo's script/ci/ helpers. A gate job whose work step is "
-                "skipped still concludes 'success', which is all any downstream "
-                "needs/result check can see -- so this publishes with the gate "
-                "never having run. Step: %s" % (job, step_if, step_label(step)),
+                "skipped still concludes 'success', which is all any "
+                "downstream needs/result check can see -- so this "
+                "publishes with the gate never having run. Step: %s"
+                % (job, step_if, step_label(step)),
             )
         # --- 10a. ... and neither may the publishing act itself -----------
         # The `script/ci/` marker above is what a GATE job's work looks like
@@ -1063,8 +1082,8 @@ def check(wf):
                     "publishing-step-is-unconditional",
                     "job '%s' has a step guarded by 'if: %s' that %s. A "
                     "publishing job whose push step is skipped still concludes "
-                    "'success', so a tag cuts a Release with no image behind it "
-                    "and nothing turns red. Step: %s"
+                    "'success', so a tag cuts a Release with no image behind "
+                    "it and nothing turns red. Step: %s"
                     % (job, step_if, reason, step_label(step)),
                 )
 
@@ -1084,11 +1103,12 @@ def check(wf):
         if not wf.has(job):
             violation(
                 "report-only-jobs-still-exist",
-                "report-only job '%s' is gone. Nothing depends on it -- that is "
-                "the point -- so deleting it breaks no other check and reverses "
-                "nothing visibly, while restoring the silence it exists to end: "
-                "a release blocked by a cancelled or skipped picture gate "
-                "becomes a grey job on a green-looking run" % job,
+                "report-only job '%s' is gone. Nothing depends on it -- that "
+                "is the point -- so deleting it breaks no other check and "
+                "reverses nothing visibly, while restoring the silence it "
+                "exists to end: a release blocked by a cancelled or "
+                "skipped picture gate becomes a grey job on a "
+                "green-looking run" % job,
             )
             continue
         report_if = wf.condition(job)
@@ -1096,7 +1116,9 @@ def check(wf):
         # the file, and a trailing comment satisfied it while the condition it
         # was reading had been replaced by `false`.
         terms = top_terms(report_if, "&")
-        observes = any(canon(term) in TIER_B_NOT_SUCCESS_TESTS for term in terms)
+        observes = any(
+            canon(term) in TIER_B_NOT_SUCCESS_TESTS for term in terms
+        )
         reads_failed_need = "always" in status_functions_in(report_if)
         if (
             not wf.needs_job(job, TIER_B)
@@ -1106,13 +1128,19 @@ def check(wf):
         ):
             violation(
                 "report-only-jobs-still-exist",
-                "report-only job '%s' can no longer observe a picture gate that "
-                "did not succeed. It must need %s, and its condition must carry "
-                "always() (which is what lets a job read a need that did not "
-                "succeed) and, as a mandatory top-level conjunct, "
+                "report-only job '%s' can no longer observe a picture gate "
+                "that did not succeed. It must need %s, and its condition must "
+                "carry always() (which is what lets a job read a need that did "
+                "not succeed) and, as a mandatory top-level conjunct, "
                 "\"needs.%s.result != 'success'\" (which is what makes it fire "
                 "for skipped, cancelled and failure alike). needs: %s if: %s"
-                % (job, TIER_B, TIER_B, wf.needs(job) or "<absent>", report_if or "<absent>"),
+                % (
+                    job,
+                    TIER_B,
+                    TIER_B,
+                    wf.needs(job) or "<absent>",
+                    report_if or "<absent>",
+                ),
             )
 
     # --- 10b. the picture gate runs where a picture can be taken ----------
@@ -1175,11 +1203,11 @@ def check(wf):
             violation(
                 "publishing-job-is-behind-the-picture-gate",
                 "job '%s' can publish (%s) and its condition carries a status "
-                "function, which overrides GitHub's default skip propagation -- "
-                "so a SKIPPED picture gate no longer stops it. A job in that "
-                "position must ALSO require the gate explicitly, as a mandatory "
-                "top-level conjunct \"needs.%s.result == 'success'\" with no "
-                "top-level '||' in the condition. if: %s"
+                "function, which overrides GitHub's default skip propagation "
+                "-- so a SKIPPED picture gate no longer stops it. A job in "
+                "that position must ALSO require the gate explicitly, as a "
+                "mandatory top-level conjunct \"needs.%s.result == 'success'\" "
+                "with no top-level '||' in the condition. if: %s"
                 % (job, reason, TIER_B, job_if or "<absent>"),
             )
 
@@ -1190,10 +1218,13 @@ def main(argv):
     check(wf)
     if _violations:
         sys.stderr.write(
-            "check_release_gates: %d violation(s) in %s\n" % (len(_violations), path)
+            "check_release_gates: %d violation(s) in %s\n"
+            % (len(_violations), path)
         )
         return 1
-    sys.stdout.write("check_release_gates: %s holds the release invariant\n" % path)
+    sys.stdout.write(
+        "check_release_gates: %s holds the release invariant\n" % path
+    )
     return 0
 
 
@@ -1202,15 +1233,14 @@ if __name__ == "__main__":
         raise SystemExit(main(sys.argv))
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 -- see below
-        # NEVER a silent exit. The implementation this replaced could die with
-        # status 141 and no output at all, from a SIGPIPE between two of its
-        # own awk helpers, on an input a reviewer supplied -- a checker that
-        # says nothing and exits non-zero teaches a maintainer to re-run it
-        # until it is quiet. Anything unexpected here is a traceback on
-        # stderr and exit 2, which is the same status as "unreadable".
-        import traceback
-
+    # Deliberately BaseException, not Exception. NEVER a silent exit: the
+    # implementation this replaced could die with status 141 and no output at
+    # all, from a SIGPIPE between two of its own awk helpers, on an input a
+    # reviewer supplied -- and a checker that says nothing and exits non-zero
+    # teaches a maintainer to re-run it until it is quiet, which is a gate
+    # with a retry button. Anything unexpected here is a traceback on stderr
+    # and exit 2, the same status as "unreadable".
+    except BaseException:
         traceback.print_exc()
         sys.stderr.write(
             "check_release_gates: internal error; the release invariant was "
