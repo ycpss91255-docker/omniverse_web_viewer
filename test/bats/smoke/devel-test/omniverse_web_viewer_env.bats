@@ -427,6 +427,47 @@ teardown() {
   assert_success
 }
 
+# THREE VALID FILES THE SCALAR PROBE ABOVE USED TO CALL SCALARS. Deciding
+# "scalar" from "there is text after the colon on the header line" is wrong
+# for a one-line FLOW MAPPING (which is a real mapping) and for a YAML node
+# PROPERTY -- an anchor or a tag -- which is not the value at all. In each of
+# the three the operator was told to fix something already correct, which is
+# the exact class of provably-false diagnostic this group of helpers exists
+# to end: a message caught being wrong about the file on the screen gets the
+# next true thing it says discounted too.
+@test "a flow mapping is not called a scalar" {
+  printf 'network:\n  public_ip: "10.54.54.1"\nviewer: {ui_mode: "stream-only"}\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  refute_output --partial "is set to a value rather than opening a section"
+  assert_output --partial "'viewer:' is written as a one-line flow collection"
+  assert_output --partial "rewrite 'viewer:' as an indented block mapping"
+}
+
+@test "an anchored section header is not called a scalar" {
+  printf 'network:\n  public_ip: "10.54.54.1"\nviewer: &v\n  something_else: "x"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  refute_output --partial "is set to a value rather than opening a section"
+  refute_output --partial "flow collection"
+  assert_output --partial "there IS a 'viewer:' section in it"
+}
+
+@test "a tagged section header is not called a scalar" {
+  printf 'network:\n  public_ip: "10.54.54.1"\nviewer: !!map\n  something_else: "x"\nui_mode: "stream-only"\n' \
+    | sudo tee /etc/host.yaml >/dev/null
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
+  assert_success
+  assert_output --partial "top-level 'ui_mode:'"
+  refute_output --partial "is set to a value rather than opening a section"
+  refute_output --partial "flow collection"
+  assert_output --partial "there IS a 'viewer:' section in it"
+}
+
 # The supplier variable was never initialised, and it is read in a script that
 # is the container ENTRYPOINT -- so its environment is operator- and
 # compose-controlled, and an unset shell variable read out of the environment
