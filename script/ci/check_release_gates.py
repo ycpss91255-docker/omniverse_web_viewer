@@ -69,29 +69,48 @@ people looking.
     only for the publishing signals in PUBLISH_USES / PUBLISH_RUN_RE.
  2. GitHub's EXPRESSION SEMANTICS are not evaluated. Conditions are split at
     parenthesis depth 0 by this file's own tokeniser (string-literal aware,
-    whitespace-insensitive) and compared against closed sets of spellings
-    (TAG_REF_TESTS, TIER_B_SUCCESS_TESTS, NOT_CANCELLED_TESTS). An equivalent
-    expression written some OTHER way is reported as a violation -- a false
-    positive whose fix is to add the spelling to that set -- and an
-    inequivalent one that happens to canonicalise to a set member is not
-    caught. `contains()`, `format()`, `fromJSON()` and every other function
-    are opaque text.
- 3. Gate WORK is recognised as "a step whose `run:` or `uses:` names one of
-    this repo's `script/ci/` helpers". A gate whose work is an inline `run:`
-    block, a third-party action, or a helper invoked through a variable can
-    still be given a step-level `if:` unseen. Shell comments are stripped
-    from `run:` bodies by a "whitespace-preceded `#` to end of line"
-    heuristic, so a `#` inside a quoted shell string is treated as a comment.
+    whitespace-insensitive, and now CASE-insensitive -- `if: ALWAYS()` walked
+    the whole invariant past the case-sensitive version) and compared against
+    closed sets of spellings (TAG_REF_TESTS, TIER_B_SUCCESS_TESTS,
+    NOT_CANCELLED_TESTS). An equivalent expression written some OTHER way is
+    reported as a violation -- a false positive whose fix is to add the
+    spelling to that set -- and an inequivalent one that happens to
+    canonicalise to a set member is not caught. `contains()`, `format()`,
+    `fromJSON()` and every other function are opaque text.
+ 3. Gate WORK is pinned by IDENTITY for exactly the two jobs in
+    GATE_WORK_DRIVERS (tier-b-visual-e2e, verify-tag-shape): each must carry
+    a step whose `run:` is that job's driver invocation verbatim,
+    unconditional, with no second guarded copy of the same script. For EVERY
+    OTHER gate or publishing job the older, weaker test still applies -- "an
+    unconditional step whose `run:`/`uses:` names something under
+    `script/ci/`" -- and that one is a COUNT, not an identity: IN THOSE JOBS
+    THE GATE'S WORK CAN STILL BE A NO-OP. An unconditional decoy naming the
+    directory satisfies it while the real work sits behind an `if:`, whether
+    that work is an inline `run:`, a third-party action, or a command reached
+    through a variable. Shell comments are stripped from `run:` bodies for
+    THIS purpose by a "whitespace-preceded `#` to end of line" heuristic, so
+    a `#` inside a quoted shell string is treated as a comment here (it is
+    NOT stripped when deriving publishing -- see 4).
  4. PUBLISHING is recognised by effective `permissions:` (job-level, else
     workflow-level), by the action names in PUBLISH_USES, by a truthy or
     expression-valued `push:` input, and by the command patterns in
-    PUBLISH_RUN_RE. A job that publishes some other way -- an unfamiliar
-    action, a helper script that pushes without saying so, a token passed to
-    a program this list does not name -- is not derived and is therefore not
-    required to carry the gate. Widening those lists is the whole cost of
-    closing this. One gap here is DELIBERATE and is a trade, not an
-    oversight: `docker/build-push-action` is not a signal by itself, only its
-    `push:` input is, because `push: false` is how this repo's own
+    PUBLISH_RUN_RE, searched over the RAW `run:` body (comments not stripped,
+    line continuations joined) plus step-level `env:` VALUES, with job-level
+    `env:` read separately. Those
+    three choices all trade a false positive for never missing a publish: a
+    commented-out `docker push`, or one that only appears as the value of an
+    env var, marks the job as one that must stand behind the gate.
+    PUBLISH_RUN_RE IS AN ENUMERATION AND ENUMERATIONS DO NOT CONVERGE -- three
+    rounds of widening have each been followed by a reviewer naming another
+    spelling, and a publishing command nobody has thought of yet is still not
+    derived from its `run:`. What does not depend on the enumeration is the
+    `permissions:` signal, which is a capability rather than a spelling. A
+    job that publishes some other way -- an unfamiliar action, a helper
+    script that pushes without saying so, a token passed to a program this
+    list does not name -- is not derived from its commands and is caught only
+    if it holds a write scope. One gap here is DELIBERATE and is a trade, not
+    an oversight: `docker/build-push-action` is not a signal by itself, only
+    its `push:` input is, because `push: false` is how this repo's own
     build-worker builds on every PR and listing the action reported every
     build job as one that must stand behind the release gate. The cost is
     that an invocation whose `push:` arrives from somewhere this file cannot
@@ -106,7 +125,13 @@ people looking.
     this file. They are checked nowhere in this repo.
  7. WHAT THE RUNNER LABELS MEAN. `[self-hosted, gpu]` is asserted as a label
     set. Whether the machine answering to `gpu` actually has an NVENC-capable
-    GPU is not knowable from here.
+    GPU is not knowable from here. The four shapes of `runs-on` that CAN be
+    resolved are a sequence, a scalar, a `{group:, labels:}` mapping and
+    `${{ matrix.<name> }}` against this job's own `strategy.matrix`; a runner
+    GROUP with no labels, and any other expression, are reported as
+    unresolved rather than guessed -- which is a violation the day someone
+    writes one legitimately, and the fix is to state the labels in the
+    workflow.
  8. PyYAML IS NOT GITHUB'S PARSER. Anchors and aliases are expanded here and
     rejected by GitHub, so a workflow read through one would fail loudly at
     GitHub before it could publish -- the difference cannot hide a bypass,
@@ -121,6 +146,26 @@ people looking.
     caller is release_gate_workflow.bats inside the image that has the
     package -- but a future caller that ignores exit codes would have no
     check at all rather than a degraded one.
+10. TRIGGER REACHABILITY is answered for TAG patterns only, and only against
+    two probe tags (`v1.2.3`, `v1.2.3-rc1`). Negations (`!pattern`) are
+    honoured, last match winning. A `paths:` / `paths-ignore:` filter on the
+    same `push:` trigger is REFUSED rather than evaluated: whether GitHub
+    applies a path filter to a tag push is not settled from the workflow
+    text, and the reading that would matter (it does) makes an unmatchable
+    path filter silence every tag push while the tag patterns still look
+    right. Reachability through `workflow_call`, a `repository_dispatch`, or
+    a workflow in another file is not considered at all.
+11. GITHUB'S CASE RULES ARE ASSUMED, NOT DOCUMENTED. That expression function
+    and context names are case-insensitive is what actions/languageservices
+    implements and what the well-known write-ups say; GitHub's public
+    expressions reference does not state it. This file therefore matches
+    case-insensitively because that is safer under BOTH readings, not because
+    the behaviour is documented -- see canon_key.
+12. THIS FILE'S OWN LINT. `shellcheck /ci/*.sh` cannot see a `.py`. The
+    `devel-test` stage now runs pyflakes over `/ci/*.py`, which catches
+    undefined names and unused imports and NOTHING about whether a property
+    is right; release_gate_workflow.bats, which proves each property fails
+    when removed, is still the only thing that does that.
 ===========================================================================
 """
 
@@ -143,6 +188,39 @@ GATE_JOBS = (
 )
 
 TIER_B = "tier-b-visual-e2e"
+
+# The gate jobs whose WORK IS ONE EXACT COMMAND, and what that command is.
+#
+# WHY IDENTITY AND NOT A COUNT. Property 10 asks "is there an unconditional
+# step in this job that names something under script/ci/?". That question
+# cannot tell tier_b_visual_e2e.sh from derive_image_tag.sh, and it cannot
+# tell `bash script/ci/tier_b_visual_e2e.sh` from the same line with `|| true`
+# after it. A reviewer walked EIGHT bypasses past the count, all of them
+# publishing with no picture ever taken:
+#
+#   - the driver suffixed with `|| true`, or wrapped in `set +e; ...; exit 0`
+#   - the driver replaced by `--help` or `--version`, which exit 0 at once
+#   - the work step pointed at a DIFFERENT script/ci/ helper entirely
+#   - the real work moved behind an `if:` (as an inline `run:`, a third-party
+#     action, or `run: $CMD` with the command in `env:`) while an
+#     unconditional `echo` naming `script/ci/` kept the count satisfied
+#
+# So the property here is not "some step mentions the directory". It is
+# "THIS command runs, unconditionally, and no other step in this job invokes
+# the same script in some other spelling". Property 10 stays as the broader
+# net over every gate and publishing job; this is the identity pin on the two
+# jobs whose work is a single named driver.
+#
+# THE COST, stated so it is a decision and not a surprise: the invocation is
+# compared EXACTLY (whitespace-collapsed, nothing else). Adding a legitimate
+# argument -- `bash script/ci/tier_b_visual_e2e.sh --retries 2` -- is a
+# violation until the new spelling is written HERE. That is the intended
+# trade: an argument is exactly how a no-op arrives, so a new one is a change
+# to what the gate does and belongs in this table where it can be reviewed.
+GATE_WORK_DRIVERS = {
+    TIER_B: "bash script/ci/tier_b_visual_e2e.sh",
+    "verify-tag-shape": "bash script/ci/derive_image_tag.sh",
+}
 
 # Report-only jobs. They exist to ADD a failure (a blocked release that would
 # otherwise be a grey cancelled job on a green-looking run). Nothing may
@@ -190,14 +268,44 @@ PUBLISH_USES = (
 # bare `docker push`: `docker buildx build --push` names neither string the
 # text-matching version of this file looked for, and it was one of the
 # mutations that walked past it.
+#
+# THIS IS AN ENUMERATION AND ENUMERATIONS DO NOT CONVERGE. Said plainly here
+# and in limitation 4, because three rounds of widening it have each been
+# followed by a reviewer naming something else: `docker image push`,
+# `buildah push`, `podman push`, `gh api -X POST .../releases`, and -- the one
+# that defeated EVERY pattern at once rather than one of them -- a shell line
+# continuation, because each of these matches within a single line. A
+# publishing command spelled in a way nobody has thought of yet is still not
+# derived, and no amount of adding rows changes that. What DOES change it is
+# the `permissions:` signal, which is a capability rather than a spelling and
+# is why permissions are checked first and broadest.
+#
+# Line continuations are joined before matching (see _join_continuations), so
+# `docker \` + newline + `push ...` is one line by the time it gets here.
 PUBLISH_RUN_RE = (
-    re.compile(r"\bdocker\s+push\b"),
+    re.compile(r"\bdocker\s+(?:image\s+)?push\b"),
     re.compile(r"\bdocker\s+compose\s+push\b"),
+    re.compile(r"\bdocker\s+manifest\s+push\b"),
     re.compile(
         r"\bdocker\s+(?:buildx\s+)?(?:build|bake)\b[^\n]*(?:\s|^)--push\b"
     ),
-    re.compile(r"\bgh\s+release\s+(?:create|upload)\b"),
+    re.compile(r"\b(?:podman|buildah|nerdctl)\s+(?:image\s+)?push\b"),
+    re.compile(r"\b(?:podman|nerdctl)\s+manifest\s+push\b"),
+    re.compile(r"\bctr\s+(?:images?|i)\s+push\b"),
+    re.compile(r"\bgh\s+release\s+(?:create|upload|edit)\b"),
+    # A REST write against the releases (or packages) API is a Release cut by
+    # hand. Scoped to an explicit write METHOD on purpose: this repo's own
+    # publish-image reads `/repos/<r>/releases/tags/v<version>` to refuse a
+    # publish with no Release behind it, and that GET must not be derived as
+    # a publish -- it sits behind an `if:`, and calling it "the publishing
+    # act" would report the guard itself as a violation.
+    re.compile(
+        r"\bgh\s+api\b(?=[^\n]*(?:-X|--method)[=\s]\s*"
+        r"(?:POST|PUT|PATCH|DELETE))(?=[^\n]*\b(?:releases|packages)\b)",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bnpm\s+publish\b"),
+    re.compile(r"\bpnpm\s+publish\b"),
     re.compile(r"\byarn\s+publish\b"),
     re.compile(r"\btwine\s+upload\b"),
     re.compile(r"\bcargo\s+publish\b"),
@@ -459,9 +567,43 @@ def canon(term):
     return "".join(out)
 
 
+def canon_key(term):
+    """<term> canonicalised AND lower-cased, for comparison against a set.
+
+    EVERY comparison against a closed set of spellings goes through here, and
+    never through canon() directly, because the sets below are written in one
+    case and the thing being compared may be written in any.
+
+    WHY LOWER-CASE. `if: ALWAYS() && startsWith(github.ref, 'refs/tags/')` on
+    call-release, paired with a Tier B work step that cannot fail, was walked
+    straight past a version of this file that matched `\\balways\\s*\\(`
+    case-sensitively: the whole release invariant, defeated by two capital
+    letters. The same case-sensitivity ALSO reported `STARTSWITH(...)` as a
+    violation, which is a false positive -- so it failed open for the
+    spelling an attacker wants and closed for one a maintainer might write.
+
+    HONESTY ABOUT THE SOURCE. That GitHub's expression function names and
+    context names are case-insensitive is what actions/languageservices (the
+    parser behind the Actions VS Code extension) implements, and it is widely
+    written up, but it is NOT stated in GitHub's public expressions
+    reference. This file therefore does not RELY on it being true: matching
+    case-insensitively costs nothing and is strictly safer whichever way the
+    real evaluator behaves. If GitHub were case-SENSITIVE, `ALWAYS()` would
+    be an unknown function and the workflow would fail rather than publish;
+    if it is case-INSENSITIVE, this is the only thing that catches it.
+
+    String literals are lower-cased too. GitHub's `==` on strings is
+    documented as case-insensitive, so `needs.x.result == 'SUCCESS'` and
+    `... == 'success'` are one expression, and folding them together is the
+    same decision, not an extra one.
+    """
+    return canon(term).lower()
+
+
+# Every set below is written LOWER-CASE and compared against canon_key().
 TAG_REF_TESTS = frozenset(
     (
-        "startsWith(github.ref,'refs/tags/')",
+        "startswith(github.ref,'refs/tags/')",
         "github.ref_type=='tag'",
         "'tag'==github.ref_type",
     )
@@ -488,11 +630,11 @@ TIER_B_NOT_SUCCESS_TESTS = frozenset(
 
 
 def is_tag_ref_test(term):
-    return canon(term) in TAG_REF_TESTS
+    return canon_key(term) in TAG_REF_TESTS
 
 
 def is_tier_b_success_test(term):
-    return canon(term) in TIER_B_SUCCESS_TESTS
+    return canon_key(term) in TIER_B_SUCCESS_TESTS
 
 
 def status_functions_in(expr):
@@ -501,6 +643,12 @@ def status_functions_in(expr):
     Outside string literals only, so a job name or a commit message
     containing the word `always` is not a status function -- and, equally, a
     status function cannot be hidden inside one.
+
+    CASE-INSENSITIVE, for the reason canon_key() gives at length: matching
+    `always` but not `ALWAYS` let `if: ALWAYS()` on call-release defeat the
+    entire release invariant. The returned names are always the lower-case
+    spellings from STATUS_FUNCTIONS, so callers comparing against `"always"`
+    keep working whatever the file said.
     """
     plain = []
     for _, char, in_string in _scan(expr):
@@ -508,7 +656,7 @@ def status_functions_in(expr):
     text = "".join(plain)
     found = []
     for name in STATUS_FUNCTIONS:
-        if re.search(r"\b%s\s*\(" % name, text):
+        if re.search(r"\b%s\s*\(" % name, text, re.IGNORECASE):
             found.append(name)
     return found
 
@@ -574,8 +722,16 @@ class Workflow(object):
     def step_condition(self, step):
         return unwrap(as_text(step.get("if")))
 
-    def runs_on(self, job):
-        return as_list(self.body(job).get("runs-on"))
+    def runs_on_raw(self, job):
+        """<job>'s `runs-on` EXACTLY as written.
+
+        Not as_list()'d: `runs-on` has three valid shapes -- a scalar, a
+        sequence of labels, and a MAPPING with `group:` / `labels:` -- and
+        flattening the mapping to `str(dict)` reported the documented
+        runner-group syntax as a job that had left the GPU runner. See
+        runs_on_variants.
+        """
+        return self.body(job).get("runs-on")
 
     def permissions(self, job):
         """<job>'s EFFECTIVE permissions: its own, else the workflow's.
@@ -604,6 +760,141 @@ def _strip_shell_comments(text):
     for line in text.split("\n"):
         out.append(re.sub(r"(^|\s)#.*$", r"\1", line))
     return "\n".join(out)
+
+
+_MATRIX_RUNS_ON_RE = re.compile(
+    r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}"
+)
+
+
+def runs_on_variants(wf, job):
+    """(every label set <job> could run on, None), or (None, why not).
+
+    `runs-on` has more than one legal shape, and reading only the two this
+    repo happens to use reported the others as a job that had left the GPU
+    runner -- a false positive on a valid edit, which is the kind of noise
+    that gets a check switched off:
+
+      - a SEQUENCE, `[self-hosted, gpu]`: one variant, those labels;
+      - a SCALAR, `ubuntu-latest`: one variant, one label;
+      - a MAPPING, `{group: gpu-hosts, labels: [self-hosted, gpu]}`: this is
+        documented GitHub syntax for picking a runner GROUP as well as
+        labels, and it will be written here the day the org moves the GPU
+        host into a group;
+      - `${{ matrix.runner }}`: resolved against this job's
+        `strategy.matrix`, and EVERY value it could take must satisfy the
+        caller -- a matrix with one GPU entry and one hosted entry means the
+        gate runs on a hosted runner for half its variants.
+
+    A `group:` with no `labels:` is NOT resolvable here: which machines are
+    in a runner group is repo/org settings, which limitation 6 says this file
+    cannot see. That comes back as a problem, not as a silent pass.
+    """
+    raw = wf.runs_on_raw(job)
+    if raw is None:
+        return None, "runs-on is absent"
+    if isinstance(raw, dict):
+        if "labels" in raw:
+            return [as_list(raw.get("labels"))], None
+        if "group" in raw:
+            return None, (
+                "runs-on names a runner group ('%s') and no labels:. Which "
+                "machines are in a group is a repo/org SETTING, which this "
+                "file cannot read -- add 'labels: [self-hosted, gpu]' "
+                "alongside the group so the requirement is in the workflow"
+                % as_text(raw.get("group"))
+            )
+        return None, "runs-on is a mapping with neither labels: nor group:"
+    if isinstance(raw, (list, tuple)):
+        return [as_list(raw)], None
+
+    text = as_text(raw).strip()
+    match = _MATRIX_RUNS_ON_RE.fullmatch(text)
+    if match:
+        name = match.group(1)
+        strategy = wf.body(job).get("strategy")
+        matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+        if not isinstance(matrix, dict) or name not in matrix:
+            return None, (
+                "runs-on is '%s' but this job's strategy.matrix declares no "
+                "'%s', so the runner it lands on is not determined here"
+                % (text, name)
+            )
+        values = matrix.get(name)
+        if not isinstance(values, (list, tuple)) or not values:
+            return None, (
+                "runs-on is '%s' and strategy.matrix.%s is not a non-empty "
+                "list" % (text, name)
+            )
+        variants = []
+        for value in values:
+            if isinstance(value, dict):
+                if "labels" not in value:
+                    return None, (
+                        "runs-on is '%s' and one strategy.matrix.%s entry is "
+                        "a mapping with no labels:" % (text, name)
+                    )
+                variants.append(as_list(value.get("labels")))
+            else:
+                variants.append(as_list(value))
+        return variants, None
+    if "${{" in text:
+        return None, (
+            "runs-on is the expression '%s', whose value is decided outside "
+            "this file (an input, an env, a reusable-workflow caller), so the "
+            "runner it lands on is not determined here" % text
+        )
+    return [[text]], None
+
+
+def _join_continuations(text):
+    """<text> with shell line continuations folded into one line.
+
+    `docker \\` + newline + `push ghcr.io/...` is ONE command. Every pattern
+    in PUBLISH_RUN_RE matches within a line, so without this a backslash
+    defeated all of them at once -- not one row of the table, the whole
+    table.
+    """
+    return re.sub(r"\\\n[ \t]*", " ", text)
+
+
+def publish_search_text(step):
+    """The text of <step> to search for PUBLISHING commands.
+
+    RAW. Shell comments are deliberately NOT stripped here, and that is the
+    opposite of what step_text() does for gate WORK, because the two fail in
+    opposite directions:
+
+      - for gate work, treating a commented-out line as real work would let
+        `run: true  # bash script/ci/x.sh` count as the gate;
+      - for publishing, treating a real command as a comment REMOVES the
+        publish signal, and a job that is not derived as publishing is not
+        required to stand behind the picture gate at all.
+
+    `run: echo "build #1 done" ; docker push ghcr.io/...` is the whole bypass:
+    a `#` inside a double-quoted shell string is not a comment to the shell,
+    the strip heuristic ate the rest of the line, and the push vanished. So
+    this searches the raw body and ACCEPTS the false positive in the other
+    direction -- a genuinely commented-out `docker push` marks the job as one
+    that must stand behind the gate, which costs a `needs:` line and never a
+    missed publish.
+
+    STEP-LEVEL `env:` VALUES ARE INCLUDED. `env: CMD: docker push ...` with
+    `run: eval "$CMD"` is indirection this file cannot follow at the `run:`
+    end, but it can see the command where it is written. Same trade: a
+    variable that merely NAMES a push marks the step as publishing.
+    Job-level `env:` is read separately, by publishing_reason, so its reason
+    message points at the job rather than at an arbitrary step.
+    """
+    parts = []
+    step_env = step.get("env")
+    if isinstance(step_env, dict):
+        for value in step_env.values():
+            parts.append(as_text(value))
+    run = step.get("run")
+    if run is not None:
+        parts.append(as_text(run))
+    return _join_continuations("\n".join(parts))
 
 
 def step_text(step):
@@ -664,6 +955,21 @@ def publishing_reason(wf, job):
         if marker in job_uses:
             return "uses: %s" % job_uses
 
+    # Job-level `env:` once, with its own reason. Folding it into every step's
+    # search would report "step 'Checkout' runs \\bdocker\\s+push\\b" about a
+    # command written twenty lines above the steps, which sends a maintainer
+    # to the wrong place.
+    job_env = body.get("env")
+    if isinstance(job_env, dict):
+        for name, value in job_env.items():
+            text = _join_continuations(as_text(value))
+            for pattern in PUBLISH_RUN_RE:
+                if pattern.search(text):
+                    return "job-level env %s matches %s" % (
+                        as_text(name),
+                        pattern.pattern,
+                    )
+
     for step in wf.steps(job):
         uses = as_text(step.get("uses"))
         for marker in PUBLISH_USES:
@@ -677,7 +983,7 @@ def publishing_reason(wf, job):
                 step_label(step),
                 as_text(with_block.get("push")),
             )
-        run = _strip_shell_comments(as_text(step.get("run") or ""))
+        run = publish_search_text(step)
         for pattern in PUBLISH_RUN_RE:
             if pattern.search(run):
                 return "step '%s' runs %s" % (step_label(step), pattern.pattern)
@@ -699,7 +1005,12 @@ def publishing_step_reason(step):
     with_block = step.get("with")
     if isinstance(with_block, dict) and _truthy_push(with_block.get("push")):
         return "passes push: %s" % as_text(with_block.get("push"))
-    run = _strip_shell_comments(as_text(step.get("run") or ""))
+    # Step-level env only, NOT the job's: a job-level `env:` naming a push
+    # says the JOB can publish (which publishing_reason uses), but it does
+    # not make every step in that job the publishing act, and reporting each
+    # guarded step as one would be a false positive on every diagnostic step
+    # in a publishing job.
+    run = publish_search_text(step)
     for pattern in PUBLISH_RUN_RE:
         if pattern.search(run):
             return "runs %s" % pattern.pattern
@@ -776,14 +1087,42 @@ def tag_trigger_globs(wf):
     return as_list(push.get("tags"))
 
 
+def tag_trigger_path_filters(wf):
+    """The `paths:` / `paths-ignore:` keys under `on.push`, if any."""
+    on = get_on(wf.doc)
+    if not isinstance(on, dict):
+        return []
+    push = on.get("push")
+    if not isinstance(push, dict):
+        return []
+    return [key for key in ("paths", "paths-ignore") if key in push]
+
+
 def tag_glob_matches(globs, tag):
+    """True when <tag> reaches the workflow through <globs>.
+
+    NEGATIONS ARE HONOURED. A pattern starting with `!` EXCLUDES what it
+    matches, and later patterns override earlier ones. Without this case a
+    single appended `- '!v[0-9]+.[0-9]+.[0-9]+-*'` silently excluded every
+    release candidate -- no picture gate, no Release, no image, and no signal
+    that anything was meant to happen -- while the property above it, whose
+    own comment says PRESENCE IS NOT REACHABILITY, passed because the list
+    still had items in it and one of them still matched `v1.2.3`.
+
+    A list of nothing but negations matches nothing, which is what GitHub
+    does too (it requires at least one positive pattern) and is reported as
+    the unreachable trigger it is.
+    """
+    matched = False
     for glob in globs:
+        negated = glob.startswith("!")
+        pattern = glob[1:] if negated else glob
         try:
-            if re.match(glob_to_regex(glob), tag):
-                return True
+            if re.match(glob_to_regex(pattern), tag):
+                matched = not negated
         except re.error:
             continue
-    return False
+    return matched
 
 
 # ===========================================================================
@@ -868,12 +1207,13 @@ def check(wf):
     narrow = [
         term
         for term in top_terms(publish_if, "&")
-        if canon(term) in NOT_CANCELLED_TESTS
+        if canon_key(term) in NOT_CANCELLED_TESTS
     ]
     wide = [
         term
         for term in top_terms(publish_if, "&")
-        if canon(term) not in NOT_CANCELLED_TESTS and status_functions_in(term)
+        if canon_key(term) not in NOT_CANCELLED_TESTS
+        and status_functions_in(term)
     ]
     if wide:
         violation(
@@ -983,10 +1323,31 @@ def check(wf):
             "is about the patterns, not the key.)",
         )
     else:
+        # A `paths:` / `paths-ignore:` filter alongside `tags:` is REFUSED
+        # rather than interpreted. Whether GitHub evaluates a path filter for
+        # a TAG push is not something this file can settle from the workflow
+        # text, and the two readings differ in the direction that matters: if
+        # it is evaluated, `paths: ['does/not/exist/**']` stops every tag push
+        # from starting this workflow -- no picture gate, no Release -- while
+        # the tag patterns below still match perfectly. So the filter is a
+        # violation with a fix (take it off `push:`, or split the tag trigger
+        # into its own `on.push` entry) rather than a guess.
+        for key in tag_trigger_path_filters(wf):
+            violation(
+                "tag-trigger-has-no-path-filter",
+                "on.push carries a '%s:' filter alongside 'tags:'. A path "
+                "filter that matches nothing stops a tag push from starting "
+                "this workflow at all, and this checker cannot evaluate it "
+                "against a commit it does not have -- so the tag patterns "
+                "below can all match while nothing runs. Remove it from the "
+                "push trigger." % key,
+            )
         # PRESENCE IS NOT REACHABILITY: `- 'never-matches-anything'` is a
         # sequence with items in it, and it starts no workflow for any real
-        # tag. Both shapes this repo cuts are tried, because the incident
-        # behind the rule (#70) was an rc.
+        # tag. So is `- '!v[0-9]+.[0-9]+.[0-9]+-*'`, which is a NEGATION and
+        # excludes every rc -- see tag_glob_matches. Both shapes this repo
+        # cuts are tried, because the incident behind the rule (#70) was an
+        # rc.
         for probe in ("v1.2.3", "v1.2.3-rc1"):
             if not tag_glob_matches(globs, probe):
                 violation(
@@ -1111,6 +1472,78 @@ def check(wf):
                 "be about" % job,
             )
 
+    # --- 10c. the gate's work is THAT command, identified, not counted -----
+    # See GATE_WORK_DRIVERS for the eight bypasses that walked past the count
+    # above. Three clauses, all of them about ONE named invocation:
+    #
+    #   (a) it is PRESENT, spelled exactly as the table says;
+    #   (b) it is UNCONDITIONAL (verify-tag-shape's deriver may carry the
+    #       per-step tag guard property 9 requires it to have INSTEAD of a
+    #       job-level `if:`, and nothing else);
+    #   (c) NOTHING SHADOWS IT -- no other step in the job invokes the same
+    #       script in any other spelling, so a second, guarded, `|| true`
+    #       copy cannot be mistaken for the work while (a) is satisfied by a
+    #       line that no longer runs anything.
+    #
+    # The one other spelling allowed by (c) is a `--print-<something>` QUERY,
+    # which asks the driver for a value rather than doing the job (this
+    # repo's Tier B job pulls the producer image the driver names). It must
+    # itself be unconditional: a skipped query fails the step that uses it.
+    for job in sorted(GATE_WORK_DRIVERS):
+        if not wf.has(job):
+            continue
+        driver = GATE_WORK_DRIVERS[job]
+        script = driver.split()[-1]
+        found_verbatim = False
+        for step in wf.steps(job):
+            run = as_text(step.get("run") or "")
+            uses = as_text(step.get("uses") or "")
+            if script not in run and script not in uses:
+                continue
+            collapsed = " ".join(run.split())
+            step_if = wf.step_condition(step)
+            if collapsed == driver:
+                found_verbatim = True
+                if step_if and not (
+                    job == "verify-tag-shape" and is_tag_ref_test(step_if)
+                ):
+                    violation(
+                        "gate-job-runs-its-driver-verbatim",
+                        "gate job '%s' runs its driver (%s) behind 'if: %s'. A "
+                        "gate job whose work step is skipped still concludes "
+                        "'success', which is all any downstream needs/result "
+                        "check can see, so this publishes with the gate never "
+                        "having run. Step: %s"
+                        % (job, driver, step_if, step_label(step)),
+                    )
+                continue
+            if "--print-" in run and not step_if:
+                continue
+            violation(
+                "gate-job-runs-its-driver-verbatim",
+                "gate job '%s' has a step that invokes %s in a spelling that "
+                "is neither the gate's work nor an unconditional "
+                "'--print-<x>' query: %s. `|| true`, `--help`, `--version`, a "
+                "`set +e; ...; exit 0` wrapper and a second guarded copy all "
+                "leave the job reporting 'success' with no picture taken. The "
+                "job's work must be exactly \"%s\" -- if it legitimately needs "
+                "an argument, add the new spelling to GATE_WORK_DRIVERS in "
+                "check_release_gates.py, where it can be reviewed. Step: %s"
+                % (job, script, collapsed or uses, driver, step_label(step)),
+            )
+        if not found_verbatim:
+            violation(
+                "gate-job-runs-its-driver-verbatim",
+                "gate job '%s' has no step whose run: is exactly \"%s\". That "
+                "command IS this job's work; a job that runs but does not do "
+                "it reports 'success' all the same, and every needs/result "
+                "check downstream sees a picture that was never taken. "
+                "Counting steps that merely name something under script/ci/ "
+                "is what this replaces: an unconditional decoy satisfied the "
+                "count while the real work moved behind an 'if:'."
+                % (job, driver),
+            )
+
     # --- 6c. the report-only jobs still exist, and can still observe ------
     # Property 6 says nothing may DEPEND on these two. It said nothing about
     # them being there at all, so deleting both was a silent no-op -- and
@@ -1133,7 +1566,7 @@ def check(wf):
         # was reading had been replaced by `false`.
         terms = top_terms(report_if, "&")
         observes = any(
-            canon(term) in TIER_B_NOT_SUCCESS_TESTS for term in terms
+            canon_key(term) in TIER_B_NOT_SUCCESS_TESTS for term in terms
         )
         reads_failed_need = "always" in status_functions_in(report_if)
         if (
@@ -1164,15 +1597,29 @@ def check(wf):
     # "boot a real Kit producer and assert a browser renders a non-black frame
     # from it", and no hosted runner has NVENC -- so `runs-on: ubuntu-latest`
     # here does not slow the gate down, it removes it.
-    labels = [label.strip() for label in wf.runs_on(TIER_B)]
-    if "self-hosted" not in labels or "gpu" not in labels:
+    variants, problem = runs_on_variants(wf, TIER_B)
+    if problem is not None:
         violation(
             "tier-b-runs-on-the-gpu-runner",
-            "%s must run on [self-hosted, gpu]: it boots a real Kit producer "
-            "and asserts a real browser renders a real frame, and no hosted "
-            "runner has NVENC. Moving it off the GPU does not slow the gate "
-            "down, it removes it. runs-on: %s" % (TIER_B, labels or "<absent>"),
+            "%s must run on [self-hosted, gpu], and this file cannot tell "
+            "that it does: %s. It boots a real Kit producer and asserts a "
+            "real browser renders a real frame, and no hosted runner has "
+            "NVENC -- moving it off the GPU does not slow the gate down, it "
+            "removes it." % (TIER_B, problem),
         )
+    else:
+        for variant in variants:
+            labels = [label.strip() for label in variant]
+            if "self-hosted" in labels and "gpu" in labels:
+                continue
+            violation(
+                "tier-b-runs-on-the-gpu-runner",
+                "%s must run on [self-hosted, gpu]: it boots a real Kit "
+                "producer and asserts a real browser renders a real frame, "
+                "and no hosted runner has NVENC. Moving it off the GPU does "
+                "not slow the gate down, it removes it. runs-on resolves to: "
+                "%s" % (TIER_B, labels or "<empty>"),
+            )
 
     # --- 11. EVERY job that can publish stands behind the picture gate ----
     # Properties 1-4 name call-release and publish-image because those were
