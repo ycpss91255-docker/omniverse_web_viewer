@@ -450,8 +450,16 @@ USER root
 # a package from this line. `python3-yaml` rather than pip: this base has no
 # pip and PEP 668 marks the interpreter externally managed, so apt is both the
 # smaller and the supported route.
+#
+# pyflakes rides along on the same apt call for the OTHER half of the same
+# problem: `shellcheck /ci/*.sh` is a shell glob and cannot see a .py, so a
+# 1265-line Python checker had no static analysis at all -- against this
+# repo's own rule that lint counts as testing. It catches undefined names,
+# unreachable imports and shadowed definitions, and NOTHING about whether a
+# property is right; release_gate_workflow.bats, which proves each property
+# fails when removed, is still the only thing that does that.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-yaml && \
+    apt-get install -y --no-install-recommends python3-yaml python3-pyflakes && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -472,16 +480,22 @@ COPY .base/script/docker/wrapper /lint/wrapper
 # is the only proof of the tag -> image-tag mapping available without pushing
 # a tag. Copied before the lint RUN so one copy serves both purposes.
 #
-# The directory now also carries check_release_gates.py, which the shellcheck
-# RUN below does not and cannot lint (`/ci/*.sh` is a shell glob). Its
-# stand-in is release_gate_workflow.bats, which byte-compiles it in memory
-# before running it -- a syntax error there would otherwise surface as a
-# checker that exits 2 on every workflow, which reads like a broken input.
+# The directory also carries check_release_gates.py, which shellcheck does not
+# and cannot lint (`/ci/*.sh` is a shell glob) -- pyflakes below is its
+# linter, and release_gate_workflow.bats byte-compiles it in memory before
+# running it, because a syntax error would otherwise surface as a checker that
+# exits 2 on every workflow, which reads like a broken input.
 COPY --chmod=0755 script/ci/ /ci/
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
 # helpers, which nothing else was linting.
-RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh
+# pyflakes on the same line, because `/ci/*.sh` is a shell glob and cannot see
+# check_release_gates.py -- a 1265-line Python file whose only static check was
+# an in-memory `compile()` in the bats. One RUN rather than two: hadolint's
+# DL3059 refuses consecutive RUNs, and both tools name themselves in their own
+# output, so a failure still says which language it came from.
+RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh && \
+    python3 -m pyflakes /ci/*.py
 WORKDIR /lint
 RUN hadolint Dockerfile
 
