@@ -64,9 +64,20 @@ productive attack in the last review (the comment channel) appeared in none
 of them. An over-claimed gate is worse than a narrow one, because it stops
 people looking.
 
- 1. ONE FILE. A gate moved into a reusable workflow, a composite action, or
-    a second workflow file is not examined. A `uses:` line naming one is read
-    only for the publishing signals in PUBLISH_USES / PUBLISH_RUN_RE.
+ 1. ONE FILE, BUT NO LONGER ONE FILE SILENTLY. A gate moved into a reusable
+    workflow, a composite action, or a second workflow file is not examined;
+    a `uses:` line naming one is read only for the publishing signals in
+    PUBLISH_USES / PUBLISH_RUN_RE. That was the CHEAPEST bypass in the repo,
+    because nothing enumerated `.github/workflows/`: a second workflow file
+    with `on: push: tags: ['v*']` and a `docker push` published with no gate
+    while every check here -- this one included -- stayed green. The
+    `devel-test` stage now copies the DIRECTORY (`COPY .github/workflows/
+    /workflows/`) and release_gate_workflow.bats asserts exactly which files
+    are in it, so adding a workflow is a red test rather than a silence. The
+    limitation itself is unchanged: THIS FILE still reads the one workflow it
+    is given, and a second one is a decision for whoever adds it -- defend
+    the invariant there too, or say why that file cannot publish. Reusable
+    workflows and composite actions are not enumerated at all.
  2. GitHub's EXPRESSION SEMANTICS are not evaluated. Conditions are split at
     parenthesis depth 0 by this file's own tokeniser (string-literal aware,
     whitespace-insensitive, and now CASE-insensitive -- `if: ALWAYS()` walked
@@ -91,6 +102,28 @@ people looking.
     THIS purpose by a "whitespace-preceded `#` to end of line" heuristic, so
     a `#` inside a quoted shell string is treated as a comment here (it is
     NOT stripped when deriving publishing -- see 4).
+
+    ON THE TWO PINNED JOBS the pin is now an INVOCATION rather than a string:
+    `shell:`, `working-directory:` and `env:` are refused on a step that
+    invokes the driver, and `defaults.run` and `env:` are refused on those
+    jobs and at workflow level, because all three of `shell: cat {0}`,
+    `working-directory:` and a `TIER_B_*` variable turn the pinned command
+    into something that takes no picture WITHOUT editing the pinned line.
+    WHAT REMAINS OPEN IN THAT FAMILY, precisely:
+      (a) AN EARLIER STEP CAN PREPARE THE GROUND. A step that names the
+          driver path in full is examined whatever it does with it (so
+          `run: echo exit 0 > script/ci/tier_b_visual_e2e.sh` IS reported),
+          but one that reaches the same file through a glob, a variable or a
+          checkout of another ref is not, and neither is a `$GITHUB_PATH`
+          entry that shadows `bash` itself. Only steps that NAME the driver
+          are read; the rest of the job is not.
+      (b) `container:` and `services:` on the job are not read, and they
+          decide which machine the pinned command runs on.
+      (c) `defaults.run` is refused WHOLE rather than key by key, so a key
+          GitHub adds later is covered by accident rather than by design.
+          That is the intended direction, and it is why there is no list of
+          `defaults.run` keys here to go stale.
+      (d) what the driver ITSELF does is item 5.
  4. PUBLISHING is recognised by effective `permissions:` (job-level, else
     workflow-level), by the action names in PUBLISH_USES, by a truthy or
     expression-valued `push:` input, and by the command patterns in
@@ -102,7 +135,9 @@ people looking.
     env var, marks the job as one that must stand behind the gate.
     PUBLISH_RUN_RE IS AN ENUMERATION AND ENUMERATIONS DO NOT CONVERGE -- three
     rounds of widening have each been followed by a reviewer naming another
-    spelling, and a publishing command nobody has thought of yet is still not
+    spelling, and one row had been WRONG rather than merely incomplete
+    (`regctl push|copy`, two subcommands regctl does not have, sitting in the
+    table looking like coverage while `regctl image copy` went through), and a publishing command nobody has thought of yet is still not
     derived from its `run:`. What does not depend on the enumeration is the
     `permissions:` signal, which is a capability rather than a spelling. A
     job that publishes some other way -- an unfamiliar action, a helper
@@ -124,7 +159,10 @@ people looking.
     approval rules, and who may dispatch a workflow live in GitHub, not in
     this file. They are checked nowhere in this repo.
  7. WHAT THE RUNNER LABELS MEAN. `[self-hosted, gpu]` is asserted as a label
-    set. Whether the machine answering to `gpu` actually has an NVENC-capable
+    set, matched case-INSENSITIVELY (GitHub matches labels that way; this
+    file did not, and reported `[Self-Hosted, GPU]` as a gate that had left
+    the GPU -- fail-closed noise, but the same inconsistency the expression
+    change argued against). Whether the machine answering to `gpu` actually has an NVENC-capable
     GPU is not knowable from here. The four shapes of `runs-on` that CAN be
     resolved are a sequence, a scalar, a `{group:, labels:}` mapping and
     `${{ matrix.<name> }}` against this job's own `strategy.matrix`; a runner
@@ -161,6 +199,28 @@ people looking.
     expressions reference does not state it. This file therefore matches
     case-insensitively because that is safer under BOTH readings, not because
     the behaviour is documented -- see canon_key.
+
+    THE ARGUMENT THAT ACTUALLY CARRIES THE DECISION, since "safer" was
+    asserted rather than shown. Under a CASE-SENSITIVE GitHub, every spelling
+    this file newly ACCEPTS fails closed or loud rather than publishing:
+      - `ALWAYS()`, `!FAILURE()` and friends would be unknown functions, so
+        the workflow errors at GitHub before any job runs. Loud.
+      - `STARTSWITH(github.ref, ...)` in a job's `if:` is likewise an unknown
+        function: the run fails rather than the job silently skipping.
+      - `needs.x.result == 'SUCCESS'` would simply be false under a
+        case-sensitive `==`, so the job it guards does not run. Closed.
+    ONE ACCEPTANCE IS PERMISSIVE, and it is named here rather than left to be
+    found: is_tag_ref_test is also the permitted exception on
+    verify-tag-shape's driver step (property 10 and clause (b) of 10c). Under
+    a case-sensitive reading `if: GITHUB.REF_TYPE == 'TAG'` is accepted THERE
+    as the per-step tag guard while evaluating to something that never runs
+    the step -- and verify-tag-shape has no job-level `if:` by design, so the
+    job still reports 'success' and the picture gate downstream still starts.
+    The consequence is bounded: the deriver's shape check is skipped, which
+    is the check that stops a malformed tag reaching the GPU and the Release;
+    the picture gate itself, and every property that keeps a publish behind
+    it, is untouched. It is a real gap under a reading nobody has evidence
+    for, and it is the only one this case-folding creates.
 12. THIS FILE'S OWN LINT. `shellcheck /ci/*.sh` cannot see a `.py`. The
     `devel-test` stage now runs pyflakes over `/ci/*.py`, which catches
     undefined names and unused imports and NOTHING about whether a property
@@ -221,6 +281,51 @@ GATE_WORK_DRIVERS = {
     TIER_B: "bash script/ci/tier_b_visual_e2e.sh",
     "verify-tag-shape": "bash script/ci/derive_image_tag.sh",
 }
+
+# A STRING IS NOT AN INVOCATION. The table above is compared against
+# `" ".join(step["run"].split())`, and FOUR SIBLING KEYS decide what that
+# string actually does. A reviewer walked six mutations past the comparison,
+# every one of them publishing with no picture, and in THREE of them the
+# pinned `run:` line is untouched -- the diff shows only a `defaults:` block:
+#
+#   shell: cat {0}              GitHub's documented custom-shell form is
+#   shell: bash -n {0}          `command [...options] {0}`. The driver is
+#                               PRINTED, or syntax-checked, and never runs,
+#                               while the step and the job report 'success'.
+#   working-directory: <dir>    the same string, resolved against another
+#                               tree -- a fixture holding a stub of the same
+#                               path.
+#   env: TIER_B_PRODUCER_IMAGE  the driver reads it (and TIER_B_VIEWER_IMAGE,
+#                               and TIER_B_BOOT_TIMEOUT) from its
+#                               environment, so the "picture" is one of
+#                               whatever image the editor chose.
+#   defaults.run.<any of those> at JOB or WORKFLOW level, which is how all
+#                               three arrive without touching the step at all.
+#
+# So the property is now "THIS COMMAND RUNS, UNMODIFIED, IN THE EXPECTED
+# PLACE" rather than "this string appears". These keys are refused on a step
+# that invokes a pinned driver, and `defaults.run` / `env:` are refused on
+# the two driver jobs and at workflow level, where they reach them.
+#
+# THE COST, stated so it is a decision and not a surprise: a legitimate
+# `shell:` or `env:` on one of those two steps is a violation until the
+# spelling is added HERE, next to the argument trade GATE_WORK_DRIVERS
+# already makes. The remedy is always achievable -- put the declaration on a
+# job or a step that does not run a pinned driver -- and the refusal is loud.
+# The list is deliberately whole-key rather than key-by-key for `defaults`,
+# because `defaults.run` has exactly the keys above and enumerating them
+# again is the enumeration failure this file keeps writing down.
+GATE_WORK_STEP_MODIFIERS = ("shell", "working-directory", "env")
+
+# A `--print-<x>` QUERY is the one other spelling a driver job may contain:
+# it asks the driver for a value rather than doing the job (this repo's Tier
+# B job pulls the producer image the driver names). It used to be recognised
+# by `"--print-" in run`, a SUBSTRING over the whole body, which granted any
+# unconditional step carrying that literal anywhere a free pass to invoke the
+# driver in any spelling at all -- `echo --print-nothing && <driver> --help
+# || true`. Now every occurrence of the script in the step must ITSELF be
+# invoked with exactly one `--print-<x>` argument.
+_PRINT_QUERY_RE = re.compile(r"^--print-[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Report-only jobs. They exist to ADD a failure (a blocked release that would
 # otherwise be a grey cancelled job on a green-looking run). Nothing may
@@ -309,7 +414,33 @@ PUBLISH_RUN_RE = (
     re.compile(r"\byarn\s+publish\b"),
     re.compile(r"\btwine\s+upload\b"),
     re.compile(r"\bcargo\s+publish\b"),
-    re.compile(r"\b(?:oras|crane|regctl)\s+(?:push|copy)\b"),
+    re.compile(r"\b(?:oras|crane)\s+(?:push|copy)\b"),
+    # `regctl` USED TO SHARE THE ROW ABOVE, and matched nothing real: regctl
+    # has no `push` and no `copy` subcommand -- the writes are `regctl image
+    # copy|import`, `regctl artifact put`, `regctl manifest put` and `regctl
+    # index create`, and `regctl image copy` was confirmed missed. A row that
+    # LOOKS like coverage and provides none is worse than an admitted gap,
+    # because the name appearing in the table is what stops anyone checking.
+    # Written as <known noun> x <write verb> rather than as a list of exact
+    # subcommand pairs, so a write verb regctl adds under one of these nouns
+    # is covered without another round of naming spellings. Scoped to the
+    # WRITE verbs on purpose: `regctl image digest`, `regctl tag ls` and the
+    # rest of the read surface are ordinary CI queries, and reporting them
+    # would put every registry lookup behind the picture gate.
+    #
+    # NARROWED IN ONE DIRECTION, said out loud: the old row would have
+    # matched a `regctl push` if regctl ever grew one, purely by accident.
+    # This does not. That is the same trade every row here makes -- an
+    # enumeration is only ever as wide as what someone thought of -- and it
+    # buys a row that matches the commands that exist.
+    re.compile(
+        r"\bregctl\s+(?:artifact|image|index|manifest|tag)\s+"
+        r"(?:copy|import|put|create|mod|delete)\b"
+    ),
+    # A registry login in a job that publishes nothing is not a normal
+    # pattern -- the same reasoning that puts docker/login-action in
+    # PUBLISH_USES rather than leaving it to the push spelling.
+    re.compile(r"\bregctl\s+registry\s+login\b"),
     re.compile(r"\bskopeo\s+copy\b"),
     re.compile(r"\bhelm\s+push\b"),
     re.compile(r"\bcurl\b[^\n]*(?:\s-T\s|--upload-file)"),
@@ -909,6 +1040,40 @@ def step_text(step):
     return "\n".join(parts)
 
 
+def driver_arguments(text, script):
+    """The argument string of every invocation of <script> in <text>.
+
+    Not a shell parser, and it does not need to be: the question is only
+    "what follows the script path, up to the end of THIS command?". So the
+    remainder is cut at the first character that can end a command or a
+    substitution -- `; | & newline ) " ' >` and a backtick.
+
+      docker pull "$(bash .../tier_b_visual_e2e.sh --print-producer-image)"
+        -> ['--print-producer-image']
+      echo --print-nothing && bash .../tier_b_visual_e2e.sh --help || true
+        -> ['--help']
+
+    The second is the whole reason this exists: the substring test it
+    replaces saw `--print-` in the FIRST command and let the second one --
+    the one that actually invokes the driver, and exits 0 without taking a
+    picture -- through unexamined.
+
+    Being an approximation, it errs toward reporting: an invocation whose
+    arguments this cannot cut cleanly is not a bare `--print-<x>` query and
+    is reported, which is the direction a gate should fail in.
+    """
+    out = []
+    for match in re.finditer(re.escape(script), text):
+        rest = text[match.end():]
+        out.append(re.split(r"[;|&\n)\"'`>]", rest, maxsplit=1)[0].strip())
+    return out
+
+
+def is_print_query(args):
+    """True when <args> is exactly one `--print-<x>` argument."""
+    return bool(args) and _PRINT_QUERY_RE.match(args) is not None
+
+
 def step_label(step):
     for key in ("name", "uses", "run", "id"):
         if step.get(key) is not None:
@@ -1330,8 +1495,16 @@ def check(wf):
         # it is evaluated, `paths: ['does/not/exist/**']` stops every tag push
         # from starting this workflow -- no picture gate, no Release -- while
         # the tag patterns below still match perfectly. So the filter is a
-        # violation with a fix (take it off `push:`, or split the tag trigger
-        # into its own `on.push` entry) rather than a guess.
+        # violation with a fix rather than a guess.
+        #
+        # THE REMEDY HAS TO BE ACHIEVABLE. This message used to offer "split
+        # the tag trigger into its own `on.push` entry", and there is no such
+        # thing: `on.push` is a single YAML key and a second one is a
+        # duplicate key, which GitHub rejects and _StrictLoader refuses. The
+        # rule was right and failed closed; the sentence sent the operator to
+        # do something that cannot be done, which is the same
+        # provably-false-diagnostic failure the entrypoint helpers were
+        # rewritten for. The two things that CAN be done are below.
         for key in tag_trigger_path_filters(wf):
             violation(
                 "tag-trigger-has-no-path-filter",
@@ -1339,8 +1512,13 @@ def check(wf):
                 "filter that matches nothing stops a tag push from starting "
                 "this workflow at all, and this checker cannot evaluate it "
                 "against a commit it does not have -- so the tag patterns "
-                "below can all match while nothing runs. Remove it from the "
-                "push trigger." % key,
+                "below can all match while nothing runs. Either drop the "
+                "'%s:' filter from on.push entirely, or move the "
+                "path-filtered work into a SEPARATE workflow file that has "
+                "no 'tags:' trigger, leaving this one's push trigger "
+                "unfiltered. (There is no second 'on.push' to split into: it "
+                "is one key, and a duplicate is refused here and by GitHub.)"
+                % (key, key),
             )
         # PRESENCE IS NOT REACHABILITY: `- 'never-matches-anything'` is a
         # sequence with items in it, and it starts no workflow for any real
@@ -1494,6 +1672,55 @@ def check(wf):
             continue
         driver = GATE_WORK_DRIVERS[job]
         script = driver.split()[-1]
+
+        # --- (d) nothing between the pinned string and what it DOES -------
+        # `defaults.run` and `env:` reach this job's steps from above, so
+        # refusing them only on the step leaves the two spellings that never
+        # touch the step at all. Workflow level is included because it
+        # reaches every job in the file, this one among them.
+        for where, block in (
+            ("this job's", wf.body(job).get("defaults")),
+            ("the workflow's", wf.doc.get("defaults")),
+        ):
+            run_defaults = block.get("run") if isinstance(block, dict) else None
+            if run_defaults:
+                violation(
+                    "gate-driver-runs-unmodified",
+                    "%s defaults.run (%s) applies to gate job '%s', whose "
+                    "work is pinned to \"%s\". `shell:` there is GitHub's "
+                    "documented `command [...options] {0}` form -- `cat {0}` "
+                    "PRINTS the driver and `bash -n {0}` syntax-checks it, "
+                    "both exit 0, and the job reports 'success' with no "
+                    "picture taken -- and `working-directory:` resolves the "
+                    "same command against another tree. Neither shows up as "
+                    "an edit to the step. Put the default on a job that runs "
+                    "no pinned driver, or add the spelling to "
+                    "GATE_WORK_STEP_MODIFIERS in check_release_gates.py "
+                    "where it can be reviewed."
+                    % (where, sorted(run_defaults), job, driver),
+                )
+        for where, block in (
+            ("job-level", wf.body(job).get("env")),
+            ("workflow-level", wf.doc.get("env")),
+        ):
+            if block:
+                violation(
+                    "gate-driver-runs-unmodified",
+                    "a %s env: (%s) reaches gate job '%s', whose work is "
+                    "pinned to \"%s\". The driver reads its own knobs from "
+                    "the environment (TIER_B_PRODUCER_IMAGE, "
+                    "TIER_B_VIEWER_IMAGE, TIER_B_BOOT_TIMEOUT), so a "
+                    "variable set here decides WHAT the gate looks at while "
+                    "the pinned line stays exactly as written. Declare it on "
+                    "a job or a step that runs no pinned driver."
+                    % (
+                        where,
+                        sorted(block) if isinstance(block, dict) else block,
+                        job,
+                        driver,
+                    ),
+                )
+
         found_verbatim = False
         for step in wf.steps(job):
             run = as_text(step.get("run") or "")
@@ -1502,6 +1729,27 @@ def check(wf):
                 continue
             collapsed = " ".join(run.split())
             step_if = wf.step_condition(step)
+
+            # A step that invokes the driver AT ALL -- the pinned command or
+            # a `--print-` query -- may not carry a key that changes what
+            # that command does or where it does it.
+            for key in GATE_WORK_STEP_MODIFIERS:
+                if step.get(key) is None:
+                    continue
+                violation(
+                    "gate-driver-runs-unmodified",
+                    "gate job '%s' has a step that invokes %s and carries "
+                    "'%s:'. The pinned command is compared as a STRING, and "
+                    "this key decides what that string DOES: `shell: cat "
+                    "{0}` prints the driver instead of running it (GitHub's "
+                    "custom-shell form is `command [...options] {0}`), "
+                    "`working-directory:` resolves it against another tree, "
+                    "and `env:` sets the knobs the driver reads for itself. "
+                    "In each case the step, and the job, report 'success' "
+                    "with no picture taken. Step: %s"
+                    % (job, script, key, step_label(step)),
+                )
+
             if collapsed == driver:
                 found_verbatim = True
                 if step_if and not (
@@ -1517,7 +1765,17 @@ def check(wf):
                         % (job, driver, step_if, step_label(step)),
                     )
                 continue
-            if "--print-" in run and not step_if:
+            # (c) EVERY invocation of the script in this step must itself be
+            # a bare `--print-<x>` query. `"--print-" in run` was a substring
+            # over the whole body, so `echo --print-nothing && <driver>
+            # --help || true` was one unconditional step that satisfied it
+            # while invoking the driver in a spelling that takes no picture.
+            invocations = driver_arguments(run, script)
+            if (
+                invocations
+                and all(is_print_query(args) for args in invocations)
+                and not step_if
+            ):
                 continue
             violation(
                 "gate-job-runs-its-driver-verbatim",
@@ -1610,7 +1868,17 @@ def check(wf):
     else:
         for variant in variants:
             labels = [label.strip() for label in variant]
-            if "self-hosted" in labels and "gpu" in labels:
+            # CASE-INSENSITIVE, like canon_key and for the same reason.
+            # GitHub matches runner labels case-insensitively; this compared
+            # them case-SENSITIVELY while comparing expressions
+            # case-insensitively, which is the exact inconsistency the
+            # expression change argued against one round earlier.
+            # `[Self-Hosted, GPU]` is the same runner and was reported as a
+            # gate that had left the GPU. It failed CLOSED, so this is noise
+            # rather than a hole -- and noise is how a check gets switched
+            # off. The label still has to BE there, in some case.
+            folded = [label.lower() for label in labels]
+            if "self-hosted" in folded and "gpu" in folded:
                 continue
             violation(
                 "tier-b-runs-on-the-gpu-runner",

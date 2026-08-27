@@ -452,9 +452,17 @@ USER root
 # smaller and the supported route.
 #
 # pyflakes rides along on the same apt call for the OTHER half of the same
-# problem: `shellcheck /ci/*.sh` is a shell glob and cannot see a .py, so a
-# 1265-line Python checker had no static analysis at all -- against this
-# repo's own rule that lint counts as testing. It catches undefined names,
+# problem: `shellcheck /ci/*.sh` is a shell glob and cannot see a .py, so the
+# Python checker had no static analysis at all -- against this
+# repo's own rule that lint counts as testing.
+#
+# NO LINE COUNT IS QUOTED HERE, or in the two other places that used to quote
+# one. Three comments claimed "1265-line" while the file had grown to 1712,
+# and the commit that wrote them said in its own changelog entry that the
+# number "is not asserted anywhere in the tree" -- while asserting it wrongly
+# in three places. A number nothing derives is a number that goes stale on the
+# next edit, and a comment caught being wrong about the file it sits in gets
+# the next true thing it says discounted too. It catches undefined names,
 # unreachable imports and shadowed definitions, and NOTHING about whether a
 # property is right; release_gate_workflow.bats, which proves each property
 # fails when removed, is still the only thing that does that.
@@ -490,8 +498,8 @@ COPY --chmod=0755 script/ci/ /ci/
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
 # helpers, which nothing else was linting.
 # pyflakes on the same line, because `/ci/*.sh` is a shell glob and cannot see
-# check_release_gates.py -- a 1265-line Python file whose only static check was
-# an in-memory `compile()` in the bats. One RUN rather than two: hadolint's
+# check_release_gates.py, a Python file whose only static check was an
+# in-memory `compile()` in the bats. One RUN rather than two: hadolint's
 # DL3059 refuses consecutive RUNs, and both tools name themselves in their own
 # output, so a failure still says which language it came from.
 RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh && \
@@ -514,7 +522,19 @@ RUN hadolint Dockerfile
 # workflow re-ran shellcheck, hadolint and all of the bats below (~30 s) for a
 # change none of them can see. Nothing in `runtime` is FROM this stage, so the
 # ordering has no effect on the published image.
-COPY .github/workflows/main.yaml /workflows/main.yaml
+#
+# THE DIRECTORY, NOT THE FILE. This used to be `COPY
+# .github/workflows/main.yaml /workflows/main.yaml`, and nothing anywhere
+# enumerated `.github/workflows/`. That made the cheapest bypass in the repo a
+# NEW FILE: a second workflow carrying `on: push: tags: ['v*']` and a `docker
+# push` publishes with no picture gate, and every check here stays green --
+# including the release-gate checker, which is pointed at main.yaml by name
+# and cannot report on a file it was never given. Copying the directory lets
+# release_gate_workflow.bats assert what is IN it, so adding a workflow is a
+# red test and a decision rather than a silence. It does not make the checker
+# read the second file: limitation 1 in check_release_gates.py's header still
+# stands, and now says which half of it is closed.
+COPY .github/workflows/ /workflows/
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats

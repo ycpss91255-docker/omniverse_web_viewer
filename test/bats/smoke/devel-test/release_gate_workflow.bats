@@ -41,6 +41,17 @@
 # own work step into a no-op while an unconditional decoy kept the "there is
 # still work here" COUNT satisfied.
 #
+# Round 7 closed those two and a reviewer landed 39 more against IT, whose
+# misses shared ONE root cause: the gate's driver was pinned as a STRING and
+# not as an INVOCATION. Four sibling keys decide what a `run:` string
+# actually does -- `shell:`, `working-directory:`, `env:` and `defaults.run`
+# at job or workflow level -- and the checker read none of them, so six
+# mutations published with no picture, three of them without touching the
+# pinned line at all. Plus one bypass that needed no edit to any watched
+# file: a SECOND workflow in `.github/workflows/`, which nothing enumerated.
+# Those are the cases marked "root cause 7b", "root cause 7c" and the
+# `/workflows/` case at the top of this file.
+#
 # NAMES. Cases here are named for WHAT THEY DO, not for a reviewer's label.
 # An earlier version of this file carried 25 identifiers (C3 C4 C5 T1 J1 U1 U2
 # D1 B1 B2 E1 E2 E3 G1 F1 F2 N4 N5 H1 H2 M5 I1 I2 P3 P4) reconstructed from a
@@ -1573,6 +1584,15 @@ JOB
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tag-trigger-has-no-path-filter]"
+  # The RULE is right and fails closed. The REMEDY was not achievable:
+  # "split the tag trigger into its own `on.push` entry" describes a second
+  # `on.push` key, which is a duplicate key -- refused here and by GitHub.
+  # A remedy an operator cannot carry out discounts the true thing the
+  # message says next, which is the same failure the entrypoint's flat-key
+  # diagnostics were rewritten for.
+  refute_output --partial "into its own"
+  assert_output --partial "drop the 'paths:' filter from on.push entirely"
+  assert_output --partial "no second 'on.push' to split into"
 }
 
 # --- root cause 12: runs-on read in two of its four shapes ----------------

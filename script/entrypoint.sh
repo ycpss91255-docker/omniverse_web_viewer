@@ -113,7 +113,7 @@ yaml_top_level_key() {
 }
 
 # yaml_section_kind <section> <file>: print what the COLUMN-0 `<section>:`
-# line actually does -- `section`, `scalar` or `flow`.
+# line actually does -- `section`, `scalar`, `flow` or `alias`.
 #
 # yaml_top_level_key cannot tell those apart: it matches `^<section>:` every
 # way, so on its own it reports a scalar as "a section that exists", and the
@@ -135,12 +135,32 @@ yaml_top_level_key() {
 #   viewer: !!map    + indented body   value; so is a TAG. The section below
 #                                      is a perfectly ordinary block mapping.
 #
-# So node properties are stripped first, and a remaining `{`/`[` is reported
-# as `flow` -- which gets its own true reason and its own true remedy -- while
-# only real leftover text is `scalar`. This is the exact class of bug this
-# whole group of helpers exists to end: a diagnostic that is provably false
-# about the file in front of the operator gets the next true thing it says
-# discounted too.
+# FOUR KINDS, THEN. The anchor's direct companion was missed by the round
+# that added the anchor:
+#
+#   viewer: *v                         an ALIAS. Every parser resolves it to
+#                                      the anchored node, so the file is
+#                                      valid and `viewer:` really does supply
+#                                      a mapping -- calling it "set to a
+#                                      value rather than opening a section"
+#                                      is false about the file on the screen,
+#                                      and "make it open a section" describes
+#                                      work already done. What IS true is
+#                                      that this line-based reader does not
+#                                      FOLLOW the reference: the keys are
+#                                      wherever the anchor is, not below this
+#                                      header. An alias cannot carry an
+#                                      anchor or a tag of its own (YAML
+#                                      forbids properties on an alias), so it
+#                                      is recognised after the strip, not
+#                                      before.
+#
+# So node properties are stripped first, a remaining `{`/`[` is reported as
+# `flow` and a remaining `*` as `alias` -- each with its own true reason and
+# its own true remedy -- while only real leftover text is `scalar`. This is
+# the exact class of bug this whole group of helpers exists to end: a
+# diagnostic that is provably false about the file in front of the operator
+# gets the next true thing it says discounted too.
 #
 # Reads the HEADER LINE ONLY, then exits. yaml_value's scan treats a
 # scalar-bearing header as opening a section (its `index($0, section ":") == 1`
@@ -166,6 +186,7 @@ yaml_section_kind() {
       }
       if (v == "")            { kind = "section" }
       else if (v ~ /^[{[]/)   { kind = "flow" }
+      else if (v ~ /^\*/)     { kind = "alias" }
       else                    { kind = "scalar" }
       exit
     }
@@ -206,13 +227,17 @@ yaml_section_has_key() {
 # flat_key_reason <key> <section> <file>: the clause naming WHY our scoped
 # lookup came back empty. It used to say "but no '<section>:' section supplying
 # it", which is FALSE whenever the section is there and merely lacks the key,
-# and "two cases" was itself an undercount -- FOUR states end with the scoped
+# and "two cases" was itself an undercount -- SIX states end with the scoped
 # lookup empty, and the old branch reported two of them wrongly:
 #
 #   1. no `<section>:` at all;
 #   2. `<section>:` carrying a SCALAR, so it opens no section to read from --
 #      reported as a section that exists, with a remedy (indent under it) that
 #      makes the file invalid YAML if followed;
+#   2a. `<section>:` written as a one-line FLOW collection, and
+#   2b. `<section>:` written as an ALIAS to an anchor elsewhere: both are real
+#      mappings that this line-based reader does not scan, and calling either
+#      a scalar is provably false about the file on the screen;
 #   3. `<section>:` a real section that has no `<key>:` in it;
 #   4. `<section>:` a real section whose `<key>:` IS there with an empty value
 #      -- reported as "does not supply '<key>'" about a key on the screen in
@@ -233,6 +258,10 @@ flat_key_reason() {
     printf "%s" "'${section}:' is written as a one-line flow collection," \
                 " which this reader does not scan -- it reads keys from" \
                 " INDENTED lines below the section header"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "alias" ]; then
+    printf "%s" "'${section}:' is an alias to an anchor defined elsewhere" \
+                " in the file, and this reader does not follow it -- it" \
+                " reads keys from INDENTED lines below the section header"
   elif yaml_section_has_key "${section}" "${key}" "${file}"; then
     printf "%s" "there IS a '${section}:' section in it and it does carry a" \
                 " '${key}:', but that key has no value"
@@ -242,7 +271,7 @@ flat_key_reason() {
   fi
 }
 
-# flat_key_fix <key> <section> <file>: the REMEDY for the same four states, as
+# flat_key_fix <key> <section> <file>: the REMEDY for the same six states, as
 # a lower-case imperative clause both messages splice into their own sentence.
 #
 # Kept separate from flat_key_reason rather than folded into it because the
@@ -250,9 +279,10 @@ flat_key_reason() {
 # own sentence, the warning hangs it off "If that key was meant for this
 # viewer, ..." -- and because a shared, state-INDEPENDENT remedy is exactly the
 # bug being fixed here: the old fixed sentence said "Indent it under
-# '<section>:'" in all four states, which is wrong in three of them (there is
+# '<section>:'" in all six states, which is wrong in five of them (there is
 # nothing to indent under in state 1, indenting under a scalar is invalid YAML
-# in state 2, and the key is already indented in state 4). Varying the reason
+# in state 2, a flow collection and an alias are already mappings in 2a and 2b,
+# and the key is already indented in state 4). Varying the reason
 # while leaving the remedy fixed would have kept the operator doing the wrong
 # thing, just with a better explanation of why they were there.
 flat_key_fix() {
@@ -265,6 +295,9 @@ flat_key_fix() {
   elif [ "$(yaml_section_kind "${section}" "${file}")" = "flow" ]; then
     printf "%s" "rewrite '${section}:' as an indented block mapping, with" \
                 " '${key}:' on its own line below it"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "alias" ]; then
+    printf "%s" "replace the alias with an indented block mapping under" \
+                " '${section}:', with '${key}:' on its own line below it"
   elif yaml_section_has_key "${section}" "${key}" "${file}"; then
     printf "%s" "give the empty '${key}:' already inside '${section}:' a value"
   else
