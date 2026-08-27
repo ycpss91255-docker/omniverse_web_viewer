@@ -89,7 +89,14 @@ people looking.
     action, a helper script that pushes without saying so, a token passed to
     a program this list does not name -- is not derived and is therefore not
     required to carry the gate. Widening those lists is the whole cost of
-    closing this.
+    closing this. One gap here is DELIBERATE and is a trade, not an
+    oversight: `docker/build-push-action` is not a signal by itself, only its
+    `push:` input is, because `push: false` is how this repo's own
+    build-worker builds on every PR and listing the action reported every
+    build job as one that must stand behind the release gate. The cost is
+    that an invocation whose `push:` arrives from somewhere this file cannot
+    resolve -- a reusable-workflow input, a changed upstream default -- is
+    not derived.
  5. It says NOTHING about what the gate ASSERTS. That a picture was really
     looked at is tier_b_visual_e2e.sh's job and its own spec's; this file
     only guarantees that job ran, on the GPU, and that nothing published
@@ -100,11 +107,20 @@ people looking.
  7. WHAT THE RUNNER LABELS MEAN. `[self-hosted, gpu]` is asserted as a label
     set. Whether the machine answering to `gpu` actually has an NVENC-capable
     GPU is not knowable from here.
- 8. ANCHORS AND ALIASES. PyYAML expands them; GitHub Actions rejects a
-    workflow that uses them. A workflow this file reads through an alias
-    would fail loudly at GitHub before it could publish anything, so the
-    difference cannot hide a bypass -- but the structure examined here is the
-    expanded one, not the bytes.
+ 8. PyYAML IS NOT GITHUB'S PARSER. Anchors and aliases are expanded here and
+    rejected by GitHub, so a workflow read through one would fail loudly at
+    GitHub before it could publish -- the difference cannot hide a bypass,
+    but the structure examined here is the expanded one, not the bytes. Any
+    other construct where the two parsers disagree is a divergence that did
+    not exist while both sides read text, and it is not enumerable from
+    here. Duplicate keys, which GitHub rejects and PyYAML resolves
+    last-wins, are refused outright for exactly this reason.
+ 9. IT NEEDS PyYAML. Outside the `devel-test` image the checker REFUSES
+    (exit 2, by name) rather than running, so it is no longer true that this
+    runs anywhere with bash. That is loud rather than silent, and the only
+    caller is release_gate_workflow.bats inside the image that has the
+    package -- but a future caller that ignores exit codes would have no
+    check at all rather than a degraded one.
 ===========================================================================
 """
 
