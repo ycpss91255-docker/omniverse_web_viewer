@@ -2,6 +2,9 @@
   "compilerOptions": {
     "target": "ES2020",
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    // Vite's ambient types, for `import.meta.env.DEV` in main.ts (the flag
+    // that keeps the query-string target override out of built bundles).
+    "types": ["vite/client"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowJs": true,

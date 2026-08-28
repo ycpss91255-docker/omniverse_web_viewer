@@ -47,8 +47,19 @@ RUN if getent group "${USER_GID}" >/dev/null; then \
             "$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
     else \
         useradd -m -l -s /bin/bash -u "${USER_UID}" -g "${USER_GID}" "${USER_NAME}"; \
-    fi && \
-    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    fi
+
+# NOTE: `sys` deliberately grants NO sudo. It used to end with
+# `echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers`, and since
+# `runtime` is FROM devel-base is FROM sys, that line was INHERITED BY THE
+# PUBLISHED IMAGE -- making its "non-root" USER root-equivalent with a single
+# `sudo`, on an image that is pushed publicly to GHCR, pinned by downstream
+# consumers (isaac#173), and run there on a network port with --network=host.
+# The non-root USER is the containment story for that exposure; nothing in the
+# runtime needs privilege (see the runtime-test guard at the bottom of this
+# file). The grant now lives ONLY in the stages that actually use it --
+# usd-viewer-build, stream-only-build and devel -- all of which are either
+# discarded after their build or interactive-only.
 
 ############################## devel-base ##############################
 FROM sys AS devel-base
@@ -89,11 +100,23 @@ ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 
+# Per-stage sudo grant (see the note in `sys`): this stage stages its dist
+# under /app with sudo so the build itself stays as the non-root USER. The
+# stage is discarded once `runtime` has COPY'd the dist out of it.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
 
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
+# `npm install`, NOT `npm ci`: this tree is the upstream web-viewer-sample
+# submodule, which ships no package-lock.json, and D2 says it is built
+# UNMODIFIED. Our own code is installed with `npm ci` from a committed lockfile
+# (stream-only-build / example / e2e-test); this one stage's dependency tree is
+# still resolved fresh on every build. Closing that needs either an upstream
+# lockfile or a decision to layer one of ours onto the sample.
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
@@ -124,14 +147,24 @@ ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 
+# Per-stage sudo grant (see the note in `sys`): same reason as
+# usd-viewer-build, and this stage is likewise discarded after the dist COPY.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
 
 WORKDIR /build
-COPY --chown="${USER}":"${GROUP}" package.json .npmrc /build/
+COPY --chown="${USER}":"${GROUP}" package.json package-lock.json .npmrc /build/
 COPY --chown="${USER}":"${GROUP}" packages/stream-core /build/packages/stream-core
 COPY --chown="${USER}":"${GROUP}" apps/stream-only /build/apps/stream-only
-RUN npm install && \
+# `npm ci`, not `npm install`: the bundle this stage emits is what ships in the
+# public image, so the tree that produces it must be the COMMITTED one, not
+# whatever the ranges resolve to today. `npm ci` also fails loudly on lock drift
+# instead of silently rewriting the lockfile. The workspace is deliberately
+# PARTIAL here (no examples/) and npm ci simply skips the absent member.
+RUN npm ci && \
     npm -w stream-core test && \
     npm -w stream-only run lint && \
     npm -w stream-only test && \
@@ -145,11 +178,29 @@ RUN npm install && \
     sudo chown -R "${USER}":"${GROUP}" /app/stream-only
 
 ############################## runtime ##############################
-# LEAN deployed image (replaces the old `serve = FROM devel`). FROM devel-base
-# for node + serve only -- NO npm install, NO src/ submodule, NO node_modules,
-# NO build toolchain. Both built dists are COPY'd in from the build stages so
-# the uniform entrypoint can serve either app by VIEWER_UI_MODE. This is the
-# image Isaac runs (omniverse_web_viewer:runtime).
+# LEAN deployed image (replaces the old `serve = FROM devel`). This is the image
+# Isaac runs (omniverse_web_viewer:runtime) and the one published to GHCR.
+#
+# WHAT IT ACTUALLY SHIPS, stated exactly, because the previous wording ("node +
+# serve only ... NO build toolchain") was not true of the built image and
+# ADR-0001 repeated the claim: `devel-base` apt-installs sudo/git/curl and the
+# nodejs deb brings npm + corepack along with node, and ALL of that was
+# inherited here. What ships now is node + serve + curl + the two built dists,
+# and nothing else from the build:
+#   - npm / npx / corepack are DELETED. They are only reachable via node's own
+#     package tree, never installed by apt, so they have to be removed rather
+#     than not-installed;
+#   - git and sudo are PURGED. Nothing in the runtime, or in any stage built
+#     FROM it, uses either;
+#   - curl STAYS, deliberately. It is the HTTP client the two FROM-runtime test
+#     stages use -- runtime-test's RUNTIME_SMOKE_CMD and test/e2e/run-in-image.sh
+#     -- and removing it while `node` (which has global fetch) remains would buy
+#     no real containment, only a rewrite of that contract.
+# Also: NO src/ submodule, NO app node_modules, NO source tree.
+#
+# Removed HERE rather than never-installed because devel-base must have curl to
+# fetch nodesource, and the two build stages need the toolchain; this stage is
+# the first point downstream of them where the deployable set is knowable.
 FROM devel-base AS runtime
 
 ARG USER_NAME="user"
@@ -157,6 +208,17 @@ ARG USER_GROUP="user"
 ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 ARG ENTRYPOINT_FILE="script/entrypoint.sh"
+
+# First layer of the stage, so it caches independently of the dists below.
+# SUDO_FORCE_REMOVE: sudo's prerm refuses to uninstall itself when no root
+# password is set, on the reasoning that an interactive host would lock itself
+# out of administration. For a single-purpose container image with no root
+# password and no administrator, having no path to root is the goal, not the
+# accident it warns about.
+RUN SUDO_FORCE_REMOVE=yes apt-get purge -y git sudo && \
+    rm -rf /usr/lib/node_modules/npm /usr/lib/node_modules/corepack \
+           /usr/bin/npm /usr/bin/npx /usr/bin/corepack && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
 # Host-side log tee helper (base#328 / base#368). No-op when [logging]
@@ -203,6 +265,14 @@ COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/log
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/config "${CONFIG_DIR}"
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
 
+# Per-stage sudo grant (see the note in `sys`). Passwordless sudo in an
+# INTERACTIVE dev container is by design (it is why .hadolint.yaml ignores
+# DL3004); the defect was that `sys` handed the same grant to the published
+# runtime image. devel needs it for `sudo rm -rf "${CONFIG_DIR}"` below, and
+# devel-test (FROM devel) needs it for the bats specs that write /etc/host.yaml.
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
 USER "${USER}"
 
 ENV HOME="/home/${USER_NAME}"
@@ -221,6 +291,7 @@ RUN cat "${CONFIG_DIR}"/shell/bashrc >> "${HOME}/.bashrc" && \
 # Full workspace + upstream submodule for in-place dev builds.
 COPY --chown="${USER}":"${GROUP}" src/package.json src/.npmrc /app/
 WORKDIR /app
+# `npm install` for the same reason as usd-viewer-build: no upstream lockfile.
 RUN npm install
 
 COPY --chown="${USER}":"${GROUP}" src/ /app/
@@ -262,6 +333,30 @@ ARG RUNTIME_SMOKE_CMD='timeout 30 bash -c '"'"'serve -s /app/usd-viewer/dist -l 
 # Inherit USER from runtime (non-root). The smoke does not need privilege.
 RUN bash -c "${RUNTIME_SMOKE_CMD}"
 
+# REGRESSION GUARD for the line above. Asserting the posture is the only thing
+# that keeps it true: the `sys` sudoers grant was inherited all the way into the
+# published GHCR image for its whole life, and nothing anywhere noticed. This
+# runs as the runtime USER, so it asks exactly the question an attacker with a
+# foothold in the shipped container would: can this user become root without a
+# password? A `sudo` that is absent, or present and refuses, both pass.
+RUN if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then \
+        echo "runtime-test: the shipped image grants passwordless root to $(id -un)" >&2; \
+        exit 1; \
+    fi
+
+# REGRESSION GUARD for what the `runtime` stage says it ships. ADR-0001 has an
+# invariant ("no npm ... no dev toolchain") that the built image did not hold
+# for its whole life, because nothing ever checked. `curl` is deliberately NOT
+# in this list -- see the runtime stage header for why it stays.
+RUN present=""; \
+    for b in git npm npx corepack sudo; do \
+        if command -v "${b}" >/dev/null 2>&1; then present="${present} ${b}"; fi; \
+    done; \
+    if [ -n "${present}" ]; then \
+        echo "runtime-test: the shipped image still carries:${present}" >&2; \
+        exit 1; \
+    fi
+
 ############################## example ##############################
 # Embeddable stream demo site (examples/embedded-site-demo). Vanilla
 # TS + Vite, served on EXAMPLE_PORT (8080) -- independent of the main
@@ -289,10 +384,12 @@ WORKDIR /app
 # install of only the example can no longer resolve stream-core). The built
 # example dist is served via the usd-viewer mode dir so the generic entrypoint
 # renders it (VIEWER_UI_MODE=usd-viewer).
-COPY --chown="${USER}":"${GROUP}" package.json .npmrc /app/
+COPY --chown="${USER}":"${GROUP}" package.json package-lock.json .npmrc /app/
 COPY --chown="${USER}":"${GROUP}" packages/stream-core /app/packages/stream-core
 COPY --chown="${USER}":"${GROUP}" examples/embedded-site-demo /app/examples/embedded-site-demo
-RUN npm install && \
+# Same committed lockfile as stream-only-build; the workspace is partial here
+# too (no apps/), which npm ci tolerates.
+RUN npm ci && \
     npm -w stream-core test && \
     npm -w embedded-site-demo run lint && \
     npm -w embedded-site-demo test && \
@@ -334,6 +431,46 @@ FROM devel AS devel-test
 
 USER root
 
+# PyYAML, for script/ci/check_release_gates.py -- the release-invariant
+# checker, run by release_gate_workflow.bats below. It parses
+# .github/workflows/main.yaml rather than pattern-matching its text, because
+# two text-matching versions were walked past by a reviewer (12 mutations,
+# then 21) on things a parser handles for free: trailing comments, `"if":` /
+# `'if':` / `if :` as four spellings of one key, a `(` inside a quoted string
+# breaking parenthesis depth, and a job header with a trailing comment not
+# being a job.
+#
+# python3 is ALREADY here (it comes with the Ubuntu base; `command -v python3`
+# answers /usr/bin/python3) -- only the YAML module is missing, so this is one
+# apt package and no interpreter.
+#
+# IT NEVER SHIPS. This stage is a leaf: `runtime` is `FROM devel-base`,
+# `runtime-test` and `e2e-test` are `FROM runtime`, `devel-test` is `FROM
+# devel`, and nothing anywhere is `FROM devel-test`. No published image gains
+# a package from this line. `python3-yaml` rather than pip: this base has no
+# pip and PEP 668 marks the interpreter externally managed, so apt is both the
+# smaller and the supported route.
+#
+# pyflakes rides along on the same apt call for the OTHER half of the same
+# problem: `shellcheck /ci/*.sh` is a shell glob and cannot see a .py, so the
+# Python checker had no static analysis at all -- against this
+# repo's own rule that lint counts as testing.
+#
+# NO LINE COUNT IS QUOTED HERE, or in the two other places that used to quote
+# one. Three comments claimed "1265-line" while the file had grown to 1712,
+# and the commit that wrote them said in its own changelog entry that the
+# number "is not asserted anywhere in the tree" -- while asserting it wrongly
+# in three places. A number nothing derives is a number that goes stale on the
+# next edit, and a comment caught being wrong about the file it sits in gets
+# the next true thing it says discounted too. It catches undefined names,
+# unreachable imports and shadowed definitions, and NOTHING about whether a
+# property is right; release_gate_workflow.bats, which proves each property
+# fails when removed, is still the only thing that does that.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-yaml python3-pyflakes && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=test-tools-stage /usr/local/bin/shellcheck /usr/local/bin/shellcheck
 COPY --from=test-tools-stage /usr/local/bin/hadolint /usr/local/bin/hadolint
 
@@ -350,13 +487,54 @@ COPY .base/script/docker/wrapper /lint/wrapper
 # also EXECUTED here -- derive_image_tag.bats runs the deriver in-image, which
 # is the only proof of the tag -> image-tag mapping available without pushing
 # a tag. Copied before the lint RUN so one copy serves both purposes.
+#
+# The directory also carries check_release_gates.py, which shellcheck does not
+# and cannot lint (`/ci/*.sh` is a shell glob) -- pyflakes below is its
+# linter, and release_gate_workflow.bats byte-compiles it in memory before
+# running it, because a syntax error would otherwise surface as a checker that
+# exits 2 on every workflow, which reads like a broken input.
 COPY --chmod=0755 script/ci/ /ci/
 # /lint/*.sh keeps our loose files (script/entrypoint.sh) covered on
 # top of the template's wrapper + lib coverage; /ci/*.sh adds the CI
 # helpers, which nothing else was linting.
-RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh
+# pyflakes on the same line, because `/ci/*.sh` is a shell glob and cannot see
+# check_release_gates.py, a Python file whose only static check was an
+# in-memory `compile()` in the bats. One RUN rather than two: hadolint's
+# DL3059 refuses consecutive RUNs, and both tools name themselves in their own
+# output, so a failure still says which language it came from.
+RUN shellcheck -S warning /lint/*.sh /lint/wrapper/*.sh /lint/lib/*.sh /ci/*.sh && \
+    python3 -m pyflakes /ci/*.py
 WORKDIR /lint
 RUN hadolint Dockerfile
+
+# The WORKFLOW ITSELF, because the release invariant is now under test rather
+# than merely argued for. The picture gate (#70) lives entirely in `if:` /
+# `needs:` expressions in .github/workflows/main.yaml and nothing read them, so
+# an edit that drops `tier-b-visual-e2e` from a `needs:` list left every gate
+# green with the protection gone. release_gate_workflow.bats runs
+# /ci/check_release_gates.sh over this file (and over mutated copies of it), so
+# the file has to be in the image the bats run in. Same mechanism the specs
+# already use for their inputs -- a COPY naming exactly what the stage owns.
+#
+# AFTER the two lint RUNs, not before. Neither of them reads this file --
+# shellcheck takes /lint/ and /ci/, hadolint takes the Dockerfile -- but a
+# COPY placed above them invalidates their layers, so editing a COMMENT in the
+# workflow re-ran shellcheck, hadolint and all of the bats below (~30 s) for a
+# change none of them can see. Nothing in `runtime` is FROM this stage, so the
+# ordering has no effect on the published image.
+#
+# THE DIRECTORY, NOT THE FILE. This used to be `COPY
+# .github/workflows/main.yaml /workflows/main.yaml`, and nothing anywhere
+# enumerated `.github/workflows/`. That made the cheapest bypass in the repo a
+# NEW FILE: a second workflow carrying `on: push: tags: ['v*']` and a `docker
+# push` publishes with no picture gate, and every check here stays green --
+# including the release-gate checker, which is pointed at main.yaml by name
+# and cannot report on a file it was never given. Copying the directory lets
+# release_gate_workflow.bats assert what is IN it, so adding a workflow is a
+# red test and a decision rather than a silence. It does not make the checker
+# read the second file: limitation 1 in check_release_gates.py's header still
+# stands, and now says which half of it is closed.
+COPY .github/workflows/ /workflows/
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats
@@ -367,9 +545,11 @@ ENV BATS_LIB_PATH="/usr/lib/bats"
 # Tool-first smoke layout, base ADR-00000012: test/bats/smoke/<stage>/ names
 # the STAGE each spec is built to run in, so the specs a stage owns are the
 # ones its COPY names -- no spec can drift into an image that cannot satisfy
-# it. All three of this repo's specs belong to `devel-test`: derive_image_tag
-# needs /ci/ and example_demo needs /examples/, which exist only here, and
-# omniverse_web_viewer_env needs /app/*/dist + /entrypoint.sh, which exist in
+# it. All five of this repo's specs belong to `devel-test`: derive_image_tag
+# and tier_b_visual_e2e need /ci/, release_gate_workflow needs /ci/ plus
+# /workflows/, and example_demo needs /examples/, all of which exist only
+# here, and omniverse_web_viewer_env needs /app/*/dist +
+# /entrypoint.sh, which exist in
 # `runtime` too -- but `runtime-test` runs RUNTIME_SMOKE_CMD, not bats, so
 # there is no second consumer to justify a `shared/` tree today. The day a
 # runtime-test bats block is added, moving that one file to shared/ is the
@@ -411,12 +591,21 @@ ARG USER="${USER_NAME}"
 ARG GROUP="${USER_GROUP}"
 
 # Browsers go to a world-readable path so the non-root USER can run them in the
-# gate RUN below (Chromium refuses its sandbox as root). node + npm come from
-# devel-base (carried via runtime's FROM chain).
+# gate RUN below (Chromium refuses its sandbox as root). `node` comes from
+# devel-base via runtime's FROM chain; `npm` does NOT -- `runtime` deletes it,
+# so this stage COPYs it back from devel-base a few lines below.
 ENV PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
 
 # Root for the apt install Playwright's `install --with-deps chromium` performs.
 USER root
+
+# `runtime` deletes npm/npx so the SHIPPED image does not carry a package
+# manager. This stage is never pushed and needs one to install Playwright, so it
+# takes npm back from `devel-base` rather than the shipped image keeping it for
+# everyone's benefit. `node` itself comes from runtime's FROM chain, as before.
+COPY --from=devel-base /usr/lib/node_modules/npm /usr/lib/node_modules/npm
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx
 
 WORKDIR /e2e
 COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
@@ -425,7 +614,7 @@ COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
 # browser plus its OS deps. `--with-deps` apt-installs the headless libs.
 # Browsers land in the world-readable PLAYWRIGHT_BROWSERS_PATH so the non-root
 # user can launch them. hadolint ignore=DL3016
-RUN npm install --no-audit --no-fund && \
+RUN npm ci --no-audit --no-fund && \
     npx playwright install --with-deps chromium && \
     chmod -R a+rx "${PLAYWRIGHT_BROWSERS_PATH}" && \
     chown -R "${USER}":"${GROUP}" /e2e

@@ -23,7 +23,21 @@ hold:
 
 - **Lean runtime (PRD D4 / S5).** The deployable image must carry only
   `node` + `serve` (from `devel-base`) plus the two built dists -- no npm,
-  no source tree, no `node_modules`, no dev toolchain.
+  no source tree, no app `node_modules`, no dev toolchain.
+
+  Being `FROM devel-base` does not deliver that on its own, and for a long
+  time it did not: `devel-base` apt-installs `sudo git curl ca-certificates`
+  and the nodejs deb brings `npm` + `corepack` with it, so the published
+  image carried all of them while this bullet said otherwise. Anyone sizing
+  the sidecar's blast radius from this ADR was underestimating it. The
+  `runtime` stage now removes what it does not ship (`npm`, `npx`,
+  `corepack`, `git`, `sudo`) and `runtime-test` asserts their absence
+  in-image, so this bullet is enforced rather than merely stated. One
+  documented exception: **`curl` stays**, because the two `FROM runtime`
+  test stages use it as their HTTP client (`RUNTIME_SMOKE_CMD` and
+  `test/e2e/run-in-image.sh`), and removing it while `node` -- which has a
+  global `fetch` -- remains would change the contract without changing what
+  an attacker can do.
 - **Two apps with different builds.** `usd-viewer` is the upstream
   `web-viewer-sample` built UNMODIFIED (D2) from its own `src/` + `npm install`;
   `stream-only` is our own app built through the npm WORKSPACE so it resolves
@@ -42,13 +56,31 @@ build path.
 Use the multi-stage builder pattern with DEDICATED build stages:
 
 ```
-                  +- usd-viewer-build  --+
-  devel-base -----+                      +-(COPY dist)-> runtime  (ship, lean)
-       |          +- stream-only-build --+                  +- runtime-test
-       |                                                    +- e2e-test
-       +-------------------------------------(COPY dist)-> devel
-                                                              +- devel-test
+  sys -> devel-base
+            |
+            +- usd-viewer-build  --+
+            |                      +-(COPY dist)-> runtime  (ship, lean)
+            +- stream-only-build --+                  |
+            |                                         +- runtime-test
+            |                                         +- e2e-test
+            |
+            +- example        (demo site on EXAMPLE_PORT; never shipped)
+            |
+            +---------------------(COPY dist)-> devel
+                                                  |
+                                                  +- devel-test
+                                                     ^
+                                                     | COPY bats / shellcheck /
+                                                     | hadolint
+                                                     |
+                                            test-tools-stage
+                                            (FROM ${TEST_TOOLS_IMAGE};
+                                             a pull-only source stage)
 ```
+
+All ELEVEN stages in the Dockerfile appear above. The diagram is the map
+someone reads before touching the file, so a stage missing from it is a stage
+they do not know exists.
 
 - `sys -> devel-base` is the shared foundation (`devel-base` installs `node` +
   `serve`).
@@ -60,6 +92,12 @@ Use the multi-stage builder pattern with DEDICATED build stages:
   `COPY --from` both dists so the uniform entrypoint (`serve /app/$mode/dist`)
   behaves identically to `runtime` for `devel-test`.
 - `runtime-test` / `e2e-test` are `FROM runtime`; `devel-test` is `FROM devel`.
+- `example` is a fourth `FROM devel-base` sibling: it builds and serves
+  `examples/embedded-site-demo` on `EXAMPLE_PORT`, independent of the viewer so
+  both can run at once. It ships nothing and is never pushed.
+- `test-tools-stage` is `FROM ${TEST_TOOLS_IMAGE}` and builds nothing: it exists
+  only so `devel-test` can `COPY --from` bats / shellcheck / hadolint out of a
+  pinned image instead of installing them.
 
 ## Consequences
 
@@ -80,8 +118,13 @@ Benefits (why dedicated builders beat devel-as-builder):
 
 Costs (accepted):
 
-- `devel` and the `*-build` stages each run `npm install` (NOT each run a
-  build). This duplicate install is the unavoidable price of keeping a separate
+- `devel` and the `*-build` stages each run an install (NOT each run a build).
+  Which install differs, and the difference is deliberate: `stream-only-build`
+  (and the `example` stage) run `npm ci` from the committed workspace lockfile,
+  because the bundle they emit is what ships; `usd-viewer-build` and `devel`
+  run `npm install`, because that tree is the upstream `web-viewer-sample`
+  submodule, which ships no lockfile and which D2 says is built UNMODIFIED.
+  This duplicate install is the unavoidable price of keeping a separate
   interactive dev image AND dedicated builders; it buys all the benefits above.
 
 ## Alternatives considered

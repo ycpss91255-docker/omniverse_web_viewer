@@ -7,6 +7,21 @@
 # env var, overrides them. Precedence: host.yaml > env > built-in
 # default. Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are workload
 # runtime params delivered via env / .env (D8), NOT host.yaml.
+#
+# KEYS ARE READ FROM THEIR OWN SECTION ONLY. This file is by design shared
+# with the other containers on the host (isaac#65), so `public_ip` is taken
+# from `network:` and `ui_mode` from `viewer:`, and a key in someone else's
+# section is left alone. A key written at column 0 -- outside any section --
+# is not read either, and the two keys differ in what happens next:
+#   public_ip at column 0 -> the entrypoint REFUSES to start and names the
+#     section it belongs in. A missing `network:` section is anomalous (that
+#     section is why this file is read at all), and ignoring the key would
+#     mean dialling an address nobody chose, with exit 0 and HTTP 200.
+#   ui_mode at column 0   -> REPORTED on stderr and ignored. A missing
+#     `viewer:` section is normal (the mode usually arrives via the
+#     VIEWER_UI_MODE env), so refusing would stop a correctly configured
+#     viewer from booting over a key another container owns -- and this file
+#     cannot tell that apart from a key meant for us and mis-indented.
 # ---------------------------------------------------------------------
 
 network:

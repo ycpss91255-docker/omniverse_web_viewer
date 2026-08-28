@@ -22,6 +22,11 @@
 #     the teardown into someone else's outage;
 #   - teardown removes ONLY those two names -- no compose project, no
 #     `down --remove-orphans`, nothing that reconciles anything it does not own;
+#   - startup additionally reaps `owv-tierb-*` containers left by a HARD-KILLED
+#     earlier run (the producer is not `--rm`, so only the trap removes it, and
+#     the trap does not run on SIGKILL). Still prefix-guarded through `_drop`,
+#     and only for containers older than TIER_B_ORPHAN_MAX_AGE_MIN, so a live
+#     instance is never touched;
 #   - ports are PROBED free before use, starting well away from the ports the
 #     dev/demo stacks have historically held (5173/49100, 5174/49200);
 #   - nothing here touches a compose project, an image tag or a shared name.
@@ -34,8 +39,12 @@
 # directory mode; verified working end to end on an RTX 5090. Overridable via
 # TIER_B_PRODUCER_USER, so set it empty once a fixed tag is published.
 #
+# Usage:
+#   tier_b_visual_e2e.sh                          run the acceptance
+#   tier_b_visual_e2e.sh --print-producer-image   print the pinned producer ref
+#
 # Env knobs (all optional):
-#   TIER_B_PRODUCER_IMAGE  producer image (default: the pinned 0.0.1 tag)
+#   TIER_B_PRODUCER_IMAGE  producer image (default: 0.0.1 pinned BY DIGEST)
 #   TIER_B_PRODUCER_USER   --user for the producer (default: 0:0, isaac#244)
 #   TIER_B_VIEWER_IMAGE    e2e-test image (default: from .env.generated)
 #   TIER_B_INSTANCE        instance scope (default: GITHUB_RUN_ID, else $$)
@@ -44,18 +53,51 @@
 #   TIER_B_PUBLIC_IP       publicEndpointAddress (default: 127.0.0.1)
 #   TIER_B_BOOT_TIMEOUT    seconds to wait for the producer (default: 900)
 #   TIER_B_ARTIFACT_DIR    evidence dir (default: <repo>/.tier-b-artifacts)
+#   TIER_B_ORPHAN_MAX_AGE_MIN
+#                          minutes before an owv-tierb-* container from ANOTHER
+#                          instance counts as orphaned and is reaped
+#                          (default: 120, i.e. twice the job's timeout-minutes)
 #
 # Exit 0 = a real browser saw a real, non-black frame from a real producer.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1}"
+# PINNED BY DIGEST, not by the mutable `:0.0.1` tag.
+#
+# This container is the strongest thing this repo runs: root (isaac#244, see
+# below), `--network=host --ipc=host --gpus all`, on a PERSISTENT self-hosted
+# GPU runner. The busybox in the same workflow job is pinned by digest and
+# .github/workflows/main.yaml states the reason ("runs as root with the
+# workspace bind-mounted, BEFORE checkout, on a persistent self-hosted GPU
+# host"); the same file separately states that "GHCR tags are MUTABLE". The
+# producer was the one container left resolving through a tag, and isaac#244 is
+# an OPEN defect in that image, so a re-push under the same tag is likely
+# rather than hypothetical.
+#
+# The digest below is the current `:0.0.1` OCI index digest, re-resolved from
+# the registry (`docker buildx imagetools inspect`). Moving the pin is a
+# deliberate edit here (or a TIER_B_PRODUCER_IMAGE override for a one-off), not
+# something a registry push can do on our behalf.
+PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-docker/isaac-stream-source@sha256:af1bb815142f190b7e08c402f4dd8b47b69332937b12ff2ca85d45c1fced7318"
+PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-${PRODUCER_IMAGE_DEFAULT}}"
+
+# `--print-producer-image` prints the resolved producer reference and exits, so
+# the workflow's separate pull step (kept so a registry problem is
+# distinguishable from an acceptance failure, and so a multi-GB pull does not
+# eat the acceptance step's budget) pulls exactly what this script will run
+# instead of carrying a second copy of the pin that can drift from it.
+if [ "${1:-}" = "--print-producer-image" ]; then
+  printf '%s\n' "${PRODUCER_IMAGE}"
+  exit 0
+fi
 PRODUCER_USER="${TIER_B_PRODUCER_USER-0:0}"
 INSTANCE="${TIER_B_INSTANCE:-${GITHUB_RUN_ID:-$$}}"
 PUBLIC_IP="${TIER_B_PUBLIC_IP:-127.0.0.1}"
 BOOT_TIMEOUT="${TIER_B_BOOT_TIMEOUT:-900}"
 ARTIFACT_DIR="${TIER_B_ARTIFACT_DIR:-${REPO_ROOT}/.tier-b-artifacts}"
+ORPHAN_MAX_AGE_MIN="${TIER_B_ORPHAN_MAX_AGE_MIN:-120}"
 
 # The name prefix is the isolation guarantee; keep it in ONE place.
 NAME_PREFIX="owv-tierb-${INSTANCE}"
@@ -128,29 +170,109 @@ _drop() {
   docker rm -f "${name}" >/dev/null 2>&1 || true
 }
 
+# THE `grep -q` TRAP, and why every check below counts instead.
+#
+# This script runs under `set -o pipefail`. `docker ... | grep -q PATTERN`
+# exits grep on its FIRST match, which closes the pipe while docker is still
+# writing; docker then dies of SIGPIPE (141), and pipefail hands that 141 up as
+# the pipeline's status. The `if` therefore reads "not found" for something that
+# is plainly there -- and it does so only once the output is long enough for
+# docker to still be writing when grep leaves, i.e. it passes in every small
+# reproduction and fails against a real multi-megabyte Kit log.
+#
+# `grep -c` reads to EOF, so docker always finishes writing and never gets the
+# signal; the count is what decides. `|| true` absorbs grep's exit 1 on zero
+# matches so the count, not an exit status, is the answer in that case too.
+#
+# _container_exists NAME  -- a container with exactly NAME exists (any state).
+_container_exists() {
+  local hits
+  hits="$(docker ps -a --format '{{.Names}}' | grep -cxF -- "$1" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
+# _container_running NAME -- a container with exactly NAME is currently up.
+_container_running() {
+  local hits
+  hits="$(docker ps --format '{{.Names}}' | grep -cxF -- "$1" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
+# _log_contains NAME MARKER -- NAME's log (stdout+stderr) contains MARKER.
+_log_contains() {
+  local hits
+  hits="$(docker logs "$1" 2>&1 | grep -cF -- "$2" || true)"
+  [ "${hits:-0}" -gt 0 ]
+}
+
+# cleanup -- teardown, and NOTHING ELSE. It must not decide the exit status.
+#
+# It used to open with `local rc=$?` and close with `exit "${rc}"` while being
+# trapped on EXIT INT TERM, and both halves of that were wrong on a signal:
+#
+#   - on a signal path `$?` is the status of the last COMPLETED command (the
+#     `sleep 5` in the boot-wait loop, i.e. 0), not a failure. Signalling this
+#     script's pid alone therefore made it exit 0 -- and line 57 says exit 0
+#     means "a real browser saw a real, non-black frame", which the workflow's
+#     picture gate believes. A killed run reported the picture VERIFIED having
+#     asserted nothing. Only a process-GROUP signal happened to give 130/143,
+#     because there the trap never got to overwrite the status;
+#   - the same function being the INT/TERM handler AND the EXIT handler meant
+#     its own `exit` re-entered it through the EXIT trap, so teardown ran twice
+#     and producer.log was written twice.
+#
+# The sibling runners (test/e2e/run-tier-b.sh, test/e2e/run-in-image.sh) have
+# always had the right shape: a teardown function on EXIT with no `exit` in it,
+# so the status the shell was already exiting with is preserved. This follows
+# them, and the signal paths get an EXPLICIT non-zero of their own (128+signo,
+# the shell convention) so a killed run can never be read as a pass.
 cleanup() {
-  local rc=$?
   # Save the producer log BEFORE removing it -- it is the only diagnosis a
   # nightly failure leaves behind.
-  if docker ps -a --format '{{.Names}}' | grep -qx "${PRODUCER_NAME}"; then
+  if _container_exists "${PRODUCER_NAME}"; then
     docker logs "${PRODUCER_NAME}" >"${ARTIFACT_DIR}/producer.log" 2>&1 || true
   fi
   log "teardown: dropping ${VIEWER_NAME} + ${PRODUCER_NAME}"
   _drop "${VIEWER_NAME}"
   _drop "${PRODUCER_NAME}"
-  exit "${rc}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# `exit` here runs cleanup once, through the EXIT trap, with a status that says
+# what happened. GitHub's step timeout and the runner's job cancellation both
+# arrive as one of these.
+trap 'fail "interrupted (SIGINT) -- no picture was verified"; exit 130' INT
+trap 'fail "terminated (SIGTERM) -- no picture was verified"; exit 143' TERM
+
+# _env_value NAME DEFAULT -- read one variable from the derived .env files
+# WITHOUT letting them into this shell.
+#
+# They used to be sourced wholesale, and by the time that happened this script
+# had already resolved INSTANCE, PRODUCER_NAME, VIEWER_NAME, PUBLIC_IP,
+# BOOT_TIMEOUT, ARTIFACT_DIR and more -- so any of those names appearing in the
+# hand-authored .env silently replaced them. PRODUCER_NAME is the dangerous
+# one: `_drop` REFUSES a name outside the owv-tierb-* prefix (that refusal is
+# the isolation guarantee and must stay), so teardown would decline to remove
+# the container this script had just started under the overridden name, and the
+# script would exit 0 leaving a `--gpus all` Kit container running on the
+# shared host. Exactly two values are wanted from those files, so exactly two
+# are taken, and the sourcing happens in a subshell that dies with the
+# substitution.
+_env_value() {
+  local name="$1" default="$2"
+  (
+    # shellcheck source=/dev/null
+    if [ -f "${REPO_ROOT}/.env.generated" ]; then . "${REPO_ROOT}/.env.generated"; fi
+    # shellcheck source=/dev/null
+    if [ -f "${REPO_ROOT}/.env" ]; then . "${REPO_ROOT}/.env"; fi
+    printf '%s\n' "${!name:-${default}}"
+  )
+}
 
 # Viewer image: the e2e-test stage tag the build wrapper produces
 # (${DOCKER_HUB_USER}/${IMAGE_NAME}:e2e-test). Read from the derived .env so
 # this follows whatever the repo is configured as, with a plain default.
-DOCKER_HUB_USER="local"
-IMAGE_NAME="omniverse_web_viewer"
-# shellcheck source=/dev/null
-[ -f "${REPO_ROOT}/.env.generated" ] && . "${REPO_ROOT}/.env.generated"
-# shellcheck source=/dev/null
-[ -f "${REPO_ROOT}/.env" ] && . "${REPO_ROOT}/.env"
+DOCKER_HUB_USER="$(_env_value DOCKER_HUB_USER local)"
+IMAGE_NAME="$(_env_value IMAGE_NAME omniverse_web_viewer)"
 VIEWER_IMAGE="${TIER_B_VIEWER_IMAGE:-${DOCKER_HUB_USER}/${IMAGE_NAME}:e2e-test}"
 
 SERVE_PORT="${TIER_B_SERVE_PORT:-$(_pick_port "${SERVE_PORT_BASE}")}"
@@ -170,6 +292,51 @@ if ! docker image inspect "${VIEWER_IMAGE}" >/dev/null 2>&1; then
   fail "viewer image ${VIEWER_IMAGE} is not present -- build it first (just build -t e2e-test)"
   exit 1
 fi
+
+# Reap STALE containers from the whole owv-tierb-* namespace first. The
+# producer is deliberately not --rm and is removed only by the EXIT/INT/TERM
+# trap, so a SIGKILLed run (runner reboot, docker daemon restart, the GHA hard
+# kill after the grace period, the job's own timeout-minutes) leaves a Kit
+# container alive holding `--gpus all` and the host network. INSTANCE is
+# GITHUB_RUN_ID, which differs on every run, so the per-instance pre-clean
+# below walks straight past it and nothing else in the repo removes it either
+# -- the workflow's pre-checkout step only deletes .tier-b-artifacts. The next
+# Tier B then contends with a stale Kit for GPU memory and can fail for reasons
+# that have nothing to do with the viewer, which by the release invariant is a
+# blocked release with a misleading symptom.
+#
+# Two guards keep this from becoming the outage it is meant to prevent:
+#   - the names come from a `^owv-tierb-` docker filter and still go through
+#     `_drop`, which refuses anything outside that prefix, so the isolation
+#     guarantee is exactly as strong as before;
+#   - only containers OLDER than ORPHAN_MAX_AGE_MIN are touched. The job's
+#     budget is `timeout-minutes: 60`, so at twice that nothing reaped here can
+#     belong to a live run -- a concurrent instance (TIER_B_INSTANCE override,
+#     local dev) is left alone even though the `concurrency` group already
+#     serialises the CI ones.
+_reap_orphans() {
+  local names name created started now age
+  now="$(date -u +%s)"
+  mapfile -t names < <(
+    docker ps -a --filter 'name=^owv-tierb-' --format '{{.Names}}' 2>/dev/null || true
+  )
+  for name in "${names[@]}"; do
+    [ -n "${name}" ] || continue
+    case "${name}" in
+      "${PRODUCER_NAME}" | "${VIEWER_NAME}") continue ;;
+    esac
+    created="$(docker inspect -f '{{.Created}}' "${name}" 2>/dev/null || true)"
+    started="$(date -u -d "${created}" +%s 2>/dev/null || echo 0)"
+    age=$((now - started))
+    if [ "${age}" -lt $((ORPHAN_MAX_AGE_MIN * 60)) ]; then
+      log "leaving ${name} alone (age ${age}s < ${ORPHAN_MAX_AGE_MIN}m; another instance may own it)"
+      continue
+    fi
+    log "reaping orphaned ${name} (age ${age}s) -- a hard-killed run left it holding the GPU"
+    _drop "${name}"
+  done
+}
+_reap_orphans
 
 # Pre-clean OUR OWN names only: a hard-killed earlier run of the same instance
 # can leave the (non---rm) producer behind, and `docker run --name` would then
@@ -213,12 +380,12 @@ log "waiting up to ${BOOT_TIMEOUT}s for: ${READY_MARKER}"
 deadline=$((SECONDS + BOOT_TIMEOUT))
 ready=false
 while [ "${SECONDS}" -lt "${deadline}" ]; do
-  if ! docker ps --format '{{.Names}}' | grep -qx "${PRODUCER_NAME}"; then
+  if ! _container_running "${PRODUCER_NAME}"; then
     fail "producer container exited before the streaming server started"
     docker logs "${PRODUCER_NAME}" 2>&1 | tail -n 60 || true
     exit 1
   fi
-  if docker logs "${PRODUCER_NAME}" 2>&1 | grep -qF "${READY_MARKER}"; then
+  if _log_contains "${PRODUCER_NAME}" "${READY_MARKER}"; then
     ready=true
     break
   fi
@@ -235,6 +402,13 @@ log "producer is streaming; handing over to the browser"
 # One container is both the viewer and the browser: e2e-test is FROM runtime,
 # so it carries the real dist AND Playwright/Chromium. Host network so the page
 # it serves and the producer it dials are both on 127.0.0.1.
+# Remove any attestation that exists BEFORE the browser runs. The workflow's
+# pre-clean happens before checkout, and the driver only mkdir -p's this
+# directory -- so a step that plants a well-formed attestation early would
+# have it survive and be read as this run's evidence. The file must be
+# written by the acceptance spec, in this run, or not exist.
+rm -f "${ARTIFACT_DIR}/tier-b-attestation.json"
+
 rc=0
 docker run --rm \
   --name "${VIEWER_NAME}" \
@@ -243,6 +417,8 @@ docker run --rm \
   -e SIGNALING_PORT="${SIGNAL_PORT}" \
   -e SERVE_PORT="${SERVE_PORT}" \
   -e OWV_ARTIFACT_DIR=/artifacts \
+  -e GITHUB_SHA="${GITHUB_SHA:-}" \
+  -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
   -v "${ARTIFACT_DIR}":/artifacts \
   "${VIEWER_IMAGE}" \
   bash /e2e/run-tier-b.sh || rc=$?
@@ -251,6 +427,61 @@ if [ "${rc}" -ne 0 ]; then
   fail "visual acceptance failed (exit ${rc}); producer log tail follows"
   docker logs "${PRODUCER_NAME}" 2>&1 | tail -n 60 || true
   exit "${rc}"
+fi
+
+# --------------------------------------------------------------------------
+# The browser step returning 0 is NOT the picture. Require the evidence.
+#
+# Review round 8 produced five single-step, checker-green edits to main.yaml
+# that each make this job report success without a picture: truncating this
+# file (`: > script/ci/tier_b_visual_e2e.sh --print-x`), `sed -i '1a exit 0'
+# script/ci/*.sh`, a $GITHUB_PATH entry shadowing `bash`, a job-level
+# `container:` whose bash is a stub, and $GITHUB_ENV aiming
+# TIER_B_PRODUCER_IMAGE at busybox. Reading main.yaml cannot separate those
+# from a real run -- they are all "the driver did not sample a frame" -- so
+# the driver stops asserting it and starts checking for what a real run leaves
+# behind: an attestation the acceptance spec writes only after it has sampled
+# a frame that passed every threshold.
+#
+# This fails CLOSED by construction. Missing file, unparseable file, absent
+# python3, wrong commit, wrong run, degenerate frame -- every one of them
+# exits non-zero, which blocks call-release and publish-image. A gate that
+# cannot prove the picture must never let the picture be claimed.
+ATTESTATION="${ARTIFACT_DIR}/tier-b-attestation.json"
+
+if [ ! -f "${ATTESTATION}" ]; then
+  fail "no attestation at ${ATTESTATION}: the acceptance spec never sampled a frame"
+  fail "the browser step exited 0 but produced no evidence -- refusing to claim a picture"
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 is required to verify the attestation; refusing to claim an unverified picture"
+  exit 1
+fi
+
+# Bound the frame thresholds to the spec's own constants (test/e2e/
+# tier-b-visual.spec.ts: MIN_MEAN_LUMA / MIN_BRIGHT_FRACTION). The spec has
+# already enforced them; re-checking here is what makes a hand-written
+# attestation useless without also faking a plausible frame.
+if ! ATTESTATION_SUMMARY="$(
+  OWV_ATTESTATION="${ATTESTATION}" \
+  OWV_MIN_MEAN_LUMA=8 \
+  OWV_MIN_MAX_LUMA=32 \
+  OWV_MIN_BRIGHT_FRACTION=0.1 \
+  python3 "${SCRIPT_DIR}/verify_tier_b_attestation.py"
+)"; then
+  fail "attestation did not verify; refusing to claim a picture"
+  exit 1
+fi
+
+log "attestation verified: ${ATTESTATION_SUMMARY}"
+
+# Hand the publisher a value it can require. publish-image refuses to push
+# without it, so a tier-b job that never sampled a frame cannot be laundered
+# into a release by a green job status alone.
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  printf 'attestation=%s\n' "${ATTESTATION_SUMMARY}" >>"${GITHUB_OUTPUT}"
 fi
 
 log "PASS: a real browser rendered a real, non-black frame from a real Kit producer"

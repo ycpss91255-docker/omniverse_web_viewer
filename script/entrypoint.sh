@@ -27,20 +27,321 @@ set -euo pipefail
 # shellcheck source=/dev/null
 . /usr/local/lib/base/logging.sh
 
-# yaml_value <key> <file>: extract a scalar value for a top-level-ish
-# `<key>: <value>` line. Strips surrounding quotes, a trailing inline
-# `# comment`, and trailing whitespace. Prints nothing if absent.
+# yaml_value <section> <key> <file>: extract the scalar value of
+# `<section>:` / `  <key>: <value>`. Strips surrounding quotes, a trailing
+# inline `# comment`, and surrounding whitespace. Prints nothing if absent.
+#
+# THE SECTION ARGUMENT IS THE POINT. This used to match `^[[:space:]]*<key>:`
+# -- any indentation, any section, first hit wins -- and /etc/host.yaml is BY
+# DESIGN a file shared with other containers on the host (isaac#65, cited two
+# comments down); the live isaac host.yaml already carries a second top-level
+# `livestream:` block, so a key colliding with one of ours is ordinary rather
+# than exotic. Unscoped, a foreign `ui_mode:` failed our enum and the container
+# refused to boot, and a foreign `public_ip:` in an EARLIER section won -- the
+# viewer then silently dialled the wrong host, exit 0, HTTP 200, every gate
+# green. Scoping the lookup to `network:` / `viewer:` means only the keys this
+# file's own schema defines can steer the viewer.
+#
+# A top-level key (column 0) opens or closes the section; only INDENTED keys
+# inside the requested section are considered. A key written AT column 0 is
+# therefore not a value of ours -- see yaml_top_level_key below, which refuses
+# to let that be silent.
 yaml_value() {
-  awk -F': *' -v key="$1" '
-    $0 ~ "^[[:space:]]*" key ":" {
-      v = $2
-      sub(/[[:space:]]*#.*$/, "", v)   # drop inline comment
-      gsub(/"/, "", v)                 # drop quotes
+  awk -v section="$1" -v key="$2" '
+    /^[^[:space:]#]/ {
+      in_section = (index($0, section ":") == 1)
+      next
+    }
+    !in_section { next }
+    $0 ~ "^[[:space:]]+" key ":" {
+      v = $0
+      sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "", v)   # drop the key
+      sub(/[[:space:]]*#.*$/, "", v)                  # drop inline comment
+      gsub(/"/, "", v)                                # drop quotes
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
       print v
       exit
     }
-  ' "$2" 2>/dev/null || true
+  ' "$3"
+}
+
+# yaml_top_level_key <key> <file>: true when `<key>:` appears at COLUMN 0.
+#
+# Scoping the lookup above to `network:` / `viewer:` closed a real hole (a
+# foreign section's key steering this viewer) but opened a quieter one: before
+# it, `^[[:space:]]*key:` also matched column 0, so a FLAT host.yaml --
+# `public_ip: "10.9.9.9"` with no `network:` above it -- used to work. After
+# it, that file resolves nothing and the container boots on env/defaults,
+# dialling an address nobody chose with exit 0 and HTTP 200. That is the exact
+# failure mode the unreadable-host.yaml fix declared unacceptable, so a flat
+# key is REFUSED rather than accepted-as-fallback or ignored.
+#
+# Refused, not accepted, because the shared-file argument still applies: a key
+# at column 0 in a file shared with other containers (isaac#65) is addressed to
+# nobody in particular, and quietly steering the viewer from it is what the
+# scoping fix exists to prevent.
+#
+# THE TWO KEYS ARE NOT SYMMETRIC, and treating them as one rule was a bug of
+# its own. `refuse_flat_key` fires when OUR OWN SCOPED LOOKUP produced no
+# value, and that precondition means opposite things for the two keys:
+#
+#   - public_ip: a missing `network:` section is anomalous. That section is
+#     the whole reason this file is read, so a file with none of it, plus a
+#     column-0 `public_ip:`, is a file someone wrote FOR us and mis-shaped.
+#     Refusing is right, and the failure it prevents is the bad one -- a
+#     plausible page dialling an address nobody chose, exit 0 and HTTP 200.
+#
+#   - ui_mode: a missing `viewer:` section is the NORMAL, DOCUMENTED state
+#     ("A host.yaml with only a network section leaves the viewer value
+#     untouched", below), because VIEWER_UI_MODE is routinely supplied by env
+#     instead. So the precondition is met on ordinary, correct files, and
+#     refusing there blocks a properly configured viewer from booting over a
+#     key another container owns -- a narrower restatement of the very bug the
+#     scoping fix above was written for.
+#
+# It cannot be made precise, either. `network:` + `public_ip:` + a column-0
+# `ui_mode:` is BYTE-FOR-BYTE the file an operator writes when they meant that
+# key for us and got the shape wrong, AND the file that results when another
+# container simply owns a top-level `ui_mode:`. Nothing in the file separates
+# them, so any refusal rule necessarily blocks the innocent one. ui_mode is
+# therefore TOLD, not refused: see warn_flat_key. Not silent, and not fatal.
+yaml_top_level_key() {
+  awk -v key="$1" '
+    $0 ~ "^" key ":" { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$2"
+}
+
+# yaml_section_kind <section> <file>: print what the COLUMN-0 `<section>:`
+# line actually does -- `section`, `scalar`, `flow` or `alias`.
+#
+# yaml_top_level_key cannot tell those apart: it matches `^<section>:` every
+# way, so on its own it reports a scalar as "a section that exists", and the
+# remedy that follows from that -- indent the key under it -- yields invalid
+# YAML, a mapping key indented under a scalar value. An operator who does what
+# the message says ends up worse off than before.
+#
+# THREE KINDS, NOT TWO. Deciding "scalar" from "there is text after the colon"
+# was itself provably wrong about three VALID files, and told the operator to
+# fix something already correct:
+#
+#   viewer: {ui_mode: "stream-only"}   a FLOW MAPPING. It is a real mapping
+#                                      supplying the key -- just written on
+#                                      one line, which this line-based reader
+#                                      does not scan. Saying it "is set to a
+#                                      value rather than opening a section" is
+#                                      false about the file on the screen.
+#   viewer: &anchor  + indented body   an ANCHOR is a node PROPERTY, not the
+#   viewer: !!map    + indented body   value; so is a TAG. The section below
+#                                      is a perfectly ordinary block mapping.
+#
+# FOUR KINDS, THEN. The anchor's direct companion was missed by the round
+# that added the anchor:
+#
+#   viewer: *v                         an ALIAS. Every parser resolves it to
+#                                      the anchored node, so the file is
+#                                      valid and `viewer:` really does supply
+#                                      a mapping -- calling it "set to a
+#                                      value rather than opening a section"
+#                                      is false about the file on the screen,
+#                                      and "make it open a section" describes
+#                                      work already done. What IS true is
+#                                      that this line-based reader does not
+#                                      FOLLOW the reference: the keys are
+#                                      wherever the anchor is, not below this
+#                                      header. An alias cannot carry an
+#                                      anchor or a tag of its own (YAML
+#                                      forbids properties on an alias), so it
+#                                      is recognised after the strip, not
+#                                      before.
+#
+# So node properties are stripped first, a remaining `{`/`[` is reported as
+# `flow` and a remaining `*` as `alias` -- each with its own true reason and
+# its own true remedy -- while only real leftover text is `scalar`. This is
+# the exact class of bug this whole group of helpers exists to end: a
+# diagnostic that is provably false about the file in front of the operator
+# gets the next true thing it says discounted too.
+#
+# Reads the HEADER LINE ONLY, then exits. yaml_value's scan treats a
+# scalar-bearing header as opening a section (its `index($0, section ":") == 1`
+# ignores whatever follows the colon), and this probe must not inherit that:
+# it never looks below the header, so nothing yaml_value would have mis-scanned
+# there can reach the answer.
+yaml_section_kind() {
+  awk -v section="$1" '
+    index($0, section ":") != 1 { next }
+    {
+      v = $0
+      sub(/^[^:]*:[[:space:]]*/, "", v)   # drop the section name
+      sub(/[[:space:]]*#.*$/, "", v)      # drop inline comment
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      # An anchor and a tag may BOTH be present, in either order, and neither
+      # is the value.
+      for (i = 0; i < 2; i++) {
+        if (v ~ /^&[^[:space:]]+/) {
+          sub(/^&[^[:space:]]+[[:space:]]*/, "", v)
+        } else if (v ~ /^![^[:space:]]*/) {
+          sub(/^![^[:space:]]*[[:space:]]*/, "", v)
+        }
+      }
+      if (v == "")            { kind = "section" }
+      else if (v ~ /^[{[]/)   { kind = "flow" }
+      else if (v ~ /^\*/)     { kind = "alias" }
+      else                    { kind = "scalar" }
+      exit
+    }
+    END { print (kind == "" ? "section" : kind) }
+  ' "$2"
+}
+
+# yaml_section_has_key <section> <key> <file>: true when the body of
+# `<section>:` carries an indented `<key>:` LINE AT ALL, whatever its value.
+#
+# Called only after the scoped lookup came back empty, so a hit here means the
+# key IS there with an empty value -- the state the old two-way reason reported
+# as "that section does not supply '<key>'" about a key sitting plainly in the
+# section, before telling the operator to indent something already indented.
+#
+# Mirrors yaml_value's scan deliberately: the question being answered is what
+# THAT scan saw, so an answer from a different scan would describe a different
+# file. It therefore shares yaml_value's quirk (a scalar-bearing header still
+# opens a section) -- unreachable through this path, because every caller tests
+# yaml_section_kind first and stops there.
+yaml_section_has_key() {
+  awk -v section="$1" -v key="$2" '
+    /^[^[:space:]#]/ {
+      in_section = (index($0, section ":") == 1)
+      next
+    }
+    !in_section { next }
+    $0 ~ "^[[:space:]]+" key ":" { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$3"
+}
+
+# refuse_flat_key <key> <section> <file>: exit 1 when <key> is at column 0 and
+# the scoped lookup found nothing, so a misplaced key is never silently
+# ignored. Called only after the scoped lookup came back empty, and only for
+# network.public_ip -- see the asymmetry note above yaml_top_level_key for why
+# viewer.ui_mode uses warn_flat_key instead.
+# flat_key_reason <key> <section> <file>: the clause naming WHY our scoped
+# lookup came back empty. It used to say "but no '<section>:' section supplying
+# it", which is FALSE whenever the section is there and merely lacks the key,
+# and "two cases" was itself an undercount -- SIX states end with the scoped
+# lookup empty, and the old branch reported two of them wrongly:
+#
+#   1. no `<section>:` at all;
+#   2. `<section>:` carrying a SCALAR, so it opens no section to read from --
+#      reported as a section that exists, with a remedy (indent under it) that
+#      makes the file invalid YAML if followed;
+#   2a. `<section>:` written as a one-line FLOW collection, and
+#   2b. `<section>:` written as an ALIAS to an anchor elsewhere: both are real
+#      mappings that this line-based reader does not scan, and calling either
+#      a scalar is provably false about the file on the screen;
+#   3. `<section>:` a real section that has no `<key>:` in it;
+#   4. `<section>:` a real section whose `<key>:` IS there with an empty value
+#      -- reported as "does not supply '<key>'" about a key on the screen in
+#      front of the operator, with a remedy telling them to indent it when it
+#      is already indented.
+#
+# An operator who catches the message being provably wrong about the file they
+# are looking at discounts the next true thing it says, which is the whole
+# value of these lines.
+flat_key_reason() {
+  local key="$1" section="$2" file="$3"
+  if ! yaml_top_level_key "${section}" "${file}"; then
+    printf "%s" "there is no '${section}:' section in it to supply it"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "scalar" ]; then
+    printf "%s" "'${section}:' is set to a value rather than opening a" \
+                " section, so nothing can be read out of it"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "flow" ]; then
+    printf "%s" "'${section}:' is written as a one-line flow collection," \
+                " which this reader does not scan -- it reads keys from" \
+                " INDENTED lines below the section header"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "alias" ]; then
+    printf "%s" "'${section}:' is an alias to an anchor defined elsewhere" \
+                " in the file, and this reader does not follow it -- it" \
+                " reads keys from INDENTED lines below the section header"
+  elif yaml_section_has_key "${section}" "${key}" "${file}"; then
+    printf "%s" "there IS a '${section}:' section in it and it does carry a" \
+                " '${key}:', but that key has no value"
+  else
+    printf "%s" "there IS a '${section}:' section in it, but that section" \
+                " does not supply '${key}'"
+  fi
+}
+
+# flat_key_fix <key> <section> <file>: the REMEDY for the same six states, as
+# a lower-case imperative clause both messages splice into their own sentence.
+#
+# Kept separate from flat_key_reason rather than folded into it because the
+# callers place the two halves differently -- the refusal states the fix as its
+# own sentence, the warning hangs it off "If that key was meant for this
+# viewer, ..." -- and because a shared, state-INDEPENDENT remedy is exactly the
+# bug being fixed here: the old fixed sentence said "Indent it under
+# '<section>:'" in all six states, which is wrong in five of them (there is
+# nothing to indent under in state 1, indenting under a scalar is invalid YAML
+# in state 2, a flow collection and an alias are already mappings in 2a and 2b,
+# and the key is already indented in state 4). Varying the reason
+# while leaving the remedy fixed would have kept the operator doing the wrong
+# thing, just with a better explanation of why they were there.
+flat_key_fix() {
+  local key="$1" section="$2" file="$3"
+  if ! yaml_top_level_key "${section}" "${file}"; then
+    printf "%s" "add a '${section}:' section and put '${key}:' in its body"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "scalar" ]; then
+    printf "%s" "make '${section}:' open a section rather than carry a" \
+                " value, and put '${key}:' in its body"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "flow" ]; then
+    printf "%s" "rewrite '${section}:' as an indented block mapping, with" \
+                " '${key}:' on its own line below it"
+  elif [ "$(yaml_section_kind "${section}" "${file}")" = "alias" ]; then
+    printf "%s" "replace the alias with an indented block mapping under" \
+                " '${section}:', with '${key}:' on its own line below it"
+  elif yaml_section_has_key "${section}" "${key}" "${file}"; then
+    printf "%s" "give the empty '${key}:' already inside '${section}:' a value"
+  else
+    printf "%s" "indent it under '${section}:'"
+  fi
+}
+
+refuse_flat_key() {
+  local key="$1" section="$2" file="$3"
+  if yaml_top_level_key "${key}" "${file}"; then
+    echo "entrypoint: ${file} has a top-level '${key}:' and" \
+         "$(flat_key_reason "${key}" "${section}" "${file}");" \
+         "this file's keys are read from their own" \
+         "section only, so that value would be silently ignored and the" \
+         "viewer would boot on env/defaults. To fix it," \
+         "$(flat_key_fix "${key}" "${section}" "${file}")" \
+         "(see config/host.yaml.example). If that key belongs to another" \
+         "container, give the viewer its own '${section}: ${key}: ...' and" \
+         "that value wins" >&2
+    exit 1
+  fi
+}
+
+# warn_flat_key <key> <section> <file> <effective> <supplier>: say on STDERR
+# that a column-0 <key> was not read, and name the value actually in effect
+# plus where it came from. NEVER exits -- that is the whole point, and the
+# reason it exists next to refuse_flat_key rather than as a flag on it. See
+# the asymmetry note above yaml_top_level_key: for ui_mode the refusal
+# precondition is met by ordinary correct files, so refusing blocks a properly
+# configured viewer over a key another container owns. Naming the key and the
+# value actually in effect is the strongest thing that is still safe: the
+# operator who mis-shaped their own file reads one line and fixes it, and the
+# operator whose neighbour owns that key still boots.
+warn_flat_key() {
+  local key="$1" section="$2" file="$3" effective="$4" supplier="$5"
+  echo "entrypoint: ${file} has a top-level '${key}:' and" \
+       "$(flat_key_reason "${key}" "${section}" "${file}");" \
+       "this file's keys are read from their own" \
+       "section only, so that value was NOT read. In effect: '${effective}'" \
+       "(from ${supplier}). If that key was meant for this viewer," \
+       "$(flat_key_fix "${key}" "${section}" "${file}")" \
+       "(see config/host.yaml.example) and it wins. If it" \
+       "belongs to another container sharing this file (isaac#65), nothing" \
+       "needs doing -- this line is the only trace either way" >&2
 }
 
 # Per-host config (mounted by caller from config/host.yaml). When
@@ -50,14 +351,74 @@ yaml_value() {
 # viewer.ui_mode follows the same precedence as public_ip: host.yaml
 # viewer.ui_mode > VIEWER_UI_MODE env > built-in default. A host.yaml
 # with only a network section leaves the viewer value untouched
-# (back-compat). Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
+# (back-compat) -- and, because that is NORMAL rather than anomalous, a
+# column-0 `ui_mode:` is reported and ignored where a column-0 `public_ip:` is
+# refused; see the asymmetry note above yaml_top_level_key.
+# Ports (SIGNALING_PORT / MEDIA_PORT / SERVE_PORT) are
 # workload runtime params delivered via env/.env (D8), NOT host.yaml.
-if [ -f /etc/host.yaml ]; then
-  host_ip="$(yaml_value public_ip /etc/host.yaml)"
-  if [ -n "${host_ip}" ]; then SIGNALING_SERVER="${host_ip}"; fi
+# Initialised HERE so `set -u` has something to read, and under a
+# LEADING-UNDERSCORE, INTERNAL name because this script is the container
+# ENTRYPOINT: its environment is operator- and compose-controlled on the way
+# in, and it ends in `exec "${@}"` on the way out, so a bare name is both read
+# from and handed to somebody else's environment.
+#
+# Reading the obvious name was the first half of that: with `docker run -e
+# flat_ui_mode_supplier=...` and NO /etc/host.yaml mounted at all, the block
+# below never runs, the deferred warning fires anyway, and the boot log states
+# that a file which does not exist carries a key it does not have, with the
+# operator's own text spliced in as the supplier.
+#
+# ASSIGNING the obvious name is the other half, and initialising it did not
+# fix that -- it introduced it. The assignment does not create a fresh
+# shell-local: an inherited variable keeps its export attribute, so this line
+# would EMPTY a variable the operator set and hand that emptied version to the
+# exec'd process. The environment this entrypoint passes on is not its to
+# edit. Under the `_` prefix neither half can happen: nothing named
+# `flat_ui_mode_supplier` is read here, and nothing of that name is altered in
+# what the CMD inherits.
+_flat_ui_mode_supplier=""
 
-  yaml_ui_mode="$(yaml_value ui_mode /etc/host.yaml)"
-  if [ -n "${yaml_ui_mode}" ]; then VIEWER_UI_MODE="${yaml_ui_mode}"; fi
+if [ -f /etc/host.yaml ]; then
+  # An UNREADABLE host.yaml is an operator mistake, not an absent file, and it
+  # must not be treated as one. awk's failure used to be swallowed
+  # (`2>/dev/null || true`), so a mode-000 or wrong-owner /etc/host.yaml booted
+  # silently on env/defaults -- i.e. dialled whatever address the operator had
+  # just moved OUT of the env into that file, with exit 0 and HTTP 200. Both
+  # the suppression and the guess are gone: the file is checked here, and awk's
+  # exit status now reaches `set -e` if anything else goes wrong reading it.
+  if [ ! -r /etc/host.yaml ]; then
+    echo "entrypoint: /etc/host.yaml exists but is not readable by" \
+         "$(id -un) (uid $(id -u)); refusing to fall back to env/defaults" \
+         "and dial an address nobody chose" >&2
+    exit 1
+  fi
+
+  host_ip="$(yaml_value network public_ip /etc/host.yaml)"
+  if [ -n "${host_ip}" ]; then
+    SIGNALING_SERVER="${host_ip}"
+  else
+    refuse_flat_key public_ip network /etc/host.yaml
+  fi
+
+  yaml_ui_mode="$(yaml_value viewer ui_mode /etc/host.yaml)"
+  if [ -n "${yaml_ui_mode}" ]; then
+    VIEWER_UI_MODE="${yaml_ui_mode}"
+  elif yaml_top_level_key ui_mode /etc/host.yaml; then
+    # Deferred to after the default is applied below, so the warning can name
+    # the mode ACTUALLY in effect without duplicating the default literal. The
+    # supplier is decided here, while VIEWER_UI_MODE still holds only what the
+    # environment gave us: non-empty means an operator (or the image ENV) chose
+    # a mode for THIS container, empty means nothing did and the built-in
+    # default is about to. That difference does not change whether we boot --
+    # the built-in default is itself a supported configuration, per the
+    # back-compat note above -- it changes what the operator is told, which is
+    # where it is actually useful.
+    if [ -n "${VIEWER_UI_MODE:-}" ]; then
+      _flat_ui_mode_supplier="the VIEWER_UI_MODE env"
+    else
+      _flat_ui_mode_supplier="the built-in default; nothing else supplied one"
+    fi
+  fi
 fi
 
 # Resolve final values (built-in defaults). MEDIA_PORT has NO default:
@@ -65,6 +426,14 @@ fi
 SIGNALING_SERVER="${SIGNALING_SERVER:-127.0.0.1}"
 SIGNALING_PORT="${SIGNALING_PORT:-49100}"
 VIEWER_UI_MODE="${VIEWER_UI_MODE:-usd-viewer}"
+
+# The deferred half of the flat-ui_mode note above: emitted here so it can name
+# the resolved mode. Fires only when /etc/host.yaml carried a column-0
+# `ui_mode:` AND our own `viewer:` section supplied nothing.
+if [ -n "${_flat_ui_mode_supplier}" ]; then
+  warn_flat_key ui_mode viewer /etc/host.yaml \
+    "${VIEWER_UI_MODE}" "${_flat_ui_mode_supplier}"
+fi
 
 # Validate before substituting. Each value lands in a browser-executed
 # JS bundle via sed, so a bad value must fail the container fast rather
@@ -76,10 +445,31 @@ if [[ ! "${SIGNALING_SERVER}" =~ ^[A-Za-z0-9.-]+$ ]]; then
        "(allowed: hostname / IPv4 chars A-Za-z0-9.-)" >&2
   exit 1
 fi
-if [[ ! "${SIGNALING_PORT}" =~ ^[0-9]+$ ]]; then
-  echo "entrypoint: invalid signaling port '${SIGNALING_PORT}' (must be numeric)" >&2
-  exit 1
-fi
+#
+# reject_bad_port <name> <value>: exit 1 unless <value> is an integer 1..65535
+# written WITHOUT a leading zero. Both halves of that rule earn their place:
+#   - the range, because `0` and `99999` are not ports. They reach the browser
+#     otherwise -- stream-only at least throws a visible readout, but usd-viewer
+#     (upstream, unmodified) just never connects and says nothing;
+#   - the leading zero, because the port sed below replaces the QUOTED sentinel
+#     `"__OWV_PORT__"`, so the value lands in the bundle as a BARE numeric
+#     token. `SIGNALING_PORT=049100` renders `signalingPort:049100`, which is
+#     `SyntaxError: Decimals with leading zeros are not allowed in strict mode`
+#     -- the whole ES module fails to parse and the viewer is a black page,
+#     while the entrypoint exits 0, `serve` answers HTTP 200 and every gate
+#     stays green. `[ x -lt y ]` parses base 10, so a range test alone does not
+#     catch it.
+reject_bad_port() {
+  local name="$1" value="$2"
+  if [[ ! "${value}" =~ ^(0|[1-9][0-9]*)$ ]] || \
+     [ "${value}" -lt 1 ] || [ "${value}" -gt 65535 ]; then
+    echo "entrypoint: invalid ${name} '${value}'" \
+         "(must be an integer 1..65535, written without a leading zero)" >&2
+    exit 1
+  fi
+}
+
+reject_bad_port "signaling port" "${SIGNALING_PORT}"
 case "${VIEWER_UI_MODE}" in
   usd-viewer | stream-only) ;;
   *)
@@ -90,17 +480,75 @@ case "${VIEWER_UI_MODE}" in
 esac
 # MEDIA_PORT is OPTIONAL (D1): unset -> rendered as the literal `null`
 # (the stream-only app omits mediaPort and the library SDP-negotiates).
-# When set it must be an integer 1..65535.
+# When set it must be an integer 1..65535, same rule as the signaling port --
+# it is substituted for the same kind of quoted sentinel and reaches the
+# bundle as the same kind of bare numeric token.
 if [ -n "${MEDIA_PORT:-}" ]; then
-  if [[ ! "${MEDIA_PORT}" =~ ^[0-9]+$ ]] || \
-     [ "${MEDIA_PORT}" -lt 1 ] || [ "${MEDIA_PORT}" -gt 65535 ]; then
-    echo "entrypoint: invalid media port '${MEDIA_PORT}'" \
-         "(must be an integer 1..65535, or unset to negotiate)" >&2
-    exit 1
-  fi
+  reject_bad_port "media port" "${MEDIA_PORT}"
   media_value="${MEDIA_PORT}"
 else
   media_value="null"
+fi
+
+# SERVE_PORT is not rendered into any bundle -- the CMD passes it to `serve -l`
+# -- but the same rule applies for the same reason the header states: a bad
+# value must fail the container fast. `SERVE_PORT=0` otherwise starts a viewer
+# nobody can reach, on a port nobody chose. Only checked when set: the `example`
+# stage serves on EXAMPLE_PORT and leaves this unset.
+#
+# BOTH NETWORK FORMS ARE ACCEPTED, because `serve -l` takes an ENDPOINT, not
+# only a port, and that endpoint is the only way to scope the listen ADDRESS:
+# `SERVE_PORT=tcp://127.0.0.1:5173` binds loopback only. Validating a bare
+# integer alone (as the first version of this check did) silently removed that
+# -- the published image could then only listen on every interface, so a viewer
+# meant for the local browser is reachable by any LAN peer, and a URL handed to
+# its user is a URL handed to the viewer. The port half is validated in both
+# forms, which is what the fast-fail was actually for.
+#
+# `serve --help` (14.2.6) documents FOUR endpoint forms; the other two are
+# REFUSED here, deliberately and by name rather than by accident:
+#   - `pipe:\\.\pipe\Name` is a WINDOWS named pipe. The published image is
+#     linux/amd64 (the only platform CI builds and gates), so this form cannot
+#     work in it at all -- accepting it would only move the failure from a
+#     named entrypoint error to an obscure one from `serve` after boot.
+#   - `unix:/path/to/socket.sock` is a UNIX domain socket, and NOTHING that
+#     consumes this container can address one: the browser dials a URL, the
+#     runtime-test smoke and both e2e runners curl `http://127.0.0.1:<port>`,
+#     and compose delivers `SERVE_PORT` as a port. A socket would also widen
+#     the charset this value is allowed to carry, and that charset is load
+#     bearing: the CMD is `sh -c "serve -s ... -l ${SERVE_PORT}"`, so the value
+#     is expanded BY A SHELL -- validation is the escaping here exactly as it
+#     is for the sentinels above.
+# If a socket endpoint is ever wanted, it needs its own path containment rule
+# and a consumer that can reach it; it is not a one-line widening of this case.
+if [ -n "${SERVE_PORT:-}" ]; then
+  case "${SERVE_PORT}" in
+    tcp://*)
+      serve_endpoint="${SERVE_PORT#tcp://}"
+      serve_host="${serve_endpoint%:*}"
+      # No colon -> `%:*` returns the whole string; that is a host with no port.
+      if [ "${serve_host}" = "${serve_endpoint}" ] || \
+         [[ ! "${serve_host}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "entrypoint: invalid serve endpoint '${SERVE_PORT}'" \
+             "(expected tcp://<host>:<port>, host from A-Za-z0-9.-)" >&2
+        exit 1
+      fi
+      reject_bad_port "serve port" "${serve_endpoint##*:}"
+      ;;
+    unix:* | pipe:*)
+      # Refused with the reason, not with the port message: `unix:/x.sock` is a
+      # real `serve -l` form, so "must be an integer 1..65535" would read as a
+      # typo report rather than as the deliberate decision it is.
+      echo "entrypoint: unsupported serve endpoint '${SERVE_PORT}'" \
+           "(supported: <port> or tcp://<host>:<port>; a UNIX socket cannot be" \
+           "reached by the browser or by any of this repo's HTTP gates, and a" \
+           "Windows named pipe cannot exist in a linux/amd64 image)" >&2
+      exit 1
+      ;;
+    *)
+      reject_bad_port "serve port" "${SERVE_PORT}"
+      ;;
+  esac
 fi
 
 # VIEWER_UI_MODE selects which app dist to render + serve (D7); the CMD

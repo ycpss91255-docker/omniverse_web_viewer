@@ -8,8 +8,9 @@ live stream panel) and a **developer reference** (clean, copy-pasteable
 integration code).
 
 Unlike the main viewer, this example is plain **vanilla TypeScript + Vite** with
-**one runtime dependency** -- `@nvidia/omniverse-webrtc-streaming-library`. No
-React, no bootstrap, no selection screen: it does a stream-only direct connect.
+**two runtime dependencies** -- `stream-core` (the shared connect kernel, an npm
+workspace sibling) and `@nvidia/omniverse-webrtc-streaming-library`. No React, no
+bootstrap, no selection screen: it does a stream-only direct connect.
 
 ## Layout
 
@@ -17,9 +18,13 @@ React, no bootstrap, no selection screen: it does a stream-only direct connect.
 |------|------|
 | `index.html` | Site chrome (header / nav / hero) + the stream panel (`<video id="remote-video">`). |
 | `src/main.ts` | DOM + library glue: resolve the target, connect, surface status. |
-| `src/buildStreamConfig.js` | Pure, DOM-free factory for the DIRECT stream config. Validated and unit-tested. |
-| `src/buildStreamConfig.test.js` | `node --test` unit tests for the factory. |
-| `src/streamTarget.json` | Build-time `__OWV_SERVER__` / `__OWV_PORT__` placeholders. |
+| `src/resolveTarget.js` | Pure, DOM-free target resolution: the baked sentinels, with a `?server=&port=&media=` override the caller must opt into -- `main.ts` opts in only under the Vite dev server, so built bundles ignore the query. |
+| `test/resolveTarget.test.js` | `node --test` unit tests for the resolver. |
+| `src/streamTarget.json` | Build-time `__OWV_SERVER__` / `__OWV_PORT__` / `__OWV_MEDIA_PORT__` placeholders. |
+
+The DIRECT-config factory itself is NOT in this example: `buildStreamConfig` lives
+in the `stream-core` workspace package, shared with the main viewer, and the local
+copy was deleted.
 
 ## Run it (container)
 
@@ -33,22 +38,25 @@ Build the image, then run it with host networking, pointing it at a running
 stream (`SIGNALING_SERVER` is the host running the Kit/Isaac stream):
 
 ```bash
-make build -- -t example
-docker run --rm -d --network=host \
-  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
-  local/omniverse_web_viewer:example
+just build -t example
+just run -t example -d
 # then open http://<host-ip>:8080
 ```
 
-The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` from
-`SIGNALING_SERVER` / `SIGNALING_PORT` (env) or `/etc/host.yaml`
-(`network.public_ip`) into the built bundle on every boot.
+The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` /
+`__OWV_MEDIA_PORT__` from `SIGNALING_SERVER` / `SIGNALING_PORT` / `MEDIA_PORT`
+(env) or `/etc/host.yaml` (`network.public_ip`) into the built bundle on every
+boot. `just run` reads those from the generated `.env` -- set them in
+`setup.conf` `[environment]` and re-run `./script/setup.sh apply`.
 
-> Note: `make run -- -t example -d` is not usable yet -- the `example` (and
-> `serve`) compose service inherits a `/dev:/dev` device mount from `devel` and
-> fails at start with a `/dev/pts` error (tracked in #26). Use the `docker run`
-> form above until that is fixed. (`make run` also does not forward `-e` env
-> vars in detached mode.)
+To point the container somewhere for a single run without touching either,
+start it directly instead (`just run` does not forward `-e` in detached mode):
+
+```bash
+docker run --rm -d --network=host \
+  -e SIGNALING_SERVER=<host-ip> -e SIGNALING_PORT=49100 -e EXAMPLE_PORT=8080 \
+  local/omniverse_web_viewer:example
+```
 
 ## Run it (dev)
 
@@ -69,23 +77,28 @@ http://localhost:8080/?server=<host-ip>&port=49100
 The whole integration is three steps (see `src/main.ts`):
 
 ```ts
-import { AppStreamer, StreamType } from '@nvidia/omniverse-webrtc-streaming-library';
-import { buildStreamConfig } from './buildStreamConfig.js';
+import { buildStreamConfig, connectStream } from 'stream-core';
 
 const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
-AppStreamer.connect({ streamConfig, streamSource: StreamType.DIRECT });
+connectStream(streamConfig, { onStart: () => console.info('connecting...') });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
 
 ### iframe alternative
 
 If you do not want to bundle the streaming library into your own app, embed the
-main viewer in an `<iframe>` instead. With auto-launch (#14) it boots straight
-into the stream with no selection screen:
+main viewer in an `<iframe>` instead:
 
 ```html
 <iframe src="http://<viewer-host>:5173/" allow="autoplay" style="width:100%;height:60vh;border:0"></iframe>
 ```
+
+Run that viewer with **`VIEWER_UI_MODE=stream-only`** (or `viewer.ui_mode` in
+`host.yaml`) for the iframe to boot straight into the stream. The default mode is
+the interactive `usd-viewer`, which shows its landing / "UI Option" screen and,
+against an Isaac-family Kit app, blanks by design (#18). The `VIEWER_AUTO_LAUNCH`
+knob this section used to name was removed entirely (BREAKING, D7);
+`VIEWER_UI_MODE=stream-only` is how auto-entry into a bare stream is selected now.
 
 The direct-connect approach in this example gives you full control over layout
 and lifecycle; the iframe is the zero-code option.
@@ -93,7 +106,7 @@ and lifecycle; the iframe is the zero-code option.
 ## Test / lint
 
 ```bash
-npm test           # node --test (buildStreamConfig unit tests)
+npm test           # node --test (resolveTarget unit tests)
 npm run lint       # eslint
 npm run build      # vite build -> dist/
 ```

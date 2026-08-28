@@ -1,0 +1,5 @@
+# Per-host runtime config: mounted into the container at /etc/host.yaml at RUN
+# time, never baked in. Without this it is swept into the image by the layered
+# config COPY (Dockerfile CONFIG_SRC), so one machine's host.yaml would ride
+# along in a devel layer. The .example alongside it is documentation and stays.
+config/host.yaml

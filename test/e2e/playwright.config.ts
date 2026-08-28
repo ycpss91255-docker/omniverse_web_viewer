@@ -22,7 +22,14 @@ export default defineConfig({
   testDir: '.',
   testMatch: ['**/*.spec.ts'],
   fullyParallel: false,
-  forbidOnly: !!process.env.CI,
+  // Hardcoded, NOT `!!process.env.CI`: every entry point to this config is a
+  // script running inside a container that is never handed a CI variable
+  // (`run-in-image.sh` is a Dockerfile RUN, and the Tier B container is started
+  // with four -e flags, none of them CI), so the guard was always false and a
+  // committed `test.only` would have narrowed the suites to one test with both
+  // gates still reporting green. There is no interactive or watch use of this
+  // config to keep `.only` alive for.
+  forbidOnly: true,
   retries: 0,
   workers: 1,
   reporter: [['list']],

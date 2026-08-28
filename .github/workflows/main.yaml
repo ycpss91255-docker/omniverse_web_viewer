@@ -4,7 +4,25 @@ on:
   push:
     branches: [main, master]
     tags:
-      - 'v*'
+      # VERSION SHAPE, not 'v*'. `v*` accepted names
+      # script/ci/derive_image_tag.sh hard-rejects (`v2`, `vnext`, `vlatest`),
+      # and that rejection lived in publish-image, the LAST job in the chain --
+      # so such a tag cut a real GitHub Release first and only then failed,
+      # producing exactly the Release-without-an-image state this file argues
+      # against, after spending a full Tier B run on the shared GPU.
+      #
+      # These globs are a COARSE PREFILTER, not the grammar, and the difference
+      # matters. GitHub's tag filter patterns have no alternation and no
+      # anchored character classes, so the pre-release glob below accepts ANY
+      # suffix: `v1.2.3-`, `v1.2.3--`, `v1.2.3-rc_1`, `v1.2.3-rc1.` and
+      # `v1.2.3-rc1+b` all start this workflow and are all rejected by the
+      # deriver's VERSION_RE. Narrowing the glob further would trade that for
+      # the opposite failure -- a legitimate `v1.2.3-rc.1` silently not
+      # triggering at all -- so the authoritative check is a JOB instead: see
+      # verify-tag-shape, which runs the deriver before anything irreversible
+      # and is a `needs` of both the Release and the GPU gate.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
   # Nightly, for the Tier B visual acceptance ONLY (#48). Every other job in
   # this workflow is gated off `schedule` below -- a scheduled run must not
@@ -28,27 +46,73 @@ on:
       # It is NOT an escape from the picture gate (#70): a non-empty value here
       # makes tier-b-visual-e2e run for this dispatch as well, and the publish
       # is gated on it succeeding exactly as a tag push is.
+      #
+      # Nor is it an escape from the release/image pairing: this value is only
+      # SHAPE-checked by derive_image_tag.sh, and GHCR tags are mutable, so
+      # publish-image additionally requires the version to already exist as the
+      # tag v<version> AT THIS EXACT COMMIT. See the guard step in that job.
       publish_image_tag:
         description: >-
           Publish the runtime image to GHCR under this version (e.g. 0.3.0).
           Ignored on a tag ref -- the tag itself wins. Leave empty to publish
           nothing. Publishing ALWAYS runs the Tier B visual acceptance first
-          (self-hosted GPU runner), whatever the box above says.
+          (self-hosted GPU runner), whatever the box above says. Off a non-tag
+          ref the version must already be a tag pointing at the commit being
+          built, or the publish is refused.
         type: string
         default: ''
 
-# call-release uses softprops/action-gh-release@v2 which needs
-# contents: write to create a GitHub Release. Reusable workflow
-# permissions intersect with the caller's, and GitHub Actions'
-# default GITHUB_TOKEN is read-only, so this grant must live here
-# (release-worker.yaml declaring it upstream is not enough).
-permissions:
-  contents: write
+# NO workflow-level `permissions:` block. `contents: write` used to live here,
+# for call-release's benefit alone, and every other job inherited it -- including
+# call-docker-build, which runs on EVERY pull_request, and tier-b-visual-e2e,
+# which runs on a persistent, shared, self-hosted GPU host.
+#
+# actions/checkout persists that token into .git/config on the runner, so the
+# least-trusted job in the file (a build driven by a Dockerfile and build args
+# that come from the PR branch) sat next to a token that can push commits and
+# create tags -- and creating a VERSION-SHAPED tag (the push filter at the top
+# of this file; not every `v*`, which it stopped being when that filter was
+# narrowed) is itself a trigger here, i.e. directly upstream of the release
+# path. Same-repo branch PRs get the full write
+# token; only FORK PRs are forced read-only by GitHub, so branch protection does
+# not contain this. On the GPU host the same token would let a compromise of the
+# pulled producer image, or another tenant on that shared machine, escalate from
+# GPU-host access to pushing to this repo.
+#
+# The grant is now on call-release ONLY, which is where it was always for.
+# Job-level permissions are honoured on jobs that `uses:` a reusable workflow --
+# publish-image already relied on that -- and reusable-workflow permissions
+# intersect with the caller's, so release-worker.yaml declaring it upstream is
+# still not enough on its own.
+#
+# ---------------------------------------------------------------------------
+# ACTION PINNING POLICY: every third-party `uses:` in this file is pinned to a
+# full commit SHA, with the human-readable version in a trailing comment. Major
+# version tags are MUTABLE -- the tj-actions/changed-files incident retagged
+# every version tag to malicious code -- and this file hands GITHUB_TOKEN with
+# `packages: write` to docker/login-action and lets docker/build-push-action do
+# the push, so a retag of either would yield the registry credential and the
+# ability to publish arbitrary content to
+# ghcr.io/ycpss91255-docker/omniverse_web_viewer, which downstream consumers pin
+# and execute. `busybox` is pinned by digest for the same reason and one more:
+# that container runs as root with the workspace bind-mounted, BEFORE checkout,
+# on a persistent self-hosted GPU host.
+#
+# `ycpss91255-docker/base/...` reusable workflows stay on version TAGS
+# deliberately: they are first-party, the tags are ours, and the refs are the
+# subject of their own tracked decisions (#37, #67, base#915). Bumping a pin
+# means replacing both the SHA and the trailing version comment -- there is no
+# dependabot `github-actions` entry in this repo yet, so that is manual today.
+# ---------------------------------------------------------------------------
 
 jobs:
   call-docker-build:
     # Not on the nightly schedule: that trigger is for tier-b-visual-e2e only.
     if: github.event_name != 'schedule'
+    # Builds and tests; pushes nothing (build-worker passes push: false to every
+    # build and carries no registry login). Read is all it can justify.
+    permissions:
+      contents: read
     uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v0.41.0
     with:
       image_name: omniverse_web_viewer
@@ -69,6 +133,33 @@ jobs:
       build_args: |
         RUNTIME_SMOKE_CMD=timeout 30 bash -c 'serve -s /app/usd-viewer/dist -l 5173 & serve -s /app/stream-only/dist -l 5174 & for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && curl -fsS http://127.0.0.1:5174 >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'
 
+  # ------------------- version-shape gate, before the damage ----------------
+  # The authoritative answer to "can this ref be published?", placed BEFORE
+  # anything irreversible happens. It runs script/ci/derive_image_tag.sh -- the
+  # same script publish-image uses, so there is one grammar and not two -- and
+  # a ref that script refuses fails here, before call-release cuts a Release
+  # and before the GPU job spends up to an hour of shared-runner time.
+  #
+  # NO `if:` ON PURPOSE. This job must never be SKIPPED, because a skipped need
+  # skips its dependents, and tier-b-visual-e2e's condition deliberately
+  # carries no status function (see its own note). With no `if:` the job always
+  # runs and always succeeds off a tag ref, so needing it costs the nightly one
+  # cheap hosted job and changes nothing else. The tag check itself is guarded
+  # per-step instead.
+  verify-tag-shape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Off a tag ref there is no version to check: publish-image runs the same
+      # deriver on the hand-typed input, behind its own tag-exists guard.
+      - name: Refuse a tag the image-tag deriver cannot publish
+        if: ${{ github.ref_type == 'tag' }}
+        run: bash script/ci/derive_image_tag.sh
+
   call-release:
     # THE PICTURE GATE (#70). v0.3.0-rc1 was published without the Tier B
     # visual acceptance ever having run for that commit -- a tag push skipped
@@ -86,8 +177,32 @@ jobs:
     # release is BLOCKED, not waved through. There is no override input, no
     # continue-on-error and no `if: always()` escape by design -- an override
     # on this gate would be reached for exactly when it matters most.
-    needs: [call-docker-build, tier-b-visual-e2e]
-    if: startsWith(github.ref, 'refs/tags/')
+    #
+    # The second clause below carves out the IMAGE-ONLY RECOVERY DISPATCH. The
+    # documented way to republish an image whose push failed is to dispatch
+    # this workflow with the TAG selected as the ref (see the publish guard's
+    # note), and the gate here was ref-shape only -- so that dispatch also
+    # re-ran call-release against a Release that already exists, having first
+    # spent a fresh Tier B run on the shared GPU. If the re-cut errored,
+    # publish-image's `needs.call-release.result` condition then blocked the
+    # image republish, defeating the whole point of the dispatch. A dispatch
+    # carrying publish_image_tag is asking for an IMAGE; the Release is already
+    # there, so this job stands down. Note this is still a plain condition,
+    # with no status function in it -- the picture-gate rule above is intact.
+    #
+    # "The Release is already there" is an ASSUMPTION, and standing down is
+    # only safe because something else verifies it: publish-image's Release
+    # guard runs on this exact path (its condition covers any dispatch carrying
+    # publish_image_tag, tag ref included) and refuses the publish when no
+    # published Release v<version> exists. Without that, this stand-down turned
+    # "call-release failed, so no Release was cut" into "the recovery dispatch
+    # publishes the image anyway". Do not narrow that guard's condition without
+    # revisiting this one.
+    needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence]
+    if: >-
+      startsWith(github.ref, 'refs/tags/')
+      && !(github.event_name == 'workflow_dispatch'
+           && inputs.publish_image_tag != '')
     # Back on a released base tag: the temporary commit-SHA pin from #66 is
     # gone and #67's condition is met. v0.42.0's archive step copies
     # `Dockerfile script/ .hadolint.yaml test/bats/smoke/ .base/ README.md
@@ -101,6 +216,13 @@ jobs:
     # deliberate, not an oversight. Likewise the .base subtree stays at v0.41.0
     # -- base#915 records that the v0.42.0 upgrade path is broken for a v0.41.0
     # consumer, and only the workflow ref moves here.
+    # The ONLY job that needs write. release-worker runs
+    # softprops/action-gh-release, which creates a GitHub Release; GitHub's
+    # default GITHUB_TOKEN is read-only, and reusable-workflow permissions
+    # intersect with the caller's, so the grant has to be here rather than
+    # upstream -- but here means THIS job, not the whole workflow.
+    permissions:
+      contents: write
     uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.42.0
     with:
       archive_name_prefix: omniverse_web_viewer
@@ -123,6 +245,53 @@ jobs:
   #
   # No `:latest`. A moving tag is precisely what a downstream pin must not be,
   # and an rc must never become the tag consumers get by default.
+  # ------------------- the frame, as a thing you can require ----------------
+  #
+  # Every other gate in this file asks whether the Tier B JOB went green.
+  # Review round 8 showed that question has a floor: five single-step edits to
+  # this file keep that job green while the acceptance spec never runs --
+  # `: > script/ci/tier_b_visual_e2e.sh --print-x` (truncate the driver, the
+  # trailing token slipping past the checker's --print- whitelist),
+  # `sed -i '1a exit 0' script/ci/*.sh` (a glob is not the pinned path), a
+  # $GITHUB_PATH entry shadowing `bash`, a job-level `container:` whose bash is
+  # a stub, and `echo TIER_B_PRODUCER_IMAGE=busybox >> "$GITHUB_ENV"`. Reading
+  # this file cannot tell any of them from a real run; the text is identical.
+  # What differs is whether a frame was ever sampled.
+  #
+  # This job asks the other question, once, for both publishers. Its input is
+  # written by test/e2e/tier-b-visual.spec.ts only after it sampled a frame
+  # that cleared every threshold, and verified by
+  # script/ci/verify_tier_b_attestation.py against this run's own commit and
+  # run id. All five bypasses end with no frame, so all five end with an empty
+  # string here -- and this job fails on empty without needing to know that
+  # any of them exist. That is what the static checker cannot buy: it
+  # enumerates the ways a workflow can lie, and enumerations do not converge.
+  #
+  # Cheap, hosted, and NO `if:` and no status function, so GitHub's default
+  # skip propagation carries a skipped or failed Tier B straight through to
+  # both publishers -- the same mechanism that makes an unavailable GPU runner
+  # block a release rather than wave it through.
+  require-picture-evidence:
+    needs: [tier-b-visual-e2e]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      ATTESTATION: ${{ needs.tier-b-visual-e2e.outputs.attestation }}
+    steps:
+      # Without this the job cannot see the script it is pinned to, exits 127,
+      # and -- because both publishers require its success -- deadlocks every
+      # release. It shipped that way for one commit: the guard was converted
+      # from inline shell to a pinned script and the checkout that a script
+      # needs was not added with it. No test noticed, because every mutation
+      # test in the suite edits a workflow that is never executed.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      # Pinned as an invocation, exactly like the Tier B driver. See the
+      # script's header for why this is not an inline `if [ -z ... ]`.
+      - name: Refuse a release whose picture left no evidence
+        run: bash script/ci/require_attestation.sh
+
   publish-image:
     # Gated on THREE things: never publish an image the build/test gate
     # rejected, never publish an image whose Release failed to cut, and -- the
@@ -133,33 +302,37 @@ jobs:
     #
     # `!cancelled()` rather than the implicit success(): a job whose `needs`
     # include a SKIPPED job is skipped unless the condition uses a status
-    # function, and call-release is legitimately skipped on the manual
-    # escape-hatch path (no tag ref). The explicit `needs.*.result` checks put
+    # function, and call-release is legitimately skipped on BOTH dispatch
+    # paths -- the manual escape hatch off a branch (no tag ref) and the
+    # image-only recovery dispatch off a tag ref, which stands down rather than
+    # re-cutting a Release that already exists. The explicit `needs.*.result`
+    # checks put
     # back the strictness that buys -- and note that only call-release is
     # allowed to be 'skipped'. tier-b-visual-e2e must be 'success' outright:
     # skipped, failed, cancelled and timed-out all block the publish, on the
     # tag path AND on the manual escape-hatch path (which is why a non-empty
     # publish_image_tag makes the Tier B job run for that dispatch too).
-    needs: [call-docker-build, call-release, tier-b-visual-e2e]
+    needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence]
     if: >-
       !cancelled()
       && needs.call-docker-build.result == 'success'
       && needs.tier-b-visual-e2e.result == 'success'
+      && needs.require-picture-evidence.result == 'success'
       && (needs.call-release.result == 'success'
           || needs.call-release.result == 'skipped')
       && (startsWith(github.ref, 'refs/tags/')
           || (github.event_name == 'workflow_dispatch'
               && inputs.publish_image_tag != ''))
     runs-on: ubuntu-latest
-    # Job-level, so the workflow-wide `contents: write` (which call-release
-    # needs to create a Release) is not also handed to a job that pushes to a
-    # registry. This job only reads the tree and writes a package.
+    # This job only reads the tree and writes a package, so that is all it
+    # gets. It was the first job in this file to scope itself down; every job
+    # now declares its own, and `contents: write` reaches call-release alone.
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           # The runtime stage builds both app dists, and usd-viewer builds from
           # the upstream `src` submodule.
@@ -180,18 +353,112 @@ jobs:
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
           echo "Publishing \`${ref}\`" >> "${GITHUB_STEP_SUMMARY}"
 
+      # THE ESCAPE HATCH'S MISSING GUARD.
+      #
+      # On a tag ref the version is DERIVED and cannot drift. On the dispatch
+      # path it is typed by hand, derive_image_tag.sh checks only its SHAPE, and
+      # GHCR tags are MUTABLE -- so a single dispatch from main with
+      # publish_image_tag=0.3.0 would have replaced the image behind the v0.3.0
+      # Release with a build of arbitrary branch code, silently. The downstream
+      # consumer that pins :0.3.0 (isaac#173) would then be running code no
+      # Release points at, with no signal that anything moved. The same input
+      # could also mint a version-tagged image with no Release behind it at all
+      # -- "a dangling artifact a consumer could pin", which the comment block
+      # above this job names as the state to avoid.
+      #
+      # Rule: the requested version must ALREADY have a published Release
+      # v<version>, and its tag must point at the commit this run is building.
+      # The documented recovery case still works -- a Release whose image push
+      # failed is republished by dispatching with the TAG selected as the ref,
+      # where derive_image_tag uses the ref and the COMMIT half of the check is
+      # satisfied by construction -- while publishing branch code under a
+      # released version is refused.
+      #
+      # THIS STEP RUNS ON EVERY DISPATCH-DRIVEN PUBLISH, TAG REF INCLUDED. The
+      # condition used to be `!startsWith(github.ref, 'refs/tags/')` alone, on
+      # the reasoning that the tag path cannot drift. That is true of a tag
+      # PUSH, but the documented recovery gesture is a workflow_dispatch whose
+      # REF IS THE TAG -- and once call-release began standing down for a
+      # dispatch carrying publish_image_tag, nothing on that path checked the
+      # Release any more. The traced hole: push v0.4.0 -> call-release FAILS ->
+      # no Release and no image -> operator runs the documented recovery
+      # dispatch (tag as the ref, publish_image_tag=0.4.0) -> call-release
+      # stands down, this guard skipped because the ref is a tag -> an image
+      # published with NO RELEASE BEHIND IT, which is precisely the dangling
+      # artifact this job's header names as the state to avoid.
+      #
+      # A tag PUSH still skips it, deliberately: there call-release cuts the
+      # Release inside this same run, so querying the API for a Release created
+      # seconds earlier would swap a real hole for a flaky gate on the one path
+      # that cannot drift.
+      - name: Refuse to publish a version with no Release behind it
+        if: >-
+          ${{ !startsWith(github.ref, 'refs/tags/')
+              || (github.event_name == 'workflow_dispatch'
+                  && inputs.publish_image_tag != '') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          version="${IMAGE_REF##*:}"
+          sha_re='^[0-9a-f]{40}$'
+
+          # CHECK THE RELEASE, because that is what the error message promises.
+          # This step used to resolve /git/ref/tags/ alone and then say "no tag
+          # ... so this image would have no Release behind it" -- but a tag can
+          # exist with NO Release behind it, when its own run's call-release
+          # failed. Concrete path: push v0.4.0, call-release fails, then
+          # dispatch from main (whose head is still the tagged commit) with
+          # publish_image_tag=0.4.0. The tag check passed, call-release is
+          # skipped on a non-tag ref, and the image published with no Release
+          # behind it -- precisely the dangling artifact this job's header
+          # names as the state to avoid. /releases/tags/ 404s on a draft too,
+          # which is the right answer here: a draft is not something a consumer
+          # can find their way back to.
+          #
+          # A miss prints an error BODY rather than failing quietly, so every
+          # answer below is validated by shape, not by exit status.
+          release_id="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/v${version}" \
+                          -q '.id' 2>/dev/null || true)"
+          if [[ ! "${release_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: no published Release v${version} exists, so this image would have no Release behind it"
+            exit 1
+          fi
+
+          # And the tag, because the commit comparison below is what stops a
+          # released version being re-pointed at different code.
+          object="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/v${version}" \
+                      -q '.object.sha' 2>/dev/null || true)"
+          if [[ ! "${object}" =~ ${sha_re} ]]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: Release v${version} exists but the tag v${version} does not resolve, so this run cannot be checked against the released commit"
+            exit 1
+          fi
+          # Lightweight tags point straight at a commit; annotated tags (what
+          # this repo cuts) point at a tag object that must be dereferenced.
+          commit="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${object}" \
+                      -q '.object.sha' 2>/dev/null || true)"
+          if [[ ! "${commit}" =~ ${sha_re} ]]; then
+            commit="${object}"
+          fi
+          if [ "${commit}" != "${GITHUB_SHA}" ]; then
+            echo "::error::refusing to publish ${IMAGE_REF}: tag v${version} is ${commit}, but this run builds ${GITHUB_SHA} -- publishing would re-point a released image at different code"
+            exit 1
+          fi
+          echo "v${version} resolves to ${commit}, which is this run's commit."
+
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push the runtime image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile
@@ -238,16 +505,41 @@ jobs:
   #   - a tag ref     -> the release path itself
   #   - a dispatch with a non-empty publish_image_tag -> the manual publish,
   #                      which would otherwise be a hole in the same rule
-  # It deliberately has NO `needs:`. Staying dependency-free is what keeps the
-  # nightly semantics untouched (call-docker-build does not run on `schedule`,
-  # so needing it would force a status function onto the gate job itself), and
-  # this job rebuilds the e2e-test image from the checked-out tree anyway, so
-  # it can never pass against a stale artifact. The cost is that on a tag push
-  # it starts in parallel with call-docker-build rather than after it.
+  # Its ONLY `needs:` is verify-tag-shape, and that one is deliberately a job
+  # with no `if:` -- it always runs and therefore can never be SKIPPED, which
+  # is what lets this job keep a condition with no status function in it (a
+  # skipped need would otherwise skip this job). It buys the thing the trigger
+  # globs cannot express: a tag whose shape the image-tag deriver rejects never
+  # reaches the GPU at all. Nothing else is a need. call-docker-build in
+  # particular is NOT, because it does not run on `schedule` and needing it
+  # would force a status function onto this gate's own condition; this job
+  # rebuilds the e2e-test image from the checked-out tree anyway, so it can
+  # never pass against a stale artifact. The cost is that on a tag push it
+  # starts in parallel with call-docker-build rather than after it.
   #
-  # The `concurrency` group below means a tag pushed while the nightly run is
-  # in flight QUEUES behind it instead of cancelling it. A release therefore
-  # waits for the GPU; that is the accepted price of the rule.
+  # The other cost is that this gate now depends on a HOSTED job: off a tag ref
+  # verify-tag-shape only checks out the repo, but a checkout flake there ends
+  # it non-success and SKIPS this job. On a tag ref that is reported by
+  # release-blocked-report; on the nightly -- where there is no release to
+  # block, and where this job IS the point of the run -- it is reported by
+  # nightly-tier-b-report. Both are report-only: nothing needs them, so neither
+  # can wave anything through.
+  #
+  # The `concurrency` group below serialises the GPU: `cancel-in-progress:
+  # false` means a tag pushed while the nightly run is in flight QUEUES behind
+  # it instead of cancelling it. A release therefore waits for the GPU; that is
+  # the accepted price of the rule.
+  #
+  # What `cancel-in-progress: false` does NOT protect is a job that is still
+  # PENDING. GitHub cancels the previously pending member of a group when a new
+  # run enters it, so with the nightly running and a tag queued behind it, a
+  # third entrant (a dispatch with run_tier_b, another tag) cancels the tag's
+  # Tier B outright. The consequence fails CLOSED -- call-release skips on a
+  # non-success need and publish-image requires `result == 'success'`, so
+  # nothing unsafe publishes -- but the pushed tag then produces no Release and
+  # no image, and the only trace is a GREY cancelled job. That is why
+  # `release-blocked-report` below exists: it turns that silence into a red
+  # run. Do not read it as an override; it can only ADD a failure.
   #
   # stream-only ONLY. #48's acceptance criteria ask for both viewer modes, which
   # is wrong against an Isaac-family producer: #18 established that `usd-viewer`
@@ -256,6 +548,7 @@ jobs:
   # asserting a picture there would fail forever. usd-viewer keeps its existing
   # per-PR config-dial cover.
   tier-b-visual-e2e:
+    needs: [verify-tag-shape]
     if: >-
       github.event_name == 'schedule'
       || startsWith(github.ref, 'refs/tags/')
@@ -263,6 +556,21 @@ jobs:
           && (inputs.run_tier_b || inputs.publish_image_tag != ''))
     runs-on: [self-hosted, gpu]
     timeout-minutes: 60
+    # The evidence, hoisted out of the job so publish-image can REQUIRE it.
+    # A green job status is not the picture: review round 8 produced five
+    # single-step edits to this file that keep this job green while removing
+    # the picture (truncating the driver, `sed -i '1a exit 0' script/ci/*.sh`,
+    # a $GITHUB_PATH shim over `bash`, a `container:` whose bash is a stub,
+    # $GITHUB_ENV aiming the producer at busybox). All five end with the
+    # acceptance spec never sampling a frame, so all five leave this output
+    # empty -- and publish-image refuses to push on an empty one.
+    outputs:
+      attestation: ${{ steps.acceptance.outputs.attestation }}
+    # Checks out, builds and runs containers -- nothing more. Explicitly read,
+    # because this job runs on a persistent, shared host where a repo-write
+    # token in the environment would turn GPU-host access into push access.
+    permissions:
+      contents: read
     # One Kit on the GPU at a time, and never cancel mid-teardown -- a killed
     # run would orphan a GPU-holding container. Mirrors isaac's stream-smoke.
     concurrency:
@@ -274,12 +582,12 @@ jobs:
       # Mirrors isaac's stream-smoke; refs ycpss91255-docker/github_runner#77.
       - name: Pre-checkout cleanup (clear stale root-owned residue)
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}":/w -w /w busybox:1 sh -c '
+          docker run --rm -v "${GITHUB_WORKSPACE}":/w -w /w busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616 sh -c '
             rm -rf .tier-b-artifacts 2>/dev/null
             true'
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           submodules: recursive
 
@@ -298,18 +606,166 @@ jobs:
 
       # Explicit, so a registry problem is distinguishable from an acceptance
       # failure and a multi-GB pull does not eat the acceptance step's budget.
+      #
+      # The reference comes FROM the driver rather than being repeated here:
+      # the producer is pinned by DIGEST (it runs as root with
+      # `--network=host --ipc=host --gpus all` on this persistent shared GPU
+      # host, and GHCR tags are mutable -- see the driver's own note and the
+      # busybox pin above), and a second copy of that digest in this file is a
+      # thing that can drift from the one actually run.
       - name: Pull the pinned producer image
-        run: docker pull ghcr.io/ycpss91255-docker/isaac-stream-source:0.0.1
+        run: docker pull "$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)"
 
       # Boots the producer, waits for its streaming server, drives the browser,
       # and tears down its own instance-scoped containers on every exit path.
+      #
+      # STEP-level timeout, inside the job's 60-minute budget. An overrun is
+      # then a step FAILURE -- the job ends `failure`, the upload below runs,
+      # and the driver is signalled (it exits 130/143 and writes producer.log
+      # on the way out). A job-level `timeout-minutes` overrun instead CANCELS
+      # the job, and `if: failure()` does not run in a cancelled job, so the
+      # single most expensive failure mode used to leave nothing behind. The
+      # job's own 60 stays as the backstop the orphan reaper's default
+      # (TIER_B_ORPHAN_MAX_AGE_MIN=120, twice the budget) is calibrated against.
       - name: Tier B visual acceptance (real producer -> real frames)
+        id: acceptance
+        timeout-minutes: 45
         run: bash script/ci/tier_b_visual_e2e.sh
 
-      - name: Upload evidence on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+      # `cancelled()` as well as `failure()`: the job can still be cancelled
+      # from outside (the concurrency group, a manual cancel, the job backstop),
+      # and a cancelled Tier B is exactly the run whose evidence is worth having
+      # -- the next run's pre-checkout step deletes .tier-b-artifacts, so
+      # anything not uploaded here is gone.
+      #
+      # `if-no-files-found: warn` (the default) rather than `ignore`: the driver
+      # always writes producer.log, which it calls "the only diagnosis a nightly
+      # failure leaves behind", so an EMPTY upload means something went wrong
+      # before that and should not look identical to a real one.
+      - name: Upload evidence on failure or cancellation
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tier-b-visual-e2e-evidence
           path: .tier-b-artifacts
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+  # ------------------- blocked-release visibility (report only) -------------
+  # NOT A GATE, and deliberately incapable of being one: nothing `needs` this
+  # job, so it can only ADD a failure to a run and can never allow a publish.
+  # The `always()` here is what lets it observe a need that did not succeed; it
+  # is not the `if: always()` the picture-gate rule forbids, which would be one
+  # that lets a release THROUGH.
+  #
+  # It exists because the gate can fail SILENTLY. A tag's Tier B that is still
+  # queued behind the nightly is cancelled outright when a third run enters the
+  # shared concurrency group (GitHub cancels the previously pending member;
+  # `cancel-in-progress: false` only protects a RUNNING job). Everything
+  # downstream then fails closed and simply does not run: call-release skips on
+  # a non-success need, publish-image requires `result == 'success'`. Correct --
+  # but the pushed tag produces no Release and no image, and the only signal is
+  # a grey cancelled job on a green-looking run. A maintainer reading the
+  # concurrency comment would reasonably conclude "it is queued, it will run",
+  # and the release quietly never happens.
+  #
+  # Its CONDITION, however, is `!= 'success'`, which is wider than the silent
+  # case it was written for: `failure` -- a genuine picture regression -- lands
+  # here too. That is correct (a failed gate on a tag ref is also a blocked
+  # release worth naming), but it means the report must not assume the silent
+  # case, so the step below picks its message from the result rather than
+  # telling every reader to wait for the GPU runner.
+  #
+  # Tag refs only: on the nightly and on dispatches there is no release to
+  # block, and a failing Tier B there is already red on its own.
+  release-blocked-report:
+    needs: [tier-b-visual-e2e]
+    if: >-
+      always()
+      && startsWith(github.ref, 'refs/tags/')
+      && needs.tier-b-visual-e2e.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The message is chosen by the RESULT. The condition is `!= 'success'`,
+      # which includes `failure` -- a genuine picture regression -- and the one
+      # message this step used to print was written for the cancelled case:
+      # it told the maintainer to "re-run once the GPU runner is free", i.e.
+      # pointed at scheduling when the actual answer was that a real browser
+      # did not see a real frame on that commit. Same job, same exit 1; only
+      # the sentence changes, so this stays a report and never a gate.
+      - name: Fail loudly, so a blocked release is red rather than grey
+        env:
+          TIER_B_RESULT: ${{ needs.tier-b-visual-e2e.result }}
+        run: |
+          set -euo pipefail
+          blocked="tier-b-visual-e2e ended '${TIER_B_RESULT}' on ${GITHUB_REF}. No Release and no image were published for this tag, by design -- no version publishes without the picture gate."
+          case "${TIER_B_RESULT}" in
+            failure)
+              echo "::error::${blocked} This is a FAILED gate, not a scheduling problem: on this commit a real browser did not render a real, non-black frame from a real producer. Read the job log and the uploaded evidence (frame PNG, luma stats, browser trace, producer log) first -- re-running is the answer only if you have reason to believe the failure was environmental."
+              ;;
+            cancelled)
+              echo "::error::${blocked} 'cancelled' usually means the job was a PENDING member of the owv-tier-b-visual-e2e concurrency group when another run entered it (GitHub cancels the previously pending member; cancel-in-progress: false only protects a RUNNING job). Re-run this workflow for the tag once the GPU runner is free."
+              ;;
+            skipped)
+              echo "::error::${blocked} 'skipped' means the job never started -- an unavailable self-hosted GPU runner, or a need of its own that did not succeed (verify-tag-shape refuses a tag whose shape cannot be published). Fix that, then re-run this workflow for the tag."
+              ;;
+            *)
+              echo "::error::${blocked} Result '${TIER_B_RESULT}' is not one this report knows how to explain; read the tier-b-visual-e2e job log."
+              ;;
+          esac
+          exit 1
+
+  # ------------------- nightly Tier B visibility (report only) --------------
+  # The same idea as release-blocked-report, for the OTHER path this gate runs
+  # on. That job is tag-refs-only, correctly: on the nightly there is no
+  # release to block. But the nightly is not a spare run -- it is the only
+  # thing that answers "is there still a picture?" between releases, and it can
+  # now fail to run for a reason that has nothing to do with the picture.
+  #
+  # tier-b-visual-e2e `needs: [verify-tag-shape]`, a hosted ubuntu-latest job.
+  # That need is what lets the gate's own condition carry no status function,
+  # and off a tag ref verify-tag-shape does nothing but check out the repo --
+  # but a checkout flake there is enough to end it non-success, which SKIPS the
+  # nightly Tier B. It fails closed (a skipped gate can never publish anything)
+  # and the run is not green, but nothing SAYS the night's picture check did
+  # not happen; a reader sees a red hosted job and reasonably reads it as an
+  # infrastructure blip. A cancelled Tier B on the nightly -- the concurrency
+  # group evicting it as a pending member -- is quieter still.
+  #
+  # Same discipline as release-blocked-report and for the same reason: NOTHING
+  # `needs` this job, so it can only ADD a failure and can never let anything
+  # through. The `always()` is what lets it observe a need that did not
+  # succeed. It is scoped to `schedule` so it cannot overlap the tag-path
+  # report, whose gating and wording are untouched by this job's existence.
+  nightly-tier-b-report:
+    needs: [tier-b-visual-e2e]
+    if: >-
+      always()
+      && github.event_name == 'schedule'
+      && needs.tier-b-visual-e2e.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Say that tonight's picture check did not pass, and why
+        env:
+          TIER_B_RESULT: ${{ needs.tier-b-visual-e2e.result }}
+        run: |
+          set -euo pipefail
+          missed="The nightly tier-b-visual-e2e ended '${TIER_B_RESULT}', so nothing verified tonight that a real browser still renders a real frame from a real producer."
+          case "${TIER_B_RESULT}" in
+            failure)
+              echo "::error::${missed} This is a FAILED gate, not a scheduling problem: read the job log and the uploaded evidence (frame PNG, luma stats, browser trace, producer log). A release cut before this is fixed will be blocked by the same gate."
+              ;;
+            cancelled)
+              echo "::error::${missed} 'cancelled' usually means the job was evicted from the owv-tier-b-visual-e2e concurrency group as a PENDING member (cancel-in-progress: false only protects a RUNNING job). Re-run this workflow with run_tier_b once the GPU runner is free."
+              ;;
+            skipped)
+              echo "::error::${missed} 'skipped' means the job never started -- an unavailable self-hosted GPU runner, or its need verify-tag-shape (a hosted job whose only work off a tag ref is a checkout) not succeeding. A checkout flake there is enough to silence the whole nightly, which is why this report exists. Re-run this workflow with run_tier_b."
+              ;;
+            *)
+              echo "::error::${missed} Result '${TIER_B_RESULT}' is not one this report knows how to explain; read the tier-b-visual-e2e job log."
+              ;;
+          esac
+          exit 1
