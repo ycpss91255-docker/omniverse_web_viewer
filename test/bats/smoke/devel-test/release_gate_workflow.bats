@@ -1796,3 +1796,96 @@ JOB
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
 }
+
+# ==========================================================================
+# THE FIVE ROUND-8 BYPASSES
+# ==========================================================================
+#
+# Each of these was GREEN against the round-8 checker and publishes a version
+# nobody saw a frame from. They are locked here as the regression suite for
+# the shape of the mistake, not just the five instances: every one of them
+# reaches the driver WITHOUT naming it verbatim, which is precisely what the
+# old exact-path substring test could not see.
+#
+# The evidence chain above is what actually stops them at publish time. These
+# cases exist so the checker reports them too -- a gate that fails late and
+# silently teaches nobody, and the operator who wrote the edit deserves to be
+# told at the point they wrote it.
+
+_gate_step() {
+  _mutate "s|^        run: bash script/ci/tier_b_visual_e2e.sh\$|        run: bash script/ci/tier_b_visual_e2e.sh\n      - name: prep\n        run: ${1}|"
+}
+
+@test "gates: truncating the driver with a --print- token appended is caught" {
+  _gate_step "': > script/ci/tier_b_visual_e2e.sh --print-x'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: overwriting the driver with a --print- token appended is caught" {
+  _gate_step "'echo true > script/ci/tier_b_visual_e2e.sh --print-producer-image'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: rewriting the driver through a glob is caught" {
+  _gate_step "'sed -i \"1a exit 0\" script/ci/*.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: a redundant path separator does not hide a rewrite" {
+  _gate_step "'sed -i \"1a exit 0\" script/ci//tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: rewriting a sibling script in script/ci is caught" {
+  _gate_step "'sed -i \"1a exit 0\" script/ci/derive_image_tag.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: a step writing the producer image to \$GITHUB_ENV is caught" {
+  _gate_step "'echo \"TIER_B_PRODUCER_IMAGE=busybox:latest\" >> \"\$GITHUB_ENV\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: a step shadowing bash through \$GITHUB_PATH is caught" {
+  _gate_step "'echo /tmp/shim >> \"\$GITHUB_PATH\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: a container: on the gate job is caught" {
+  _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    container:\n      image: ubuntu:24.04\n    runs-on: [self-hosted, gpu]|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: services: on the gate job is caught" {
+  _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    services:\n      db:\n        image: postgres\n    runs-on: [self-hosted, gpu]|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# The other half of the same fix: it must not cry wolf. Round 8 began
+# rejecting a correct edit (a redirect on the --print- query) for the same
+# reason it accepted the truncations -- it read the text after the path
+# without reading the command before it.
+@test "gates: a redirect on the --print- query is not a violation" {
+  _mutate 's|--print-producer-image)"$|--print-producer-image 2>/dev/null)"|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}

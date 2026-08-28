@@ -109,16 +109,29 @@ people looking.
     jobs and at workflow level, because all three of `shell: cat {0}`,
     `working-directory:` and a `TIER_B_*` variable turn the pinned command
     into something that takes no picture WITHOUT editing the pinned line.
+    That claim was WRONG AS WRITTEN for one round, and the correction is
+    worth keeping visible: it used to say a step naming the driver "is
+    examined whatever it does with it", and offered `run: echo exit 0 >
+    script/ci/tier_b_visual_e2e.sh` as the example it catches. Round 8's
+    reviewer appended one token -- `... > script/ci/tier_b_visual_e2e.sh
+    --print-x` -- and the same step went green, because the argument reader
+    took "text follows the path" to mean "the path was invoked" and handed
+    the trailing token to the `--print-<x>` whitelist. The sentence claiming
+    coverage was the specific thing that would have stopped the next reader
+    looking there. Both are fixed: the classifier now reads the command
+    BEFORE the path (driver_occurrences), and selection is on the driver's
+    DIRECTORY, so a glob, a redundant separator and a sibling script are all
+    examined.
     WHAT REMAINS OPEN IN THAT FAMILY, precisely:
-      (a) AN EARLIER STEP CAN PREPARE THE GROUND. A step that names the
-          driver path in full is examined whatever it does with it (so
-          `run: echo exit 0 > script/ci/tier_b_visual_e2e.sh` IS reported),
-          but one that reaches the same file through a glob, a variable or a
-          checkout of another ref is not, and neither is a `$GITHUB_PATH`
-          entry that shadows `bash` itself. Only steps that NAME the driver
-          are read; the rest of the job is not.
-      (b) `container:` and `services:` on the job are not read, and they
-          decide which machine the pinned command runs on.
+      (a) A CHECKOUT OF ANOTHER REF can swap the driver out without any path
+          under script/ci/ appearing in the step at all. `actions/checkout`
+          with `ref:` is not read here. This is the one member of the family
+          the directory sweep does not reach; the evidence chain (item 14)
+          is what covers it, because a swapped driver still samples no frame.
+      (b) `container:` and `services:` on the job ARE now refused outright,
+          as are steps writing to `$GITHUB_ENV` or `$GITHUB_PATH`. They are
+          named keys, not a general defence: a key GitHub adds tomorrow that
+          reaches the driver the same way is covered by item 14, not here.
       (c) `defaults.run` is refused WHOLE rather than key by key, so a key
           GitHub adds later is covered by accident rather than by design.
           That is the intended direction, and it is why there is no list of
@@ -226,6 +239,34 @@ people looking.
     undefined names and unused imports and NOTHING about whether a property
     is right; release_gate_workflow.bats, which proves each property fails
     when removed, is still the only thing that does that.
+13. THE RELEASE PATH DOES NOT PASS THROUGH `main`, AND THIS FILE ONLY GUARDS
+    WHAT DOES. This checker runs inside `devel-test`, built by
+    `call-docker-build`, which is a REQUIRED status check on `main` with
+    `enforce_admins: true` -- so a pull request that breaks it cannot merge.
+    That is a real gate and it is worth having. It is also not the release
+    trigger. A release is a TAG PUSH, and GitHub runs the workflow file FROM
+    THE TAGGED COMMIT: `git tag v9.9.9 <any commit> && git push origin
+    v9.9.9` publishes using whatever main.yaml that commit carries, which no
+    pull request, no required check and no run of this file ever saw. There
+    is no tag ruleset on this repository (verified: /rulesets is empty,
+    /tags/protection is 404). So the accurate statement of what this file
+    buys is "a main.yaml that reached `main` passed these properties", NOT
+    "a published version passed them". Closing that gap needs a tag ruleset,
+    which is a repository setting; no amount of work in here can do it.
+14. THE ONE PROPERTY THAT IS NOT ABOUT TEXT is
+    check_picture_leaves_evidence, and it is the answer to items 3(a) and 13
+    rather than another entry in the enumeration. Everything else here asks
+    whether main.yaml SAYS the right thing; that question has a floor,
+    reached in round 8, when five single-step edits each left a workflow
+    this file passed and a Tier B job that went green having sampled no
+    frame. The chain -- spec samples a frame, writes an attestation; the
+    driver verifies it against this run's commit; the job exposes it; the
+    require-picture-evidence job fails on empty; both publishers stand
+    behind that job -- fails all five at once, without this file having to
+    know any of them exist. It does not make the workflow unforgeable
+    (whoever can edit main.yaml can edit those links too, and item 13 still
+    stands), but it moves the question from "did the job report success?" to
+    "does a frame exist, and is it this commit's frame?".
 ===========================================================================
 """
 
@@ -1040,38 +1081,111 @@ def step_text(step):
     return "\n".join(parts)
 
 
-def driver_arguments(text, script):
-    """The argument string of every invocation of <script> in <text>.
+# Tokens that may precede the driver path and still leave it the thing being
+# RUN: an interpreter, an option to one, or a leading VAR=value assignment.
+_INTERPRETERS = frozenset(("bash", "sh", "dash", "ksh", "zsh", "command", "exec"))
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_REDIRECT_RE = re.compile(r"^\d*[<>]")
+# Command boundaries. `(` and a backtick open a new command; the closers end
+# one. Quotes are NOT boundaries -- they are stripped from tokens instead, so
+# that `"$(bash <driver> --print-x)"` reads as one command, not three.
+_CMD_OPEN_RE = re.compile(r"\|\||&&|[;|&\n(`]")
+_CMD_CLOSE_RE = re.compile(r"\|\||&&|[;|&\n)`]")
+# Anything under the driver's directory. The selection test used to be the
+# driver's exact path as a SUBSTRING, which is why round 8's `sed -i
+# '1a exit 0' script/ci/*.sh` and `script/ci//tier_b_visual_e2e.sh` were never
+# examined at all: neither string contains the literal path, though every
+# shell resolves both to it. Selecting on the directory catches the glob, the
+# redundant separator, and any sibling script reached the same way -- and
+# costs nothing, because a gate job has no business writing in there.
+_CI_PATH_RE = re.compile(r"[A-Za-z0-9_./*?\[\]-]*script/ci/[A-Za-z0-9_./*?\[\]-]*")
 
-    Not a shell parser, and it does not need to be: the question is only
-    "what follows the script path, up to the end of THIS command?". So the
-    remainder is cut at the first character that can end a command or a
-    substitution -- `; | & newline ) " ' >` and a backtick.
 
-      docker pull "$(bash .../tier_b_visual_e2e.sh --print-producer-image)"
-        -> ['--print-producer-image']
-      echo --print-nothing && bash .../tier_b_visual_e2e.sh --help || true
-        -> ['--help']
+def _command_segment(text, start, end):
+    """The single command containing text[start:end]."""
+    seg_start = 0
+    for match in _CMD_OPEN_RE.finditer(text[:start]):
+        seg_start = match.end()
+    match = _CMD_CLOSE_RE.search(text[end:])
+    seg_end = end + (match.start() if match else len(text) - end)
+    return text[seg_start:seg_end], start - seg_start
 
-    The second is the whole reason this exists: the substring test it
-    replaces saw `--print-` in the FIRST command and let the second one --
-    the one that actually invokes the driver, and exits 0 without taking a
-    picture -- through unexamined.
 
-    Being an approximation, it errs toward reporting: an invocation whose
-    arguments this cannot cut cleanly is not a bare `--print-<x>` query and
-    is reported, which is the direction a gate should fail in.
+def _tokens(fragment):
+    """Whitespace tokens with surrounding quotes stripped."""
+    return [tok.strip("\"'") for tok in fragment.split() if tok.strip("\"'")]
+
+
+def driver_occurrences(text, script):
+    """Classify every mention of <script>: was it RUN, or done something to?
+
+    The predecessor of this function asked only "what follows the path?" and
+    called every answer an invocation. Review round 8 walked straight through
+    that: `run: ': > script/ci/tier_b_visual_e2e.sh --print-x'` truncates the
+    driver to zero bytes, and because a `--print-<x>` token happened to follow
+    the path, the whole step was waved through as a harmless query. The step
+    that does the SAME THING without the trailing token was correctly
+    reported -- so one appended token was the entire difference between a
+    blocked edit and a published one.
+
+    The fix is to read what comes BEFORE. A path is invoked when it is the
+    command: first token of its command, or preceded only by an interpreter,
+    an option to one, or a leading VAR=value assignment. Anything else --
+    `sed -i ... <path>`, `: > <path>`, `cp /dev/null <path>`, `echo x > <path>`
+    -- is something being done TO the driver, and is reported.
+
+    Returns a list of (kind, detail) pairs where kind is "invocation" (detail
+    is the argument list, redirections dropped) or "mutation" (detail is the
+    command, for the message).
     """
-    out = []
+    found = []
+    seen = set()
+    # First the directory sweep: any path under script/ci/ that something is
+    # done TO. This is where the glob and the double-separator spellings are
+    # caught, and it deliberately does not care which file they name.
+    for match in _CI_PATH_RE.finditer(text):
+        segment, offset = _command_segment(text, match.start(), match.end())
+        before = _tokens(segment[:offset])
+        while before and _ASSIGNMENT_RE.match(before[0]):
+            before.pop(0)
+        if all(
+            tok in _INTERPRETERS or tok == "env" or tok.startswith("-")
+            for tok in before
+        ):
+            continue  # invoked, not mutated; the exact-path pass below judges it
+        seen.add(match.start())
+        found.append(("mutation", " ".join(segment.split())[:160]))
+
     for match in re.finditer(re.escape(script), text):
-        rest = text[match.end():]
-        out.append(re.split(r"[;|&\n)\"'`>]", rest, maxsplit=1)[0].strip())
-    return out
+        if match.start() in seen:
+            continue
+        segment, offset = _command_segment(text, match.start(), match.end())
+        before = _tokens(segment[:offset])
+        after = _tokens(segment[offset + len(script):])
+
+        while before and _ASSIGNMENT_RE.match(before[0]):
+            before.pop(0)
+        # `env` with its own options, then the interpreter, then options.
+        invoked = all(
+            tok in _INTERPRETERS or tok == "env" or tok.startswith("-")
+            for tok in before
+        )
+        if invoked:
+            # A trailing redirection is not an argument to the driver:
+            # `<driver> --print-producer-image 2>/dev/null` is still a bare
+            # query, and round 8 rejected it -- new noise on a correct edit,
+            # which is the failure mode this file argues against.
+            found.append(
+                ("invocation", [tok for tok in after if not _REDIRECT_RE.match(tok)])
+            )
+        else:
+            found.append(("mutation", " ".join(segment.split())[:160]))
+    return found
 
 
 def is_print_query(args):
     """True when <args> is exactly one `--print-<x>` argument."""
-    return bool(args) and _PRINT_QUERY_RE.match(args) is not None
+    return len(args) == 1 and _PRINT_QUERY_RE.match(args[0]) is not None
 
 
 def step_label(step):
@@ -1721,11 +1835,55 @@ def check(wf):
                     ),
                 )
 
+        # --- (e) the three keys that reach the driver without naming it ---
+        # Round 8's `env:` refusals above cover the spellings that sit IN this
+        # file's env blocks. These three do the same job from outside them:
+        # `container:` gives every step a different filesystem (and its own
+        # `env:`), `services:` rides alongside it, and a step writing to
+        # $GITHUB_ENV or $GITHUB_PATH sets the driver's knobs -- or shadows
+        # `bash` itself -- for every LATER step, naming nothing under
+        # script/ci/ and so slipping past every path-based test here.
+        #
+        # Named, not enumerated: these are three keys we can point at, and the
+        # evidence chain (see check_picture_leaves_evidence) is what covers
+        # the ones nobody has thought of yet.
+        for key in ("container", "services"):
+            if wf.body(job).get(key) is not None:
+                violation(
+                    "gate-driver-runs-unmodified",
+                    "gate job '%s' declares `%s:`, which decides what "
+                    "`%s` even means -- a `container.image` whose bash is a "
+                    "stub, or whose `env:` aims the driver at another "
+                    "producer, leaves the pinned work step reporting "
+                    "'success' with no picture taken. The gate runs on the "
+                    "runner, unwrapped." % (job, key, driver),
+                )
+
+        for step in wf.steps(job):
+            body = _strip_shell_comments(as_text(step.get("run") or ""))
+            for var in ("GITHUB_ENV", "GITHUB_PATH"):
+                if ("$%s" % var) in body or ("${%s}" % var) in body:
+                    violation(
+                        "gate-driver-runs-unmodified",
+                        "gate job '%s' has a step writing to $%s, which "
+                        "reaches every later step in the job without naming "
+                        "the driver: $GITHUB_ENV sets the knobs the driver "
+                        "reads for itself, and $GITHUB_PATH can shadow `bash` "
+                        "outright. Either way the pinned step runs and takes "
+                        "no picture. Step: %s" % (job, var, step_label(step)),
+                    )
+
         found_verbatim = False
         for step in wf.steps(job):
             run = as_text(step.get("run") or "")
             uses = as_text(step.get("uses") or "")
-            if script not in run and script not in uses:
+            ci_dir = script.rsplit("/", 1)[0] + "/"
+            if (
+                script not in run
+                and script not in uses
+                and ci_dir not in run
+                and ci_dir not in uses
+            ):
                 continue
             collapsed = " ".join(run.split())
             step_if = wf.step_condition(step)
@@ -1770,7 +1928,23 @@ def check(wf):
             # over the whole body, so `echo --print-nothing && <driver>
             # --help || true` was one unconditional step that satisfied it
             # while invoking the driver in a spelling that takes no picture.
-            invocations = driver_arguments(run, script)
+            # Read the step's run body with comments stripped: a comment
+            # that merely NAMES the driver was reported as an invocation,
+            # which is the same conflation F1 exploited from the other side.
+            occurrences = driver_occurrences(_strip_shell_comments(run), script)
+            mutated = [detail for kind, detail in occurrences if kind == "mutation"]
+            if mutated:
+                violation(
+                    "gate-job-runs-its-driver-verbatim",
+                    "gate job '%s' has a step that does something TO its "
+                    "driver (%s) rather than running it: %s. Truncating, "
+                    "rewriting or replacing the driver leaves the pinned work "
+                    "step running a file that no longer takes a picture, "
+                    "while the job still reports 'success'. Step: %s"
+                    % (job, script, "; ".join(mutated), step_label(step)),
+                )
+                continue
+            invocations = [detail for kind, detail in occurrences if kind == "invocation"]
             if (
                 invocations
                 and all(is_print_query(args) for args in invocations)
