@@ -2165,3 +2165,71 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
   assert_success
   [ "${output}" -ge 1 ]
 }
+
+# ==========================================================================
+# THE ALLOW-LIST, ATTACKED
+# ==========================================================================
+#
+# An allow-list only converges if it is CLOSED. Its first version was not: a
+# `" *"` suffix meant "starts with this", and
+#
+#   ./script/setup.sh apply && find . -name 'tier_b_visual_e2e.sh' \
+#     -exec sed -i '2i exit 0' {} +
+#
+# matched a declared entry, because a prefix cannot tell an argument from a
+# chained command. That is the blocklist's mistake wearing the allow-list's
+# clothes -- a pattern open at one end is open to everything past it. There is
+# no wildcard now; an entry is the whole step.
+
+@test "gates: a declared prefix cannot carry a chained command" {
+  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/setup.sh apply \&\& find . -name "tier_b_visual_e2e.sh" -exec sed -i "2i exit 0" {} +|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: appending a command to a declared step is caught" {
+  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test; sed -i "2i exit 0" script/ci/tier_b_visual_e2e.sh|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+}
+
+@test "gates: changing a declared step's flags is caught" {
+  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test --no-cache|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# The @ref is part of the action. Matching the name alone would let a declared
+# step be repointed at a moving tag or a fork -- the supply-chain half of the
+# same hole.
+@test "gates: repointing a declared action at a moving ref is caught" {
+  _mutate 's|uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02|uses: actions/upload-artifact@main|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: repointing a declared action at a fork is caught" {
+  _mutate 's|uses: actions/upload-artifact@|uses: evilfork/upload-artifact@|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# The trust boundary is the MACHINE, not the job. The GPU runner is persistent
+# and shared, so a job nobody declared can prepare the ground for the one that
+# takes the picture -- edit the workspace, plant a shim on PATH -- while the
+# gate job's own steps stay exactly as declared.
+@test "gates: an undeclared job on the self-hosted runner is caught" {
+  _append_job <<'JOB'
+  helper:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - run: find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}

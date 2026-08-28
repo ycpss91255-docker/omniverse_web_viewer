@@ -2599,26 +2599,42 @@ def _refuses_empty_attestation(wf, job):
 # a line here, in a diff a reviewer sees. These jobs decide whether a version
 # can be published. They are not a place for convenience steps.
 #
-# Matching is on the step's ACTION (`uses:`, compared up to the @ref) or its
-# COLLAPSED `run:` body, with paths normalised. A `run:` entry ending in " *"
-# matches by prefix, for the two steps whose bodies carry long inline
-# arguments that would be unreadable here.
+# Matching is EXACT, on the step's ACTION (`uses:`, including its @ref) or its
+# collapsed, path-normalised `run:` body.
+#
+# There is no wildcard. There was, for one commit -- a `" *"` suffix meaning
+# "starts with this" -- and it let
+#
+#     ./script/setup.sh apply && find . -name 'tier_b_visual_e2e.sh' \
+#       -exec sed -i '2i exit 0' {} +
+#
+# through, because a prefix match cannot tell an ARGUMENT from a chained
+# COMMAND. That is the allow-list making the blocklist's mistake: a pattern
+# that is open at one end is open to everything past that end. Every entry is
+# the whole step or it is not an entry.
+#
+# The @ref is part of the action, not decoration. Matching `actions/checkout`
+# without it would let a declared step be pointed at `@main`, or at a fork,
+# which is the supply-chain half of the same hole.
 GATE_JOB_ALLOWED_STEPS = {
     "tier-b-visual-e2e": (
-        "uses:actions/checkout",
-        "uses:actions/upload-artifact",
-        "run:docker run --rm -v \"${GITHUB_WORKSPACE}\":/w -w /w busybox@ *",
-        "run:./script/setup.sh apply *",
+        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "uses:actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "run:docker run --rm -v \"${GITHUB_WORKSPACE}\":/w -w /w "
+        "busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d"
+        "11b1ab28616 sh -c ' rm -rf .tier-b-artifacts 2>/dev/null true'",
+        "run:./script/setup.sh apply sed -i "
+        "\"s|^WS_PATH=.*|WS_PATH=${GITHUB_WORKSPACE}|\" .env.generated",
         "run:./script/build.sh -t e2e-test",
         "run:docker pull \"$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"",
         "run:bash script/ci/tier_b_visual_e2e.sh",
     ),
     "verify-tag-shape": (
-        "uses:actions/checkout",
+        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
         "run:bash script/ci/derive_image_tag.sh",
     ),
     "require-picture-evidence": (
-        "uses:actions/checkout",
+        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
         "run:bash script/ci/require_attestation.sh",
     ),
 }
@@ -2628,22 +2644,44 @@ def step_signature(step):
     """What this step IS, for allow-list comparison."""
     uses = as_text(step.get("uses") or "")
     if uses:
-        return "uses:" + normalise_paths(uses.split("@", 1)[0].strip())
+        # The @ref included: a declared action pointed at @main, or at a fork,
+        # is a different action with the same name.
+        return "uses:" + normalise_paths(uses.strip())
     return "run:" + " ".join(normalise_paths(as_text(step.get("run") or "")).split())
 
 
 def step_is_allowed(signature, allowed):
-    for entry in allowed:
-        if entry.endswith(" *"):
-            if signature.startswith(entry[:-2]):
-                return True
-        elif signature == entry:
-            return True
-    return False
+    return signature in allowed
 
 
 def check_gate_steps_are_declared(wf):
-    """No step runs in a gate job unless it is declared above."""
+    """No step runs in a gate job unless it is declared above.
+
+    And no UNDECLARED JOB runs on the self-hosted runner at all. That runner
+    is persistent and shared: jobs landing on it see the same machine and the
+    same workspace directory, so a job nobody declared can prepare the ground
+    for the one that takes the picture -- plant a shim, edit the checked-out
+    driver -- without ever appearing in the gate job whose steps this table
+    constrains. The allow-list would otherwise stop at the job boundary, which
+    is not where the trust boundary is.
+    """
+    for job in wf.names():
+        if job in GATE_JOB_ALLOWED_STEPS:
+            continue
+        if any(
+            "self-hosted" in str(variant)
+            for variant in runs_on_variants(wf, job)
+        ):
+            violation(
+                "gate-job-runs-only-declared-steps",
+                "job '%s' asks for the self-hosted runner but is not declared "
+                "in GATE_JOB_ALLOWED_STEPS. That runner is persistent and "
+                "shared -- an undeclared job on it can edit the workspace or "
+                "the PATH that the picture gate then runs in, while the gate "
+                "job's own steps stay exactly as declared. Declare the job, or "
+                "run it on a hosted runner." % job,
+            )
+
     for job, allowed in sorted(GATE_JOB_ALLOWED_STEPS.items()):
         if not wf.has(job):
             continue
