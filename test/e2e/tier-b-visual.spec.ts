@@ -458,6 +458,49 @@ test('a real Kit producer renders a real, non-black picture in a real browser', 
         () => getComputedStyle(document.getElementById('stream-status') as HTMLElement).display,
       ),
     ).toBe('none');
+
+    // --- 6. leave evidence the publisher can require -----------------------
+    //
+    // Everything above happened inside a browser that no later job can see.
+    // Review round 8 showed the job's exit status is not enough on its own:
+    // five different single-step edits to main.yaml make `tier-b-visual-e2e`
+    // report success without this spec ever running, and the workflow text
+    // that results is indistinguishable from a real run. So a real run leaves
+    // something behind that a fake one cannot: the frame it actually sampled,
+    // bound to the commit and run being published.
+    //
+    // script/ci/verify_tier_b_attestation.py re-checks these numbers and the
+    // binding, and publish-image refuses to push without that check having
+    // passed.
+    //
+    // NOT written through saveArtifact(): that helper swallows write errors
+    // because a missing screenshot must never fail an otherwise good run. The
+    // opposite is true here. If this cannot be written, the gate downstream
+    // cannot tell "no picture" from "could not record the picture", and the
+    // whole point is that those two must never look alike -- so a failure to
+    // write is a failure of the acceptance.
+    const attestation = {
+      commit: process.env.GITHUB_SHA ?? '',
+      run_id: process.env.GITHUB_RUN_ID ?? '',
+      width: stats.width,
+      height: stats.height,
+      meanLuma: stats.meanLuma,
+      maxLuma: stats.maxLuma,
+      brightFraction: stats.brightFraction,
+    };
+    if (!ARTIFACT_DIR) {
+      throw new Error(
+        'OWV_ARTIFACT_DIR is unset: the acceptance cannot record the frame it saw, ' +
+          'and an unrecorded picture is not a verified picture',
+      );
+    }
+    mkdirSync(ARTIFACT_DIR, { recursive: true });
+    writeFileSync(
+      join(ARTIFACT_DIR, 'tier-b-attestation.json'),
+      JSON.stringify(attestation, null, 2),
+    );
+    // eslint-disable-next-line no-console
+    console.log(`[tier-b] attestation: ${JSON.stringify(attestation)}`);
   } finally {
     await page.close();
   }

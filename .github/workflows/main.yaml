@@ -198,7 +198,7 @@ jobs:
     # "call-release failed, so no Release was cut" into "the recovery dispatch
     # publishes the image anyway". Do not narrow that guard's condition without
     # revisiting this one.
-    needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e]
+    needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence]
     if: >-
       startsWith(github.ref, 'refs/tags/')
       && !(github.event_name == 'workflow_dispatch'
@@ -245,6 +245,51 @@ jobs:
   #
   # No `:latest`. A moving tag is precisely what a downstream pin must not be,
   # and an rc must never become the tag consumers get by default.
+  # ------------------- the frame, as a thing you can require ----------------
+  #
+  # Every other gate in this file asks whether the Tier B JOB went green.
+  # Review round 8 showed that question has a floor: five single-step edits to
+  # this file keep that job green while the acceptance spec never runs --
+  # `: > script/ci/tier_b_visual_e2e.sh --print-x` (truncate the driver, the
+  # trailing token slipping past the checker's --print- whitelist),
+  # `sed -i '1a exit 0' script/ci/*.sh` (a glob is not the pinned path), a
+  # $GITHUB_PATH entry shadowing `bash`, a job-level `container:` whose bash is
+  # a stub, and `echo TIER_B_PRODUCER_IMAGE=busybox >> "$GITHUB_ENV"`. Reading
+  # this file cannot tell any of them from a real run; the text is identical.
+  # What differs is whether a frame was ever sampled.
+  #
+  # This job asks the other question, once, for both publishers. Its input is
+  # written by test/e2e/tier-b-visual.spec.ts only after it sampled a frame
+  # that cleared every threshold, and verified by
+  # script/ci/verify_tier_b_attestation.py against this run's own commit and
+  # run id. All five bypasses end with no frame, so all five end with an empty
+  # string here -- and this job fails on empty without needing to know that
+  # any of them exist. That is what the static checker cannot buy: it
+  # enumerates the ways a workflow can lie, and enumerations do not converge.
+  #
+  # Cheap, hosted, and NO `if:` and no status function, so GitHub's default
+  # skip propagation carries a skipped or failed Tier B straight through to
+  # both publishers -- the same mechanism that makes an unavailable GPU runner
+  # block a release rather than wave it through.
+  require-picture-evidence:
+    needs: [tier-b-visual-e2e]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      ATTESTATION: ${{ needs.tier-b-visual-e2e.outputs.attestation }}
+    steps:
+      - name: Refuse a release whose picture left no evidence
+        run: |
+          if [ -z "${ATTESTATION}" ]; then
+            echo "::error::tier-b-visual-e2e reported success but produced no"\
+                 "attestation: no frame was sampled for ${GITHUB_SHA}. Refusing"\
+                 "to release a version whose picture was not verified."
+            exit 1
+          fi
+          echo "picture verified for ${GITHUB_SHA}: ${ATTESTATION}"
+          echo "Picture verified for \`${GITHUB_SHA}\`: ${ATTESTATION}" \
+            >>"${GITHUB_STEP_SUMMARY}"
+
   publish-image:
     # Gated on THREE things: never publish an image the build/test gate
     # rejected, never publish an image whose Release failed to cut, and -- the
@@ -265,11 +310,12 @@ jobs:
     # skipped, failed, cancelled and timed-out all block the publish, on the
     # tag path AND on the manual escape-hatch path (which is why a non-empty
     # publish_image_tag makes the Tier B job run for that dispatch too).
-    needs: [call-docker-build, call-release, tier-b-visual-e2e]
+    needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence]
     if: >-
       !cancelled()
       && needs.call-docker-build.result == 'success'
       && needs.tier-b-visual-e2e.result == 'success'
+      && needs.require-picture-evidence.result == 'success'
       && (needs.call-release.result == 'success'
           || needs.call-release.result == 'skipped')
       && (startsWith(github.ref, 'refs/tags/')
@@ -508,6 +554,16 @@ jobs:
           && (inputs.run_tier_b || inputs.publish_image_tag != ''))
     runs-on: [self-hosted, gpu]
     timeout-minutes: 60
+    # The evidence, hoisted out of the job so publish-image can REQUIRE it.
+    # A green job status is not the picture: review round 8 produced five
+    # single-step edits to this file that keep this job green while removing
+    # the picture (truncating the driver, `sed -i '1a exit 0' script/ci/*.sh`,
+    # a $GITHUB_PATH shim over `bash`, a `container:` whose bash is a stub,
+    # $GITHUB_ENV aiming the producer at busybox). All five end with the
+    # acceptance spec never sampling a frame, so all five leave this output
+    # empty -- and publish-image refuses to push on an empty one.
+    outputs:
+      attestation: ${{ steps.acceptance.outputs.attestation }}
     # Checks out, builds and runs containers -- nothing more. Explicitly read,
     # because this job runs on a persistent, shared host where a repo-write
     # token in the environment would turn GPU-host access into push access.
@@ -570,6 +626,7 @@ jobs:
       # job's own 60 stays as the backstop the orphan reaper's default
       # (TIER_B_ORPHAN_MAX_AGE_MIN=120, twice the budget) is calibrated against.
       - name: Tier B visual acceptance (real producer -> real frames)
+        id: acceptance
         timeout-minutes: 45
         run: bash script/ci/tier_b_visual_e2e.sh
 

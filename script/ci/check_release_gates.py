@@ -1942,6 +1942,228 @@ def check(wf):
                 % (job, reason, TIER_B, job_if or "<absent>"),
             )
 
+    # Last, and deliberately last: the one property that is not about text.
+    check_picture_leaves_evidence(wf)
+
+
+# The one property on this page that is not a question about text.
+#
+# Everything else here asks "does main.yaml say the right thing?". Review
+# round 8 established the ceiling on that question: five single-step edits --
+# `: > script/ci/tier_b_visual_e2e.sh --print-x` (truncate the driver, with a
+# trailing token that this file's own --print- whitelist waves through),
+# `sed -i '1a exit 0' script/ci/*.sh` (the glob is not the pinned path), a
+# $GITHUB_PATH entry shadowing `bash`, a job-level `container:` whose bash is
+# a stub, and `echo TIER_B_PRODUCER_IMAGE=busybox >> "$GITHUB_ENV"` -- each
+# leave a workflow this checker passes and a Tier B job that goes green having
+# sampled no frame. They are five members of an unbounded family: the checker
+# reads a fixed set of keys, and a runner has endless ways to change what a
+# command does. PUBLISH_RUN_RE's comment already concedes enumerations do not
+# converge; round 8 showed that is just as true on the gate-work side.
+#
+# So this property does not enumerate. It requires the workflow to carry a
+# chain that makes the frame ITSELF the thing publish-image waits on:
+#
+#   the acceptance spec samples a frame and writes an attestation
+#     -> the driver verifies it against this run's commit, emits it as a
+#        step output
+#       -> the Tier B job exposes that step output as a job output
+#         -> publish-image binds that job output and FAILS ON EMPTY
+#
+# All five bypasses break the same link -- no frame means no attestation means
+# an empty output -- without this checker having to know they exist. What is
+# enumerated here is only the chain's own four links, and those are ours: they
+# change when we change them, not when an attacker finds a new spelling.
+#
+# This does NOT make the workflow unforgeable. Someone editing main.yaml can
+# also edit these four lines, and this checker only guards what reaches `main`
+# (a tag push runs the tagged commit's workflow -- see WHAT THIS CANNOT SEE,
+# item 13). It raises the floor from "the job said it was fine" to "a frame
+# exists, and it is this commit's frame", which is where the actual v0.3.0-rc1
+# failure lived.
+ATTESTATION_OUTPUT = "attestation"
+ACCEPTANCE_STEP_ID = "acceptance"
+ATTESTATION_REF = "needs.%s.outputs.%s" % (TIER_B, ATTESTATION_OUTPUT)
+EVIDENCE_JOB = "require-picture-evidence"
+
+
+def check_picture_leaves_evidence(wf):
+    """Require the frame -> attestation -> job output -> publisher chain."""
+    vid = "picture-leaves-evidence"
+
+    if not wf.has(TIER_B):
+        # Its absence is already a violation elsewhere; do not double-report.
+        return
+
+    # Link 3: the job exposes the evidence, sourced from the step that does
+    # the gate work. A job output wired to some other step would be evidence
+    # of nothing in particular.
+    outputs = wf.body(TIER_B).get("outputs")
+    attested = ""
+    if isinstance(outputs, dict):
+        attested = str(outputs.get(ATTESTATION_OUTPUT, "") or "")
+    if not attested:
+        violation(
+            vid,
+            "job '%s' does not declare an '%s' output, so the frame it "
+            "sampled cannot leave the job and no later job can require it. "
+            "A green job status is not a picture: it is equally green when "
+            "the driver was replaced, shadowed or pointed at another image."
+            % (TIER_B, ATTESTATION_OUTPUT),
+        )
+    elif ACCEPTANCE_STEP_ID not in attested:
+        violation(
+            vid,
+            "job '%s' declares its '%s' output as %r, which does not read "
+            "from the '%s' step. The evidence must come from the step that "
+            "does the gate work; sourced from anywhere else it attests to "
+            "something other than the frame."
+            % (TIER_B, ATTESTATION_OUTPUT, attested, ACCEPTANCE_STEP_ID),
+        )
+
+    # Link 2b: that step still carries the id the output reads from.
+    if not any(
+        str(step.get("id", "")) == ACCEPTANCE_STEP_ID
+        for step in wf.steps(TIER_B)
+        if isinstance(step, dict)
+    ):
+        violation(
+            vid,
+            "no step in '%s' has id '%s', so the job output above resolves to "
+            "the empty string -- and an empty attestation is exactly what a "
+            "job that sampled no frame produces. The two must not look alike."
+            % (TIER_B, ACCEPTANCE_STEP_ID),
+        )
+
+    # Link 4: one job REQUIRES the evidence, in a way that can actually fail.
+    # A guard that reads the value and shrugs is decoration.
+    if not wf.has(EVIDENCE_JOB):
+        violation(
+            vid,
+            "there is no '%s' job, so nothing turns the frame into something a "
+            "publisher can wait on. Without it the release path rests on the "
+            "Tier B job's STATUS, which stays green when the driver is "
+            "replaced, shadowed, or pointed at another image."
+            % EVIDENCE_JOB,
+        )
+    else:
+        if ATTESTATION_REF not in yaml_dump_job(wf, EVIDENCE_JOB):
+            violation(
+                vid,
+                "job '%s' never reads %s, so it gates on nothing."
+                % (EVIDENCE_JOB, "${{ %s }}" % ATTESTATION_REF),
+            )
+        elif not _refuses_empty_attestation(wf, EVIDENCE_JOB):
+            violation(
+                vid,
+                "job '%s' reads %s but no step FAILS when it is empty, so the "
+                "evidence is decorative: a run that sampled no frame yields "
+                "the empty string and sails through."
+                % (EVIDENCE_JOB, "${{ %s }}" % ATTESTATION_REF),
+            )
+        # Its own condition must not override skip propagation: a status
+        # function here would let it run -- and pass -- after a skipped or
+        # failed Tier B, which is the whole failure it exists to stop.
+        gate_if = wf.condition(EVIDENCE_JOB)
+        if status_functions_in(gate_if):
+            violation(
+                vid,
+                "job '%s' carries a status function in its condition (%s), "
+                "which overrides GitHub's default skip propagation -- so it "
+                "would run, and could pass, for a Tier B that never ran."
+                % (EVIDENCE_JOB, gate_if),
+            )
+
+    # ...and every publisher stands behind it, by the same two mechanisms the
+    # picture gate itself is required to be behind.
+    for job, reason in publishing_jobs(wf):
+        if job in (TIER_B, EVIDENCE_JOB):
+            continue
+        if not wf.needs_job(job, EVIDENCE_JOB):
+            violation(
+                vid,
+                "job '%s' can publish (%s) but does not have %s in its needs, "
+                "so it can publish for a commit whose frame was never "
+                "recorded. needs: %s"
+                % (job, reason, EVIDENCE_JOB, wf.needs(job) or "<absent>"),
+            )
+            continue
+        job_if = wf.condition(job)
+        if status_functions_in(job_if) and not (
+            ("needs.%s.result == 'success'" % EVIDENCE_JOB) in (job_if or "")
+            and not has_top_level_or(job_if)
+        ):
+            violation(
+                vid,
+                "job '%s' can publish (%s) and its condition carries a status "
+                "function, so a SKIPPED evidence gate no longer stops it. It "
+                "must ALSO require \"needs.%s.result == 'success'\" as a "
+                "mandatory top-level conjunct. if: %s"
+                % (job, reason, EVIDENCE_JOB, job_if or "<absent>"),
+            )
+
+
+def yaml_dump_job(wf, job):
+    """Flatten a job back to text, for presence questions about expressions.
+
+    Expressions like ${{ needs.x.outputs.y }} can appear in `env:`, `with:`,
+    `if:` or inline in a `run:`; asking "does this job mention it at all" is a
+    presence question, and flattening is the honest way to ask it. The
+    FAILS-ON-EMPTY question below is structural and is not asked this way.
+    """
+    return yaml.safe_dump(wf.body(job), default_flow_style=False, sort_keys=True)
+
+
+def _refuses_empty_attestation(wf, job):
+    """True when some step binds the attestation and exits non-zero on empty.
+
+    Deliberately narrow: the step must bind the value into the environment
+    (so the shell sees a value, not an interpolation the runner splices in)
+    and its body must contain both an emptiness test and a non-zero exit. A
+    guard spelled some other way reads as absent and fails closed, which is
+    the correct direction for a gate -- a false alarm costs a comment, a
+    missed one costs a release nobody looked at.
+    """
+    job_env = wf.body(job).get("env")
+    job_bound = (
+        [
+            name
+            for name, value in job_env.items()
+            if ATTESTATION_REF in str(value)
+        ]
+        if isinstance(job_env, dict)
+        else []
+    )
+
+    for step in wf.steps(job):
+        if not isinstance(step, dict):
+            continue
+        # Bound at either level: a job-level `env:` reaches every step, and
+        # binding it once for a single-step job is the clearer spelling.
+        env = step.get("env")
+        bound = list(job_bound)
+        if isinstance(env, dict):
+            bound += [
+                name
+                for name, value in env.items()
+                if ATTESTATION_REF in str(value)
+            ]
+        if not bound:
+            continue
+        body = _strip_shell_comments(str(step.get("run", "")))
+        if not body:
+            continue
+        tests_empty = any(
+            ('-z "${%s}"' % name) in body
+            or ('-z "$%s"' % name) in body
+            or ('-n "${%s}"' % name) in body
+            or ('-n "$%s"' % name) in body
+            for name in bound
+        )
+        if tests_empty and ("exit 1" in body or "exit 1\n" in body):
+            return True
+    return False
+
 
 def main(argv):
     path = argv[1] if len(argv) > 1 else ".github/workflows/main.yaml"

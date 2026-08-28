@@ -61,7 +61,8 @@
 # Exit 0 = a real browser saw a real, non-black frame from a real producer.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # PINNED BY DIGEST, not by the mutable `:0.0.1` tag.
 #
@@ -417,6 +418,60 @@ if [ "${rc}" -ne 0 ]; then
   fail "visual acceptance failed (exit ${rc}); producer log tail follows"
   docker logs "${PRODUCER_NAME}" 2>&1 | tail -n 60 || true
   exit "${rc}"
+fi
+
+# --------------------------------------------------------------------------
+# The browser step returning 0 is NOT the picture. Require the evidence.
+#
+# Review round 8 produced five single-step, checker-green edits to main.yaml
+# that each make this job report success without a picture: truncating this
+# file (`: > script/ci/tier_b_visual_e2e.sh --print-x`), `sed -i '1a exit 0'
+# script/ci/*.sh`, a $GITHUB_PATH entry shadowing `bash`, a job-level
+# `container:` whose bash is a stub, and $GITHUB_ENV aiming
+# TIER_B_PRODUCER_IMAGE at busybox. Reading main.yaml cannot separate those
+# from a real run -- they are all "the driver did not sample a frame" -- so
+# the driver stops asserting it and starts checking for what a real run leaves
+# behind: an attestation the acceptance spec writes only after it has sampled
+# a frame that passed every threshold.
+#
+# This fails CLOSED by construction. Missing file, unparseable file, absent
+# python3, wrong commit, wrong run, degenerate frame -- every one of them
+# exits non-zero, which blocks call-release and publish-image. A gate that
+# cannot prove the picture must never let the picture be claimed.
+ATTESTATION="${ARTIFACT_DIR}/tier-b-attestation.json"
+
+if [ ! -f "${ATTESTATION}" ]; then
+  fail "no attestation at ${ATTESTATION}: the acceptance spec never sampled a frame"
+  fail "the browser step exited 0 but produced no evidence -- refusing to claim a picture"
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 is required to verify the attestation; refusing to claim an unverified picture"
+  exit 1
+fi
+
+# Bound the frame thresholds to the spec's own constants (test/e2e/
+# tier-b-visual.spec.ts: MIN_MEAN_LUMA / MIN_BRIGHT_FRACTION). The spec has
+# already enforced them; re-checking here is what makes a hand-written
+# attestation useless without also faking a plausible frame.
+if ! ATTESTATION_SUMMARY="$(
+  OWV_ATTESTATION="${ATTESTATION}" \
+  OWV_MIN_MEAN_LUMA=8 \
+  OWV_MIN_BRIGHT_FRACTION=0.1 \
+  python3 "${SCRIPT_DIR}/verify_tier_b_attestation.py"
+)"; then
+  fail "attestation did not verify; refusing to claim a picture"
+  exit 1
+fi
+
+log "attestation verified: ${ATTESTATION_SUMMARY}"
+
+# Hand the publisher a value it can require. publish-image refuses to push
+# without it, so a tier-b job that never sampled a frame cannot be laundered
+# into a release by a green job status alone.
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  printf 'attestation=%s\n' "${ATTESTATION_SUMMARY}" >>"${GITHUB_OUTPUT}"
 fi
 
 log "PASS: a real browser rendered a real, non-black frame from a real Kit producer"
