@@ -39,6 +39,8 @@ setup() {
   ARTIFACTS="${TMP}/artifacts"
   DRIVER_LOG="${TMP}/driver.log"
   STARTED="${TMP}/producer-started"
+  ARGV_LOG="${TMP}/docker-argv.log"
+  ATT_SRC="${TMP}/staged-attestation.json"
 
   mkdir -p "${STUB_BIN}" "${ARTIFACTS}"
   _write_docker_stub
@@ -195,6 +197,20 @@ _write_passing_docker_stub() {
     '  image | pull | rm | inspect | stop | kill) exit 0 ;;' \
     '  run)' \
     '    : >"${OWV_STUB_STARTED}"' \
+    '    printf "%s\\n" "$*" >>"${OWV_STUB_ARGV}"' \
+    '    # Standing in for the acceptance container: the evidence appears' \
+    '    # DURING the run, written by the thing that saw the frame -- which' \
+    '    # is the only way it appears for real. A test that pre-plants it is' \
+    '    # testing the verifier against its own wishful fixture.' \
+    '    for a in "$@"; do' \
+    '      case "${a}" in' \
+    '        */viewer:*)' \
+    '          if [ -n "${OWV_STUB_ATT_SRC:-}" ] && [ -f "${OWV_STUB_ATT_SRC}" ]; then' \
+    '            cp "${OWV_STUB_ATT_SRC}" "${OWV_STUB_ATT_DST}"' \
+    '          fi' \
+    '          ;;' \
+    '      esac' \
+    '    done' \
     '    echo stub-container-id' \
     '    exit 0' \
     '    ;;' \
@@ -224,6 +240,9 @@ _run_driver_to_completion() {
     PATH="${STUB_BIN}:${PATH}" \
     OWV_STUB_NAME="${STUB_PRODUCER}" \
     OWV_STUB_STARTED="${STARTED}" \
+    OWV_STUB_ARGV="${ARGV_LOG}" \
+    OWV_STUB_ATT_SRC="${ATT_SRC}" \
+    OWV_STUB_ATT_DST="${ARTIFACTS}/${ATTESTATION_NAME}" \
     TIER_B_INSTANCE="${STUB_INSTANCE}" \
     TIER_B_PRODUCER_IMAGE="stub/producer:0.0.0" \
     TIER_B_VIEWER_IMAGE="stub/viewer:e2e-test" \
@@ -242,6 +261,7 @@ _write_attestation() {
   local commit="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
   local run_id="12345"
   local mean_luma="151.99"
+  local max_luma="255"
   local bright="0.99988"
   local width="1920"
   local height="1080"
@@ -254,6 +274,7 @@ _write_attestation() {
       commit) commit="${value}" ;;
       run_id) run_id="${value}" ;;
       meanLuma) mean_luma="${value}" ;;
+      maxLuma) max_luma="${value}" ;;
       brightFraction) bright="${value}" ;;
       width) width="${value}" ;;
       height) height="${value}" ;;
@@ -268,9 +289,10 @@ _write_attestation() {
     "  \"width\": ${width}," \
     "  \"height\": ${height}," \
     "  \"meanLuma\": ${mean_luma}," \
+    "  \"maxLuma\": ${max_luma}," \
     "  \"brightFraction\": ${bright}" \
     '}' \
-    > "${ARTIFACTS}/${ATTESTATION_NAME}"
+    > "${ATT_SRC}"
 }
 
 @test "tier_b: a browser step that exits 0 without evidence is not a picture" {
@@ -302,7 +324,7 @@ _write_attestation() {
 
 @test "tier_b: a black frame in the attestation is rejected" {
   _write_passing_docker_stub
-  _write_attestation meanLuma=0 brightFraction=0
+  _write_attestation meanLuma=0 maxLuma=0 brightFraction=0
 
   run _run_driver_to_completion
   [ "${status}" -ne 0 ]
@@ -316,4 +338,46 @@ _write_attestation() {
     GITHUB_SHA=abc0000000000000000000000000000000000abc \
     GITHUB_RUN_ID=777
   [ "${status}" -eq 0 ]
+}
+
+# The bug this case exists for: the acceptance spec reads GITHUB_SHA and
+# GITHUB_RUN_ID from ITS OWN process environment, and it runs inside a
+# container. The driver runs on the runner, where both are set. If they are
+# not plumbed across that boundary the spec writes commit "" -- and the
+# verifier, comparing against the runner's real SHA, refuses every single
+# run. Fail-closed, so the invariant held; but the release path would have
+# been dead on arrival, and no amount of verifier testing would have shown it,
+# because the verifier was only ever fed fixtures written the way the author
+# wished the producer wrote them.
+#
+# So this asserts the PLUMBING, not the parsing: the two flags are on the
+# command line the driver actually emits.
+@test "tier_b: the acceptance container is given the commit and run it must attest to" {
+  _write_passing_docker_stub
+  _write_attestation commit=abc0000000000000000000000000000000000abc run_id=777
+
+  run _run_driver_to_completion \
+    GITHUB_SHA=abc0000000000000000000000000000000000abc \
+    GITHUB_RUN_ID=777
+  [ "${status}" -eq 0 ]
+
+  # The viewer is the last container the driver starts.
+  grep -q -- '-e GITHUB_SHA=abc0000000000000000000000000000000000abc' "${ARGV_LOG}"
+  grep -q -- '-e GITHUB_RUN_ID=777' "${ARGV_LOG}"
+}
+
+# An attestation planted before the run is not this run's evidence.
+@test "tier_b: an attestation left behind before the run is discarded" {
+  _write_passing_docker_stub
+  _write_attestation
+  # Planted directly in the artifact dir, as an earlier step in the job could:
+  # the workflow's pre-clean runs before checkout and the driver only mkdir -p's
+  # this directory. Staging it (the stub path) is how a REAL run delivers it.
+  cp "${ATT_SRC}" "${ARTIFACTS}/${ATTESTATION_NAME}"
+  # ...and the acceptance container writes nothing, which is the whole point:
+  # the planted file is the ONLY evidence, and it is not this run's.
+  rm -f "${ATT_SRC}"
+
+  run _run_driver_to_completion
+  [ "${status}" -ne 0 ]
 }

@@ -286,6 +286,12 @@ GATE_JOBS = (
     "call-release",
     "publish-image",
     "tier-b-visual-e2e",
+    # Load-bearing since the evidence chain landed: `continue-on-error: true`
+    # here turns a job that FAILED on an empty attestation into one whose
+    # conclusion is 'success', which is all `needs.*.result` can see. Adding
+    # a job to the release path without adding it here is how that happens,
+    # and it happened once already.
+    "require-picture-evidence",
 )
 
 TIER_B = "tier-b-visual-e2e"
@@ -1084,6 +1090,26 @@ def step_text(step):
 # Tokens that may precede the driver path and still leave it the thing being
 # RUN: an interpreter, an option to one, or a leading VAR=value assignment.
 _INTERPRETERS = frozenset(("bash", "sh", "dash", "ksh", "zsh", "command", "exec"))
+# Commands that READ a path without changing it. A gate job naming a file
+# under script/ci/ as an argument to one of these is doing something
+# legitimate -- linting it, listing it, running this very checker over the
+# workflow -- and reporting it taught nothing except "do not mention the
+# directory".
+#
+# This is a TABLE ON PURPOSE, in the same spirit as GATE_WORK_DRIVERS: the
+# round-9 reviewer's complaint was not that read-only mentions were refused,
+# it was that there was nowhere to declare one. Adding a command here is a
+# reviewable diff. Anything absent is still reported, which is the direction
+# a gate should fail in -- a false alarm costs a line in this tuple, a missed
+# mutation costs a release nobody looked at.
+_READ_ONLY_COMMANDS = frozenset(
+    (
+        "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
+        "ls", "stat", "file", "wc", "md5sum", "sha256sum", "cmp", "diff",
+        "echo", "printf", "shellcheck", "shfmt", "python3", "python",
+        "pyflakes", "test", "[",
+    )
+)
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _REDIRECT_RE = re.compile(r"^\d*[<>]")
 # Command boundaries. `(` and a backtick open a new command; the closers end
@@ -1098,6 +1124,21 @@ _CMD_CLOSE_RE = re.compile(r"\|\||&&|[;|&\n)`]")
 # shell resolves both to it. Selecting on the directory catches the glob, the
 # redundant separator, and any sibling script reached the same way -- and
 # costs nothing, because a gate job has no business writing in there.
+def normalise_paths(text):
+    """Collapse the spellings a shell resolves but a substring test does not.
+
+    `script//ci/x.sh` and `script/./ci/x.sh` name the same file as
+    `script/ci/x.sh`, and every shell agrees. A literal substring test does
+    not, which is how round 8's `script/ci//tier_b_visual_e2e.sh` got in --
+    and fixing only THAT spelling left `script//ci/` and `script/./ci/`,
+    which is what round 9's reviewer walked in through. Normalise once,
+    before any question is asked about a path, rather than adding a spelling
+    each time somebody finds one.
+    """
+    text = re.sub(r"/\./", "/", text)
+    return re.sub(r"/{2,}", "/", text)
+
+
 _CI_PATH_RE = re.compile(r"[A-Za-z0-9_./*?\[\]-]*script/ci/[A-Za-z0-9_./*?\[\]-]*")
 
 
@@ -1138,6 +1179,7 @@ def driver_occurrences(text, script):
     is the argument list, redirections dropped) or "mutation" (detail is the
     command, for the message).
     """
+    text = normalise_paths(text)
     found = []
     seen = set()
     # First the directory sweep: any path under script/ci/ that something is
@@ -1153,6 +1195,20 @@ def driver_occurrences(text, script):
             for tok in before
         ):
             continue  # invoked, not mutated; the exact-path pass below judges it
+        # A read-only command naming the path is a mention, not a mutation --
+        # unless a redirection points AT the path, which is how `echo x >
+        # <driver>` overwrites it while `echo` sits in this table.
+        command = next(
+            (tok for tok in before if not _ASSIGNMENT_RE.match(tok)), ""
+        )
+        redirected = bool(before) and _REDIRECT_RE.match(before[-1]) is not None
+        if command in _READ_ONLY_COMMANDS and not redirected:
+            # Recorded, not merely skipped: the exact-path pass below walks
+            # the same text and would otherwise re-classify this very
+            # occurrence as a mutation, which is how the read-only table
+            # looked like it did nothing.
+            seen.add(match.start())
+            continue
         seen.add(match.start())
         found.append(("mutation", " ".join(segment.split())[:160]))
 
@@ -1861,6 +1917,24 @@ def check(wf):
 
         for step in wf.steps(job):
             body = _strip_shell_comments(as_text(step.get("run") or ""))
+            if step is not None and (
+                "$GITHUB_OUTPUT" in body or "${GITHUB_OUTPUT}" in body
+            ):
+                collapsed_run = " ".join(
+                    normalise_paths(as_text(step.get("run") or "")).split()
+                )
+                if collapsed_run != driver:
+                    violation(
+                        "gate-driver-runs-unmodified",
+                        "gate job '%s' has a step other than its pinned work "
+                        "step writing to $GITHUB_OUTPUT. That file IS the "
+                        "evidence channel -- a step that writes "
+                        "`attestation=...` there hands the publisher a frame "
+                        "nobody sampled, and every other check in this file "
+                        "still passes. Only \"%s\" may write it. Step: %s"
+                        % (job, driver, step_label(step)),
+                    )
+
             for var in ("GITHUB_ENV", "GITHUB_PATH"):
                 if ("$%s" % var) in body or ("${%s}" % var) in body:
                     violation(
@@ -1878,11 +1952,13 @@ def check(wf):
             run = as_text(step.get("run") or "")
             uses = as_text(step.get("uses") or "")
             ci_dir = script.rsplit("/", 1)[0] + "/"
+            run_n = normalise_paths(run)
+            uses_n = normalise_paths(uses)
             if (
-                script not in run
-                and script not in uses
-                and ci_dir not in run
-                and ci_dir not in uses
+                script not in run_n
+                and script not in uses_n
+                and ci_dir not in run_n
+                and ci_dir not in uses_n
             ):
                 continue
             collapsed = " ".join(run.split())
@@ -1945,6 +2021,14 @@ def check(wf):
                 )
                 continue
             invocations = [detail for kind, detail in occurrences if kind == "invocation"]
+            # Nothing invoked and nothing mutated: the step only MENTIONS a
+            # path under script/ci/ through a read-only command (see
+            # _READ_ONLY_COMMANDS). Falling through to the catch-all below
+            # reported `shellcheck <driver>` and `ls script/ci/` as bypasses,
+            # which is the same read-a-mention-as-an-action conflation this
+            # round set out to remove.
+            if not occurrences and script not in uses:
+                continue
             if (
                 invocations
                 and all(is_print_query(args) for args in invocations)
@@ -2157,6 +2241,7 @@ def check(wf):
 # failure lived.
 ATTESTATION_OUTPUT = "attestation"
 ACCEPTANCE_STEP_ID = "acceptance"
+ACCEPTANCE_EXPR = "steps.%s.outputs.%s" % (ACCEPTANCE_STEP_ID, ATTESTATION_OUTPUT)
 ATTESTATION_REF = "needs.%s.outputs.%s" % (TIER_B, ATTESTATION_OUTPUT)
 EVIDENCE_JOB = "require-picture-evidence"
 
@@ -2185,14 +2270,22 @@ def check_picture_leaves_evidence(wf):
             "the driver was replaced, shadowed or pointed at another image."
             % (TIER_B, ATTESTATION_OUTPUT),
         )
-    elif ACCEPTANCE_STEP_ID not in attested:
+    elif ACCEPTANCE_EXPR not in " ".join(attested.split()):
+        # An id MENTIONED is not an output READ. `"acceptance-ok"` and
+        # `${{ steps.acceptance.outcome }}` both contain the id and are both
+        # permanently non-empty -- a constant dressed as evidence.
         violation(
             vid,
-            "job '%s' declares its '%s' output as %r, which does not read "
-            "from the '%s' step. The evidence must come from the step that "
-            "does the gate work; sourced from anywhere else it attests to "
-            "something other than the frame."
-            % (TIER_B, ATTESTATION_OUTPUT, attested, ACCEPTANCE_STEP_ID),
+            "job '%s' declares its '%s' output as %r, which is not %s. The "
+            "evidence must be the value the gate-work step produced; a "
+            "constant, or that step's `outcome`, is never empty and so "
+            "attests to nothing."
+            % (
+                TIER_B,
+                ATTESTATION_OUTPUT,
+                attested,
+                "${{ %s }}" % ACCEPTANCE_EXPR,
+            ),
         )
 
     # Link 2b: that step still carries the id the output reads from.
@@ -2288,6 +2381,27 @@ def yaml_dump_job(wf, job):
     return yaml.safe_dump(wf.body(job), default_flow_style=False, sort_keys=True)
 
 
+_EXIT_NONZERO_RE = re.compile(r"(?:^|[;&|\n(]|\bthen\b|\belse\b)\s*exit\s+[1-9]")
+
+
+def _strip_quoted(text):
+    """Blank out single- and double-quoted spans, keeping newlines."""
+    out = []
+    quote = None
+    for char in text:
+        if quote is None and char in "\"'":
+            quote = char
+            out.append(" ")
+        elif quote is not None and char == quote:
+            quote = None
+            out.append(" ")
+        elif quote is not None:
+            out.append("\n" if char == "\n" else " ")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def _refuses_empty_attestation(wf, job):
     """True when some step binds the attestation and exits non-zero on empty.
 
@@ -2317,6 +2431,17 @@ def _refuses_empty_attestation(wf, job):
         env = step.get("env")
         bound = list(job_bound)
         if isinstance(env, dict):
+            # A step-level `env:` REBINDING a job-level name wins at runtime.
+            # Counting the union meant `env: {ATTESTATION: sentinel}` on the
+            # guard step left the checker satisfied by the job-level binding
+            # while the shell saw the constant -- `-z` never true, the guard
+            # unable to fire. A shadowed name is not bound.
+            shadowed = {
+                name
+                for name, value in env.items()
+                if ATTESTATION_REF not in str(value)
+            }
+            bound = [name for name in bound if name not in shadowed]
             bound += [
                 name
                 for name, value in env.items()
@@ -2334,7 +2459,13 @@ def _refuses_empty_attestation(wf, job):
             or ('-n "$%s"' % name) in body
             for name in bound
         )
-        if tests_empty and ("exit 1" in body or "exit 1\n" in body):
+        # `exit 1` must be a COMMAND, not a mention. Searching the raw
+        # body accepted `echo "a stricter policy would exit 1 here"` --
+        # a guard that prints and returns 0, which the docstring above
+        # claimed was impossible. Quoted spans are blanked before the
+        # search; the emptiness test is asked of the unstripped body,
+        # because `-z "${VAR}"` is quoted by construction.
+        if tests_empty and _EXIT_NONZERO_RE.search(_strip_quoted(body)):
             return True
     return False
 

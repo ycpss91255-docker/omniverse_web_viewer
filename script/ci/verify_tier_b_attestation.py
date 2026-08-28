@@ -34,6 +34,7 @@ driver hands to `$GITHUB_OUTPUT` for `publish-image` to require.
 """
 
 import json
+import math
 import os
 import sys
 
@@ -56,19 +57,61 @@ def env_float(name, default):
 
 
 def require_number(doc, key):
-    """Pull a numeric field, refusing absence, wrong type and NaN alike.
+    """Pull a numeric field, refusing everything a real measurement is not.
 
     `bool` is rejected explicitly: it is a subclass of `int` in Python, so a
     JSON `true` would otherwise sail through as 1 and read as a bright frame.
+
+    NaN and the infinities are rejected together. NaN compares >= to nothing
+    so it fails the thresholds anyway, but `Infinity` passes every one of
+    them -- and Python's json accepts the non-standard `Infinity` literal
+    unless told otherwise. A canvas cannot report an infinite mean luma; a
+    forger can.
     """
     if key not in doc:
         fail("attestation has no {!r} field".format(key))
     value = doc[key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         fail("attestation field {!r} is not a number: {!r}".format(key, value))
-    if value != value:  # NaN, which compares >= to nothing
-        fail("attestation field {!r} is NaN".format(key))
+    if not math.isfinite(value):
+        fail(
+            "attestation field {!r} is not a finite number: {!r} -- no frame "
+            "measures that".format(key, value)
+        )
     return float(value)
+
+
+def require_dimension(doc, key):
+    """A pixel count: finite, integral, and at least one.
+
+    `width > 0` alone accepts 1e-300, which is not a frame anyone rendered.
+    """
+    value = require_number(doc, key)
+    if value < 1 or value != int(value):
+        fail(
+            "attested {} is not a whole number of pixels: {!r}".format(key, value)
+        )
+    return value
+
+
+def _no_duplicate_keys(pairs):
+    """Refuse a JSON object that says a thing twice.
+
+    Python's json is last-wins, so `{"meanLuma": 0, ..., "meanLuma": 99}`
+    reads as 99 while a human reading the artifact sees the 0 first. The
+    workflow parser in check_release_gates.py already refuses duplicate keys
+    for exactly this reason; evidence deserves at least the same standard.
+    """
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            fail("attestation names {!r} more than once".format(key))
+        seen[key] = value
+    return seen
+
+
+def _reject_constant(name):
+    fail("attestation contains the non-numeric JSON constant {}".format(name))
 
 
 def require_binding(doc, key, env_name):
@@ -105,7 +148,11 @@ def main():
         fail("cannot read {}: {}".format(path, err))
 
     try:
-        doc = json.loads(raw)
+        doc = json.loads(
+            raw,
+            object_pairs_hook=_no_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
     except ValueError as err:
         fail("{} is not valid JSON: {}".format(path, err))
 
@@ -115,16 +162,25 @@ def main():
     require_binding(doc, "commit", "GITHUB_SHA")
     require_binding(doc, "run_id", "GITHUB_RUN_ID")
 
-    width = require_number(doc, "width")
-    height = require_number(doc, "height")
+    width = require_dimension(doc, "width")
+    height = require_dimension(doc, "height")
     mean_luma = require_number(doc, "meanLuma")
+    max_luma = require_number(doc, "maxLuma")
     bright_fraction = require_number(doc, "brightFraction")
 
-    if width <= 0 or height <= 0:
-        fail("attested frame has no dimensions: {}x{}".format(width, height))
-
     min_mean_luma = env_float("OWV_MIN_MEAN_LUMA", 8.0)
+    min_max_luma = env_float("OWV_MIN_MAX_LUMA", 32.0)
     min_bright_fraction = env_float("OWV_MIN_BRIGHT_FRACTION", 0.1)
+
+    # maxLuma is asserted by the spec and was written into the attestation
+    # from the beginning; not checking it meant a forged attestation did not
+    # even have to be internally consistent.
+    if max_luma < min_max_luma:
+        fail(
+            "attested frame is black: maxLuma {} < {}".format(
+                max_luma, min_max_luma
+            )
+        )
 
     if mean_luma < min_mean_luma:
         fail(

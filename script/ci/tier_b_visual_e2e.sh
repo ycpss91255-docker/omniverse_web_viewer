@@ -402,6 +402,13 @@ log "producer is streaming; handing over to the browser"
 # One container is both the viewer and the browser: e2e-test is FROM runtime,
 # so it carries the real dist AND Playwright/Chromium. Host network so the page
 # it serves and the producer it dials are both on 127.0.0.1.
+# Remove any attestation that exists BEFORE the browser runs. The workflow's
+# pre-clean happens before checkout, and the driver only mkdir -p's this
+# directory -- so a step that plants a well-formed attestation early would
+# have it survive and be read as this run's evidence. The file must be
+# written by the acceptance spec, in this run, or not exist.
+rm -f "${ARTIFACT_DIR}/tier-b-attestation.json"
+
 rc=0
 docker run --rm \
   --name "${VIEWER_NAME}" \
@@ -410,6 +417,8 @@ docker run --rm \
   -e SIGNALING_PORT="${SIGNAL_PORT}" \
   -e SERVE_PORT="${SERVE_PORT}" \
   -e OWV_ARTIFACT_DIR=/artifacts \
+  -e GITHUB_SHA="${GITHUB_SHA:-}" \
+  -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
   -v "${ARTIFACT_DIR}":/artifacts \
   "${VIEWER_IMAGE}" \
   bash /e2e/run-tier-b.sh || rc=$?

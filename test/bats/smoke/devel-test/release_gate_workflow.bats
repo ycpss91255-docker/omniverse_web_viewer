@@ -1889,3 +1889,86 @@ _gate_step() {
   assert_success
   assert_output --partial "holds the release invariant"
 }
+
+# ==========================================================================
+# ROUND-9 REVIEW FINDINGS
+# ==========================================================================
+#
+# The evidence chain landed in round 9 and its reviewer took it apart the same
+# day: three of its four links were locked by SUBSTRING tests, which is the
+# failure this file has now written down three times while committing it a
+# fourth. These cases are the structural versions.
+
+@test "gates: a redundant separator before ci does not hide a rewrite" {
+  _gate_step "'sed -i \"1a exit 0\" script//ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: a dot component in the path does not hide a rewrite" {
+  _gate_step "'sed -i \"1a exit 0\" script/./ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: only the pinned work step may write \$GITHUB_OUTPUT" {
+  _gate_step "'printf \"attestation=1920x1080\\\\n\" >> \"\$GITHUB_OUTPUT\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: continue-on-error on the evidence gate is caught" {
+  _mutate 's|^  require-picture-evidence:$|  require-picture-evidence:\n    continue-on-error: true|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-has-no-continue-on-error]"
+}
+
+@test "gates: a step-level env shadowing the attestation binding is caught" {
+  _mutate 's|^      - name: Refuse a release whose picture left no evidence$|      - name: Refuse a release whose picture left no evidence\n        env:\n          ATTESTATION: sentinel|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: a constant standing in for the attestation output is caught" {
+  _mutate 's|^      attestation: \${{ steps.acceptance.outputs.attestation }}$|      attestation: "acceptance-ok"|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: the acceptance step's outcome is not its evidence" {
+  _mutate 's|^      attestation: \${{ steps.acceptance.outputs.attestation }}$|      attestation: ${{ steps.acceptance.outcome }}|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+# The other direction, and the reason _READ_ONLY_COMMANDS is a table rather
+# than a guess: the round-9 directory sweep reported `shellcheck <driver>`,
+# `ls script/ci/` and running this very checker as bypasses. A gate that cries
+# wolf on correct edits gets edited out.
+@test "gates: linting the driver is not a bypass" {
+  _gate_step "'shellcheck script/ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+@test "gates: running this checker from a gate job is not a bypass" {
+  _gate_step "'python3 script/ci/check_release_gates.py .github/workflows/main.yaml'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+@test "gates: a read-only command with a redirect onto the driver is caught" {
+  _gate_step "'cat /dev/null > script/ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
