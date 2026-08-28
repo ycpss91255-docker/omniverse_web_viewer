@@ -227,7 +227,7 @@ _append_job() {
 # ---------------------------------------------------------------- publish --
 
 @test "gates: dropping tier-b from publish-image's needs is caught" {
-  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e\]/needs: [call-docker-build, call-release]/'
+  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]/needs: [call-docker-build, call-release, require-picture-evidence]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[publish-image-needs-tier-b]"
@@ -268,7 +268,7 @@ _append_job() {
 # ---------------------------------------------------------------- release --
 
 @test "gates: dropping tier-b from call-release's needs is caught" {
-  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: [verify-tag-shape, call-docker-build]/'
+  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, call-docker-build, require-picture-evidence]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[call-release-needs-tier-b]"
@@ -351,7 +351,7 @@ _append_job() {
 # job that waits on them would inherit an always()-gated dependency, which is
 # the escape the picture-gate rule forbids.
 @test "gates: making a report-only job a dependency is caught" {
-  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e\]/needs: [call-docker-build, call-release, tier-b-visual-e2e, release-blocked-report]/'
+  _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]/needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence, release-blocked-report]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[no-job-needs-a-report-only-job]"
@@ -381,7 +381,7 @@ _append_job() {
 # whose own condition carries a status function.
 @test "gates: a decoy job named after the gate does not satisfy a needs" {
   {
-    sed 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e-summary]/' \
+    sed 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e-summary, require-picture-evidence]/' \
       "${WORKFLOW}"
     printf '%s\n' \
       "  tier-b-visual-e2e-summary:" \
@@ -392,7 +392,7 @@ _append_job() {
       "      - name: Summarise" \
       "        run: echo done"
   } > "${MUTATED}"
-  run grep -qF 'tier-b-visual-e2e-summary]' "${MUTATED}"
+  run grep -qF 'tier-b-visual-e2e-summary,' "${MUTATED}"
   assert_success
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
@@ -403,7 +403,7 @@ _append_job() {
 # Reading `needs:` as a list rather than a string is only an improvement if it
 # still reads the OTHER valid spellings of the same list.
 @test "gates: a quoted needs list is read as the same list" {
-  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e\]/needs: ["verify-tag-shape", "call-docker-build", "tier-b-visual-e2e"]/'
+  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: ["verify-tag-shape", "call-docker-build", "tier-b-visual-e2e", "require-picture-evidence"]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
@@ -956,7 +956,7 @@ JOB
 # the list, and the words in it were reported as jobs that do not exist ("#",
 # "the", "picture", "gate").
 @test "gates: a trailing comment after needs: is not four missing jobs" {
-  _mutate 's|^    needs: \[call-docker-build, call-release, tier-b-visual-e2e\]$|    needs: [call-docker-build, call-release, tier-b-visual-e2e]  # the picture gate|'
+  _mutate 's|^    needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]$|    needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence]  # the picture gate|'
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
@@ -1714,4 +1714,85 @@ JOB
       return 1
       ;;
   esac
+}
+
+# ==========================================================================
+# THE EVIDENCE CHAIN
+# ==========================================================================
+#
+# Every property above this point asks a question about the TEXT of
+# main.yaml. Review round 8 proved that class of question has a floor: five
+# single-step edits -- `: > script/ci/tier_b_visual_e2e.sh --print-x`,
+# `sed -i '1a exit 0' script/ci/*.sh`, a $GITHUB_PATH entry shadowing `bash`,
+# a job-level `container:` whose bash is a stub, and $GITHUB_ENV aiming
+# TIER_B_PRODUCER_IMAGE at busybox -- each leave a workflow this checker
+# passes and a job that goes green having sampled no frame at all. They are
+# not spellings to enumerate; they are five members of an unbounded family,
+# and the checker's own PUBLISH_RUN_RE comment already concedes enumerations
+# do not converge.
+#
+# The answer is not a sixth spelling. It is to stop taking the job's word for
+# it: the acceptance spec writes an attestation only after sampling a frame
+# that cleared every threshold, and publish-image refuses to push without it.
+# All five bypasses fail that check at once, because all five end the same way
+# -- no frame, no attestation.
+#
+# That only holds while the chain is intact, so the chain is what these cases
+# lock. Cutting any link is exactly the edit an attacker (or a tired
+# maintainer) would make next.
+
+@test "gates: tier-b publishes its attestation as a job output" {
+  _mutate '/^    outputs:$/,/^      attestation:/d'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: the acceptance step keeps the id its output is read from" {
+  _mutate 's|^        id: acceptance$|        id: something-else|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: deleting the evidence gate job is caught" {
+  _mutate '/^  require-picture-evidence:$/,/^  publish-image:$/{/^  publish-image:$/!d}'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: an evidence gate that cannot fail is caught" {
+  _mutate 's|^          if \[ -z "${ATTESTATION}" \]; then$|          if false; then|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: an evidence gate reading nothing is caught" {
+  _mutate 's|^      ATTESTATION: \${{ needs.tier-b-visual-e2e.outputs.attestation }}$|      ATTESTATION: "ok"|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: an evidence gate with a status function is caught" {
+  _mutate 's|^  require-picture-evidence:$|  require-picture-evidence:\n    if: always()|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: a publisher dropping the evidence gate from needs is caught" {
+  _mutate 's|^    needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]$|    needs: [call-docker-build, call-release, tier-b-visual-e2e]|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: a publisher that stops requiring the evidence gate is caught" {
+  _mutate "/^      && needs.require-picture-evidence.result == 'success'\$/d"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
 }

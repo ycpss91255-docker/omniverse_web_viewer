@@ -157,3 +157,163 @@ _signal_driver() {
   run grep -c 'teardown: dropping' "${DRIVER_LOG}"
   assert_output "1"
 }
+
+# ---------------------------------------------------------------------------
+# ATTESTATION: exit 0 must mean "a frame was seen", not "the browser step
+# returned 0".
+#
+# Review round 8 produced five single-step, checker-green ways to make the
+# tier-b job report success without a picture: truncating this driver to zero
+# bytes (`: > script/ci/tier_b_visual_e2e.sh --print-x`), shadowing `bash` via
+# $GITHUB_PATH, `sed -i '1a exit 0' script/ci/*.sh`, a job-level `container:`
+# whose bash is a stub, and $GITHUB_ENV pointing TIER_B_PRODUCER_IMAGE at
+# busybox. Every one of them ends the same way -- the acceptance spec never
+# runs, so no frame is ever sampled -- and no amount of reading main.yaml can
+# tell them apart from a real run.
+#
+# So the driver stops trusting the browser step's exit status alone and
+# requires the EVIDENCE the spec writes when it actually sampled a non-black
+# frame. A run that produced no attestation, or one bound to a different
+# commit, is not a verified picture and must not exit 0.
+#
+# The stub below drives the whole happy path with no GPU, no Kit and no daemon:
+# the producer "boots" (logs emit the ready marker) and the viewer "passes"
+# (docker run exits 0) -- while writing nothing. That is exactly the shape of
+# all five bypasses.
+
+ATTESTATION_NAME="tier-b-attestation.json"
+
+# A docker stub that reaches the END of the run: producer logs emit the ready
+# marker, so the driver leaves its boot-wait loop and starts the viewer, whose
+# `docker run` exits 0 having written no evidence.
+_write_passing_docker_stub() {
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'sub="${1:-}"' \
+    'shift || true' \
+    'case "${sub}" in' \
+    '  image | pull | rm | inspect | stop | kill) exit 0 ;;' \
+    '  run)' \
+    '    : >"${OWV_STUB_STARTED}"' \
+    '    echo stub-container-id' \
+    '    exit 0' \
+    '    ;;' \
+    '  ps)' \
+    '    for a in "$@"; do' \
+    '      if [ "${a}" = "--filter" ]; then exit 0; fi' \
+    '    done' \
+    '    printf "%s\n" "${OWV_STUB_NAME}"' \
+    '    exit 0' \
+    '    ;;' \
+    '  logs)' \
+    '    printf "%s\n" "[PRODUCER] empty lit stage streaming"' \
+    '    exit 0' \
+    '    ;;' \
+    '  *) exit 0 ;;' \
+    'esac' \
+    > "${STUB_BIN}/docker"
+  chmod 0755 "${STUB_BIN}/docker"
+}
+
+# Run the driver to completion against the passing stub. Extra env assignments
+# may be passed as KEY=VALUE arguments. Returns the driver's exit status;
+# combined output lands in "${DRIVER_LOG}".
+_run_driver_to_completion() {
+  local rc=0
+  env \
+    PATH="${STUB_BIN}:${PATH}" \
+    OWV_STUB_NAME="${STUB_PRODUCER}" \
+    OWV_STUB_STARTED="${STARTED}" \
+    TIER_B_INSTANCE="${STUB_INSTANCE}" \
+    TIER_B_PRODUCER_IMAGE="stub/producer:0.0.0" \
+    TIER_B_VIEWER_IMAGE="stub/viewer:e2e-test" \
+    TIER_B_SERVE_PORT="5399" \
+    TIER_B_SIGNAL_PORT="49399" \
+    TIER_B_ARTIFACT_DIR="${ARTIFACTS}" \
+    TIER_B_BOOT_TIMEOUT="30" \
+    "$@" \
+    bash "${DRIVER}" >"${DRIVER_LOG}" 2>&1 || rc=$?
+  return "${rc}"
+}
+
+# Write an attestation of the shape the spec produces on a real pass.
+# _write_attestation [KEY=VALUE ...] overrides individual JSON fields.
+_write_attestation() {
+  local commit="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  local run_id="12345"
+  local mean_luma="151.99"
+  local bright="0.99988"
+  local width="1920"
+  local height="1080"
+  local kv key value
+
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    value="${kv#*=}"
+    case "${key}" in
+      commit) commit="${value}" ;;
+      run_id) run_id="${value}" ;;
+      meanLuma) mean_luma="${value}" ;;
+      brightFraction) bright="${value}" ;;
+      width) width="${value}" ;;
+      height) height="${value}" ;;
+    esac
+  done
+
+  mkdir -p "${ARTIFACTS}"
+  printf '%s\n' \
+    '{' \
+    "  \"commit\": \"${commit}\"," \
+    "  \"run_id\": \"${run_id}\"," \
+    "  \"width\": ${width}," \
+    "  \"height\": ${height}," \
+    "  \"meanLuma\": ${mean_luma}," \
+    "  \"brightFraction\": ${bright}" \
+    '}' \
+    > "${ARTIFACTS}/${ATTESTATION_NAME}"
+}
+
+@test "tier_b: a browser step that exits 0 without evidence is not a picture" {
+  _write_passing_docker_stub
+
+  run _run_driver_to_completion
+  [ "${status}" -ne 0 ]
+  grep -qiE 'attestation|evidence' "${DRIVER_LOG}"
+}
+
+@test "tier_b: an attestation naming a different commit is rejected" {
+  _write_passing_docker_stub
+  _write_attestation commit=1111111111111111111111111111111111111111
+
+  run _run_driver_to_completion \
+    GITHUB_SHA=2222222222222222222222222222222222222222
+  [ "${status}" -ne 0 ]
+  grep -qiE 'commit' "${DRIVER_LOG}"
+}
+
+@test "tier_b: an attestation naming a different run is rejected" {
+  _write_passing_docker_stub
+  _write_attestation run_id=111
+
+  run _run_driver_to_completion GITHUB_RUN_ID=222
+  [ "${status}" -ne 0 ]
+  grep -qiE 'run' "${DRIVER_LOG}"
+}
+
+@test "tier_b: a black frame in the attestation is rejected" {
+  _write_passing_docker_stub
+  _write_attestation meanLuma=0 brightFraction=0
+
+  run _run_driver_to_completion
+  [ "${status}" -ne 0 ]
+}
+
+@test "tier_b: a matching attestation with a real frame passes" {
+  _write_passing_docker_stub
+  _write_attestation commit=abc0000000000000000000000000000000000abc run_id=777
+
+  run _run_driver_to_completion \
+    GITHUB_SHA=abc0000000000000000000000000000000000abc \
+    GITHUB_RUN_ID=777
+  [ "${status}" -eq 0 ]
+}
