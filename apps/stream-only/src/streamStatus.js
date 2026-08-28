@@ -73,6 +73,35 @@
 // never delivers a frame terminal (the #63 case): an element that reports no
 // progress at all, or reports the same reading forever, produces no evidence,
 // and a bare `playing` event with no frame behind it is a claim like any other.
+//
+// The same rule, applied to the LIVE state (issue #75). #73 stopped a stale
+// verdict from outranking a real frame; it left the mirror image untouched --
+// a claim outranking a real frame while the stream is running. Everything
+// callback-driven was gated on two booleans, `terminal` and `lossAnnounced`,
+// and a recovery clears both, so the next session-start retry walked through
+// connecting(), repainted `connecting to <server>:<port>...` on top of a
+// playing picture and armed a fresh connect window. Nothing could cancel that
+// window: hide() runs off `playing` / `loadeddata`, which fired once when
+// playback began and do NOT re-fire while frames keep arriving steadily. So it
+// ran its full length and ended in a red `no video from the source` over the
+// same working stream, which the #73 recovery watch then withdrew one poll
+// later -- and the next retry started it again. Measured in a browser against
+// a real WebRTC picture (test/e2e/status-loopback.spec.ts): 20.0 s of false
+// `connecting`, ~1.0 s of false terminal, repeating roughly every 30 s, while
+// the element decoded ~30 frames a second throughout.
+//
+// So the readout is now guarded on the OBSERVATION this file already takes --
+// framesAdvancingNow(), frame progress past the watchdog's most recent
+// reading -- and not on a fourth boolean, which would be one more thing to
+// keep in sync with reality and is what the three bugs above were made of.
+// connecting() says nothing over a picture that is playing, terminate() draws
+// no conclusion against one, and the watchdog withdraws whatever a claim
+// managed to write in the gap between two frames, window and all. stopped() is
+// deliberately NOT guarded: it is the accelerator (#62) that announces a loss
+// sooner than the poll can, and at the instant frames really do stop the last
+// reading is usually still moving, so guarding it would cost the acceleration
+// it exists for. What it writes is withdrawn a poll later if the picture was
+// in fact fine, which is the same rule doing the work from the other side.
 
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
@@ -260,16 +289,42 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     (isError ? logger.error : logger.info)(`[stream] ${text}`);
   }
 
-  // Frames on the element have moved past where they stood when the terminal
-  // state latched (#73) -- the one piece of evidence allowed to reopen it. No
-  // baseline (the element cannot report progress) or an unchanged reading is
-  // not evidence: a stream that never delivers a frame must stay terminal.
-  function framesAdvancedSinceTerminal() {
-    if (terminalProgress === null) {
+  // Frames on the element have moved past a reading taken earlier. This is the
+  // whole of "observed media outranks callback claims" as a function: what
+  // differs between its two callers is only WHICH reading they measure against.
+  // No baseline (the element cannot report progress) or an unchanged reading is
+  // not evidence, which is what keeps a stream that never delivers a frame
+  // exactly where it is.
+  function framesMovedSince(baseline) {
+    if (baseline === null) {
       return false;
     }
     const progress = readFrameProgress(videoEl);
-    return progress !== null && progress !== terminalProgress;
+    return progress !== null && progress !== baseline;
+  }
+
+  // Evidence allowed to reopen the terminal state (#73): progress past where it
+  // stood at the instant the latch closed.
+  function framesAdvancedSinceTerminal() {
+    return framesMovedSince(terminalProgress);
+  }
+
+  // Is there a picture on screen RIGHT NOW (#75)? Progress past the watchdog's
+  // most recent reading -- which is never more than one poll old, and is taken
+  // from the element rather than remembered from anything a callback said. A
+  // claim does not speak over this, and no verdict is drawn against it.
+  //
+  // It is a point sample and cannot be otherwise: a boolean "the stream is
+  // live" would be a fourth thing to keep in sync with reality, and the three
+  // bugs before this one were all made of exactly that. Two consequences are
+  // accepted deliberately. A retry landing in the gap between two frames sees
+  // nothing move and is let through -- the next sample withdraws what it wrote
+  // (see sampleFrameProgress). And an element whose counter RESETS -- handed a
+  // new stream, or having its media torn out from under it -- reads as moved,
+  // which errs towards saying nothing; the very next sample re-baselines, so a
+  // genuinely dead element is back to arming its window one poll later.
+  function framesAdvancingNow() {
+    return framesMovedSince(lastProgress);
   }
 
   function hide() {
@@ -311,6 +366,14 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     if (terminal || lossAnnounced) {
       return;
     }
+    // Nothing to add over a picture that is PLAYING either (#75). `onStart`
+    // re-fires on every session-start retry, and after a recovery both flags
+    // above are false again, so this is the whole of what stood between a
+    // retry and a `connecting to ...` readout on top of a working stream --
+    // plus a fresh window whose only possible ending was a false verdict.
+    if (framesAdvancingNow()) {
+      return;
+    }
     show(text);
     // Armed once, from the FIRST attempt. `onStart` re-fires on every
     // session-start retry, so re-arming here would move the deadline out by a
@@ -345,6 +408,17 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
   // same. show() runs before the latch closes, which is the one write that is
   // allowed through it.
   function terminate(text) {
+    // A verdict is a conclusion ABOUT the media, so the media outranks it too
+    // (#75). Both windows that end here are armed by claims -- a connect
+    // attempt or an `onStop` -- and a claim that turned out to be wrong must
+    // not be allowed to paint an error over a picture that is playing. The
+    // readout goes away instead, which is what a live picture means, and the
+    // machine stays live: if the frames really do stop later, the watchdog
+    // announces and escalates from scratch.
+    if (framesAdvancingNow()) {
+      hide();
+      return;
+    }
     cancelEscalation();
     show(text, true);
     terminal = true;
@@ -425,9 +499,14 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     if (progress !== lastProgress) {
       lastProgress = progress;
       stillSamples = 0;
-      if (lossAnnounced) {
-        hide(); // frames are back -- the same recovery a `playing` event drives
-      }
+      // The picture moved, so whatever the readout says is out of date: a loss
+      // someone announced (`onStop` or this watchdog), or a connect attempt a
+      // session-start retry re-announced in the gap between two frames (#75).
+      // hide() clears the text AND disarms whatever window came with it, which
+      // is what a `playing` event would have done if it re-fired -- and it does
+      // not re-fire while frames simply keep arriving, which is exactly how a
+      // spurious window used to survive all the way to a false verdict.
+      hide();
     } else if (!lossAnnounced) {
       stillSamples += 1;
       if (stillSamples >= stallSamples) {

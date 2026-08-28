@@ -68,9 +68,18 @@ declare global {
  * Build the in-page loopback and point #remote-video at its receiving end.
  * Non-trickle ICE (offer/answer exchanged only once gathering has completed),
  * so there is no candidate-before-remote-description race to flake on.
+ *
+ * `holdAgainstTeardown` makes the element KEEP the media (#75). The streaming
+ * library nulls `#remote-video.srcObject` at the start of every session-start
+ * attempt -- observed, not assumed: with the loopback running against the dead
+ * test host, `srcObject` went null and the decoded-frame counter reset to 0
+ * within 200 ms of each `onStart`. A producer whose frames keep arriving is
+ * precisely the case #75 is about, so the option ignores those null
+ * assignments and lets the picture play on. Default off, so every spec written
+ * before #75 drives a byte-identical loopback.
  */
-async function startLoopback(page: Page): Promise<void> {
-  await page.evaluate(async () => {
+async function startLoopback(page: Page, holdAgainstTeardown = false): Promise<void> {
+  await page.evaluate(async (holdMedia: boolean) => {
     // Replacing an earlier loopback (the latch check builds a second one).
     if (window.__OWV_LOOPBACK__) {
       window.clearInterval(window.__OWV_LOOPBACK__.timer);
@@ -119,6 +128,25 @@ async function startLoopback(page: Page): Promise<void> {
     await pc1.setRemoteDescription(pc2.localDescription as RTCSessionDescription);
 
     const video = document.getElementById('remote-video') as HTMLVideoElement;
+    if (holdMedia) {
+      const proto = Object.getOwnPropertyDescriptor(
+        HTMLMediaElement.prototype,
+        'srcObject',
+      ) as PropertyDescriptor;
+      Object.defineProperty(video, 'srcObject', {
+        configurable: true,
+        get(this: HTMLVideoElement) {
+          return (proto.get as () => MediaStream | null).call(this);
+        },
+        set(this: HTMLVideoElement, value: MediaStream | null) {
+          // Only a teardown is ignored; handing the element real media still
+          // works, so nothing about the app's own path is faked here.
+          if (value) {
+            (proto.set as (v: MediaStream | null) => void).call(this, value);
+          }
+        },
+      });
+    }
     video.srcObject = new MediaStream([await inbound]);
     try {
       await video.play();
@@ -126,7 +154,7 @@ async function startLoopback(page: Page): Promise<void> {
       /* the element is already autoplay + video-only; a rejection is harmless */
     }
     window.__OWV_LOOPBACK__ = { sender, track, timer };
-  });
+  }, holdAgainstTeardown);
 }
 
 /** Decoded frames delivered to #remote-video so far. */
@@ -355,4 +383,78 @@ test('a producer that starts after the connect window has elapsed clears the rea
 
   await expect(status).toBeHidden({ timeout: RECOVERABLE_TIMEOUT_MS });
   expect(await statusDisplay(page)).toBe('none');
+});
+
+// #75, and the reason this file is where it had to be proved: the claims are
+// REAL here. The page dials the dead test host, so the streaming library keeps
+// retrying session start on its own (`maxReconnects` 20, ~5 s apart), and every
+// one of those retries calls `onStart`, which the app maps onto connecting().
+// No test-only seam manufactures the claim; the only thing the harness does is
+// keep the picture alive across the library's teardown of the element.
+//
+// Measured on this harness before the fix: the retry at +5.8 s repainted
+// `connecting to <server>:<port>...` over an element decoding at ~30 fps, it
+// stood for 20.0 s (the whole connect window), the window then painted a red
+// `no video from the source -- it never started` over the same picture at 683
+// decoded frames and climbing, and #73's recovery watch withdrew that ~1.0 s
+// later -- after which the next retry started the cycle again, roughly every
+// 30 s. Held here for a full 30 s, which spans two to three real session-start
+// attempts.
+test('a session-start retry cannot repaint over a live picture (#75)', async ({ page }) => {
+  test.setTimeout(120_000);
+  const status = page.locator('#stream-status');
+
+  // The library announces each session-start attempt on the console. Counting
+  // them is what keeps this spec from passing vacuously: if the library made no
+  // attempt during the hold, nothing claimed anything and a hidden readout
+  // would prove nothing.
+  const attempts: string[] = [];
+  const startedAt = Date.now();
+  const at = (): string => `+${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
+  page.on('console', (msg) => {
+    if (msg.text().includes('initializing signaling connection')) {
+      attempts.push(at());
+    }
+  });
+
+  // Wait for the library's first attempt before handing it media: it nulls
+  // #remote-video.srcObject while constructing, before any loopback of ours
+  // could hold the element.
+  await expect
+    .poll(() => attempts.length, {
+      message: 'the streaming library never attempted a session start',
+      timeout: 30_000,
+    })
+    .toBeGreaterThan(0);
+
+  await startLoopback(page, true);
+  await expectFramesFlowing(page);
+  await expect(status).toBeHidden();
+
+  const framesBefore = await framesRendered(page);
+  const attemptsBefore = attempts.length;
+  const holdUntil = Date.now() + 30_000;
+  const reappeared: string[] = [];
+  while (Date.now() < holdUntil) {
+    if ((await statusDisplay(page)) !== 'none') {
+      reappeared.push(`${at()} ${JSON.stringify((await status.textContent()) ?? '')}`);
+    }
+    await page.waitForTimeout(250);
+  }
+
+  // The harness kept its side of the bargain -- real frames throughout, and
+  // real claims arriving over them -- so a hidden readout means what it says.
+  expect(
+    await framesRendered(page),
+    'the loopback stopped delivering frames, so this spec proved nothing',
+  ).toBeGreaterThan(framesBefore);
+  expect(
+    attempts.length,
+    'the library made no session-start attempt during the hold, so nothing claimed anything',
+  ).toBeGreaterThan(attemptsBefore);
+
+  expect(
+    reappeared,
+    `the readout reappeared over a picture that was playing: ${reappeared.join(' | ')}`,
+  ).toEqual([]);
 });
