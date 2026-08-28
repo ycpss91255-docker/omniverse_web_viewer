@@ -1282,12 +1282,6 @@ JOB
 # A SECOND genuine query is still a query. This is the acceptance pair for
 # the decoy case above: what makes that one a violation is the `--help`
 # invocation, not the presence of a second step.
-@test "gates: a second genuine --print- query on the driver still passes" {
-  _mutate "s@^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$@        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\n      - name: Record the producer this run will use\n        run: echo \"producer=\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\" >> \"\${GITHUB_STEP_SUMMARY}\"@"
-  run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
-}
 
 # An env: on a step of the gate job that does NOT invoke the driver cannot
 # change what the driver does: it is a different process.
@@ -1886,12 +1880,6 @@ _gate_step() {
 # rejecting a correct edit (a redirect on the --print- query) for the same
 # reason it accepted the truncations -- it read the text after the path
 # without reading the command before it.
-@test "gates: a redirect on the --print- query is not a violation" {
-  _mutate 's|--print-producer-image)"$|--print-producer-image 2>/dev/null)"|'
-  run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
-}
 
 # ==========================================================================
 # ROUND-9 REVIEW FINDINGS
@@ -1959,19 +1947,7 @@ _gate_step() {
 # than a guess: the round-9 directory sweep reported `shellcheck <driver>`,
 # `ls script/ci/` and running this very checker as bypasses. A gate that cries
 # wolf on correct edits gets edited out.
-@test "gates: linting the driver is not a bypass" {
-  _gate_step "'shellcheck script/ci/tier_b_visual_e2e.sh'"
-  run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
-}
 
-@test "gates: running this checker from a gate job is not a bypass" {
-  _gate_step "'python3 script/ci/check_release_gates.py .github/workflows/main.yaml'"
-  run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
-}
 
 @test "gates: a read-only command with a redirect onto the driver is caught" {
   _gate_step "'cat /dev/null > script/ci/tier_b_visual_e2e.sh'"
@@ -2082,16 +2058,110 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 # as a rewrite in the next. The cases written to prove the table worked used
 # only the bare spelling -- the test proved the wrong thing, one level down.
 # These use the spelling a human actually writes.
-@test "gates: a ./-prefixed read-only mention is not a bypass" {
-  _gate_step "'shellcheck ./script/ci/tier_b_visual_e2e.sh'"
+
+
+# ==========================================================================
+# THE ALLOW-LIST
+# ==========================================================================
+#
+# Round 11 ended the blocklist experiment. Its payload --
+#
+#   find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +
+#
+# -- names neither the directory every path test keys on nor any variable the
+# name tests match, and it was EXECUTED against the real scripts: both drivers
+# exited 0, the evidence gate printed "picture verified", the checker printed
+# "holds the release invariant". Eleven rounds, eleven times a reviewer found
+# the next spelling within the hour.
+#
+# So gate-job steps are now declared, and anything else is refused whatever it
+# does. These cases prove the inversion holds where every enumeration failed:
+# the first two are spellings nobody enumerated, and they are refused for the
+# only reason that generalises -- nobody declared them.
+
+@test "gates: reaching the driver by basename through find is caught" {
+  _gate_step "'find . -name \"tier_b_visual_e2e.sh\" -exec sed -i \"2i exit 0\" {} +'"
   run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
-@test "gates: a \$PWD-prefixed read-only mention is not a bypass" {
-  _gate_step "'cat \"\$PWD/script/ci/tier_b_visual_e2e.sh\"'"
+@test "gates: reaching the driver through a directory glob is caught" {
+  _gate_step "'sed -i \"2i exit 0\" script/*/tier_b_visual_e2e.sh'"
   run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: an undeclared action in a gate job is caught" {
+  _mutate 's|^    steps:\n      # Pre-checkout self-heal|XXX|; s|^      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in$|      - uses: actions/setup-node@v4\n      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: writing the runner's file-command file directly is caught" {
+  _gate_step "'echo /tmp/shim >> \"\$RUNNER_TEMP\"/_runner_file_commands/add_path_x'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: pushd into the driver's directory is caught" {
+  _gate_step "'pushd script/ci \&\& sed -i \"2i exit 0\" tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: a decoy step wearing the acceptance id is caught" {
+  _mutate 's|^        id: acceptance$|        id: real|; s|^      - name: Tier B visual acceptance (real producer -> real frames)$|      - name: decoy\n        id: acceptance\n        run: echo x\n\n      - name: Tier B visual acceptance (real producer -> real frames)|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# The evidence gate runs a script, so it must be able to SEE that script. It
+# shipped for one commit without a checkout: exit 127 on every run, and since
+# both publishers require its success, no release could ever be cut again.
+# Fails closed, which is the safe direction and no comfort -- it would have
+# been found on the next tag push, by a person, at the worst moment.
+@test "gates: every gate job that runs a repo script checks the repo out" {
+  run bash "${CHECK}" "${WORKFLOW}"
   assert_success
-  assert_output --partial "holds the release invariant"
+  run grep -c 'uses: actions/checkout@' "${WORKFLOW}"
+  assert_success
+  # tier-b-visual-e2e, verify-tag-shape, publish-image, require-picture-evidence
+  [ "${output}" -ge 4 ]
+}
+
+# The six cases that used to live near here asserted that a LEGITIMATE extra
+# step in a gate job -- `shellcheck <driver>`, `cat ./<driver>`, a redirect on
+# the --print- query -- was not a bypass. They were right under a blocklist,
+# where the question was "does this step name something forbidden?", and they
+# are obsolete under an allow-list, where no undeclared step in a gate job is
+# permitted at all. Deleted rather than weakened: a case asserting a premise
+# that no longer holds is worse than no case, because it passes for the wrong
+# reason or fails for the right one and gets "fixed".
+#
+# What replaces them is the contract itself. Editing a declared step is a
+# two-line change -- the workflow and the table -- and that is the cost the
+# allow-list charges in exchange for converging.
+@test "gates: editing a declared step without declaring it is caught" {
+  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test --no-cache|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: the declared --print- query step is not read as a bypass" {
+  # The shipped workflow contains a step that legitimately names the driver
+  # (`docker pull "$(bash <driver> --print-producer-image)"`). It is declared,
+  # and the mutation sweep must not report it -- this is the whole workflow
+  # going green, asserted where a reader looking for that property finds it.
+  run bash "${CHECK}" "${WORKFLOW}"
+  assert_success
+  run grep -c -- '--print-producer-image' "${WORKFLOW}"
+  assert_success
+  [ "${output}" -ge 1 ]
 }

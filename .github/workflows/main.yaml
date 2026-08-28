@@ -278,6 +278,15 @@ jobs:
     env:
       ATTESTATION: ${{ needs.tier-b-visual-e2e.outputs.attestation }}
     steps:
+      # Without this the job cannot see the script it is pinned to, exits 127,
+      # and -- because both publishers require its success -- deadlocks every
+      # release. It shipped that way for one commit: the guard was converted
+      # from inline shell to a pinned script and the checkout that a script
+      # needs was not added with it. No test noticed, because every mutation
+      # test in the suite edits a workflow that is never executed.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
       # Pinned as an invocation, exactly like the Tier B driver. See the
       # script's header for why this is not an inline `if [ -z ... ]`.
       - name: Refuse a release whose picture left no evidence

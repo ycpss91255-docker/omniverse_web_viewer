@@ -2290,6 +2290,9 @@ def check(wf):
     # Last, and deliberately last: the one property that is not about text.
     check_picture_leaves_evidence(wf)
 
+    # ...and the one that inverts the question the other properties ask.
+    check_gate_steps_are_declared(wf)
+
 
 # The one property on this page that is not a question about text.
 #
@@ -2565,6 +2568,102 @@ def _refuses_empty_attestation(wf, job):
         if tests_empty and _EXIT_NONZERO_RE.search(_strip_quoted(body)):
             return True
     return False
+
+
+# ===========================================================================
+# THE ALLOW-LIST. Eleven rounds of the other thing.
+# ===========================================================================
+#
+# Every property above this asks "does this step name something forbidden?"
+# -- a question over an unbounded space, and the record is unambiguous. Each
+# round closed the spellings the last reviewer typed; each next reviewer
+# found another in under an hour: `script/ci//`, then `script//ci/` and
+# `script/./ci/`, then `cd script/ci`, then `${GITHUB_PATH:?}` and four more
+# expansions, and finally
+#
+#     find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +
+#
+# which names neither the directory every path test keys on nor any variable
+# the name tests match. That one was executed against the real drivers: both
+# exited 0, the evidence gate printed "picture verified", and the checker
+# printed "holds the release invariant". A blocklist over shell does not
+# converge, and this file spent eleven rounds demonstrating it.
+#
+# So the question is inverted. A gate job's steps are ENUMERATED HERE. Not
+# "is this step forbidden?" but "is this step one of the ones we declared?".
+# The space is finite, it is ours, and it changes only when we change it --
+# an unknown step is refused whatever it does and whatever it names, so the
+# next spelling nobody has thought of is refused too.
+#
+# The cost is real and is the point: adding a step to a gate job means adding
+# a line here, in a diff a reviewer sees. These jobs decide whether a version
+# can be published. They are not a place for convenience steps.
+#
+# Matching is on the step's ACTION (`uses:`, compared up to the @ref) or its
+# COLLAPSED `run:` body, with paths normalised. A `run:` entry ending in " *"
+# matches by prefix, for the two steps whose bodies carry long inline
+# arguments that would be unreadable here.
+GATE_JOB_ALLOWED_STEPS = {
+    "tier-b-visual-e2e": (
+        "uses:actions/checkout",
+        "uses:actions/upload-artifact",
+        "run:docker run --rm -v \"${GITHUB_WORKSPACE}\":/w -w /w busybox@ *",
+        "run:./script/setup.sh apply *",
+        "run:./script/build.sh -t e2e-test",
+        "run:docker pull \"$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"",
+        "run:bash script/ci/tier_b_visual_e2e.sh",
+    ),
+    "verify-tag-shape": (
+        "uses:actions/checkout",
+        "run:bash script/ci/derive_image_tag.sh",
+    ),
+    "require-picture-evidence": (
+        "uses:actions/checkout",
+        "run:bash script/ci/require_attestation.sh",
+    ),
+}
+
+
+def step_signature(step):
+    """What this step IS, for allow-list comparison."""
+    uses = as_text(step.get("uses") or "")
+    if uses:
+        return "uses:" + normalise_paths(uses.split("@", 1)[0].strip())
+    return "run:" + " ".join(normalise_paths(as_text(step.get("run") or "")).split())
+
+
+def step_is_allowed(signature, allowed):
+    for entry in allowed:
+        if entry.endswith(" *"):
+            if signature.startswith(entry[:-2]):
+                return True
+        elif signature == entry:
+            return True
+    return False
+
+
+def check_gate_steps_are_declared(wf):
+    """No step runs in a gate job unless it is declared above."""
+    for job, allowed in sorted(GATE_JOB_ALLOWED_STEPS.items()):
+        if not wf.has(job):
+            continue
+        for step in wf.steps(job):
+            if not isinstance(step, dict):
+                continue
+            signature = step_signature(step)
+            if step_is_allowed(signature, allowed):
+                continue
+            violation(
+                "gate-job-runs-only-declared-steps",
+                "gate job '%s' has a step that is not declared in "
+                "GATE_JOB_ALLOWED_STEPS: %s. A gate job may run arbitrary "
+                "commands BEFORE its pinned step, and the pinned script is an "
+                "ordinary file in that job's own workspace -- so one undeclared "
+                "step can rewrite the driver, the evidence gate, or both, "
+                "while every pinned line stays byte-identical. If this step is "
+                "legitimate, declare it there, where a reviewer sees it."
+                % (job, signature[:200]),
+            )
 
 
 def main(argv):
