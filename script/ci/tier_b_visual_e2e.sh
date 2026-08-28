@@ -467,6 +467,7 @@ fi
 if ! ATTESTATION_SUMMARY="$(
   OWV_ATTESTATION="${ATTESTATION}" \
   OWV_MIN_MEAN_LUMA=8 \
+  OWV_MIN_MAX_LUMA=32 \
   OWV_MIN_BRIGHT_FRACTION=0.1 \
   python3 "${SCRIPT_DIR}/verify_tier_b_attestation.py"
 )"; then

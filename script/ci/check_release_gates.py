@@ -325,6 +325,12 @@ TIER_B = "tier-b-visual-e2e"
 # trade: an argument is exactly how a no-op arrives, so a new one is a change
 # to what the gate does and belongs in this table where it can be reviewed.
 GATE_WORK_DRIVERS = {
+    # The evidence gate. Pinned for the same reason the Tier B driver is:
+    # round 10 defeated the inline `if [ -z ... ]` version four ways in one
+    # sitting, because "does this shell text fail on empty?" is a question
+    # about a Turing-complete language. "Is this job's work exactly this
+    # command?" is not.
+    "require-picture-evidence": "bash script/ci/require_attestation.sh",
     TIER_B: "bash script/ci/tier_b_visual_e2e.sh",
     "verify-tag-shape": "bash script/ci/derive_image_tag.sh",
 }
@@ -363,6 +369,23 @@ GATE_WORK_DRIVERS = {
 # because `defaults.run` has exactly the keys above and enumerating them
 # again is the enumeration failure this file keeps writing down.
 GATE_WORK_STEP_MODIFIERS = ("shell", "working-directory", "env")
+
+# The one variable a pinned gate job is allowed to be given, per job.
+#
+# `env:` is refused on these jobs because it sets the knobs a driver reads for
+# itself -- that is what makes `TIER_B_PRODUCER_IMAGE` dangerous. But the
+# evidence gate's whole input IS an environment variable: the attestation,
+# handed down from the Tier B job. Refusing it outright would mean the gate
+# could not be given the thing it gates on.
+#
+# So it is declared here rather than allowed by accident, and the exemption is
+# narrow in both directions: only this NAME, and check_picture_leaves_evidence
+# separately requires its VALUE to be exactly the attestation reference and
+# nothing else -- no `|| 'ok'`, no trailing dot, no concatenation. A name that
+# is not in this table is refused exactly as before.
+GATE_WORK_DRIVER_ENV = {
+    "require-picture-evidence": frozenset(("ATTESTATION",)),
+}
 
 # A `--print-<x>` QUERY is the one other spelling a driver job may contain:
 # it asks the driver for a value rather than doing the job (this repo's Tier
@@ -1102,12 +1125,19 @@ _INTERPRETERS = frozenset(("bash", "sh", "dash", "ksh", "zsh", "command", "exec"
 # reviewable diff. Anything absent is still reported, which is the direction
 # a gate should fail in -- a false alarm costs a line in this tuple, a missed
 # mutation costs a release nobody looked at.
+# Interpreters: read-only toward the path they are given to RUN, and only
+# toward that one -- see runs_the_path in driver_occurrences.
+_SCRIPT_RUNNERS = frozenset(("python3", "python", "node", "ruby", "perl"))
+
 _READ_ONLY_COMMANDS = frozenset(
     (
         "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
         "ls", "stat", "file", "wc", "md5sum", "sha256sum", "cmp", "diff",
-        "echo", "printf", "shellcheck", "shfmt", "python3", "python",
-        "pyflakes", "test", "[",
+        "echo", "printf", "shellcheck", "pyflakes", "test", "[",
+        # NOT here, though they look like they belong: `shfmt -w` rewrites in
+        # place, and `python3 <script> <path>` does whatever <script> says. A
+        # command that can write is not a read-only mention, however often it
+        # is used as one.
     )
 )
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -1124,6 +1154,30 @@ _CMD_CLOSE_RE = re.compile(r"\|\||&&|[;|&\n)`]")
 # shell resolves both to it. Selecting on the directory catches the glob, the
 # redundant separator, and any sibling script reached the same way -- and
 # costs nothing, because a gate job has no business writing in there.
+_CD_INTO_CI_RE = re.compile(
+    r"(?:^|[;&|\n])\s*cd\s+[\"\']?\.?/?script/ci\b"
+)
+
+
+def _CI_ENV_NAME_RE(name):
+    """Match the NAME of a runner file variable, however it is expanded.
+
+    Round 9 tested `"$X" in body or "${X}" in body`. Round 10's reviewer got
+    past that with `${X:?}`, `${X:-/dev/null}`, `${X#}`, `v=X; "${!v}"` and
+    `"$(printenv X)"` -- and then executed the resulting shim against the real
+    driver, which printed "a real browser rendered a real, non-black frame"
+    having rendered nothing. Enumerating expansion syntax is the same losing
+    game as enumerating path spellings.
+    
+    Every one of those forms contains the bare word. So match the word, not a
+    spelling of the expansion. A gate job that so much as names GITHUB_PATH,
+    GITHUB_ENV or GITHUB_OUTPUT outside its pinned work step is reported --
+    including in a comment, which costs a rename and buys not having to think
+    about shell syntax again.
+    """
+    return re.compile(r"\b%s\b" % re.escape(name))
+
+
 def normalise_paths(text):
     """Collapse the spellings a shell resolves but a substring test does not.
 
@@ -1202,14 +1256,28 @@ def driver_occurrences(text, script):
             (tok for tok in before if not _ASSIGNMENT_RE.match(tok)), ""
         )
         redirected = bool(before) and _REDIRECT_RE.match(before[-1]) is not None
-        if command in _READ_ONLY_COMMANDS and not redirected:
-            # Recorded, not merely skipped: the exact-path pass below walks
-            # the same text and would otherwise re-classify this very
-            # occurrence as a mutation, which is how the read-only table
-            # looked like it did nothing.
-            seen.add(match.start())
+        # The SPAN, not the start. _CI_PATH_RE swallows any prefix the path
+        # carries (./ , $PWD/ , ../), so its match begins to the LEFT of the
+        # driver path -- and the exact-path pass below, matching only the path
+        # itself, lands on a different offset. Recording just the start meant
+        # `shellcheck ./script/ci/<driver>` was skipped here and then
+        # re-classified as a mutation there: a read-only mention reported as a
+        # rewrite, inside the fix whose own comment forbids exactly that.
+        span = range(match.start(), match.end())
+        # An INTERPRETER is read-only toward a path only when that path is
+        # what it runs: `python3 script/ci/check_release_gates.py` executes
+        # the named file, while `python3 /tmp/p.py script/ci/<driver>` hands
+        # the driver to arbitrary code as data. Position decides, not the
+        # command's name -- which is why python3 cannot simply sit in the
+        # read-only table.
+        runs_the_path = (
+            command in _SCRIPT_RUNNERS
+            and [tok for tok in before if not tok.startswith("-")][-1:] == [command]
+        )
+        if (command in _READ_ONLY_COMMANDS or runs_the_path) and not redirected:
+            seen.update(span)
             continue
-        seen.add(match.start())
+        seen.update(span)
         found.append(("mutation", " ".join(segment.split())[:160]))
 
     for match in re.finditer(re.escape(script), text):
@@ -1869,10 +1937,17 @@ def check(wf):
                     "where it can be reviewed."
                     % (where, sorted(run_defaults), job, driver),
                 )
+        allowed_env = GATE_WORK_DRIVER_ENV.get(job, frozenset())
         for where, block in (
             ("job-level", wf.body(job).get("env")),
             ("workflow-level", wf.doc.get("env")),
         ):
+            if isinstance(block, dict) and where == "job-level":
+                block = {
+                    name: value
+                    for name, value in block.items()
+                    if name not in allowed_env
+                } or None
             if block:
                 violation(
                     "gate-driver-runs-unmodified",
@@ -1917,9 +1992,7 @@ def check(wf):
 
         for step in wf.steps(job):
             body = _strip_shell_comments(as_text(step.get("run") or ""))
-            if step is not None and (
-                "$GITHUB_OUTPUT" in body or "${GITHUB_OUTPUT}" in body
-            ):
+            if step is not None and _CI_ENV_NAME_RE("GITHUB_OUTPUT").search(body):
                 collapsed_run = " ".join(
                     normalise_paths(as_text(step.get("run") or "")).split()
                 )
@@ -1935,8 +2008,22 @@ def check(wf):
                         % (job, driver, step_label(step)),
                     )
 
+            if step is not None and _CD_INTO_CI_RE.search(
+                normalise_paths(as_text(step.get("run") or ""))
+            ):
+                violation(
+                    "gate-driver-runs-unmodified",
+                    "gate job '%s' has a step that cd's into the driver's "
+                    "directory. Every check here asks a question about a "
+                    "PATH, and `cd script/ci` dissolves the question -- "
+                    "`sed -i '1a exit 0' tier_b_visual_e2e.sh` afterwards "
+                    "names nothing this file looks for. Work on the driver "
+                    "from the repository root, or not at all. Step: %s"
+                    % (job, step_label(step)),
+                )
+
             for var in ("GITHUB_ENV", "GITHUB_PATH"):
-                if ("$%s" % var) in body or ("${%s}" % var) in body:
+                if _CI_ENV_NAME_RE(var).search(body):
                     violation(
                         "gate-driver-runs-unmodified",
                         "gate job '%s' has a step writing to $%s, which "
@@ -2270,7 +2357,7 @@ def check_picture_leaves_evidence(wf):
             "the driver was replaced, shadowed or pointed at another image."
             % (TIER_B, ATTESTATION_OUTPUT),
         )
-    elif ACCEPTANCE_EXPR not in " ".join(attested.split()):
+    elif " ".join(attested.split()) != "${{ %s }}" % ACCEPTANCE_EXPR:
         # An id MENTIONED is not an output READ. `"acceptance-ok"` and
         # `${{ steps.acceptance.outcome }}` both contain the id and are both
         # permanently non-empty -- a constant dressed as evidence.
@@ -2314,18 +2401,28 @@ def check_picture_leaves_evidence(wf):
             % EVIDENCE_JOB,
         )
     else:
-        if ATTESTATION_REF not in yaml_dump_job(wf, EVIDENCE_JOB):
+        # The binding must be the attestation itself, ALONE. A value that
+        # merely contains the reference -- `${{ ... }}.`, `${{ ... }}${{
+        # github.sha }}` -- is never empty, so the gate can never fire, and
+        # round 10 got past the previous "does it contain the ref?" test with
+        # exactly one extra character. Whether the job then FAILS on empty is
+        # not asked of shell text any more: its work is pinned in
+        # GATE_WORK_DRIVERS, and require_attestation.sh is what decides.
+        job_env = wf.body(EVIDENCE_JOB).get("env")
+        bound = (
+            [
+                name
+                for name, value in job_env.items()
+                if " ".join(str(value).split()) == "${{ %s }}" % ATTESTATION_REF
+            ]
+            if isinstance(job_env, dict)
+            else []
+        )
+        if not bound:
             violation(
                 vid,
-                "job '%s' never reads %s, so it gates on nothing."
-                % (EVIDENCE_JOB, "${{ %s }}" % ATTESTATION_REF),
-            )
-        elif not _refuses_empty_attestation(wf, EVIDENCE_JOB):
-            violation(
-                vid,
-                "job '%s' reads %s but no step FAILS when it is empty, so the "
-                "evidence is decorative: a run that sampled no frame yields "
-                "the empty string and sails through."
+                "job '%s' does not bind %s, alone, to an environment variable, "
+                "so it gates on nothing -- or on a value that is never empty."
                 % (EVIDENCE_JOB, "${{ %s }}" % ATTESTATION_REF),
             )
         # Its own condition must not override skip propagation: a status

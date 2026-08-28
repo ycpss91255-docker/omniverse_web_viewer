@@ -1762,11 +1762,14 @@ JOB
   assert_output --partial "[picture-leaves-evidence]"
 }
 
-@test "gates: an evidence gate that cannot fail is caught" {
-  _mutate 's|^          if \[ -z "${ATTESTATION}" \]; then$|          if false; then|'
+# The guard used to be inline shell and this case weakened its `if`. It is a
+# pinned invocation now -- precisely because round 10 defeated the inline form
+# four ways -- so the equivalent attack is to point the pin somewhere else.
+@test "gates: an evidence gate pointed at another script is caught" {
+  _mutate 's|^        run: bash script/ci/require_attestation.sh$|        run: bash script/ci/derive_image_tag.sh|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[picture-leaves-evidence]"
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
 @test "gates: an evidence gate reading nothing is caught" {
@@ -1927,11 +1930,15 @@ _gate_step() {
   assert_output --partial "[gate-job-has-no-continue-on-error]"
 }
 
-@test "gates: a step-level env shadowing the attestation binding is caught" {
+# Shadowing the binding at step level was one of round 10's four. The gate's
+# work being pinned makes `env:` on that step a refused modifier outright --
+# the same rule that protects the Tier B driver, inherited for free, which is
+# the whole reason the guard became a pinned script.
+@test "gates: a step-level env on the pinned evidence gate is caught" {
   _mutate 's|^      - name: Refuse a release whose picture left no evidence$|      - name: Refuse a release whose picture left no evidence\n        env:\n          ATTESTATION: sentinel|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[picture-leaves-evidence]"
+  assert_output --partial "[gate-driver-runs-unmodified]"
 }
 
 @test "gates: a constant standing in for the attestation output is caught" {
@@ -1971,4 +1978,120 @@ _gate_step() {
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+# ==========================================================================
+# ROUND-10 REVIEW FINDINGS
+# ==========================================================================
+#
+# The round-10 reviewer did not argue that the evidence chain COULD be
+# bypassed. They installed a `docker` shim through `${GITHUB_PATH:?}`, ran the
+# real driver, and got:
+#
+#   [tier-b] attestation verified: 1920x1080 meanLuma=151.99 ...
+#   [tier-b] PASS: a real browser rendered a real, non-black frame ...
+#
+# with no GPU, no Kit, no browser and no frames -- while this checker printed
+# "holds the release invariant". The invariant did not hold.
+#
+# Two lessons, both structural rather than another spelling:
+#   - Enumerating shell EXPANSION syntax loses the same way enumerating path
+#     spellings lost. Every form contains the variable's NAME; match that.
+#   - Asking "does this shell text fail on empty?" is a question about a
+#     Turing-complete language. The gate's work is pinned as an invocation
+#     instead, which is the mechanism that already works for the driver.
+
+_out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.attestation }}\$@      attestation: ${1}@"; }
+
+@test "gates: an || fallback on the attestation output is caught" {
+  _out_expr "\${{ steps.acceptance.outputs.attestation || 'ok' }}"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: concatenating onto the attestation output is caught" {
+  _out_expr "\${{ steps.acceptance.outputs.attestation }}\${{ github.sha }}"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: one extra character on the attestation binding is caught" {
+  _mutate "s@^      ATTESTATION: \\\${{ needs.tier-b-visual-e2e.outputs.attestation }}\$@      ATTESTATION: \${{ needs.tier-b-visual-e2e.outputs.attestation }}.@"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+@test "gates: replacing the pinned evidence gate with inline shell is caught" {
+  _mutate 's@^        run: bash script/ci/require_attestation.sh$@        run: |\n          if [ -z "${ATTESTATION}" ]; then echo warn; fi\n          if false; then exit 1; fi@'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+# Every one of these published an image with no frame, confirmed against the
+# real driver. They are four spellings of one expansion; the check is on the
+# NAME, so a fifth costs nothing.
+@test "gates: GITHUB_PATH reached through a default-value expansion is caught" {
+  _gate_step "'echo /tmp/shim >> \"\${GITHUB_PATH:?}\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: GITHUB_ENV reached through a fallback expansion is caught" {
+  _gate_step "'echo X=1 >> \"\${GITHUB_ENV:-/dev/null}\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: GITHUB_OUTPUT reached through printenv is caught" {
+  _gate_step "'echo a=b >> \"\$(printenv GITHUB_OUTPUT)\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: GITHUB_OUTPUT reached through indirect expansion is caught" {
+  _gate_step "'v=GITHUB_OUTPUT; echo a=b >> \"\${!v}\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+@test "gates: an in-place rewriter is not a read-only mention" {
+  _gate_step "'shfmt -w script/ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+}
+
+@test "gates: cd-ing into the driver's directory is caught" {
+  _mutate 's@^        run: bash script/ci/tier_b_visual_e2e.sh$@        run: bash script/ci/tier_b_visual_e2e.sh\n      - name: prep\n        run: |\n          cd script/ci\n          sed -i "1a exit 0" tier_b_visual_e2e.sh@'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-driver-runs-unmodified]"
+}
+
+# The other direction. Round 10's regression was mine: the read-only table
+# was recorded by match START while the pattern swallows any prefix the path
+# carries, so `./script/ci/<driver>` was skipped in one pass and re-reported
+# as a rewrite in the next. The cases written to prove the table worked used
+# only the bare spelling -- the test proved the wrong thing, one level down.
+# These use the spelling a human actually writes.
+@test "gates: a ./-prefixed read-only mention is not a bypass" {
+  _gate_step "'shellcheck ./script/ci/tier_b_visual_e2e.sh'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+@test "gates: a \$PWD-prefixed read-only mention is not a bypass" {
+  _gate_step "'cat \"\$PWD/script/ci/tier_b_visual_e2e.sh\"'"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
 }

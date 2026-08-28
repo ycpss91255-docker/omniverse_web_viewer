@@ -278,17 +278,10 @@ jobs:
     env:
       ATTESTATION: ${{ needs.tier-b-visual-e2e.outputs.attestation }}
     steps:
+      # Pinned as an invocation, exactly like the Tier B driver. See the
+      # script's header for why this is not an inline `if [ -z ... ]`.
       - name: Refuse a release whose picture left no evidence
-        run: |
-          if [ -z "${ATTESTATION}" ]; then
-            echo "::error::tier-b-visual-e2e reported success but produced no"\
-                 "attestation: no frame was sampled for ${GITHUB_SHA}. Refusing"\
-                 "to release a version whose picture was not verified."
-            exit 1
-          fi
-          echo "picture verified for ${GITHUB_SHA}: ${ATTESTATION}"
-          echo "Picture verified for \`${GITHUB_SHA}\`: ${ATTESTATION}" \
-            >>"${GITHUB_STEP_SUMMARY}"
+        run: bash script/ci/require_attestation.sh
 
   publish-image:
     # Gated on THREE things: never publish an image the build/test gate
