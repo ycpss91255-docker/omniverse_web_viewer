@@ -44,7 +44,7 @@
 #   tier_b_visual_e2e.sh --print-producer-image   print the pinned producer ref
 #
 # Env knobs (all optional):
-#   TIER_B_PRODUCER_IMAGE  producer image (default: 0.0.1 pinned BY DIGEST)
+#   TIER_B_PRODUCER_IMAGE  producer image (default: 0.0.2 pinned BY DIGEST)
 #   TIER_B_PRODUCER_USER   --user for the producer (default: 0:0, isaac#244)
 #   TIER_B_VIEWER_IMAGE    e2e-test image (default: from .env.generated)
 #   TIER_B_INSTANCE        instance scope (default: GITHUB_RUN_ID, else $$)
@@ -64,7 +64,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# PINNED BY DIGEST, not by the mutable `:0.0.1` tag.
+# PINNED BY DIGEST, not by the mutable `:0.0.2` tag.
 #
 # This container is the strongest thing this repo runs: root (isaac#244, see
 # below), `--network=host --ipc=host --gpus all`, on a PERSISTENT self-hosted
@@ -76,11 +76,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # an OPEN defect in that image, so a re-push under the same tag is likely
 # rather than hypothetical.
 #
-# The digest below is the current `:0.0.1` OCI index digest, re-resolved from
+# The digest below is the current `:0.0.2` OCI index digest, re-resolved from
 # the registry (`docker buildx imagetools inspect`). Moving the pin is a
 # deliberate edit here (or a TIER_B_PRODUCER_IMAGE override for a one-off), not
 # something a registry push can do on our behalf.
-PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-docker/isaac-stream-source@sha256:af1bb815142f190b7e08c402f4dd8b47b69332937b12ff2ca85d45c1fced7318"
+PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-docker/isaac-stream-source@sha256:cb765323fcfa05a86fbc194c37fa37362f4d8879af0136d9218679010b654bb5"
 PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-${PRODUCER_IMAGE_DEFAULT}}"
 
 # `--print-producer-image` prints the resolved producer reference and exits, so
