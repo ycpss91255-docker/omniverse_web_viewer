@@ -88,6 +88,12 @@ setup() {
   load "${BATS_TEST_DIRNAME}/test_helper"
   TMP="${BATS_TEST_TMPDIR:-$(mktemp -d)}"
   MUTATED="${TMP}/mutated.yaml"
+  # A writable copy of the whole workflows DIRECTORY, for the cases that ask
+  # what happens when a second workflow exists. /workflows is read-only in
+  # the image and one file is no longer the unit of analysis.
+  WORKFLOW_DIR="${TMP}/workflows"
+  mkdir -p "${WORKFLOW_DIR}"
+  cp "${WORKFLOW}" "${WORKFLOW_DIR}/main.yaml"
 }
 
 # _mutate <sed-expr>...: write the shipped workflow through every <sed-expr>
@@ -114,6 +120,13 @@ _append_job() {
   fi
 }
 
+
+# _sibling_workflow <name> <yaml> -- drop another workflow next to main.yaml
+# in the writable copy, so a case can ask what the checker does with two.
+_sibling_workflow() {
+  printf '%s\n' "$2" > "${WORKFLOW_DIR}/$1"
+}
+
 @test "gates: the checker and the workflow are both in the image" {
   assert_file_exists "${CHECK}"
   assert_file_exists "${CHECKER_PY}"
@@ -135,11 +148,14 @@ _append_job() {
 # one a decision somebody has to take deliberately, in a red test, instead of
 # a silence. Whoever adds a workflow here chooses: defend the invariant in it
 # too and extend the checker, or say in this list why it cannot publish.
-@test "gates: /workflows/ holds exactly the workflows the checker was run against" {
-  run bash -c "find /workflows -mindepth 1 -printf '%P\n' | LC_ALL=C sort"
-  assert_success
-  assert_output "main.yaml"
-}
+# The assertion that used to stand here -- "find /workflows must equal exactly
+# main.yaml" -- is gone, not weakened. It was never about the workflow set; it
+# was a stand-in for an analysis that did not exist, back when the checker read
+# one file and everything beside it was unexamined territory. The checker now
+# reads the whole directory and asks each workflow whether it can publish, so
+# counting files answers a question nobody is asking. A spec whose premise has
+# gone is worse than none: it passes for the wrong reason, or fails for the
+# right one and gets "fixed".
 
 # The checker is Python now, and shellcheck's `/ci/*.sh` glob cannot lint it.
 # A syntax error would otherwise reach a maintainer as "exit 2 on every
@@ -2232,4 +2248,147 @@ JOB
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# ==========================================================================
+# EVERY WORKFLOW, NOT JUST main.yaml
+# ==========================================================================
+#
+# The checker read ONE file. A second workflow was not "allowed" -- it was
+# UNANALYSED, which is worse, so a blunt assertion stood in for the analysis:
+#
+#   find /workflows -mindepth 1  ->  must equal exactly "main.yaml"
+#
+# That held until something legitimate arrived. base v0.43.0's `upgrade.sh`
+# creates `.github/workflows/base-version-monitor.yaml` in the consumer, and
+# a green build went red on upgrade with nothing wrong: that workflow is
+# `schedule`/`workflow_dispatch`, `contents: read` + `issues: write`, and
+# pushes nothing. The guard could not tell it from a publisher, because it was
+# never looking at content -- only at how many files there were.
+#
+# Matching on filename would be worse than the blunt rule: an attacker names
+# their file `base-version-monitor.yaml` and walks in. Hashing is a list to
+# maintain and goes stale the moment base changes the file.
+#
+# So the question stops being "do I recognise this file?" and becomes "CAN IT
+# PUBLISH?" -- which the checker already derives, from permissions, actions
+# and commands, and which no filename can lie about. Every workflow in the
+# directory is analysed; a workflow that cannot publish is fine however many
+# there are; one that can must stand behind the picture gate like any other.
+
+@test "gates: a non-publishing sibling workflow is accepted" {
+  _sibling_workflow "monitor.yaml" \
+    'name: Monitor
+on:
+  schedule:
+    - cron: "0 3 * * *"
+permissions:
+  contents: read
+  issues: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo checking'
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+@test "gates: a publishing sibling workflow outside the gate is caught" {
+  _sibling_workflow "sneaky.yaml" \
+    'name: Sneaky
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  packages: write
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker push ghcr.io/x/y:latest'
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_failure 1
+  assert_output --partial "publishing-job-is-behind-the-picture-gate"
+}
+
+# The filename is not the credential. A publisher wearing the monitor's name
+# is still a publisher.
+@test "gates: a publisher named after the base monitor is still caught" {
+  _sibling_workflow "base-version-monitor.yaml" \
+    'name: Not really the monitor
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  packages: write
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker push ghcr.io/x/y:latest'
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_failure 1
+  assert_output --partial "publishing-job-is-behind-the-picture-gate"
+}
+
+@test "gates: the checker reports which workflow the violation is in" {
+  _sibling_workflow "sneaky.yaml" \
+    'name: Sneaky
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  packages: write
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker push ghcr.io/x/y:latest'
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_failure 1
+  assert_output --partial "sneaky.yaml"
+}
+
+@test "gates: a directory argument still checks main.yaml itself" {
+  _sibling_workflow "monitor.yaml" \
+    'name: Monitor
+on:
+  schedule:
+    - cron: "0 3 * * *"
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok'
+  # Break main.yaml inside the same directory: the sweep must not lose it.
+  sed -i 's|^    needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]$|    needs: [call-docker-build, call-release]|' \
+    "${WORKFLOW_DIR}/main.yaml"
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_failure 1
+}
+
+# GitHub reads both extensions, so a sweep that only knows `.yaml` leaves the
+# other half of the directory unexamined -- the exact blind spot this change
+# exists to close, reintroduced one character narrower. Found by mutation:
+# restricting the suffix tuple to `.yaml` alone broke nothing until this case.
+@test "gates: a publishing sibling with a .yml extension is caught" {
+  _sibling_workflow "release.yml" \
+    'name: Ship
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  packages: write
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker push ghcr.io/x/y:latest'
+  run bash "${CHECK}" "${WORKFLOW_DIR}"
+  assert_failure 1
+  assert_output --partial "release.yml"
 }
