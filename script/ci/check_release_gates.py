@@ -270,6 +270,7 @@ people looking.
 ===========================================================================
 """
 
+import pathlib
 import re
 import sys
 import traceback
@@ -2704,18 +2705,83 @@ def check_gate_steps_are_declared(wf):
             )
 
 
+RELEASE_WORKFLOW = "main.yaml"
+
+
+def check_sibling(wf, name):
+    """The one question a workflow OTHER than the release workflow must answer.
+
+    The picture gate lives in main.yaml. A second workflow cannot stand behind
+    it -- there is no `needs:` across files -- so the only safe shape for a
+    sibling is that it CANNOT PUBLISH. Whether it can is derived from its
+    permissions, its actions and its commands by the same publishing_jobs()
+    used on the release workflow; nothing here looks at the filename.
+
+    That matters, because filename was the obvious wrong answer. base's
+    upgrade drops `base-version-monitor.yaml` into a consumer's
+    .github/workflows/, and a filename allow-list would have let an attacker
+    walk in under that exact name. A capability test cannot be fooled that
+    way: a publisher named after the monitor is still a publisher, and the
+    real monitor stays welcome however it is named.
+    """
+    for job, reason in publishing_jobs(wf):
+        violation(
+            "publishing-job-is-behind-the-picture-gate",
+            "%s: job '%s' can publish (%s), but it is not the release "
+            "workflow and nothing outside %s can stand behind the picture "
+            "gate -- there is no `needs:` across files. A workflow beside "
+            "%s must not be able to publish."
+            % (name, job, reason, RELEASE_WORKFLOW, RELEASE_WORKFLOW),
+        )
+
+
+def workflow_paths(target):
+    """(release_workflow_path, [(sibling_path, name), ...]) for a dir or file.
+
+    A single file keeps the old behaviour, so `check_release_gates.py
+    some.yaml` still means "analyse exactly this". A DIRECTORY is the honest
+    unit: main.yaml was never the whole surface, it was just the only part
+    being read, and `release_gate_workflow.bats` papered over the rest with
+    "the directory holds exactly main.yaml" -- an assertion about file count
+    standing in for an analysis of content.
+    """
+    path = pathlib.Path(target)
+    if not path.is_dir():
+        return str(path), []
+    release = path / RELEASE_WORKFLOW
+    if not release.is_file():
+        refuse(
+            "%s has no %s: the release workflow is where the picture gate "
+            "lives, and without it there is nothing to check the rest "
+            "against" % (target, RELEASE_WORKFLOW)
+        )
+    siblings = sorted(
+        (str(f), f.name)
+        for f in path.iterdir()
+        if f.is_file() and f.suffix in (".yaml", ".yml") and f.name != RELEASE_WORKFLOW
+    )
+    return str(release), siblings
+
+
 def main(argv):
-    path = argv[1] if len(argv) > 1 else ".github/workflows/main.yaml"
-    wf = Workflow(path)
-    check(wf)
+    target = argv[1] if len(argv) > 1 else ".github/workflows"
+    release_path, siblings = workflow_paths(target)
+
+    check(Workflow(release_path))
+    for sibling_path, name in siblings:
+        check_sibling(Workflow(sibling_path), name)
+
+    scope = release_path if not siblings else "%s (+%d sibling workflow%s)" % (
+        release_path, len(siblings), "" if len(siblings) == 1 else "s"
+    )
     if _violations:
         sys.stderr.write(
             "check_release_gates: %d violation(s) in %s\n"
-            % (len(_violations), path)
+            % (len(_violations), scope)
         )
         return 1
     sys.stdout.write(
-        "check_release_gates: %s holds the release invariant\n" % path
+        "check_release_gates: %s holds the release invariant\n" % scope
     )
     return 0
 
