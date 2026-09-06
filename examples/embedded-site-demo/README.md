@@ -80,7 +80,7 @@ The whole integration is three steps (see `src/main.ts`):
 import { buildStreamConfig, connectStream } from 'stream-core';
 
 const streamConfig = buildStreamConfig('127.0.0.1', 49100); // validates + returns a DIRECT config
-connectStream(streamConfig, { onStart: () => console.info('connecting...') });
+connectStream(streamConfig, { onStart: () => console.info('connect attempt started') });
 // needs <video id="remote-video"> + <audio id="remote-audio"> in the DOM
 ```
 

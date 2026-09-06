@@ -1,10 +1,10 @@
 # TEST.md
 
-**373 tests** total: **271 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **92 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **10 Playwright** (browser e2e, `test/e2e/`: **9 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**390 tests** total: **278 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **102 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **10 Playwright** (browser e2e, `test/e2e/`: **9 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
-## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (54)
+## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (55)
 
 Two-app config-injection model (S5): the build preserves sentinel-bearing chunks as `*.js.tmpl` per app dir (`/app/usd-viewer/dist`, `/app/stream-only/dist`); the entrypoint resolves `VIEWER_UI_MODE` (app selector), validates every value, and re-renders ONLY the active app's templates on every boot with 3 seds (`__OWV_SERVER__` / `"__OWV_PORT__"` / `"__OWV_MEDIA_PORT__"`).
 
@@ -64,7 +64,8 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `an anchored section header is not called a scalar` | `viewer: &anchor` with an indented body: a YAML ANCHOR is a node property, not the value, and the section below it is an ordinary block mapping |
 | `a tagged section header is not called a scalar` | `viewer: !!map` with an indented body: same, for a TAG |
 | `an aliased section header is not called a scalar` | The anchor's direct companion, missed by the round that added anchor handling. `viewer: *v` is an ALIAS: every parser resolves it to the anchored node, so the file is valid and `viewer:` really does supply a mapping. "Set to a value rather than opening a section" is provably false about it, and the remedy that follows describes work already done. What is true is that this line-based reader does not FOLLOW the reference |
-## test/bats/smoke/devel-test/example_demo.bats (5)
+| `env: every CMD that serves the bundle execs it (PID 1 gets SIGTERM)` | MEASURED on the published `0.3.0` image: `docker top` shows `sh -c serve ...` as PID 1, `docker kill -s TERM` leaves the container running, and `docker stop` takes 10.2 s ending in SIGKILL. With `exec` the same image stops in 0.24 s, exit 0. Asserts the MECHANISM in `/lint/Dockerfile` (counted both ways, so a fourth CMD without `exec` is red) because the behaviour needs a container lifecycle and nothing in this repo runs one -- bats runs inside an image, `runtime-test` smoke-tests at build time |
+## test/bats/smoke/devel-test/example_demo.bats (7)
 
 | Test | Description |
 |------|-------------|
@@ -73,6 +74,19 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `example: imports the factory from stream-core (local copy deleted)` | No duplicate `buildStreamConfig` (S3 dedup) |
 | `example: streamTarget.json carries all three sentinels` | server/port/media sentinels present |
 | `example: resolveTarget unit tests pass (node --test)` | Runs the example's own glue tests in-image |
+| `example: onStart does not claim the stream is live (#63)` | `onStart` fires when an ATTEMPT begins and re-fires on every session-start retry, so `streaming <server>:<port>` reports a live stream with nothing connected. Fixed in `apps/stream-only` on 2026-08-14; this second consumer of the same stream-core interface kept the defect for three weeks and was edited again in between, because nothing asserted it. Over the source, not a rendered page: the demo has no browser suite, and the trade is admitted rather than skipped |
+| `example: a failed connect is not rendered with String()` | The library rejects with plain objects (`throw{action,status,info:"..."}`), so `String(e)` is `[object Object]` and the only actionable sentence is discarded. Asserts `describeStreamError` is used instead |
+
+## test/bats/smoke/devel-test/readme_operator_claims.bats (4)
+
+The operator-facing claims that MISCONFIGURE THE PRODUCT when they are wrong. Not a doc-sync tool and not a spell check: the four READMEs each told the user to write `SIGNALING_SERVER = <host-ip>` under `[environment]` in `config/docker/setup.conf`, and the grammar is `env_N = KEY=VALUE` -- base's `setup.sh` collects only keys beginning `env_`, and one that does not is dropped with no warning and exit 0. Reproduced on a scratch copy before this spec was written: with the README's form `./script/setup.sh apply` exits 0 with zero warnings and the generated `compose.yaml` contains no `SIGNALING_SERVER` at all; with the `env_N` form it carries it. An operator following the primary override instruction got a viewer dialling `127.0.0.1`, HTTP 200, and no picture -- indistinguishable from a broken producer. It shipped for four versions because nothing in this repo reads a README. The `devel-test` stage `COPY`s the four READMEs and `setup.conf` to `/doc/`, below the lint RUNs for the same layer-invalidation reason the workflow COPY gives.
+
+| Test | Description |
+|------|-------------|
+| `readme: the docs and setup.conf are both in the image` | The spec is worthless if its inputs are missing |
+| `readme: the [environment] example uses the grammar setup.sh collects` | Every key in the fenced `[environment]` example must be `env_N`; asserts the block was non-empty, so an example that disappears is not a silent pass |
+| `readme: every variable the example names exists in setup.conf` | The README cannot name a variable the shipped `setup.conf` does not set |
+| `readme: setup.conf's own [environment] keys are all env_N` | The other direction: the file the README points at must itself hold the grammar |
 
 ## test/bats/smoke/devel-test/derive_image_tag.bats (15)
 
@@ -255,12 +269,13 @@ Every property is proved TWICE -- once against the shipped workflow (it must hol
 
 `script/ci/check_release_gates.sh` and `script/ci/check_release_gates.py` are the checker, not counted specs.
 
-## packages/stream-core/test/ (20, node --test)
+## packages/stream-core/test/ (30, node --test)
 
 The kernel's contract -- the ONLY package touching the NVIDIA streaming library (lazy import; tests run registry-free).
 
 - `buildStreamConfig.test.js` (16): valid server+port config shape (DIRECT essentials incl. `remote-video`/`remote-audio` ids), string-port coercion, hostname accept; rejects empty/whitespace/sentinel/metachar server, non-numeric / non-integer / out-of-range port; media-port arg -- omitted when unset/null, pinned when valid int, string coerced, non-integer / out-of-range throw (D1).
 - `connectStream.test.js` (4): `buildStreamProps` defaults all 5 lifecycle handlers to no-ops, preserves config fields, caller handler wins; `connectStream` hands the assembled cfg to an injected connector without loading `@nvidia`.
+- `describeStreamError.test.js` (10): the renderer for a failed connect. The shapes are read out of the shipped bundle, not invented -- eighteen `throw{action,status,info:"..."}` sites where `info` holds the only actionable sentence, which `String(e)` flattened to `[object Object]`. Covers: `info` surfaced whole (including multi-line), `Error.message`, a bare string, `message` as fallback, an object with neither serialised rather than stringified, a non-string `info` serialised, `null`/`undefined` given a stable sentence, a circular object, and a throwing getter -- the last two because this runs inside a `.catch()` on the boot path, so a renderer that throws leaves the viewer with no message at all
 
 ## apps/stream-only/test/ (65, node --test)
 

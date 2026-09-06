@@ -3,3 +3,4 @@
 // embedded-site-demo example.
 export { buildStreamConfig } from './buildStreamConfig.js';
 export { buildStreamProps, connectStream } from './connectStream.js';
+export { describeStreamError } from './describeStreamError.js';

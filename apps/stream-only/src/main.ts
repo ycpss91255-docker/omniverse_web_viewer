@@ -2,7 +2,7 @@
 // config, and connect. The testable parts live in resolveTarget.js (pure),
 // streamStatus.js (the #stream-status show/hide state machine), and stream-core
 // (buildStreamConfig / connectStream); this file is DOM glue only.
-import { buildStreamConfig, connectStream } from 'stream-core';
+import { buildStreamConfig, connectStream, describeStreamError } from 'stream-core';
 import { resolveTarget } from './resolveTarget.js';
 import { createStatusController } from './streamStatus.js';
 import target from './streamTarget.json';
@@ -95,7 +95,15 @@ function start(): void {
     onStart: () => status.connecting(dialing),
     onStop: () => status.stopped(),
     onTerminate: () => status.terminated(),
-  }).catch((e: unknown) => status.show(`connection failed: ${String(e)}`, true));
+  }).catch((e: unknown) =>
+    // NOT String(e). This library rejects with plain objects
+    // (`throw{action,status,info:"..."}`, eighteen sites in the shipped
+    // bundle), so String() rendered every real connect failure as
+    // `connection failed: [object Object]` and threw away the one
+    // sentence the user could act on. describeStreamError lives in
+    // stream-core because that is the only module that knows the
+    // library's shapes, and it is unit-tested there.
+    status.show(`connection failed: ${describeStreamError(e)}`, true));
 }
 
 window.addEventListener('DOMContentLoaded', start);

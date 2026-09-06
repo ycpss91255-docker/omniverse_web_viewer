@@ -242,7 +242,17 @@ ENV VIEWER_UI_MODE="usd-viewer"
 WORKDIR "${HOME}/work"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
+# `exec serve`, not `serve`. Without it `sh` stays PID 1 and `serve` is its
+# child, so the SIGTERM Docker sends on stop goes to a shell that does not
+# forward it: MEASURED on the published 0.3.0 image, `docker top` shows
+# `sh -c serve ...` as PID 1, `docker kill -s TERM` leaves the container
+# running, and `docker stop` takes 10.2 s -- the full grace period, ending in
+# SIGKILL. Every `just stop`, every `docker stop`, and isaac's teardown paid
+# that, and serve was killed uncleanly each time. With `exec` the same image
+# stops in 0.24 s with exit code 0. The `${...}` still expand because `sh -c`
+# is still the one doing the expanding; `exec` only replaces the shell with
+# the process it was going to fork.
+CMD ["sh", "-c", "exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
 
 ############################## devel ##############################
 # Interactive dev image: full toolchain + sources for building in place, PLUS
@@ -310,7 +320,7 @@ ENV SERVE_PORT="5173"
 ENV VIEWER_UI_MODE="usd-viewer"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
+CMD ["sh", "-c", "exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
 
 ############################## runtime-test ##############################
 # Install-check smoke for the LEAN runtime image. Mirrors `FROM devel AS
@@ -420,7 +430,7 @@ ENV EXAMPLE_PORT="8080"
 ENV VIEWER_UI_MODE="usd-viewer"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "serve -s /app/${VIEWER_UI_MODE}/dist -l ${EXAMPLE_PORT}"]
+CMD ["sh", "-c", "exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${EXAMPLE_PORT}"]
 
 ############################## devel-test ##############################
 # Resolves to test-tools:local (local build.sh) or ghcr.io/.../test-tools:vX.Y.Z (CI).
@@ -535,6 +545,24 @@ RUN hadolint Dockerfile
 # read the second file: limitation 1 in check_release_gates.py's header still
 # stands, and now says which half of it is closed.
 COPY .github/workflows/ /workflows/
+
+# The operator-facing docs and the file they tell an operator to edit, in the
+# image, for the same reason and by the same mechanism.
+#
+# The four READMEs told the user to write `SIGNALING_SERVER = <host-ip>` under
+# `[environment]` in config/docker/setup.conf. The grammar is `env_N =
+# KEY=VALUE`: base's setup.sh collects only keys beginning `env_`, and one
+# that does not is dropped with no warning and exit 0. Following the primary
+# override instruction therefore produced a viewer silently dialling
+# 127.0.0.1, serving HTTP 200, with no picture -- the exact failure the
+# entrypoint spends 300 lines refusing to cause. It shipped for four versions
+# because nothing in this repo reads the READMEs.
+#
+# One spec pair is not the same as a doc-sync tool: it locks the ONE claim
+# that, when wrong, silently misconfigures the product.
+COPY README.md /doc/README.md
+COPY doc/README.zh-TW.md doc/README.zh-CN.md doc/README.ja.md /doc/
+COPY config/docker/setup.conf /doc/setup.conf
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats

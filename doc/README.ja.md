@@ -48,11 +48,18 @@ just run -t runtime -d
 
 ```ini
 [environment]
-SIGNALING_SERVER = <host-ip>
-SIGNALING_PORT = 49100
-SERVE_PORT = 5173
-VIEWER_UI_MODE = usd-viewer
+env_1 = SIGNALING_SERVER=<host-ip>
+env_2 = SIGNALING_PORT=49100
+env_3 = SERVE_PORT=5173
+env_4 = VIEWER_UI_MODE=usd-viewer
 ```
+
+`env_N = KEY=VALUE` は書式の好みではなく文法です。`setup.sh` が収集するのは
+`env_` で始まるキーだけで、このセクション内のそれ以外のキーは**警告なし・
+exit 0 のまま黙って捨てられます**。`SIGNALING_SERVER = <host-ip>`（この
+ファイルの 4 つの版がそう書けと指示していた形）と書くと `apply` は成功し、
+`compose.yaml` には何も入らず、ビューアは黙って `127.0.0.1` に接続して
+HTTP 200 を返し、映像は永遠に来ません。
 
 その後 `./script/setup.sh apply` を実行して `compose.yaml` を再生成します。
 

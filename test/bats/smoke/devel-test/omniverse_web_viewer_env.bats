@@ -649,3 +649,31 @@ teardown() {
   SIGNALING_SERVER="a;rm -rf /|b" run /entrypoint.sh true
   assert_failure
 }
+
+# SIGTERM REACHES `serve`, OR STOPPING THE VIEWER TAKES TEN SECONDS.
+#
+# MEASURED on the published ghcr.io/.../omniverse_web_viewer:0.3.0 image
+# before this case existed: `docker top` showed `sh -c serve ...` as PID 1
+# with `node /usr/bin/serve` as its child; `docker kill -s TERM` left the
+# container running; `docker stop` took 10.2 s -- the whole default grace
+# period, ending in SIGKILL. `sh` does not forward signals to a child it
+# forked. The same image with `exec` in front of `serve` stops in 0.24 s with
+# exit code 0. Every `just stop`, every `docker stop` and isaac's teardown
+# paid the ten seconds, and serve was killed uncleanly each time.
+#
+# This asserts the MECHANISM, in the Dockerfile that /lint already carries for
+# hadolint, because the behaviour itself needs a container lifecycle and
+# nothing in this repo runs one: bats runs INSIDE an image, and `runtime-test`
+# smoke-tests with `RUN`, which is build time. The trade is stated rather than
+# skipped -- a spec that starts and stops a real container belongs with the
+# host-side runners (script/ci/), and there is no home for it there today.
+@test "env: every CMD that serves the bundle execs it (PID 1 gets SIGTERM)" {
+  run grep -cE '^CMD \["sh", "-c", "exec serve ' /lint/Dockerfile
+  assert_success
+  assert_output "3"
+
+  # ...and none of them forgot it. Counting both ways is what makes a fourth
+  # CMD added without `exec` a red test rather than a silent pass.
+  run grep -E '^CMD \["sh", "-c", "serve ' /lint/Dockerfile
+  assert_failure
+}

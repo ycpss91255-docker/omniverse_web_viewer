@@ -45,3 +45,30 @@ setup() {
   run bash -c "cd '${EXAMPLE_DIR}' && node --test 'test/*.test.js'"
   assert_success
 }
+
+# #63 IS A PROPERTY OF THE INTERFACE, NOT OF ONE CONSUMER.
+#
+# `onStart` fires when a connect ATTEMPT begins and re-fires on every
+# session-start retry -- observed five times against a producer that was never
+# there. Mapping it onto `streaming <server>:<port>` therefore reports a live
+# stream with nothing connected. That was fixed in apps/stream-only on
+# 2026-08-14; this demo, the other consumer of the same stream-core interface,
+# kept the defect for three weeks and was edited again in between without
+# anyone noticing, because nothing asserted it.
+#
+# The assertion is over the SOURCE and not over a rendered page because the
+# demo has no browser suite: the trade is admitted rather than skipped.
+@test "example: onStart does not claim the stream is live (#63)" {
+  run grep -nE "onStart:.*streaming " "${EXAMPLE_DIR}/src/main.ts"
+  assert_failure
+}
+
+# The other half: a failed connect must not be rendered with String(), which
+# the library's plain-object rejections turn into "[object Object]" -- the
+# reason discarded on the one path where the user needs it.
+@test "example: a failed connect is not rendered with String()" {
+  run grep -nE 'connection failed:.*\$\{String\(' "${EXAMPLE_DIR}/src/main.ts"
+  assert_failure
+  run grep -F "describeStreamError" "${EXAMPLE_DIR}/src/main.ts"
+  assert_success
+}

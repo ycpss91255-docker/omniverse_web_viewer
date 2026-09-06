@@ -48,11 +48,17 @@ just run -t runtime -d
 
 ```ini
 [environment]
-SIGNALING_SERVER = <host-ip>
-SIGNALING_PORT = 49100
-SERVE_PORT = 5173
-VIEWER_UI_MODE = usd-viewer
+env_1 = SIGNALING_SERVER=<host-ip>
+env_2 = SIGNALING_PORT=49100
+env_3 = SERVE_PORT=5173
+env_4 = VIEWER_UI_MODE=usd-viewer
 ```
+
+`env_N = KEY=VALUE` 是文法，不是排版風格：`setup.sh` 只收集開頭為 `env_` 的
+鍵，這個 section 裡不是這個形狀的鍵會被**靜默丟棄，且 exit 0、無任何警告**。
+寫成 `SIGNALING_SERVER = <host-ip>`（這份文件有四個版本都是這樣教的）時，
+`apply` 會成功、`compose.yaml` 裡什麼都沒有，viewer 靜靜地連向 `127.0.0.1`、
+回應 HTTP 200，而畫面永遠不會出現。
 
 然後執行 `./script/setup.sh apply` 以重新產生 `compose.yaml`。
 
