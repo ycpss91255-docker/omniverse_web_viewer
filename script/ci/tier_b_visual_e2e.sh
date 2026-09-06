@@ -460,15 +460,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-# Bound the frame thresholds to the spec's own constants (test/e2e/
-# tier-b-visual.spec.ts: MIN_MEAN_LUMA / MIN_BRIGHT_FRACTION). The spec has
-# already enforced them; re-checking here is what makes a hand-written
-# attestation useless without also faking a plausible frame.
+# Bound the frame thresholds to the single-source values in
+# script/ci/visual_thresholds.json (shared with tier-b-visual.spec.ts and
+# verify_tier_b_attestation.py). The verifier reads the JSON directly; env
+# vars are no longer needed here since the Python script loads the same file.
 if ! ATTESTATION_SUMMARY="$(
   OWV_ATTESTATION="${ATTESTATION}" \
-  OWV_MIN_MEAN_LUMA=8 \
-  OWV_MIN_MAX_LUMA=32 \
-  OWV_MIN_BRIGHT_FRACTION=0.1 \
   python3 "${SCRIPT_DIR}/verify_tier_b_attestation.py"
 )"; then
   fail "attestation did not verify; refusing to claim a picture"

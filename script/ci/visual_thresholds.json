@@ -1,0 +1,5 @@
+{
+  "minMeanLuma": 8,
+  "minMaxLuma": 32,
+  "minBrightFraction": 0.1
+}

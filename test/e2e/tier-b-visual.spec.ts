@@ -41,6 +41,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import visualThresholds from '../../script/ci/visual_thresholds.json';
 
 const BASE_URL = process.env.OWV_BASE_URL || 'http://127.0.0.1:5174';
 const ARTIFACT_DIR = process.env.OWV_ARTIFACT_DIR || '';
@@ -85,9 +86,9 @@ const FRAME_PROGRESS_SAMPLE_MS = 1_000;
 // an over-tight threshold would make a codec keyframe delay look like a bug.
 // The lit checkerboard covers most of the frame, so a genuine render clears all
 // three by a wide margin while a black or single-flat-colour frame clears none.
-const MIN_MEAN_LUMA = 8;
-const MIN_MAX_LUMA = 32;
-const MIN_BRIGHT_FRACTION = 0.1;
+const MIN_MEAN_LUMA = visualThresholds.minMeanLuma;
+const MIN_MAX_LUMA = visualThresholds.minMaxLuma;
+const MIN_BRIGHT_FRACTION = visualThresholds.minBrightFraction;
 const BRIGHT_PIXEL_LUMA = 16;
 // Width the frame is downscaled to before it is read back. See sampleFrame:
 // reading a full 1080p frame back on the main thread is enough to break the

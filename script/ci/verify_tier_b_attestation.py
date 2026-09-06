@@ -136,6 +136,17 @@ def require_binding(doc, key, env_name):
         )
 
 
+def _load_threshold_defaults():
+    """Read visual_thresholds.json next to this script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "visual_thresholds.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as err:
+        fail("cannot load threshold defaults from {}: {}".format(path, err))
+
+
 def main():
     path = os.environ.get("OWV_ATTESTATION")
     if not path:
@@ -168,9 +179,12 @@ def main():
     max_luma = require_number(doc, "maxLuma")
     bright_fraction = require_number(doc, "brightFraction")
 
-    min_mean_luma = env_float("OWV_MIN_MEAN_LUMA", 8.0)
-    min_max_luma = env_float("OWV_MIN_MAX_LUMA", 32.0)
-    min_bright_fraction = env_float("OWV_MIN_BRIGHT_FRACTION", 0.1)
+    defaults = _load_threshold_defaults()
+    min_mean_luma = env_float("OWV_MIN_MEAN_LUMA", defaults["minMeanLuma"])
+    min_max_luma = env_float("OWV_MIN_MAX_LUMA", defaults["minMaxLuma"])
+    min_bright_fraction = env_float(
+        "OWV_MIN_BRIGHT_FRACTION", defaults["minBrightFraction"]
+    )
 
     # maxLuma is asserted by the spec and was written into the attestation
     # from the beginning; not checking it meant a forged attestation did not
