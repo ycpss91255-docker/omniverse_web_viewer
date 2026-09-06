@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI 發佈流水線</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #F5F3EF;
+  --surface: #FFFFFF;
+  --surface-2: #EDEAE4;
+  --text-1: #1C1917;
+  --text-2: #57534E;
+  --text-3: #A8A29E;
+  --border: #D6D3D1;
+  --infra: #1B4965;
+  --infra-soft: #D4E8F5;
+  --infra-fill: #EBF4FA;
+  --svc: #92400E;
+  --svc-soft: #FEF3C7;
+  --svc-fill: #FFFBEB;
+  --gen: #166534;
+  --gen-soft: #DCFCE7;
+  --gen-fill: #F0FDF4;
+  --overlay: #6D28D9;
+  --overlay-soft: #EDE9FE;
+  --overlay-fill: #F5F3FF;
+  --warn: #B91C1C;
+  --warn-soft: #FEE2E2;
+  --warn-fill: #FEF2F2;
+  --code-bg: #F0EDEA;
+  --arrow: #78716C;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}}
+:root[data-theme="dark"]{
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text-1);
+  background: var(--bg);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+  line-height: 1.7;
+}
+h1 {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-size: 1.65rem;
+  font-weight: 700;
+  margin: 0 0 0.15rem;
+  text-wrap: balance;
+}
+.subtitle { color: var(--text-2); font-size: 0.88rem; margin-bottom: 0.3rem; }
+.ref { font-size: 0.78rem; color: var(--text-3); margin-bottom: 2.8rem; }
+.ref a { color: var(--text-3); }
+h2 {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 3rem 0 0.8rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1.5px solid var(--border);
+  letter-spacing: -0.01em;
+}
+h2 .num { color: var(--text-3); font-weight: 400; margin-right: 0.3em; font-variant-numeric: tabular-nums; }
+h3 { font-size: 0.92rem; font-weight: 600; margin: 1.4rem 0 0.4rem; }
+p, .desc { margin: 0.55rem 0; max-width: 66ch; font-size: 0.9rem; }
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 5px;
+  font-size: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  overflow-x: auto;
+  color: var(--text-1);
+  margin: 0.8rem 0;
+  line-height: 1.55;
+}
+figure { margin: 1.4rem 0; }
+figcaption { font-size: 0.8rem; color: var(--text-2); margin-top: 0.5rem; max-width: 66ch; line-height: 1.5; }
+svg { max-width: 100%; height: auto; display: block; }
+svg text { font-family: 'JetBrains Mono', monospace; }
+.tbl-wrap { overflow-x: auto; margin: 1rem 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+th { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 2px solid var(--border); font-weight: 600; white-space: nowrap; font-size: 0.8rem; letter-spacing: 0.02em; }
+td { padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+.badge { display: inline-block; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; padding: 0.15em 0.55em; border-radius: 3px; text-transform: uppercase; vertical-align: middle; }
+.badge-infra { background: var(--infra-soft); color: var(--infra); }
+.badge-svc { background: var(--svc-soft); color: var(--svc); }
+.badge-gen { background: var(--gen-soft); color: var(--gen); }
+.badge-overlay { background: var(--overlay-soft); color: var(--overlay); }
+.badge-warn { background: var(--warn-soft); color: var(--warn); }
+.callout { border-left: 3px solid var(--infra); padding: 0.7rem 1rem; border-radius: 0 4px 4px 0; margin: 1rem 0; font-size: 0.86rem; line-height: 1.55; }
+.callout-infra { background: var(--infra-fill); border-left-color: var(--infra); }
+.callout-svc { background: var(--svc-fill); border-left-color: var(--svc); }
+.callout-gen { background: var(--gen-fill); border-left-color: var(--gen); }
+.callout-overlay { background: var(--overlay-fill); border-left-color: var(--overlay); }
+.callout-warn { background: var(--warn-fill); border-left-color: var(--warn); }
+.side { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media(max-width: 640px) { .side { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: 1rem 1.2rem; }
+</style>
+</head>
+<body>
+
+<h1>CI 發佈流水線</h1>
+<p class="subtitle">8 jobs, release invariant -- 沒有畫面就不發佈</p>
+<p class="ref">.github/workflows/main.yaml 799 行 | #70 picture gate | 2026-09-07</p>
+
+<h2><span class="num">1.</span> Release Invariant</h2>
+
+<p>owv 的核心發佈規則（#70 起）：<strong>沒有任何版本可以在 Tier B visual acceptance 通過之前發佈</strong>。這個規則由 CI pipeline 的 job dependency chain 結構性保證，不靠人為紀律。</p>
+
+<div class="callout callout-warn">
+  <strong>v0.3.0-rc1 事件</strong>：rc1 發佈時 Tier B 從未對該 commit 執行過。tag push 跳過了 GPU job，Release 照常 cut。從此之後，<code>tier-b-visual-e2e</code> 成為 <code>call-release</code> 的硬 <code>needs</code>。沒有 override input、沒有 <code>continue-on-error</code>、沒有 <code>if: always()</code> 逃生門。
+</div>
+
+<h2><span class="num">2.</span> Pipeline DAG</h2>
+
+<p>8 個 job 的依賴關係形成 DAG。每條 <code>needs</code> 邊都有明確的安全理由。</p>
+
+<figure>
+<svg viewBox="0 0 880 520" role="img" aria-label="CI pipeline DAG showing 8 jobs and their dependency edges">
+<defs>
+  <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--arrow)" opacity="0.6"/></marker>
+  <marker id="ar-warn" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--warn)" opacity="0.7"/></marker>
+  <marker id="ar-svc" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--svc)" opacity="0.7"/></marker>
+</defs>
+
+<rect x="20" y="10" width="840" height="30" rx="4" fill="var(--surface-2)" stroke="var(--border)" stroke-width="0.6"/>
+<text x="40" y="28" font-size="7.5" font-weight="600" fill="var(--text-2)">TRIGGERS:</text>
+<text x="115" y="28" font-size="7" fill="var(--infra)">push (tag v*)</text>
+<text x="220" y="28" font-size="7" fill="var(--gen)">pull_request</text>
+<text x="320" y="28" font-size="7" fill="var(--overlay)">schedule (nightly 03:00 UTC+8)</text>
+<text x="530" y="28" font-size="7" fill="var(--svc)">workflow_dispatch (run_tier_b / publish_image_tag)</text>
+
+<rect x="20" y="60" width="200" height="55" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1.2"/>
+<text x="120" y="82" text-anchor="middle" font-size="10" font-weight="600" fill="var(--text-1)">call-docker-build</text>
+<text x="120" y="95" text-anchor="middle" font-size="7" fill="var(--gen)">base build-worker v0.41.0</text>
+<text x="120" y="106" text-anchor="middle" font-size="6.5" fill="var(--text-3)">if: event != schedule</text>
+
+<rect x="250" y="60" width="170" height="55" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1"/>
+<text x="335" y="82" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">verify-tag-shape</text>
+<text x="335" y="95" text-anchor="middle" font-size="7" fill="var(--infra)">derive_image_tag.sh</text>
+<text x="335" y="106" text-anchor="middle" font-size="6.5" fill="var(--text-3)">NO if: (always runs)</text>
+
+<rect x="450" y="60" width="170" height="55" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1"/>
+<text x="535" y="82" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">verify-tag-on-main</text>
+<text x="535" y="95" text-anchor="middle" font-size="7" fill="var(--infra)">git branch --contains</text>
+<text x="535" y="106" text-anchor="middle" font-size="6.5" fill="var(--text-3)">NO if: (always runs)</text>
+
+<rect x="300" y="160" width="260" height="65" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="2"/>
+<text x="430" y="182" text-anchor="middle" font-size="11" font-weight="700" fill="var(--warn)">tier-b-visual-e2e</text>
+<text x="430" y="196" text-anchor="middle" font-size="7.5" fill="var(--warn)">[self-hosted, gpu] | 60 min timeout</text>
+<text x="430" y="210" text-anchor="middle" font-size="7" fill="var(--text-2)">schedule | tag | dispatch(run_tier_b | publish_image_tag)</text>
+<text x="430" y="220" text-anchor="middle" font-size="6.5" fill="var(--text-3)">outputs: attestation</text>
+
+<line x1="335" y1="115" x2="380" y2="158" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="535" y1="115" x2="480" y2="158" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+
+<rect x="650" y="160" width="210" height="50" rx="4" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="755" y="182" text-anchor="middle" font-size="9" font-weight="500" fill="var(--text-2)">release-blocked-report</text>
+<text x="755" y="196" text-anchor="middle" font-size="7" fill="var(--text-3)">needs: tier-b | surfaces cancelled</text>
+<line x1="560" y1="190" x2="648" y2="185" stroke="var(--arrow)" stroke-width="0.6" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+
+<rect x="340" y="270" width="220" height="50" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1.5"/>
+<text x="450" y="290" text-anchor="middle" font-size="10" font-weight="600" fill="var(--warn)">require-picture-evidence</text>
+<text x="450" y="305" text-anchor="middle" font-size="7" fill="var(--text-2)">require_attestation.sh (pinned script)</text>
+
+<line x1="430" y1="225" x2="440" y2="268" stroke="var(--warn)" stroke-width="1.2" marker-end="url(#ar-warn)"/>
+<text x="460" y="250" font-size="7" fill="var(--warn)">attestation output</text>
+
+<rect x="100" y="370" width="200" height="60" rx="4" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="1.5"/>
+<text x="200" y="392" text-anchor="middle" font-size="10" font-weight="700" fill="var(--svc)">call-release</text>
+<text x="200" y="406" text-anchor="middle" font-size="7.5" fill="var(--svc)">base release-worker v0.42.0</text>
+<text x="200" y="418" text-anchor="middle" font-size="7" fill="var(--text-2)">if: tag &amp;&amp; !dispatch(publish_image_tag)</text>
+<text x="200" y="426" text-anchor="middle" font-size="6.5" fill="var(--text-3)">permissions: contents: write</text>
+
+<rect x="560" y="370" width="200" height="60" rx="4" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="2"/>
+<text x="660" y="392" text-anchor="middle" font-size="10" font-weight="700" fill="var(--svc)">publish-image</text>
+<text x="660" y="406" text-anchor="middle" font-size="7.5" fill="var(--svc)">GHCR push</text>
+<text x="660" y="418" text-anchor="middle" font-size="7" fill="var(--text-2)">needs: build + release + tier-b + evidence</text>
+<text x="660" y="426" text-anchor="middle" font-size="6.5" fill="var(--text-3)">permissions: packages: write</text>
+
+<line x1="335" y1="106" x2="160" y2="368" stroke="var(--arrow)" stroke-width="0.7" marker-end="url(#ar)"/>
+<line x1="535" y1="106" x2="240" y2="368" stroke="var(--arrow)" stroke-width="0.7" marker-end="url(#ar)"/>
+<line x1="120" y1="115" x2="140" y2="368" stroke="var(--arrow)" stroke-width="0.7" marker-end="url(#ar)"/>
+<path d="M 430 225 C 430 330, 210 340, 210 368" fill="none" stroke="var(--warn)" stroke-width="0.9" marker-end="url(#ar-warn)"/>
+<path d="M 450 320 C 400 345, 260 350, 240 368" fill="none" stroke="var(--warn)" stroke-width="0.9" marker-end="url(#ar-warn)"/>
+
+<path d="M 120 115 C 120 340, 600 340, 600 368" fill="none" stroke="var(--svc)" stroke-width="0.8" marker-end="url(#ar-svc)"/>
+<path d="M 430 225 C 430 340, 640 340, 640 368" fill="none" stroke="var(--warn)" stroke-width="0.9" marker-end="url(#ar-warn)"/>
+<path d="M 460 320 C 500 345, 660 350, 660 368" fill="none" stroke="var(--warn)" stroke-width="0.9" marker-end="url(#ar-warn)"/>
+<path d="M 300 400 L 558 400" fill="none" stroke="var(--svc)" stroke-width="0.8" stroke-dasharray="5 3" marker-end="url(#ar-svc)"/>
+<text x="430" y="395" text-anchor="middle" font-size="6.5" fill="var(--svc)">skipped OK (recovery dispatch)</text>
+
+<rect x="20" y="450" width="840" height="55" rx="5" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1" opacity="0.8"/>
+<text x="40" y="470" font-size="9" font-weight="700" fill="var(--warn)">THE PICTURE GATE (#70)</text>
+<text x="40" y="485" font-size="7.5" fill="var(--text-1)">publish-image requires: call-docker-build == success AND tier-b-visual-e2e == success AND require-picture-evidence == success</text>
+<text x="40" y="497" font-size="7.5" fill="var(--text-1)">call-release may be skipped (recovery dispatch). tier-b must be success -- skipped / failed / cancelled / timeout all block.</text>
+
+</svg>
+<figcaption>CI pipeline DAG。紅色邊是 picture gate 強制的依賴，橙色邊是 release/publish 依賴。<code>verify-tag-shape</code> 和 <code>verify-tag-on-main</code> 故意不加 <code>if:</code>，讓 GitHub 的 default skip propagation 確保 skipped need = skipped dependent。</figcaption>
+</figure>
+
+<h2><span class="num">3.</span> 觸發條件矩陣</h2>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Job</th><th>PR</th><th>Tag Push</th><th>Nightly</th><th>Dispatch</th><th>Runner</th></tr></thead>
+<tbody>
+<tr><td><code>call-docker-build</code></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td>skip</td><td><span class="badge badge-gen">RUN</span></td><td>ubuntu-latest</td></tr>
+<tr><td><code>verify-tag-shape</code></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td>ubuntu-latest</td></tr>
+<tr><td><code>verify-tag-on-main</code></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td><span class="badge badge-gen">RUN</span></td><td>ubuntu-latest</td></tr>
+<tr><td><code>tier-b-visual-e2e</code></td><td>skip</td><td><span class="badge badge-warn">RUN</span></td><td><span class="badge badge-warn">RUN</span></td><td>if run_tier_b or publish_image_tag</td><td><strong>[self-hosted, gpu]</strong></td></tr>
+<tr><td><code>require-picture-evidence</code></td><td>skip (needs tier-b)</td><td><span class="badge badge-warn">RUN</span></td><td><span class="badge badge-warn">RUN</span></td><td>follows tier-b</td><td>ubuntu-latest</td></tr>
+<tr><td><code>call-release</code></td><td>skip</td><td><span class="badge badge-svc">RUN</span></td><td>skip</td><td>skip if publish_image_tag</td><td>ubuntu-latest</td></tr>
+<tr><td><code>publish-image</code></td><td>skip</td><td><span class="badge badge-svc">RUN</span></td><td>skip</td><td>if publish_image_tag</td><td>ubuntu-latest</td></tr>
+<tr><td><code>release-blocked-report</code></td><td>skip</td><td>follows tier-b</td><td>skip</td><td>follows tier-b</td><td>ubuntu-latest</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="num">4.</span> Picture Gate 多層防禦</h2>
+
+<p>為什麼只看 job status 不夠？Review round 8 產出了 5 種 single-step edit 可以讓 <code>tier-b-visual-e2e</code> 保持綠色但實際上沒有跑 acceptance spec：</p>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>#</th><th>手法</th><th>為什麼 job 仍然綠色</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Truncate driver: <code>: &gt; script/ci/tier_b_visual_e2e.sh --print-x</code></td><td><code>--print-</code> 不在 checker whitelist</td></tr>
+<tr><td>2</td><td><code>sed -i '1a exit 0' script/ci/*.sh</code></td><td>glob 不是 pinned path</td></tr>
+<tr><td>3</td><td><code>$GITHUB_PATH</code> entry shadowing <code>bash</code></td><td>job 用的 bash 是 stub</td></tr>
+<tr><td>4</td><td>Job-level <code>container:</code> whose bash is a stub</td><td>同上</td></tr>
+<tr><td>5</td><td><code>echo TIER_B_PRODUCER_IMAGE=busybox &gt;&gt; "$GITHUB_ENV"</code></td><td>producer 是 no-op image</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>所有 5 種手法的共同結果：<strong>沒有 frame 被 sample</strong>。<code>require-picture-evidence</code> 檢查的是 attestation output（由 Playwright spec 在 sample frame 後寫入），空值 = 拒絕發佈。</p>
+
+<figure>
+<svg viewBox="0 0 880 180" role="img" aria-label="Attestation data flow from Playwright spec through require_attestation.sh">
+
+<rect x="20" y="20" width="220" height="55" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1.2"/>
+<text x="130" y="42" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">tier-b-visual.spec.ts</text>
+<text x="130" y="56" text-anchor="middle" font-size="7" fill="var(--gen)">sample frame + threshold check</text>
+<text x="130" y="68" text-anchor="middle" font-size="7" fill="var(--text-3)">writes attestation on success</text>
+
+<line x1="240" y1="48" x2="320" y2="48" stroke="var(--gen)" stroke-width="1" marker-end="url(#ar)"/>
+<text x="280" y="42" text-anchor="middle" font-size="7" fill="var(--gen)">output</text>
+
+<rect x="325" y="20" width="200" height="55" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1"/>
+<text x="425" y="42" text-anchor="middle" font-size="9" font-weight="600" fill="var(--text-1)">steps.acceptance.outputs</text>
+<text x="425" y="56" text-anchor="middle" font-size="7" fill="var(--infra)">attestation string</text>
+<text x="425" y="68" text-anchor="middle" font-size="7" fill="var(--text-3)">empty if no frame sampled</text>
+
+<line x1="525" y1="48" x2="610" y2="48" stroke="var(--arrow)" stroke-width="1" marker-end="url(#ar)"/>
+
+<rect x="615" y="20" width="245" height="55" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1.5"/>
+<text x="738" y="42" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--warn)">require_attestation.sh</text>
+<text x="738" y="56" text-anchor="middle" font-size="7" fill="var(--warn)">refuse release if empty/placeholder</text>
+<text x="738" y="68" text-anchor="middle" font-size="7" fill="var(--text-3)">pinned as script (not inline shell)</text>
+
+<rect x="20" y="100" width="840" height="60" rx="4" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="40" y="120" font-size="8.5" font-weight="600" fill="var(--text-1)">check_release_gates.py (2800+ lines)</text>
+<text x="40" y="136" font-size="7.5" fill="var(--text-2)">PyYAML structural validator. GATE_WORK_DRIVERS pins exact invocations for tier-b and verify-tag-shape.</text>
+<text x="40" y="150" font-size="7.5" fill="var(--text-2)">12 documented blind spots (WHAT THIS CANNOT SEE) -- 上面 5 種 bypass 正是 checker 無法偵測的，attestation 補上最後一道。</text>
+
+</svg>
+<figcaption>Attestation 資料流。Playwright spec 真的 sample 到 frame 後才寫 attestation；<code>require_attestation.sh</code> 拒絕空值。<code>check_release_gates.py</code> 驗證 workflow YAML 結構正確性，但承認 12 個盲區 -- attestation 是對盲區的運行時補償。</figcaption>
+</figure>
+
+<h2><span class="num">5.</span> Image Recovery Dispatch</h2>
+
+<p>image push 失敗時的恢復路徑：以 tag ref dispatch workflow，帶 <code>publish_image_tag</code>。</p>
+
+<div class="callout callout-svc">
+  <strong>call-release stand-down</strong>：dispatch 帶 <code>publish_image_tag</code> 時，<code>call-release</code> 不跑（Release 已存在）。<code>publish-image</code> 允許 <code>call-release == skipped</code>，但 <strong>tier-b 必須 success</strong> -- recovery dispatch 不繞過 picture gate。<code>publish-image</code> 另有 Release 存在性檢查（沒有 Release 不推 image），確保 stand-down 安全。
+</div>
+
+<h2><span class="num">6.</span> 故意不加 <code>if:</code> 的設計</h2>
+
+<p><code>verify-tag-shape</code> 和 <code>verify-tag-on-main</code> 沒有 <code>if:</code> 條件。這不是遺漏：</p>
+
+<div class="side">
+<div class="card">
+  <h3>有 <code>if:</code></h3>
+  <p class="desc">Non-tag ref 時 job 被 <strong>skipped</strong>。GitHub default: a skipped need skips its dependent。<code>tier-b-visual-e2e</code> needs 這兩個 job，所以 nightly schedule 的 tier-b 也會被 skip -- 但 nightly 正是要跑 tier-b 的。</p>
+</div>
+<div class="card">
+  <h3>沒有 <code>if:</code></h3>
+  <p class="desc">Job 永遠 <strong>success</strong>（tag check 用 per-step guard）。Nightly 的 tier-b 不會因為 skipped need 被 skip。成本：nightly 多跑一個 cheap hosted job。</p>
+</div>
+</div>
+
+<div class="callout callout-infra">
+  <code>tier-b-visual-e2e</code> 的 <code>if:</code> 也故意<strong>不含 status function</strong>（沒有 <code>always()</code> / <code>!cancelled()</code> / <code>success()</code>）。GitHub default rule: job is skipped when any need did not succeed。GPU runner 不可用 &rarr; tier-b timeout/fail &rarr; call-release <strong>blocked</strong>, not waved through。
+</div>
+
+</body>
+</html>

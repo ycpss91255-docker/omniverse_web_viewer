@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>串流架構</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #F5F3EF;
+  --surface: #FFFFFF;
+  --surface-2: #EDEAE4;
+  --text-1: #1C1917;
+  --text-2: #57534E;
+  --text-3: #A8A29E;
+  --border: #D6D3D1;
+  --infra: #1B4965;
+  --infra-soft: #D4E8F5;
+  --infra-fill: #EBF4FA;
+  --svc: #92400E;
+  --svc-soft: #FEF3C7;
+  --svc-fill: #FFFBEB;
+  --gen: #166534;
+  --gen-soft: #DCFCE7;
+  --gen-fill: #F0FDF4;
+  --overlay: #6D28D9;
+  --overlay-soft: #EDE9FE;
+  --overlay-fill: #F5F3FF;
+  --warn: #B91C1C;
+  --warn-soft: #FEE2E2;
+  --warn-fill: #FEF2F2;
+  --code-bg: #F0EDEA;
+  --arrow: #78716C;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}}
+:root[data-theme="dark"]{
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text-1);
+  background: var(--bg);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+  line-height: 1.7;
+}
+h1 { font-family: 'Source Serif 4', Georgia, serif; font-size: 1.65rem; font-weight: 700; margin: 0 0 0.15rem; text-wrap: balance; }
+.subtitle { color: var(--text-2); font-size: 0.88rem; margin-bottom: 0.3rem; }
+.ref { font-size: 0.78rem; color: var(--text-3); margin-bottom: 2.8rem; }
+.ref a { color: var(--text-3); }
+h2 { font-family: 'Source Serif 4', Georgia, serif; font-size: 1.15rem; font-weight: 600; margin: 3rem 0 0.8rem; padding-bottom: 0.4rem; border-bottom: 1.5px solid var(--border); letter-spacing: -0.01em; }
+h2 .num { color: var(--text-3); font-weight: 400; margin-right: 0.3em; font-variant-numeric: tabular-nums; }
+h3 { font-size: 0.92rem; font-weight: 600; margin: 1.4rem 0 0.4rem; }
+p, .desc { margin: 0.55rem 0; max-width: 66ch; font-size: 0.9rem; }
+code { font-family: 'JetBrains Mono', monospace; font-size: 0.82em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+pre { background: var(--code-bg); padding: 0.9rem 1rem; border-radius: 5px; font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; overflow-x: auto; color: var(--text-1); margin: 0.8rem 0; line-height: 1.55; }
+figure { margin: 1.4rem 0; }
+figcaption { font-size: 0.8rem; color: var(--text-2); margin-top: 0.5rem; max-width: 66ch; line-height: 1.5; }
+svg { max-width: 100%; height: auto; display: block; }
+svg text { font-family: 'JetBrains Mono', monospace; }
+.tbl-wrap { overflow-x: auto; margin: 1rem 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+th { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 2px solid var(--border); font-weight: 600; white-space: nowrap; font-size: 0.8rem; letter-spacing: 0.02em; }
+td { padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+.badge { display: inline-block; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; padding: 0.15em 0.55em; border-radius: 3px; text-transform: uppercase; vertical-align: middle; }
+.badge-infra { background: var(--infra-soft); color: var(--infra); }
+.badge-svc { background: var(--svc-soft); color: var(--svc); }
+.badge-gen { background: var(--gen-soft); color: var(--gen); }
+.badge-overlay { background: var(--overlay-soft); color: var(--overlay); }
+.badge-warn { background: var(--warn-soft); color: var(--warn); }
+.callout { border-left: 3px solid var(--infra); padding: 0.7rem 1rem; border-radius: 0 4px 4px 0; margin: 1rem 0; font-size: 0.86rem; line-height: 1.55; }
+.callout-infra { background: var(--infra-fill); border-left-color: var(--infra); }
+.callout-svc { background: var(--svc-fill); border-left-color: var(--svc); }
+.callout-gen { background: var(--gen-fill); border-left-color: var(--gen); }
+.callout-overlay { background: var(--overlay-fill); border-left-color: var(--overlay); }
+.callout-warn { background: var(--warn-fill); border-left-color: var(--warn); }
+.side { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media(max-width: 640px) { .side { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: 1rem 1.2rem; }
+</style>
+</head>
+<body>
+
+<h1>串流架構</h1>
+<p class="subtitle">雙 app 模型 / entrypoint config injection / stream-core 抽象</p>
+<p class="ref">D7 VIEWER_UI_MODE | D1 media port | packages/stream-core 188 行 | script/entrypoint.sh 582 行 | 2026-09-07</p>
+
+<h2><span class="num">1.</span> 雙 App 模型</h2>
+
+<p>容器內攜帶兩套獨立 app，由 <code>VIEWER_UI_MODE</code> 環境變數在啟動時選擇其一。兩套 app 共用同一個 entrypoint、同一個 <code>serve</code> 實例，差異在 UI 和 streaming library 整合方式。</p>
+
+<figure>
+<svg viewBox="0 0 880 340" role="img" aria-label="Two-app model showing usd-viewer and stream-only side by side">
+<defs>
+  <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--arrow)" opacity="0.6"/></marker>
+</defs>
+
+<rect x="16" y="10" width="848" height="310" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.2"/>
+<text x="32" y="30" font-size="8" font-weight="600" fill="var(--text-2)">RUNTIME CONTAINER</text>
+
+<rect x="320" y="40" width="240" height="36" rx="18" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="1.5"/>
+<text x="440" y="62" text-anchor="middle" font-size="9.5" font-weight="700" fill="var(--svc)">VIEWER_UI_MODE</text>
+
+<line x1="380" y1="76" x2="200" y2="100" stroke="var(--svc)" stroke-width="1" marker-end="url(#ar)"/>
+<line x1="500" y1="76" x2="660" y2="100" stroke="var(--svc)" stroke-width="1" marker-end="url(#ar)"/>
+
+<text x="280" y="92" text-anchor="middle" font-size="7" fill="var(--svc)">= "usd-viewer"</text>
+<text x="590" y="92" text-anchor="middle" font-size="7" fill="var(--svc)">= "stream-only"</text>
+
+<rect x="36" y="105" width="380" height="195" rx="5" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1" opacity="0.6"/>
+<text x="52" y="125" font-size="10" font-weight="700" fill="var(--infra)">usd-viewer</text>
+<text x="52" y="140" font-size="7.5" fill="var(--text-2)">upstream NVIDIA web-viewer-sample</text>
+<text x="52" y="152" font-size="7" fill="var(--text-3)">submodule at src/ -- built UNMODIFIED (D2)</text>
+
+<rect x="52" y="165" width="165" height="42" rx="3" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="135" y="183" text-anchor="middle" font-size="8" font-weight="600" fill="var(--text-1)">src/package.json</text>
+<text x="135" y="196" text-anchor="middle" font-size="7" fill="var(--text-3)">standalone (not workspace)</text>
+
+<rect x="230" y="165" width="170" height="42" rx="3" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="315" y="183" text-anchor="middle" font-size="8" font-weight="600" fill="var(--text-1)">stream.config.json</text>
+<text x="315" y="196" text-anchor="middle" font-size="7" fill="var(--text-3)">overlay + sentinel injection</text>
+
+<rect x="52" y="220" width="350" height="32" rx="3" fill="var(--infra-soft)" stroke="var(--infra)" stroke-width="0.6"/>
+<text x="227" y="240" text-anchor="middle" font-size="8" fill="var(--infra)">producer: kit-app-template USD Viewer ONLY (not Isaac)</text>
+
+<rect x="52" y="260" width="350" height="28" rx="3" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="0.6"/>
+<text x="227" y="278" text-anchor="middle" font-size="7.5" fill="var(--warn)">blanks against Isaac Sim BY DESIGN (#18)</text>
+
+<rect x="464" y="105" width="380" height="195" rx="5" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1" opacity="0.6"/>
+<text x="480" y="125" font-size="10" font-weight="700" fill="var(--gen)">stream-only</text>
+<text x="480" y="140" font-size="7.5" fill="var(--text-2)">custom app at apps/stream-only/</text>
+<text x="480" y="152" font-size="7" fill="var(--text-3)">npm workspace member -- depends on stream-core</text>
+
+<rect x="480" y="165" width="165" height="42" rx="3" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="563" y="183" text-anchor="middle" font-size="8" font-weight="600" fill="var(--text-1)">apps/stream-only/</text>
+<text x="563" y="196" text-anchor="middle" font-size="7" fill="var(--text-3)">vite build (workspace)</text>
+
+<rect x="660" y="165" width="170" height="42" rx="3" fill="var(--overlay-fill)" stroke="var(--overlay)" stroke-width="0.8"/>
+<text x="745" y="183" text-anchor="middle" font-size="8" font-weight="600" fill="var(--overlay)">packages/stream-core</text>
+<text x="745" y="196" text-anchor="middle" font-size="7" fill="var(--overlay)">188 lines, 4 exports</text>
+
+<rect x="480" y="220" width="350" height="32" rx="3" fill="var(--gen-soft)" stroke="var(--gen)" stroke-width="0.6"/>
+<text x="655" y="240" text-anchor="middle" font-size="8" fill="var(--gen)">producer: Isaac Sim (stream-only mode for Tier B)</text>
+
+<rect x="480" y="260" width="350" height="28" rx="3" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="0.6"/>
+<text x="655" y="278" text-anchor="middle" font-size="7.5" fill="var(--gen)">streamStatus.js: local terminal state detection</text>
+
+</svg>
+<figcaption>雙 app 模型。<code>usd-viewer</code> 是 upstream submodule，<strong>不修改</strong>（D2 decision）。<code>stream-only</code> 是自有 app，使用 <code>stream-core</code> package 抽象 NVIDIA streaming library。Isaac Sim producer 只和 <code>stream-only</code> 相容。</figcaption>
+</figure>
+
+<h2><span class="num">2.</span> npm Workspace 結構</h2>
+
+<p>Root <code>omniverse-web-viewer-workspace</code> 管理三個 workspace directory。<code>src/</code>（usd-viewer）是<strong>獨立</strong>的，不在 workspace 內。</p>
+
+<pre>omniverse-web-viewer-workspace (root)
+  workspaces: [packages/*, apps/*, examples/*]
+
+  packages/
+    stream-core/        # 188 lines, 唯一碰 NVIDIA library 的 package
+      buildStreamConfig   pure factory, DOM-free, unit-testable
+      connectStream       lazy import + AppStreamer.connect(DIRECT)
+      describeStreamError error message helper
+
+  apps/
+    stream-only/        # custom viewer app
+      depends on stream-core (workspace link)
+
+  examples/
+    embedded-site/      # demo: iframe embedding example
+
+  src/                  # OUTSIDE workspace
+    usd-viewer          # upstream submodule, own package.json</pre>
+
+<h2><span class="num">3.</span> Entrypoint Config Injection Pipeline</h2>
+
+<p><code>script/entrypoint.sh</code>（582 行）在 container 啟動時執行，將環境變數注入 JS bundle。流程分三階段：</p>
+
+<figure>
+<svg viewBox="0 0 880 400" role="img" aria-label="Entrypoint config injection pipeline: parse, validate, render">
+<defs>
+  <marker id="ar2" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--arrow)" opacity="0.6"/></marker>
+</defs>
+
+<rect x="16" y="10" width="270" height="180" rx="5" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1"/>
+<text x="32" y="30" font-size="10" font-weight="700" fill="var(--infra)">Phase 1: Parse</text>
+<text x="32" y="44" font-size="7.5" fill="var(--text-2)">/etc/host.yaml + env vars</text>
+
+<rect x="32" y="56" width="238" height="36" rx="3" fill="var(--surface)" stroke="var(--infra)" stroke-width="0.8"/>
+<text x="151" y="72" text-anchor="middle" font-size="8.5" font-weight="600" fill="var(--text-1)">yaml_value()</text>
+<text x="151" y="84" text-anchor="middle" font-size="7" fill="var(--infra)">section-scoped parser (lines 49-106)</text>
+
+<rect x="32" y="100" width="238" height="36" rx="3" fill="var(--surface)" stroke="var(--infra)" stroke-width="0.8"/>
+<text x="151" y="116" text-anchor="middle" font-size="8.5" font-weight="600" fill="var(--text-1)">refuse_flat_key()</text>
+<text x="151" y="128" text-anchor="middle" font-size="7" fill="var(--infra)">reject column-0 keys (cross-section collision)</text>
+
+<rect x="32" y="144" width="238" height="36" rx="3" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="151" y="160" text-anchor="middle" font-size="8" fill="var(--text-2)">env fallback: SIGNALING_SERVER=127.0.0.1</text>
+<text x="151" y="172" text-anchor="middle" font-size="8" fill="var(--text-2)">SIGNALING_PORT=49100, VIEWER_UI_MODE=usd-viewer</text>
+
+<rect x="306" y="10" width="270" height="180" rx="5" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1"/>
+<text x="322" y="30" font-size="10" font-weight="700" fill="var(--warn)">Phase 2: Validate</text>
+<text x="322" y="44" font-size="7.5" fill="var(--text-2)">fail fast on bad input</text>
+
+<rect x="322" y="56" width="238" height="28" rx="3" fill="var(--surface)" stroke="var(--warn)" stroke-width="0.8"/>
+<text x="441" y="74" text-anchor="middle" font-size="8" fill="var(--text-1)">SERVER: /^[A-Za-z0-9.-]+$/</text>
+
+<rect x="322" y="92" width="238" height="28" rx="3" fill="var(--surface)" stroke="var(--warn)" stroke-width="0.8"/>
+<text x="441" y="110" text-anchor="middle" font-size="8" fill="var(--text-1)">PORT: integer 1..65535, no leading zero</text>
+
+<rect x="322" y="128" width="238" height="28" rx="3" fill="var(--surface)" stroke="var(--warn)" stroke-width="0.8"/>
+<text x="441" y="146" text-anchor="middle" font-size="8" fill="var(--text-1)">UI_MODE: usd-viewer | stream-only</text>
+
+<rect x="322" y="164" width="238" height="22" rx="3" fill="var(--warn-soft)" stroke="var(--warn)" stroke-width="0.5"/>
+<text x="441" y="179" text-anchor="middle" font-size="7" font-weight="600" fill="var(--warn)">validation IS the escaping</text>
+
+<rect x="596" y="10" width="268" height="180" rx="5" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1"/>
+<text x="612" y="30" font-size="10" font-weight="700" fill="var(--gen)">Phase 3: Render</text>
+<text x="612" y="44" font-size="7.5" fill="var(--text-2)">*.js.tmpl -> *.js (atomic)</text>
+
+<rect x="612" y="56" width="236" height="50" rx="3" fill="var(--surface)" stroke="var(--gen)" stroke-width="0.8"/>
+<text x="730" y="72" text-anchor="middle" font-size="8" font-weight="600" fill="var(--text-1)">3 sed substitutions</text>
+<text x="730" y="84" text-anchor="middle" font-size="7" fill="var(--gen)">__OWV_SERVER__ -> host</text>
+<text x="730" y="95" text-anchor="middle" font-size="7" fill="var(--gen)">"__OWV_PORT__" -> port (bare numeric)</text>
+
+<rect x="612" y="114" width="236" height="28" rx="3" fill="var(--surface)" stroke="var(--gen)" stroke-width="0.8"/>
+<text x="730" y="132" text-anchor="middle" font-size="8" fill="var(--text-1)">"__OWV_MEDIA_PORT__" -> port | null</text>
+
+<rect x="612" y="150" width="236" height="32" rx="3" fill="var(--gen-soft)" stroke="var(--gen)" stroke-width="0.6"/>
+<text x="730" y="166" text-anchor="middle" font-size="7.5" font-weight="600" fill="var(--gen)">temp file + mv (atomic swap)</text>
+<text x="730" y="178" text-anchor="middle" font-size="7" fill="var(--text-3)">partial sed never serves</text>
+
+<line x1="286" y1="100" x2="304" y2="100" stroke="var(--arrow)" stroke-width="1.2" marker-end="url(#ar2)"/>
+<line x1="576" y1="100" x2="594" y2="100" stroke="var(--arrow)" stroke-width="1.2" marker-end="url(#ar2)"/>
+
+<rect x="306" y="210" width="270" height="36" rx="4" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="1.5"/>
+<text x="441" y="232" text-anchor="middle" font-size="10" font-weight="700" fill="var(--svc)">exec "$@"</text>
+
+<line x1="441" y1="190" x2="441" y2="208" stroke="var(--svc)" stroke-width="1.2" marker-end="url(#ar2)"/>
+<text x="460" y="204" font-size="7" fill="var(--svc)">PID 1 handoff to CMD</text>
+
+<rect x="16" y="270" width="848" height="110" rx="5" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="32" y="290" font-size="9" font-weight="600" fill="var(--text-1)">Sentinel 生命週期（build time -> runtime）</text>
+
+<rect x="32" y="304" width="180" height="32" rx="3" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="0.8"/>
+<text x="122" y="318" text-anchor="middle" font-size="8" fill="var(--gen)">Build: vite bundles</text>
+<text x="122" y="330" text-anchor="middle" font-size="7" fill="var(--text-3)">__OWV_SERVER__ in .js</text>
+
+<line x1="212" y1="320" x2="252" y2="320" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar2)"/>
+
+<rect x="256" y="304" width="180" height="32" rx="3" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="0.8"/>
+<text x="346" y="318" text-anchor="middle" font-size="8" fill="var(--infra)">Image: *.js.tmpl</text>
+<text x="346" y="330" text-anchor="middle" font-size="7" fill="var(--text-3)">pristine template in dist</text>
+
+<line x1="436" y1="320" x2="476" y2="320" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar2)"/>
+
+<rect x="480" y="304" width="180" height="32" rx="3" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="0.8"/>
+<text x="570" y="318" text-anchor="middle" font-size="8" fill="var(--warn)">Entrypoint: validate</text>
+<text x="570" y="330" text-anchor="middle" font-size="7" fill="var(--text-3)">regex + range + enum</text>
+
+<line x1="660" y1="320" x2="700" y2="320" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar2)"/>
+
+<rect x="704" y="304" width="150" height="32" rx="3" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="0.8"/>
+<text x="779" y="318" text-anchor="middle" font-size="8" fill="var(--svc)">Served: real *.js</text>
+<text x="779" y="330" text-anchor="middle" font-size="7" fill="var(--text-3)">192.168.1.10:49100</text>
+
+<text x="32" y="360" font-size="7.5" fill="var(--text-2)">sentinel __OWV_SERVER__ 在 build 時由 vite 保留、entrypoint 驗證後替換。charset whitelist 拒絕未替換的 sentinel（底線不在允許字集內）。</text>
+<text x="32" y="372" font-size="7.5" fill="var(--text-2)">PORT sentinel 用引號包裹（"__OWV_PORT__"），sed 連引號一起替換，結果是 bare numeric token。leading zero 會導致 strict mode SyntaxError。</text>
+
+</svg>
+<figcaption>Entrypoint config injection 三階段。每一階段都有防禦目的：parse 防止 cross-section collision，validate 防止 sed/JS injection（whitelist 本身就是 escaping），render 用 atomic swap 防止 partial write。</figcaption>
+</figure>
+
+<h2><span class="num">4.</span> stream-core Package 抽象</h2>
+
+<p><code>packages/stream-core/</code>（188 行）是唯一碰 NVIDIA <code>@nvidia/omniverse-webrtc-streaming-library</code> 的 package。所有其他 code 透過這 4 個 export 間接使用 streaming library。</p>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Export</th><th>行數</th><th>職責</th><th>測試特性</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>buildStreamConfig</code></td>
+  <td>75</td>
+  <td>Pure factory: server + port + mediaPort &rarr; DIRECT stream config object</td>
+  <td>DOM-free, <code>node --test</code> 直接跑</td>
+</tr>
+<tr>
+  <td><code>connectStream</code></td>
+  <td>40</td>
+  <td>Lazy <code>import()</code> streaming lib &rarr; <code>AppStreamer.connect(DIRECT)</code></td>
+  <td><code>_connect</code> test seam（不需 registry image）</td>
+</tr>
+<tr>
+  <td><code>describeStreamError</code></td>
+  <td>67</td>
+  <td>Error code &rarr; human-readable message</td>
+  <td>Pure function</td>
+</tr>
+<tr>
+  <td><code>index.js</code></td>
+  <td>6</td>
+  <td>Re-export barrel</td>
+  <td>--</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout callout-overlay">
+  <strong>Lazy import 設計</strong>：<code>connectStream()</code> 用 dynamic <code>import()</code> 而非 top-level import。NVIDIA library 依賴 browser globals（<code>window</code>, <code>document</code>），top-level import 會在 Node.js test 環境 crash。Lazy import 讓 <code>buildStreamConfig</code> 的 unit test 可以在無 browser 環境下執行。
+</div>
+
+<div class="callout callout-infra">
+  <strong>maxReconnects = 20</strong>（library default 是 5）。<strong>不是</strong> mid-session reconnect budget：這個值只影響 session <em>start</em> retry（<code>sessionStartRetryLeft</code>）。Producer 在 stream 建立後死掉不會進這個路徑。設高是為了 startup grace：viewer 在 Kit app 還沒開好前保持重試初始 session setup。
+</div>
+
+<h2><span class="num">5.</span> 完整 Runtime 資料流</h2>
+
+<figure>
+<svg viewBox="0 0 880 220" role="img" aria-label="Runtime data flow from producer through container to browser">
+<defs>
+  <marker id="ar3" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--arrow)" opacity="0.6"/></marker>
+</defs>
+
+<rect x="16" y="60" width="160" height="80" rx="4" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.2"/>
+<text x="96" y="82" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">Producer</text>
+<text x="96" y="96" text-anchor="middle" font-size="7.5" fill="var(--text-2)">Isaac Sim /</text>
+<text x="96" y="108" text-anchor="middle" font-size="7.5" fill="var(--text-2)">Kit USD Viewer</text>
+<text x="96" y="122" text-anchor="middle" font-size="7" fill="var(--text-3)">WebRTC + NVENC</text>
+<text x="96" y="134" text-anchor="middle" font-size="7" fill="var(--text-3)">signaling on :49100</text>
+
+<line x1="176" y1="100" x2="226" y2="100" stroke="var(--arrow)" stroke-width="1" marker-end="url(#ar3)"/>
+<text x="200" y="94" text-anchor="middle" font-size="7" fill="var(--text-3)">WebRTC</text>
+
+<rect x="230" y="20" width="340" height="180" rx="5" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="1.5"/>
+<text x="246" y="40" font-size="8" font-weight="600" fill="var(--svc)">owv RUNTIME CONTAINER</text>
+
+<rect x="246" y="52" width="150" height="36" rx="3" fill="var(--surface)" stroke="var(--infra)" stroke-width="0.8"/>
+<text x="321" y="68" text-anchor="middle" font-size="8" font-weight="600" fill="var(--infra)">entrypoint.sh</text>
+<text x="321" y="80" text-anchor="middle" font-size="7" fill="var(--text-3)">config injection</text>
+
+<line x1="321" y1="88" x2="321" y2="98" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar3)"/>
+
+<rect x="246" y="102" width="150" height="36" rx="3" fill="var(--surface)" stroke="var(--gen)" stroke-width="0.8"/>
+<text x="321" y="118" text-anchor="middle" font-size="8" font-weight="600" fill="var(--gen)">serve -s dist -l PORT</text>
+<text x="321" y="130" text-anchor="middle" font-size="7" fill="var(--text-3)">static file HTTP</text>
+
+<rect x="246" y="150" width="150" height="36" rx="3" fill="var(--surface)" stroke="var(--overlay)" stroke-width="0.8"/>
+<text x="321" y="166" text-anchor="middle" font-size="8" font-weight="600" fill="var(--overlay)">*.js (rendered)</text>
+<text x="321" y="178" text-anchor="middle" font-size="7" fill="var(--text-3)">server + port baked in</text>
+
+<rect x="416" y="80" width="140" height="100" rx="3" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="486" y="100" text-anchor="middle" font-size="8" font-weight="600" fill="var(--text-1)">stream-core</text>
+<text x="486" y="116" text-anchor="middle" font-size="7" fill="var(--overlay)">buildStreamConfig</text>
+<text x="486" y="130" text-anchor="middle" font-size="7" fill="var(--overlay)">connectStream</text>
+<text x="486" y="144" text-anchor="middle" font-size="7" fill="var(--text-3)">lazy import</text>
+<text x="486" y="158" text-anchor="middle" font-size="7" fill="var(--text-3)">AppStreamer</text>
+<text x="486" y="172" text-anchor="middle" font-size="7" fill="var(--text-3)">.connect(DIRECT)</text>
+
+<line x1="570" y1="100" x2="620" y2="100" stroke="var(--arrow)" stroke-width="1" marker-end="url(#ar3)"/>
+<text x="595" y="94" text-anchor="middle" font-size="7" fill="var(--text-3)">HTTP</text>
+
+<rect x="624" y="40" width="240" height="140" rx="4" fill="var(--surface)" stroke="var(--border)" stroke-width="1.2"/>
+<text x="744" y="62" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">Browser</text>
+
+<rect x="640" y="72" width="208" height="30" rx="3" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="0.6"/>
+<text x="744" y="91" text-anchor="middle" font-size="8" fill="var(--gen)">load rendered *.js from serve</text>
+
+<rect x="640" y="110" width="208" height="30" rx="3" fill="var(--overlay-fill)" stroke="var(--overlay)" stroke-width="0.6"/>
+<text x="744" y="129" text-anchor="middle" font-size="8" fill="var(--overlay)">stream-core: connect(config)</text>
+
+<rect x="640" y="148" width="208" height="24" rx="3" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="0.6"/>
+<text x="744" y="164" text-anchor="middle" font-size="8" fill="var(--infra)">WebRTC peer connection to producer</text>
+
+<path d="M 744 180 C 744 210, 96 210, 96 140" fill="none" stroke="var(--infra)" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#ar3)"/>
+<text x="420" y="210" text-anchor="middle" font-size="7.5" font-weight="500" fill="var(--infra)">WebRTC peer-to-peer (bypasses container after signaling)</text>
+
+</svg>
+<figcaption>完整 runtime 資料流。Container 的角色是 <strong>signaling relay + static file server</strong>，不是 media proxy。WebRTC 建立後，video/audio stream 在 producer 和 browser 之間直連（DIRECT StreamType），container 不在 media path 上。</figcaption>
+</figure>
+
+<div class="callout callout-gen">
+  <strong>Container 不是 media proxy</strong>：<code>StreamType.DIRECT</code> 表示 browser 直接與 producer 建立 WebRTC peer connection。Container 只做兩件事：(1) 用 <code>serve</code> deliver 含 baked-in config 的 static files，(2) 提供 signaling 端點的初始位址。stream 建立後 container 可以消失，media 不受影響。
+</div>
+
+</body>
+</html>

@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dockerfile Stage 拓撲</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #F5F3EF;
+  --surface: #FFFFFF;
+  --surface-2: #EDEAE4;
+  --text-1: #1C1917;
+  --text-2: #57534E;
+  --text-3: #A8A29E;
+  --border: #D6D3D1;
+  --infra: #1B4965;
+  --infra-soft: #D4E8F5;
+  --infra-fill: #EBF4FA;
+  --svc: #92400E;
+  --svc-soft: #FEF3C7;
+  --svc-fill: #FFFBEB;
+  --gen: #166534;
+  --gen-soft: #DCFCE7;
+  --gen-fill: #F0FDF4;
+  --overlay: #6D28D9;
+  --overlay-soft: #EDE9FE;
+  --overlay-fill: #F5F3FF;
+  --warn: #B91C1C;
+  --warn-soft: #FEE2E2;
+  --warn-fill: #FEF2F2;
+  --code-bg: #F0EDEA;
+  --arrow: #78716C;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}}
+:root[data-theme="dark"]{
+  --bg: #1A1D23;
+  --surface: #22262E;
+  --surface-2: #2A2F38;
+  --text-1: #E7E5E4;
+  --text-2: #A8A29E;
+  --text-3: #6B6660;
+  --border: #3A3F48;
+  --infra: #7DD3FC;
+  --infra-soft: #0C3A5A;
+  --infra-fill: #0F2A3E;
+  --svc: #FCD34D;
+  --svc-soft: #452C08;
+  --svc-fill: #2A1D06;
+  --gen: #4ADE80;
+  --gen-soft: #0A3520;
+  --gen-fill: #071F14;
+  --overlay: #C4B5FD;
+  --overlay-soft: #2E1A60;
+  --overlay-fill: #1E1340;
+  --warn: #FCA5A5;
+  --warn-soft: #450A0A;
+  --warn-fill: #2D0808;
+  --code-bg: #1E2128;
+  --arrow: #78716C;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text-1);
+  background: var(--bg);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+  line-height: 1.7;
+}
+
+h1 {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-size: 1.65rem;
+  font-weight: 700;
+  margin: 0 0 0.15rem;
+  text-wrap: balance;
+}
+.subtitle {
+  color: var(--text-2);
+  font-size: 0.88rem;
+  margin-bottom: 0.3rem;
+}
+.ref {
+  font-size: 0.78rem;
+  color: var(--text-3);
+  margin-bottom: 2.8rem;
+}
+.ref a { color: var(--text-3); }
+
+h2 {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 3rem 0 0.8rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1.5px solid var(--border);
+  letter-spacing: -0.01em;
+}
+h2 .num {
+  color: var(--text-3);
+  font-weight: 400;
+  margin-right: 0.3em;
+  font-variant-numeric: tabular-nums;
+}
+
+h3 {
+  font-size: 0.92rem;
+  font-weight: 600;
+  margin: 1.4rem 0 0.4rem;
+}
+
+p, .desc {
+  margin: 0.55rem 0;
+  max-width: 66ch;
+  font-size: 0.9rem;
+}
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 5px;
+  font-size: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  overflow-x: auto;
+  color: var(--text-1);
+  margin: 0.8rem 0;
+  line-height: 1.55;
+}
+
+figure { margin: 1.4rem 0; }
+figcaption {
+  font-size: 0.8rem;
+  color: var(--text-2);
+  margin-top: 0.5rem;
+  max-width: 66ch;
+  line-height: 1.5;
+}
+
+svg { max-width: 100%; height: auto; display: block; }
+svg text { font-family: 'JetBrains Mono', monospace; }
+
+.tbl-wrap { overflow-x: auto; margin: 1rem 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+th {
+  text-align: left;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 2px solid var(--border);
+  font-weight: 600;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  letter-spacing: 0.02em;
+}
+td {
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0.15em 0.55em;
+  border-radius: 3px;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.badge-infra { background: var(--infra-soft); color: var(--infra); }
+.badge-svc { background: var(--svc-soft); color: var(--svc); }
+.badge-gen { background: var(--gen-soft); color: var(--gen); }
+.badge-overlay { background: var(--overlay-soft); color: var(--overlay); }
+.badge-warn { background: var(--warn-soft); color: var(--warn); }
+
+.callout {
+  border-left: 3px solid var(--infra);
+  padding: 0.7rem 1rem;
+  border-radius: 0 4px 4px 0;
+  margin: 1rem 0;
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+.callout-infra { background: var(--infra-fill); border-left-color: var(--infra); }
+.callout-svc { background: var(--svc-fill); border-left-color: var(--svc); }
+.callout-gen { background: var(--gen-fill); border-left-color: var(--gen); }
+.callout-overlay { background: var(--overlay-fill); border-left-color: var(--overlay); }
+.callout-warn { background: var(--warn-fill); border-left-color: var(--warn); }
+
+.side {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+@media(max-width: 640px) { .side { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1rem 1.2rem;
+}
+</style>
+</head>
+<body>
+
+<h1>Dockerfile Stage 拓撲</h1>
+<p class="subtitle">11 stages, 鑽石拓撲 -- 精實 runtime / 平行 build / 隔離 test</p>
+<p class="ref">ADR-0001 | Dockerfile 656 行 | 2026-09-07</p>
+
+<h2><span class="num">1.</span> 鑽石拓撲總覽</h2>
+
+<p>Dockerfile 不是線性 pipeline。11 個 stage 形成<strong>鑽石拓撲</strong>: <code>devel-base</code> 向下分支至 5 條平行路徑，builder stages 透過 <code>COPY --from</code> 匯流回 <code>runtime</code> 和 <code>devel</code>，再各自延伸出 test stages。</p>
+
+<figure>
+<svg viewBox="0 0 880 560" role="img" aria-label="Dockerfile 11-stage diamond topology">
+<defs>
+  <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--arrow)" opacity="0.6"/></marker>
+  <marker id="ar-gen" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="5.5" orient="auto"><path d="M0,0 L10,4 L0,8Z" fill="var(--gen)" opacity="0.6"/></marker>
+</defs>
+
+<rect x="370" y="10" width="140" height="44" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1.2"/>
+<text x="440" y="30" text-anchor="middle" font-size="10.5" font-weight="600" fill="var(--text-1)">sys</text>
+<text x="440" y="43" text-anchor="middle" font-size="7" fill="var(--infra)">FROM BASE_IMAGE</text>
+
+<line x1="440" y1="54" x2="440" y2="86" stroke="var(--arrow)" stroke-width="1" marker-end="url(#ar)"/>
+
+<rect x="350" y="90" width="180" height="52" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1.5"/>
+<text x="440" y="112" text-anchor="middle" font-size="11" font-weight="700" fill="var(--infra)">devel-base</text>
+<text x="440" y="127" text-anchor="middle" font-size="7" fill="var(--text-2)">apt + node 22 + npm + serve + git</text>
+
+<line x1="380" y1="142" x2="100" y2="196" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="410" y1="142" x2="310" y2="196" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="440" y1="142" x2="490" y2="196" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="470" y1="142" x2="660" y2="196" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="500" y1="142" x2="820" y2="196" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+
+<rect x="20" y="200" width="160" height="52" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1.2"/>
+<text x="100" y="220" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">usd-viewer-build</text>
+<text x="100" y="235" text-anchor="middle" font-size="7" fill="var(--gen)">npm install + build (src/)</text>
+<text x="100" y="246" text-anchor="middle" font-size="6.5" fill="var(--text-3)">discarded after COPY</text>
+
+<rect x="210" y="200" width="170" height="52" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1.2"/>
+<text x="295" y="220" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">stream-only-build</text>
+<text x="295" y="235" text-anchor="middle" font-size="7" fill="var(--gen)">npm ci + vite build</text>
+<text x="295" y="246" text-anchor="middle" font-size="6.5" fill="var(--text-3)">discarded after COPY</text>
+
+<rect x="420" y="200" width="150" height="52" rx="4" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="2"/>
+<text x="495" y="220" text-anchor="middle" font-size="10.5" font-weight="700" fill="var(--svc)">runtime</text>
+<text x="495" y="235" text-anchor="middle" font-size="7" fill="var(--svc)">PUBLISHED IMAGE</text>
+<text x="495" y="246" text-anchor="middle" font-size="6.5" fill="var(--text-3)">no npm/git/sudo, has curl</text>
+
+<rect x="600" y="200" width="130" height="52" rx="4" fill="var(--overlay-fill)" stroke="var(--overlay)" stroke-width="1.2"/>
+<text x="665" y="220" text-anchor="middle" font-size="10" font-weight="600" fill="var(--text-1)">devel</text>
+<text x="665" y="235" text-anchor="middle" font-size="7" fill="var(--overlay)">full toolchain</text>
+<text x="665" y="246" text-anchor="middle" font-size="6.5" fill="var(--text-3)">sudo + npm + git</text>
+
+<rect x="760" y="200" width="110" height="52" rx="4" fill="var(--surface)" stroke="var(--border)" stroke-width="1"/>
+<text x="815" y="220" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">example</text>
+<text x="815" y="235" text-anchor="middle" font-size="7" fill="var(--text-3)">demo site</text>
+<text x="815" y="246" text-anchor="middle" font-size="6.5" fill="var(--text-3)">EXAMPLE_PORT</text>
+
+<path d="M 140 252 C 140 280, 460 275, 460 200" fill="none" stroke="var(--gen)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+<text x="280" y="278" text-anchor="middle" font-size="6.5" fill="var(--gen)">COPY --from dist</text>
+
+<path d="M 340 252 C 340 270, 480 268, 480 252" fill="none" stroke="var(--gen)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+
+<path d="M 160 252 C 160 295, 640 290, 640 252" fill="none" stroke="var(--gen)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+
+<path d="M 360 252 C 360 285, 650 283, 650 252" fill="none" stroke="var(--gen)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+<text x="510" y="294" text-anchor="middle" font-size="6.5" fill="var(--gen)">COPY --from dist</text>
+
+<line x1="480" y1="252" x2="350" y2="376" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="510" y1="252" x2="530" y2="376" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+<line x1="665" y1="252" x2="730" y2="376" stroke="var(--arrow)" stroke-width="0.8" marker-end="url(#ar)"/>
+
+<rect x="270" y="380" width="150" height="52" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1.2"/>
+<text x="345" y="400" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">runtime-test</text>
+<text x="345" y="413" text-anchor="middle" font-size="7" fill="var(--warn)">FROM runtime</text>
+<text x="345" y="425" text-anchor="middle" font-size="6.5" fill="var(--text-3)">RUNTIME_SMOKE_CMD</text>
+
+<rect x="450" y="380" width="150" height="52" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1.2"/>
+<text x="525" y="400" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">e2e-test</text>
+<text x="525" y="413" text-anchor="middle" font-size="7" fill="var(--warn)">FROM runtime</text>
+<text x="525" y="425" text-anchor="middle" font-size="6.5" fill="var(--text-3)">headless Chromium</text>
+
+<rect x="650" y="380" width="150" height="52" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1.2"/>
+<text x="725" y="400" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-1)">devel-test</text>
+<text x="725" y="413" text-anchor="middle" font-size="7" fill="var(--warn)">FROM devel</text>
+<text x="725" y="425" text-anchor="middle" font-size="6.5" fill="var(--text-3)">shellcheck + hadolint + bats</text>
+
+<rect x="20" y="380" width="180" height="52" rx="4" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1" stroke-dasharray="5 3"/>
+<text x="110" y="400" text-anchor="middle" font-size="9.5" font-weight="600" fill="var(--text-2)">test-tools-stage</text>
+<text x="110" y="413" text-anchor="middle" font-size="7" fill="var(--text-3)">FROM TEST_TOOLS_IMAGE</text>
+<text x="110" y="425" text-anchor="middle" font-size="6.5" fill="var(--text-3)">external (base GHCR)</text>
+
+<line x1="200" y1="406" x2="648" y2="406" stroke="var(--arrow)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+<text x="420" y="400" text-anchor="middle" font-size="6.5" fill="var(--text-3)">COPY shellcheck, hadolint, bats</text>
+
+<rect x="20" y="470" width="840" height="70" rx="5" fill="var(--surface)" stroke="var(--border)" stroke-width="0.8"/>
+<text x="40" y="490" font-size="8" font-weight="600" fill="var(--text-2)">LEGEND</text>
+
+<rect x="40" y="500" width="12" height="12" rx="2" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1"/>
+<text x="58" y="510" font-size="7.5" fill="var(--text-2)">Foundation</text>
+
+<rect x="140" y="500" width="12" height="12" rx="2" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1"/>
+<text x="158" y="510" font-size="7.5" fill="var(--text-2)">Builder (discarded)</text>
+
+<rect x="280" y="500" width="12" height="12" rx="2" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="2"/>
+<text x="298" y="510" font-size="7.5" fill="var(--text-2)">Published image</text>
+
+<rect x="420" y="500" width="12" height="12" rx="2" fill="var(--overlay-fill)" stroke="var(--overlay)" stroke-width="1"/>
+<text x="438" y="510" font-size="7.5" fill="var(--text-2)">Development</text>
+
+<rect x="540" y="500" width="12" height="12" rx="2" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1"/>
+<text x="558" y="510" font-size="7.5" fill="var(--text-2)">Test</text>
+
+<line x1="640" y1="506" x2="670" y2="506" stroke="var(--arrow)" stroke-width="1" marker-end="url(#ar)"/>
+<text x="678" y="510" font-size="7.5" fill="var(--text-2)">FROM</text>
+
+<line x1="720" y1="506" x2="750" y2="506" stroke="var(--gen)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+<text x="758" y="510" font-size="7.5" fill="var(--text-2)">COPY --from</text>
+
+<rect x="145" y="265" width="265" height="30" rx="12" fill="var(--gen-soft)" stroke="var(--gen)" stroke-width="0.6" opacity="0.8"/>
+<text x="277" y="284" text-anchor="middle" font-size="7.5" font-weight="600" fill="var(--gen)">DIAMOND: fan out to builders, converge via COPY</text>
+
+</svg>
+<figcaption>11 個 stage 的鑽石拓撲。<code>devel-base</code> 是共享地基，builder stages 平行 build 兩套 app 的 dist，再透過 <code>COPY --from</code> 匯入 <code>runtime</code>（精實發佈 image）和 <code>devel</code>（完整開發 image）。三個 test stages 各自驗證不同面向。<code>test-tools-stage</code> 來自外部 GHCR image，僅提供測試工具二進位。</figcaption>
+</figure>
+
+<h2><span class="num">2.</span> Stage 職責與關鍵決策</h2>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Stage</th><th>FROM</th><th>職責</th><th>特徵</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>sys</code></td>
+  <td><span class="badge badge-infra">BASE_IMAGE</span></td>
+  <td>系統使用者建立、APT mirror 設定</td>
+  <td>非 root 使用者 + group</td>
+</tr>
+<tr>
+  <td><code>devel-base</code></td>
+  <td><span class="badge badge-infra">sys</span></td>
+  <td>共享開發工具地基</td>
+  <td>node 22 + npm + serve + git + curl</td>
+</tr>
+<tr>
+  <td><code>usd-viewer-build</code></td>
+  <td><span class="badge badge-gen">devel-base</span></td>
+  <td>build upstream usd-viewer (submodule <code>src/</code>)</td>
+  <td><code>npm install</code> + overlay <code>stream.config.json</code> sentinel injection</td>
+</tr>
+<tr>
+  <td><code>stream-only-build</code></td>
+  <td><span class="badge badge-gen">devel-base</span></td>
+  <td>build custom stream-only app</td>
+  <td><code>npm ci</code> + <code>vite build</code> (workspace-aware)</td>
+</tr>
+<tr>
+  <td><code>runtime</code></td>
+  <td><span class="badge badge-svc">devel-base</span></td>
+  <td><strong>PUBLISHED IMAGE</strong> -- 精實 serve-only</td>
+  <td>移除 npm/npx/corepack/git/sudo；保留 curl（health check）；entrypoint 注入 config</td>
+</tr>
+<tr>
+  <td><code>devel</code></td>
+  <td><span class="badge badge-overlay">devel-base</span></td>
+  <td>完整開發環境</td>
+  <td>保留 sudo + npm + git；可 <code>just docker exec</code> 進入</td>
+</tr>
+<tr>
+  <td><code>example</code></td>
+  <td><span class="badge badge-infra">devel-base</span></td>
+  <td>Demo 網站（embedded-site example）</td>
+  <td><code>EXAMPLE_PORT</code>；不走 entrypoint</td>
+</tr>
+<tr>
+  <td><code>runtime-test</code></td>
+  <td><span class="badge badge-warn">runtime</span></td>
+  <td>Production image 冒煙測試</td>
+  <td><code>RUNTIME_SMOKE_CMD</code>: serve + curl 200 for both dists</td>
+</tr>
+<tr>
+  <td><code>e2e-test</code></td>
+  <td><span class="badge badge-warn">runtime</span></td>
+  <td>Tier-1 browser e2e（headless Chromium）</td>
+  <td>Playwright config-dial 驗證；per-PR on hosted runner</td>
+</tr>
+<tr>
+  <td><code>devel-test</code></td>
+  <td><span class="badge badge-warn">devel</span></td>
+  <td>靜態分析 + unit test + bats spec</td>
+  <td>ShellCheck + Hadolint + bats + <code>node --test</code></td>
+</tr>
+<tr>
+  <td><code>test-tools-stage</code></td>
+  <td><span class="badge badge-infra">EXTERNAL</span></td>
+  <td>測試工具二進位來源</td>
+  <td>FROM base GHCR test-tools image；COPY shellcheck/hadolint/bats 到 devel-test</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="num">3.</span> 為什麼是鑽石，不是線性</h2>
+
+<p>ADR-0001 記錄了三個核心約束推動了這個拓撲：</p>
+
+<div class="side">
+<div class="callout callout-svc">
+  <strong>精實 runtime</strong><br>
+  <code>runtime</code> 移除所有 build 工具（npm/git/sudo），只保留 <code>curl</code>（health check 用）和 <code>serve</code>。如果 <code>runtime</code> FROM <code>devel</code>，移除動作會變成破壞性清理而非乾淨起始。FROM <code>devel-base</code> + 精確 purge 是更安全的路徑。
+</div>
+<div class="callout callout-gen">
+  <strong>Cache 隔離</strong><br>
+  <code>usd-viewer-build</code> 和 <code>stream-only-build</code> 是獨立 stage。改 <code>apps/stream-only/</code> 不會 invalidate <code>src/</code> 的 npm cache，反之亦然。兩者可平行 build（BuildKit <code>--parallel</code>）。
+</div>
+</div>
+
+<div class="side">
+<div class="callout callout-warn">
+  <strong>Test 隔離</strong><br>
+  <code>runtime-test</code> 測試的是精實 image 的行為（serve + curl），不是 build 環境的行為。<code>devel-test</code> 測試的是 lint + spec，需要完整工具鏈。兩者 FROM 不同 parent 確保不會互相污染。
+</div>
+<div class="callout callout-overlay">
+  <strong>devel 保留 sudo</strong><br>
+  開發者進入 <code>devel</code> container 需要 <code>sudo</code>（裝 debug 工具）。<code>runtime</code> 的 <code>SUDO_FORCE_REMOVE</code> 不影響 <code>devel</code>，因為它們是 sibling，不是 parent-child。
+</div>
+</div>
+
+<h2><span class="num">4.</span> COPY --from 資料流</h2>
+
+<p>鑽石的「匯流點」是 <code>COPY --from</code>。兩個 builder 各自 produce 一份 app dist，再複製到 <code>runtime</code> 和 <code>devel</code>：</p>
+
+<figure>
+<svg viewBox="0 0 880 200" role="img" aria-label="COPY --from data flow">
+
+<rect x="20" y="20" width="180" height="40" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1"/>
+<text x="110" y="44" text-anchor="middle" font-size="9" font-weight="600" fill="var(--text-1)">usd-viewer-build</text>
+<text x="110" y="16" font-size="7" fill="var(--gen)">/app/usd-viewer/dist</text>
+
+<rect x="20" y="80" width="180" height="40" rx="4" fill="var(--gen-fill)" stroke="var(--gen)" stroke-width="1"/>
+<text x="110" y="104" text-anchor="middle" font-size="9" font-weight="600" fill="var(--text-1)">stream-only-build</text>
+<text x="110" y="76" font-size="7" fill="var(--gen)">/app/stream-only/dist</text>
+
+<line x1="200" y1="35" x2="390" y2="50" stroke="var(--gen)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+<line x1="200" y1="95" x2="390" y2="70" stroke="var(--gen)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+
+<rect x="395" y="30" width="150" height="60" rx="4" fill="var(--svc-fill)" stroke="var(--svc)" stroke-width="2"/>
+<text x="470" y="55" text-anchor="middle" font-size="10" font-weight="700" fill="var(--svc)">runtime</text>
+<text x="470" y="70" text-anchor="middle" font-size="7" fill="var(--text-2)">both dists + entrypoint</text>
+<text x="470" y="82" text-anchor="middle" font-size="7" fill="var(--svc)">Dockerfile:229-230</text>
+
+<line x1="200" y1="45" x2="620" y2="50" stroke="var(--gen)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+<line x1="200" y1="105" x2="620" y2="70" stroke="var(--gen)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar-gen)"/>
+
+<rect x="625" y="30" width="140" height="60" rx="4" fill="var(--overlay-fill)" stroke="var(--overlay)" stroke-width="1.2"/>
+<text x="695" y="55" text-anchor="middle" font-size="10" font-weight="600" fill="var(--text-1)">devel</text>
+<text x="695" y="70" text-anchor="middle" font-size="7" fill="var(--text-2)">both dists + full tools</text>
+<text x="695" y="82" text-anchor="middle" font-size="7" fill="var(--overlay)">Dockerfile:312-313</text>
+
+<rect x="20" y="140" width="170" height="40" rx="4" fill="var(--surface-2)" stroke="var(--border)" stroke-width="0.8" stroke-dasharray="5 3"/>
+<text x="105" y="164" text-anchor="middle" font-size="9" font-weight="500" fill="var(--text-2)">test-tools-stage</text>
+
+<rect x="625" y="140" width="140" height="40" rx="4" fill="var(--warn-fill)" stroke="var(--warn)" stroke-width="1"/>
+<text x="695" y="164" text-anchor="middle" font-size="9" font-weight="600" fill="var(--text-1)">devel-test</text>
+
+<line x1="190" y1="160" x2="623" y2="160" stroke="var(--arrow)" stroke-width="0.8" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+<text x="400" y="154" text-anchor="middle" font-size="7" fill="var(--text-3)">COPY shellcheck, hadolint, bats (Dockerfile:484-485, 567-568)</text>
+
+</svg>
+<figcaption>COPY --from 資料流。Builder stages 的 dist 複製到 <code>runtime</code>（發佈）和 <code>devel</code>（開發），確保兩者得到相同的 build 產物。<code>test-tools-stage</code> 的二進位工具複製到 <code>devel-test</code>。</figcaption>
+</figure>
+
+<h2><span class="num">5.</span> runtime 精實化清單</h2>
+
+<p><code>runtime</code> 是唯一發佈的 image。以下是移除 / 保留的決策：</p>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>項目</th><th>決策</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td><code>npm</code> / <code>npx</code> / <code>corepack</code></td><td><span class="badge badge-warn">REMOVED</span></td><td>runtime 不需要 package manager</td></tr>
+<tr><td><code>git</code></td><td><span class="badge badge-warn">REMOVED</span></td><td>runtime 不需要 VCS</td></tr>
+<tr><td><code>sudo</code></td><td><span class="badge badge-warn">REMOVED</span></td><td><code>SUDO_FORCE_REMOVE=yes</code></td></tr>
+<tr><td><code>curl</code></td><td><span class="badge badge-svc">KEPT</span></td><td>health check + smoke test 必要</td></tr>
+<tr><td><code>serve</code></td><td><span class="badge badge-svc">KEPT</span></td><td>靜態檔案 HTTP server (CMD)</td></tr>
+<tr><td><code>entrypoint.sh</code></td><td><span class="badge badge-svc">KEPT</span></td><td>config injection (<code>*.js.tmpl</code> rendering)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout callout-svc">
+  <strong>CMD 指令</strong>: <code>exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}</code><br>
+  entrypoint 先執行 config injection（環境變數 &rarr; JS bundle），再 <code>exec</code> CMD。<code>VIEWER_UI_MODE</code> 決定 serve 哪套 app 的 dist。
+</div>
+
+</body>
+</html>
