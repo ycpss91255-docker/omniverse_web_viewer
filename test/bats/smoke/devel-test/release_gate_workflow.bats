@@ -2392,3 +2392,131 @@ jobs:
   assert_failure 1
   assert_output --partial "release.yml"
 }
+
+
+# ==========================================================================
+# THREE HOLES FOUND BY THE 2026-09-06 AUDIT
+# ==========================================================================
+#
+# All three were executed against the shipped workflow before being written
+# here: each mutation made the checker print "holds the release invariant"
+# and exit 0, and each one is a way to publish a version whose picture was
+# never verified. The mutations are kept verbatim as the cases below.
+
+# HOLE 1. The evidence conjunct was checked by SUBSTRING while the tier-b
+# conjunct next to it was checked STRUCTURALLY. `has_top_level_or` sees only
+# a `||` at depth 0, so one pair of parentheses hid it: the substring is
+# still present, no top-level `||` exists, and the picture evidence becomes
+# one alternative of an OR. publish-image carries `!cancelled()`, so a FAILED
+# evidence gate does not skip it -- the OR is the whole gate.
+@test "gates: a publisher making the evidence gate one arm of an OR is caught" {
+  _mutate "s|^      && needs.require-picture-evidence.result == 'success'\$|      \&\& (needs.require-picture-evidence.result == 'success' \|\| inputs.force_publish)|"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+# The same shape one level in: a parenthesised alternative that MENTIONS the
+# evidence job without requiring it.
+@test "gates: a publisher requiring the evidence gate only on tags is caught" {
+  _mutate "s|^      && needs.require-picture-evidence.result == 'success'\$|      \&\& (github.event_name != 'push' \|\| needs.require-picture-evidence.result == 'success')|"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[picture-leaves-evidence]"
+}
+
+# HOLE 2. The undeclared-job-on-the-shared-runner check iterated
+# `runs_on_variants()`, which returns a `(variants, problem)` TUPLE -- so it
+# stringified the whole list and matched `self-hosted` case-SENSITIVELY,
+# in a file that argues at length (canon_key) that GitHub matches labels
+# case-insensitively. `[Self-Hosted, GPU]` reaches the same shared runner as
+# `[self-hosted, gpu]` and was accepted.
+@test "gates: an undeclared job on the self-hosted runner is caught in any case" {
+  _append_job <<'YAML'
+
+  audit-hole-2:
+    runs-on: [Self-Hosted, GPU]
+    steps:
+      - run: find . -name tier_b_visual_e2e.sh -exec sed -i "2i exit 0" {} +
+YAML
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: an undeclared job on a mixed-case self-hosted scalar is caught" {
+  _append_job <<'YAML'
+
+  audit-hole-2b:
+    runs-on: Self-Hosted
+    steps:
+      - run: echo prepare the ground
+YAML
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# The other half of the same bug, and the one that decides what "correct"
+# means here. A runner GROUP names machines listed in a repo SETTING this
+# file cannot read, so it can neither confirm nor rule out the shared GPU
+# box. The old code refused it -- but by ACCIDENT: it stringified the
+# (variants, problem) tuple, and the remedy text for a group happens to
+# contain the words `self-hosted` while the text for an undetermined matrix
+# does not. Same input class, opposite verdicts, neither one chosen.
+#
+# It is chosen now, and it is refused: an undeclared job whose runner cannot
+# be determined is treated as one that might land on the shared runner. On
+# this workflow every job with no runs-on calls a reusable workflow and is
+# out of scope by header item 5, so the cost of failing closed is a
+# `labels:` line the day someone adds a group -- which the remedy text has
+# been asking for all along.
+@test "gates: an undeclared job on an undeterminable runner is caught" {
+  _append_job <<'YAML'
+
+  audit-hole-2c:
+    runs-on:
+      group: build-farm
+    steps:
+      - run: echo ordinary hosted work
+YAML
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# ...and the exemption that keeps that from being a false alarm on the
+# shipped file: a job that CALLS a reusable workflow has no runs-on at all.
+# call-docker-build and call-release are both this shape, so if the rule
+# above did not skip them the workflow would fail its own checker.
+@test "gates: an undeclared job that calls a reusable workflow is accepted" {
+  _append_job <<'YAML'
+
+  audit-hole-2d:
+    uses: ./.github/workflows/main.yaml
+YAML
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
+}
+
+# HOLE 3. `with:` was invisible to the step signature, which keyed on
+# `uses:`+@ref or the collapsed `run:` only. So the pinned action stayed
+# byte-identical while what it DID changed: `ref:` on the gate job's own
+# checkout replaces the entire tree the driver is read from. The header's
+# item 3(a) named this bypass and said the evidence chain covers it; it does
+# not, because the swapped tree's driver can print a well-shaped attestation
+# and require_attestation.sh only checks the shape.
+@test "gates: repointing a declared checkout at another ref is caught" {
+  _mutate 's|^        with:$|        with:\n          ref: refs/heads/not-the-tagged-commit|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+@test "gates: dropping a declared checkout's with: is caught" {
+  _mutate 's|^          submodules: recursive$|          submodules: false|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
