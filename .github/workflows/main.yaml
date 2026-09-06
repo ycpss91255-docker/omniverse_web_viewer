@@ -160,6 +160,34 @@ jobs:
         if: ${{ github.ref_type == 'tag' }}
         run: bash script/ci/derive_image_tag.sh
 
+  verify-tag-on-main:
+    # Tag rulesets enforce "CI passed on this commit" but not "this commit
+    # is on main". A PR branch commit that passed CI and was never merged
+    # could still be tagged. This job closes that gap: on a tag push it
+    # verifies the tagged commit is reachable from origin/main.
+    #
+    # Off a non-tag ref the step guard skips the check, so the job always
+    # succeeds and costs one trivial hosted-runner slot (same pattern as
+    # verify-tag-shape above).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history for branch reachability)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Refuse a tag on a commit not reachable from main
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          if ! git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/main'; then
+            echo "::error::Tagged commit $GITHUB_SHA is not reachable from the main branch."
+            echo "::error::Only tag commits that have been merged to main."
+            exit 1
+          fi
+          echo "Confirmed: $GITHUB_SHA is reachable from origin/main"
+
   call-release:
     # THE PICTURE GATE (#70). v0.3.0-rc1 was published without the Tier B
     # visual acceptance ever having run for that commit -- a tag push skipped
@@ -198,7 +226,7 @@ jobs:
     # "call-release failed, so no Release was cut" into "the recovery dispatch
     # publishes the image anyway". Do not narrow that guard's condition without
     # revisiting this one.
-    needs: [verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence]
+    needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence]
     if: >-
       startsWith(github.ref, 'refs/tags/')
       && !(github.event_name == 'workflow_dispatch'
@@ -548,7 +576,7 @@ jobs:
   # asserting a picture there would fail forever. usd-viewer keeps its existing
   # per-PR config-dial cover.
   tier-b-visual-e2e:
-    needs: [verify-tag-shape]
+    needs: [verify-tag-shape, verify-tag-on-main]
     if: >-
       github.event_name == 'schedule'
       || startsWith(github.ref, 'refs/tags/')
@@ -723,7 +751,7 @@ jobs:
   # thing that answers "is there still a picture?" between releases, and it can
   # now fail to run for a reason that has nothing to do with the picture.
   #
-  # tier-b-visual-e2e `needs: [verify-tag-shape]`, a hosted ubuntu-latest job.
+  # tier-b-visual-e2e `needs: [verify-tag-shape, verify-tag-on-main]`, a hosted ubuntu-latest job.
   # That need is what lets the gate's own condition carry no status function,
   # and off a tag ref verify-tag-shape does nothing but check out the repo --
   # but a checkout flake there is enough to end it non-success, which SKIPS the
