@@ -284,6 +284,7 @@ import yaml
 GATE_JOBS = (
     "call-docker-build",
     "verify-tag-shape",
+    "verify-tag-on-main",
     "call-release",
     "publish-image",
     "tier-b-visual-e2e",
@@ -1842,6 +1843,17 @@ def check(wf):
             "must always run. Guard the tag check per-step instead."
             % (wf.condition("verify-tag-shape") or "<empty>"),
         )
+    # Same invariant for verify-tag-on-main: it is a need of both
+    # call-release and tier-b-visual-e2e, so it must always run.
+    if wf.has("verify-tag-on-main") and wf.body("verify-tag-on-main").get("if") is not None:
+        violation(
+            "verify-tag-on-main-has-no-job-level-if",
+            "verify-tag-on-main has a job-level 'if:' (%s). It is a need of the "
+            "picture gate, and a skipped need skips its dependent, so this job "
+            "must always run. Guard the tag check per-step instead."
+            % (wf.condition("verify-tag-on-main") or "<empty>"),
+        )
+
 
     # --- 10. a gate job's WORK may not be conditionally skipped -----------
     # A job's `result` is all a `needs:` or a `needs.*.result` check can see,
