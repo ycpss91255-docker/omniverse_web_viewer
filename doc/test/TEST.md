@@ -1,6 +1,6 @@
 # TEST.md
 
-**390 tests** total: **278 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **102 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **10 Playwright** (browser e2e, `test/e2e/`: **9 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+**437 tests** total: **325 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **102 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **10 Playwright** (browser e2e, `test/e2e/`: **9 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
 
@@ -120,6 +120,67 @@ Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. I
 | `SIGTERM exits non-zero, so a killed run cannot claim a picture` | A GitHub step timeout / job cancellation must not be readable as a verified picture (143) |
 | `SIGINT exits non-zero, so a killed run cannot claim a picture` | Same for an interrupt (130) |
 | `teardown runs exactly once on a signal path` | The signal handler and the EXIT handler used to be the same function, so its own `exit` re-entered it and `producer.log` was written twice |
+
+## test/bats/smoke/devel-test/require_attestation.bats (17)
+
+Refusal-branch coverage for `script/ci/require_attestation.sh`, the shell guard that refuses a release whose picture left no evidence. The script exits 0 only when `ATTESTATION` is a non-empty string matching the frame-summary pattern `<W>x<H> meanLuma=<n> brightFraction=<n>`. Every other input -- empty, unset, a placeholder like `ok` or `true`, a partial or malformed summary, leading or trailing whitespace -- exits 1 and blocks the release.
+
+| Test | Description |
+|------|-------------|
+| `empty ATTESTATION is refused` | Empty string exits 1 with "produced no attestation" |
+| `unset ATTESTATION is refused` | Unset variable exits 1 with "produced no attestation" |
+| `placeholder 'ok' is refused` | Literal `ok` does not match the frame-summary regex |
+| `placeholder 'true' is refused` | Literal `true` does not match |
+| `single dot is refused` | Literal `.` does not match |
+| `number-only string is refused` | Bare number does not match |
+| `missing brightFraction is refused` | Partial summary with only `meanLuma` |
+| `missing meanLuma is refused` | Partial summary with only `brightFraction` |
+| `missing dimensions is refused` | Summary without leading `<W>x<H>` |
+| `trailing whitespace is refused` | Regex is `$`-anchored |
+| `leading whitespace is refused` | Regex is `^`-anchored |
+| `valid summary is accepted` | Canonical frame summary exits 0 |
+| `scientific notation is accepted` | `4.2e+1` matches `[0-9.e+-]+` |
+| `small dimensions are accepted` | `1x1` is a valid dimension pair |
+| `GITHUB_SHA appears in refusal message` | Commit hash propagated to stderr |
+| `GITHUB_SHA appears in success message` | Commit hash propagated to stdout |
+| `step summary is written on success` | `GITHUB_STEP_SUMMARY` file written |
+
+## test/bats/smoke/devel-test/verify_tier_b_attestation.bats (30)
+
+Refusal-branch coverage for `script/ci/verify_tier_b_attestation.py`, the Python verifier that re-checks attestation numbers and binds them to the commit and run being published. The script exits 0 only when the attestation file contains valid JSON with every required field, correct bindings, and threshold-passing numbers. Missing file, unreadable file, malformed JSON, a missing or non-numeric field, a degenerate frame, a commit or run mismatch -- every one exits 1.
+
+| Test | Description |
+|------|-------------|
+| `OWV_ATTESTATION unset is refused` | Env var not set |
+| `OWV_ATTESTATION empty string is refused` | Env var set to empty |
+| `nonexistent file is refused` | Path does not exist |
+| `invalid JSON is refused` | File contains non-JSON text |
+| `JSON array (not object) is refused` | Top-level `[...]` instead of `{...}` |
+| `duplicate keys are refused` | `_no_duplicate_keys` hook catches repeated keys |
+| `NaN constant is refused` | `parse_constant` hook rejects non-standard `NaN` |
+| `Infinity constant is refused` | `parse_constant` hook rejects non-standard `Infinity` |
+| `missing width is refused` | Required field absent |
+| `missing meanLuma is refused` | Required field absent |
+| `missing maxLuma is refused` | Required field absent |
+| `missing brightFraction is refused` | Required field absent |
+| `bool as meanLuma is refused` | `bool` is a subclass of `int` in Python; explicitly rejected |
+| `string as width is refused` | Non-numeric type |
+| `null as height is refused` | Non-numeric type |
+| `float NaN value in field is refused` | Guard via `parse_constant` path |
+| `zero width is refused` | Dimension must be >= 1 |
+| `fractional width is refused` | Dimension must be integral |
+| `negative height is refused` | Dimension must be >= 1 |
+| `wrong commit is refused` | `GITHUB_SHA` set but attestation names a different commit |
+| `wrong run_id is refused` | `GITHUB_RUN_ID` set but attestation names a different run |
+| `missing commit field when GITHUB_SHA set is refused` | Binding expected but field absent |
+| `meanLuma below threshold is refused` | Below `OWV_MIN_MEAN_LUMA` default (8) |
+| `maxLuma below threshold is refused` | Below `OWV_MIN_MAX_LUMA` default (32) |
+| `brightFraction below threshold is refused` | Below `OWV_MIN_BRIGHT_FRACTION` default (0.1) |
+| `custom threshold raises the bar` | `OWV_MIN_MEAN_LUMA=100` makes a passing frame fail |
+| `non-numeric threshold env is refused` | `env_float` rejects junk |
+| `valid doc without binding is accepted` | No `GITHUB_SHA` / `GITHUB_RUN_ID` in env |
+| `valid doc with correct binding is accepted` | Both bindings match |
+| `boundary values at threshold are accepted` | Exactly at threshold passes (>=, not >) |
 
 ## test/bats/smoke/devel-test/release_gate_workflow.bats (186)
 
