@@ -2457,12 +2457,21 @@ YAML
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
-# The other direction: a runner GROUP with no self-hosted label must not be
-# reported. It was -- by accident, because the words `self-hosted` appear in
-# the REMEDY text that runs_on_variants returns as its second tuple element,
-# which the same loop was stringifying. A check that fires on a valid edit is
-# how a check gets switched off.
-@test "gates: an undeclared job on a runner group is accepted" {
+# The other half of the same bug, and the one that decides what "correct"
+# means here. A runner GROUP names machines listed in a repo SETTING this
+# file cannot read, so it can neither confirm nor rule out the shared GPU
+# box. The old code refused it -- but by ACCIDENT: it stringified the
+# (variants, problem) tuple, and the remedy text for a group happens to
+# contain the words `self-hosted` while the text for an undetermined matrix
+# does not. Same input class, opposite verdicts, neither one chosen.
+#
+# It is chosen now, and it is refused: an undeclared job whose runner cannot
+# be determined is treated as one that might land on the shared runner. On
+# this workflow every job with no runs-on calls a reusable workflow and is
+# out of scope by header item 5, so the cost of failing closed is a
+# `labels:` line the day someone adds a group -- which the remedy text has
+# been asking for all along.
+@test "gates: an undeclared job on an undeterminable runner is caught" {
   _append_job <<'YAML'
 
   audit-hole-2c:
@@ -2470,6 +2479,21 @@ YAML
       group: build-farm
     steps:
       - run: echo ordinary hosted work
+YAML
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# ...and the exemption that keeps that from being a false alarm on the
+# shipped file: a job that CALLS a reusable workflow has no runs-on at all.
+# call-docker-build and call-release are both this shape, so if the rule
+# above did not skip them the workflow would fail its own checker.
+@test "gates: an undeclared job that calls a reusable workflow is accepted" {
+  _append_job <<'YAML'
+
+  audit-hole-2d:
+    uses: ./.github/workflows/main.yaml
 YAML
   run bash "${CHECK}" "${MUTATED}"
   assert_success

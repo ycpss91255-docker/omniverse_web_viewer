@@ -3,3 +3,8 @@
 # config COPY (Dockerfile CONFIG_SRC), so one machine's host.yaml would ride
 # along in a devel layer. The .example alongside it is documentation and stays.
 config/host.yaml
+
+# Same reason as .gitignore: never let a host-built .pyc into the build
+# context, where `COPY script/ci/ /ci/` would ship it.
+__pycache__/
+*.py[cod]

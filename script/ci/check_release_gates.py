@@ -818,6 +818,20 @@ TIER_B_SUCCESS_TESTS = frozenset(
     )
 )
 
+# The same closed set for the evidence gate. It exists because the two
+# conjuncts were NOT checked the same way: tier-b structurally, the evidence
+# gate by substring. `&& (needs.require-picture-evidence.result == 'success'
+# || inputs.force_publish)` contains the substring, has no `||` at depth 0,
+# and makes the picture evidence one alternative of an OR -- accepted, exit
+# 0, "holds the release invariant". Two spellings, because a term is
+# canonicalised before comparison and either order is the same test.
+EVIDENCE_SUCCESS_TESTS = frozenset(
+    (
+        "needs.require-picture-evidence.result=='success'",
+        "'success'==needs.require-picture-evidence.result",
+    )
+)
+
 # The narrow status function, and only it. See publish_image_status_is_narrow.
 NOT_CANCELLED_TESTS = frozenset(
     ("!cancelled()", "cancelled()==false", "false==cancelled()")
@@ -875,6 +889,19 @@ def has_top_level_or(expr):
 def has_tier_b_success_conjunct(expr):
     """True when a top-level `&&` term of <expr> IS the tier-b success test."""
     return any(is_tier_b_success_test(term) for term in top_terms(expr, "&"))
+
+
+def has_evidence_success_conjunct(expr):
+    """True when a top-level `&&` term of <expr> IS the evidence success test.
+
+    IS, not contains. A term that merely mentions the job -- `(A || B)`,
+    `!(...)`, a call taking it as an argument -- is not the test, and the
+    substring check this replaced accepted all three.
+    """
+    return any(
+        canon_key(term) in EVIDENCE_SUCCESS_TESTS
+        for term in top_terms(expr, "&")
+    )
 
 
 # ===========================================================================
@@ -2458,7 +2485,7 @@ def check_picture_leaves_evidence(wf):
             continue
         job_if = wf.condition(job)
         if status_functions_in(job_if) and not (
-            ("needs.%s.result == 'success'" % EVIDENCE_JOB) in (job_if or "")
+            has_evidence_success_conjunct(job_if)
             and not has_top_level_or(job_if)
         ):
             violation(
@@ -2619,8 +2646,11 @@ def _refuses_empty_attestation(wf, job):
 # which is the supply-chain half of the same hole.
 GATE_JOB_ALLOWED_STEPS = {
     "tier-b-visual-e2e": (
-        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
-        "uses:actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
+        " with:submodules=recursive",
+        "uses:actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        " with:if-no-files-found=warn,name=tier-b-visual-e2e-evidence,"
+        "path=.tier-b-artifacts",
         "run:docker run --rm -v \"${GITHUB_WORKSPACE}\":/w -w /w "
         "busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d"
         "11b1ab28616 sh -c ' rm -rf .tier-b-artifacts 2>/dev/null true'",
@@ -2641,14 +2671,52 @@ GATE_JOB_ALLOWED_STEPS = {
 }
 
 
+def _with_signature(step):
+    """<step>'s `with:` inputs, canonicalised to one comparable string.
+
+    WHY IT IS PART OF THE SIGNATURE. Keying on `uses:`+@ref alone let the
+    pinned action stay byte-identical while what it DID changed: adding
+    `ref: refs/heads/anything` to the picture gate's own checkout replaces
+    the entire tree the driver is then read from, and the checker printed
+    "holds the release invariant". Header item 3(a) named that bypass and
+    said the evidence chain covered it -- it did not, because the swapped
+    tree's driver can print a well-shaped attestation of its own and
+    require_attestation.sh only checks the shape.
+
+    Keys are sorted so that reordering the mapping is not a change, and
+    values go through normalise_paths for the same reason the run: body
+    does. A step with no `with:` gets the empty string, so the declared
+    entries for the steps that have none are unaffected.
+    """
+    inputs = step.get("with")
+    if not isinstance(inputs, dict) or not inputs:
+        return ""
+    parts = []
+    for key in sorted(as_text(k) for k in inputs.keys()):
+        value = inputs.get(key)
+        if value is None:
+            for raw_key in inputs:
+                if as_text(raw_key) == key:
+                    value = inputs.get(raw_key)
+                    break
+        text = " ".join(normalise_paths(as_text(value)).split())
+        parts.append("%s=%s" % (key, text))
+    return " with:" + ",".join(parts)
+
+
 def step_signature(step):
     """What this step IS, for allow-list comparison."""
     uses = as_text(step.get("uses") or "")
     if uses:
         # The @ref included: a declared action pointed at @main, or at a fork,
-        # is a different action with the same name.
-        return "uses:" + normalise_paths(uses.strip())
-    return "run:" + " ".join(normalise_paths(as_text(step.get("run") or "")).split())
+        # is a different action with the same name. The `with:` included for
+        # the reason _with_signature() gives: same action, different job.
+        return "uses:" + normalise_paths(uses.strip()) + _with_signature(step)
+    return (
+        "run:"
+        + " ".join(normalise_paths(as_text(step.get("run") or "")).split())
+        + _with_signature(step)
+    )
 
 
 def step_is_allowed(signature, allowed):
@@ -2669,9 +2737,38 @@ def check_gate_steps_are_declared(wf):
     for job in wf.names():
         if job in GATE_JOB_ALLOWED_STEPS:
             continue
+        # A job that CALLS a reusable workflow declares no runs-on of its own;
+        # where that workflow's own jobs land is decided in a file this one
+        # does not read, and header item 5 already says so. Skipping it here
+        # keeps that limitation in one place instead of turning it into a
+        # violation nobody can act on.
+        if as_text(wf.body(job).get("uses") or "").strip():
+            continue
+        variants, problem = runs_on_variants(wf, job)
+        if problem is not None:
+            # Fail CLOSED. The old code stringified the whole
+            # (variants, problem) tuple, so this branch fired or stayed
+            # silent according to whether the REMEDY TEXT happened to
+            # contain the words `self-hosted` -- it did for a runner group
+            # and did not for an undetermined matrix. Neither reading was a
+            # decision. Which machines are in a group is a repo setting this
+            # file cannot read, so an undeclared job whose runner cannot be
+            # determined is refused: on this workflow every such job calls a
+            # reusable workflow and is skipped above, so the cost is a
+            # `labels:` line on the day someone adds one.
+            violation(
+                "gate-job-runs-only-declared-steps",
+                "job '%s' is not declared in GATE_JOB_ALLOWED_STEPS and the "
+                "runner it lands on cannot be determined from this file (%s). "
+                "The self-hosted runner is persistent and shared, so a job "
+                "that MIGHT land on it is refused the same as one that asks "
+                "for it." % (job, problem),
+            )
+            continue
         if any(
-            "self-hosted" in str(variant)
-            for variant in runs_on_variants(wf, job)
+            as_text(label).strip().casefold() == "self-hosted"
+            for variant in variants
+            for label in variant
         ):
             violation(
                 "gate-job-runs-only-declared-steps",

@@ -19,3 +19,11 @@ coverage/
 # public_ip / ui_mode and is mounted into the container at /etc/host.yaml;
 # committing one machine's copy would silently repoint everyone else's viewer.
 config/host.yaml
+
+# Python bytecode. Two .pyc files for script/ci/ were tracked and shipped
+# into the devel-test image by `COPY script/ci/ /ci/` -- compiled for
+# cpython-310 while that image runs 3.12, so they were never loaded. They
+# were also evidence of the checker being run on the host with a host
+# interpreter, which this repo does not do: every test runs in a container.
+__pycache__/
+*.py[cod]
