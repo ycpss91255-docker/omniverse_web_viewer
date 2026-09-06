@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- Docs: test descriptions are now authored beside the tests as `# why:` markers in the 8 bats spec files (248 of 325 tests carry a description), not in `doc/test/TEST.md`. The aggregate count line is removed from TEST.md (aligned with base ADR-00000028 sec. 1), and the bats catalogue sections are fenced with `<!-- generated: catalogue sections -->` for a future `sync-doc-counts.sh` to regenerate from the markers. Node / Playwright sections stay manual.
 - CI: the three visual acceptance thresholds (`minMeanLuma=8`, `minMaxLuma=32`, `minBrightFraction=0.1`) are now single-sourced from `script/ci/visual_thresholds.json`. Previously they were hardcoded independently in three places (`tier-b-visual.spec.ts`, `tier_b_visual_e2e.sh`, `verify_tier_b_attestation.py`) and could drift. The spec imports the JSON, the verifier reads it at startup, and the bash driver no longer passes env var overrides to the verifier (it loads the file itself). Env var overrides (`OWV_MIN_MEAN_LUMA` etc.) still work.
 - Test: refusal-branch coverage added for both attestation scripts, which previously had zero tests: `require_attestation.bats` (17 cases covering empty/unset, placeholders, malformed summaries, valid acceptance, `GITHUB_SHA` propagation, step summary output) and `verify_tier_b_attestation.bats` (30 cases covering missing input, bad JSON, duplicate keys, NaN/Infinity, missing fields, wrong types, degenerate dimensions, binding mismatches, threshold failures, custom thresholds, valid acceptance). bats 278 -> 325; total 390 -> 437.
 

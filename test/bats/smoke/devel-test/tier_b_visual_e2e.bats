@@ -131,12 +131,29 @@ _signal_driver() {
 # is an open defect in this image, so a re-push under the same tag is likely.
 # The workflow's pull step asks this script for the reference, so this one
 # assertion covers both the run and the pull.
+
+# why: Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier
+# B driver. Its header says `Exit 0 = a real browser saw a real, non-black
+# frame`, and the workflow's picture gate believes exactly that -- so
+# exiting 0 without having asserted a picture is the one failure this script
+# may never have. It could: `cleanup()` took `local rc=$?` and ended `exit
+# "${rc}"` while trapped on `EXIT INT TERM`, and on a signal path `$?` is
+# the last COMPLETED command (the boot-wait `sleep 5`, i.e. 0). No GPU, Kit
+# or docker daemon is involved -- a stub `docker` on `PATH` answers just
+# enough for the driver to reach its boot-wait loop and stay there, which is
+# the state under test. The script is copied into the image at `/ci/`.
+
+# why: The producer runs as root with `--network=host --ipc=host --gpus all`
+# on the persistent GPU runner, and GHCR tags are mutable; the workflow's
+# pull step asks the driver for the reference, so this covers the pull too
 @test "tier_b: the producer image is pinned by digest, not by a mutable tag" {
   run bash "${DRIVER}" --print-producer-image
   assert_success
   assert_output --regexp '^ghcr\.io/.+@sha256:[0-9a-f]{64}$'
 }
 
+# why: A GitHub step timeout / job cancellation must not be readable as a
+# verified picture (143)
 @test "tier_b: SIGTERM exits non-zero, so a killed run cannot claim a picture" {
   run _signal_driver TERM
   assert [ "${status}" -ne 0 ]
@@ -144,6 +161,7 @@ _signal_driver() {
   assert [ "${status}" -eq 143 ]
 }
 
+# why: Same for an interrupt (130)
 @test "tier_b: SIGINT exits non-zero, so a killed run cannot claim a picture" {
   run _signal_driver INT
   assert [ "${status}" -ne 0 ]
@@ -151,6 +169,8 @@ _signal_driver() {
   assert [ "${status}" -eq 130 ]
 }
 
+# why: The signal handler and the EXIT handler used to be the same function,
+# so its own `exit` re-entered it and `producer.log` was written twice
 @test "tier_b: teardown runs exactly once on a signal path" {
   # The signal handler and the EXIT handler used to be the SAME function, so
   # its own `exit` re-entered it and teardown (including the producer.log
