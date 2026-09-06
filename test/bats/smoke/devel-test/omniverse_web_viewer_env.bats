@@ -31,36 +31,52 @@ teardown() {
   sudo rm -f /etc/host.yaml 2>/dev/null || true
 }
 
+# why: Two-app config-injection model (S5): the build preserves
+# sentinel-bearing chunks as `*.js.tmpl` per app dir
+# (`/app/usd-viewer/dist`, `/app/stream-only/dist`); the entrypoint resolves
+# `VIEWER_UI_MODE` (app selector), validates every value, and re-renders
+# ONLY the active app's templates on every boot with 3 seds
+# (`__OWV_SERVER__` / `"__OWV_PORT__"` / `"__OWV_MEDIA_PORT__"`).
+
+
+# why: Entrypoint check
 @test "entrypoint.sh is installed and executable" {
   assert_file_exists /entrypoint.sh
   assert [ -x /entrypoint.sh ]
 }
 
+# why: Shell availability
 @test "bash is available on PATH" {
   assert_cmd_installed bash
 }
 
+# why: Runtime env default
 @test "SIGNALING_SERVER env defaults to 127.0.0.1" {
   assert [ "${SIGNALING_SERVER}" = "127.0.0.1" ]
 }
 
+# why: Runtime env default
 @test "SIGNALING_PORT env defaults to 49100" {
   assert [ "${SIGNALING_PORT}" = "49100" ]
 }
 
+# why: Runtime env default
 @test "SERVE_PORT env defaults to 5173" {
   assert [ "${SERVE_PORT}" = "5173" ]
 }
 
+# why: App-selector default (D7)
 @test "VIEWER_UI_MODE env defaults to usd-viewer" {
   assert [ "${VIEWER_UI_MODE}" = "usd-viewer" ]
 }
 
+# why: `/app/usd-viewer/dist` + `/app/stream-only/dist` both present
 @test "both app dist dirs exist (devel has both modes)" {
   assert_dir_exists "${USD_ASSETS}"
   assert_dir_exists "${STREAM_ASSETS}"
 }
 
+# why: Per-app sentinel shape: usd-viewer carries server/port ONLY
 @test "usd-viewer build preserves server/port templates, no media sentinel" {
   run grep -rF "__OWV_SERVER__" "${USD_ASSETS}/" --include="*.js.tmpl"
   assert_success
@@ -71,6 +87,7 @@ teardown() {
   assert_failure
 }
 
+# why: stream-only carries server/port/media (from `streamTarget.json`)
 @test "stream-only build preserves all three sentinels in templates" {
   run grep -rF "__OWV_SERVER__" "${STREAM_ASSETS}/" --include="*.js.tmpl"
   assert_success
@@ -80,6 +97,7 @@ teardown() {
   assert_success
 }
 
+# why: Render path: sentinels gone from `*.js`, kept in `*.js.tmpl`
 @test "default mode (usd-viewer) renders defaults + clears sentinels" {
   run /entrypoint.sh true
   assert_success
@@ -95,6 +113,7 @@ teardown() {
   assert_success
 }
 
+# why: Mode isolation -- inactive app untouched
 @test "default mode renders ONLY the usd-viewer dir, not stream-only" {
   # Distinctive server that must only appear in the active (usd-viewer) dir.
   SIGNALING_SERVER="10.1.1.1" run /entrypoint.sh true
@@ -105,6 +124,7 @@ teardown() {
   assert_failure
 }
 
+# why: Distinctive-IP render proof
 @test "usd-viewer applies SIGNALING_SERVER env override" {
   SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
   assert_success
@@ -117,6 +137,8 @@ teardown() {
 # default (Dockerfile ENV, entrypoint fallback, overlay/stream.config.json), so
 # none of them could tell a rendered port from a fallback. 49277 can only get
 # into the bundle through the sed.
+# why: Distinctive-PORT render proof -- every other port assertion used
+# 49100, which is the baked default
 @test "usd-viewer applies SIGNALING_PORT env override" {
   SIGNALING_PORT="49277" run /entrypoint.sh true
   assert_success
@@ -124,6 +146,7 @@ teardown() {
   assert_success
 }
 
+# why: App selector switches the render target
 @test "VIEWER_UI_MODE=stream-only renders the stream-only dir" {
   VIEWER_UI_MODE="stream-only" SIGNALING_SERVER="10.2.2.2" run /entrypoint.sh true
   assert_success
@@ -134,6 +157,7 @@ teardown() {
   assert_failure
 }
 
+# why: Media default = null = SDP negotiation
 @test "stream-only unset MEDIA_PORT renders literal null (negotiate, D1)" {
   VIEWER_UI_MODE="stream-only" run /entrypoint.sh true
   assert_success
@@ -145,6 +169,7 @@ teardown() {
   assert_success
 }
 
+# why: Media knob pinned when set (D1)
 @test "stream-only MEDIA_PORT=47998 pins the media port" {
   VIEWER_UI_MODE="stream-only" MEDIA_PORT="47998" run /entrypoint.sh true
   assert_success
@@ -152,6 +177,7 @@ teardown() {
   assert_success
 }
 
+# why: Second render wins, first value gone
 @test "re-render is idempotent with changed values (de-one-shot, #17)" {
   # First render with one server, then a different one. The second value
   # must win AND the first must be gone -- proves it re-renders from the
@@ -168,6 +194,7 @@ teardown() {
   assert_failure
 }
 
+# why: `host.yaml` > env > default
 @test "host.yaml public_ip takes precedence over env" {
   printf 'network:\n  public_ip: "10.99.99.99"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -179,6 +206,7 @@ teardown() {
   assert_failure
 }
 
+# why: `yaml_value` comment handling (#104-class)
 @test "host.yaml inline comment is stripped from the value" {
   printf 'network:\n  public_ip: "10.88.88.88"  # LEAKCOMMENT\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -190,6 +218,7 @@ teardown() {
   assert_failure
 }
 
+# why: App selector via host.yaml
 @test "host.yaml viewer.ui_mode selects the served app" {
   printf 'viewer:\n  ui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -208,6 +237,9 @@ teardown() {
 # foreign section's key steered this viewer. The public_ip case is the bad one:
 # it does not fail the container, it silently dials the wrong host with exit 0
 # and HTTP 200.
+# why: `/etc/host.yaml` is shared with other containers by design
+# (isaac#65); an unscoped lookup let a foreign section's `public_ip`
+# silently repoint the viewer, exit 0 and HTTP 200
 @test "host.yaml public_ip in a FOREIGN section does not win" {
   printf 'livestream:\n  public_ip: "10.77.77.77"\nnetwork:\n  public_ip: "10.66.66.66"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -219,6 +251,8 @@ teardown() {
   assert_failure
 }
 
+# why: The same unscoped lookup made a foreign `ui_mode` fail our enum and
+# refuse to boot
 @test "host.yaml ui_mode in a FOREIGN section is ignored, not enum-checked" {
   # Unscoped, this failed the usd-viewer|stream-only enum and the container
   # refused to boot on a key that was never addressed to it.
@@ -236,6 +270,10 @@ teardown() {
 # default is instead of the address in the file the operator just wrote. That is
 # the same silent-wrong-address failure the unreadable-file case refuses, so a
 # misplaced key is refused too, not guessed at and not ignored.
+# why: Scoping the lookup to `network:` / `viewer:` stopped matching column
+# 0, so a flat `public_ip:` went from working to being ignored -- exit 0,
+# HTTP 200, dialling the env default instead of the address in the file.
+# Refused with the section named, not guessed at (exit 1)
 @test "a FLAT host.yaml key is refused, not silently ignored" {
   printf 'public_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -250,6 +288,9 @@ teardown() {
 # The refusal must not fire on a file that configures the viewer properly: a
 # top-level key someone else's container reads is exactly what /etc/host.yaml
 # being SHARED means, and our own section is the answer to it.
+# why: The refusal must not fire on a properly configured file:
+# `/etc/host.yaml` is SHARED (isaac#65), so a stray top-level key someone
+# else's container reads is ordinary, and our own section still wins
 @test "a top-level key does not refuse when the section supplies the value" {
   printf 'network:\n  public_ip: "10.22.22.22"\npublic_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -268,6 +309,11 @@ teardown() {
 # routinely supplied by env. So the refusal fired on ordinary correct files and
 # the container would not boot -- a narrower restatement of the foreign-key bug
 # two cases up. This is the reviewer's exact reproduction.
+# why: Only the `public_ip` half of the case above was covered, and the
+# `ui_mode` half was where the refusal over-fired: a missing `viewer:`
+# section is the NORMAL documented state (the mode usually comes from env),
+# so the refusal precondition was met on ordinary correct files and the
+# container would not boot over a key another container owns
 @test "a top-level ui_mode does not block a viewer the env configures" {
   printf 'network:\n  public_ip: "10.50.50.1"\nui_mode: "stream-only"\nlivestream:\n  enabled: true\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -291,6 +337,10 @@ teardown() {
 # reader of this line, so it still gets said -- but it is said, not enforced.
 # The built-in default is itself a supported configuration (the entrypoint's
 # own back-compat note), so refusing here would block a valid boot too.
+# why: The genuine case -- an operator who meant that key for us -- is still
+# TOLD, on stderr, naming the mode actually in effect; it is not enforced,
+# because the built-in default is itself a supported configuration and
+# refusing would block a valid boot too
 @test "a top-level ui_mode is named when nothing else supplies a mode" {
   printf 'network:\n  public_ip: "10.51.51.1"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -307,6 +357,7 @@ teardown() {
 
 # And when our own section DOES supply the value there is nothing to report:
 # the note must not become background noise on a correctly written file.
+# why: The note must not become background noise on a correctly written file
 @test "a top-level ui_mode is not reported when the viewer section supplies it" {
   printf 'viewer:\n  ui_mode: "stream-only"\nui_mode: "usd-viewer"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -324,6 +375,11 @@ teardown() {
 # guesswork, and discounts the next true thing it says. The two cases also
 # want different fixes: add the section, or add the key to the one already
 # there.
+# why: Both flat-key messages said "but no `<section>:` section supplying
+# it", which is false when the section exists and simply lacks the key
+# (`viewer:` / `theme: "dark"` / `ui_mode: "x"`). An operator reading "no
+# `viewer:` section" against a file whose first line is `viewer:` learns the
+# message is guesswork; the two cases also want different fixes
 @test "a present-but-incomplete section is described as present, not missing" {
   printf 'viewer:\n  theme: "dark"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -340,6 +396,8 @@ teardown() {
 
 # refuse_flat_key shares the phrasing and predates the warning, so it is fixed
 # in the same change rather than left as the odd one out.
+# why: `refuse_flat_key` shares the phrasing and predates the warning, so it
+# is corrected in the same change rather than left as the odd one out
 @test "the refusal describes a present-but-incomplete section correctly" {
   printf 'network:\n  gateway: "10.0.0.1"\npublic_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -353,6 +411,7 @@ teardown() {
 
 # ... and the genuinely-absent case still says so, so the fix above did not
 # just swap one wrong sentence for another.
+# why: The fix must not have swapped one wrong sentence for another
 @test "a genuinely absent section is still described as absent" {
   printf 'public_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -373,6 +432,13 @@ teardown() {
 # is already indented. Both halves of that are false, and a diagnostic that is
 # provably false about the file in front of the operator is not worth the line
 # it costs.
+# why: `flat_key_reason()` had two branches -- section present, section
+# absent -- for four states. A section that DOES carry our key with an EMPTY
+# value takes the flat-key path (the scoped lookup returns nothing) and was
+# then told the section "does not supply `ui_mode`" about a `ui_mode:`
+# sitting plainly inside it, and told to indent a key that is already
+# indented. Both halves are provably false about the file in front of the
+# operator; the remedy now names the empty key and asks for a value
 @test "an empty key inside the section is not reported as a missing key" {
   printf 'network:\n  public_ip: "10.53.53.1"\nviewer:\n  ui_mode:\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -392,6 +458,11 @@ teardown() {
 # must stay a refusal -- an empty `public_ip:` plus a column-0 one is still a
 # file that would otherwise dial an address nobody chose -- but the reason it
 # gives has to be the true one.
+# why: The same shape on the `public_ip` side reaches the `exit 1` REFUSAL,
+# where the stated reason is the only thing the operator has. It stays a
+# refusal -- an empty `public_ip:` plus a column-0 one is still a file that
+# would otherwise dial an address nobody chose -- but with the true reason,
+# and nothing is rendered from the column-0 key
 @test "the refusal names an empty key rather than a missing one" {
   printf 'network:\n  public_ip:\npublic_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -412,6 +483,11 @@ teardown() {
 # remedy that follows from that ("indent it under 'viewer:'") produces invalid
 # YAML, a mapping key indented under a scalar value. An operator who does what
 # the message says ends up with a file that is worse than the one they had.
+# why: `viewer: "not-a-section"` is a top-level SCALAR, but the presence
+# probe only matched `^viewer:` and so reported it as a section that exists
+# -- and the remedy that follows ("indent it under `viewer:`") produces
+# invalid YAML, a mapping key indented under a scalar value. An operator who
+# does what the message says ends up with a file worse than the one they had
 @test "a section key that is really a scalar is not called a section" {
   printf 'network:\n  public_ip: "10.54.54.1"\nviewer: "not-a-section"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -435,6 +511,11 @@ teardown() {
 # the exact class of provably-false diagnostic this group of helpers exists
 # to end: a message caught being wrong about the file on the screen gets the
 # next true thing it says discounted too.
+# why: `viewer: {ui_mode: "stream-only"}` is a real mapping written on one
+# line. Deciding "scalar" from "there is text after the colon" reported it
+# as a section set to a value, which is provably false about the file on the
+# operator's screen -- the exact class of diagnostic these helpers exist to
+# end. It now gets its own true reason and its own true remedy
 @test "a flow mapping is not called a scalar" {
   printf 'network:\n  public_ip: "10.54.54.1"\nviewer: {ui_mode: "stream-only"}\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -446,6 +527,9 @@ teardown() {
   assert_output --partial "rewrite 'viewer:' as an indented block mapping"
 }
 
+# why: `viewer: &anchor` with an indented body: a YAML ANCHOR is a node
+# property, not the value, and the section below it is an ordinary block
+# mapping
 @test "an anchored section header is not called a scalar" {
   printf 'network:\n  public_ip: "10.54.54.1"\nviewer: &v\n  something_else: "x"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -457,6 +541,7 @@ teardown() {
   assert_output --partial "there IS a 'viewer:' section in it"
 }
 
+# why: `viewer: !!map` with an indented body: same, for a TAG
 @test "a tagged section header is not called a scalar" {
   printf 'network:\n  public_ip: "10.54.54.1"\nviewer: !!map\n  something_else: "x"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -477,6 +562,12 @@ teardown() {
 # ("make it open a section") describes work already done. What is TRUE is
 # that this line-based reader does not follow the reference: the keys are not
 # below the header, they are wherever the anchor is.
+# why: The anchor's direct companion, missed by the round that added anchor
+# handling. `viewer: *v` is an ALIAS: every parser resolves it to the
+# anchored node, so the file is valid and `viewer:` really does supply a
+# mapping. "Set to a value rather than opening a section" is provably false
+# about it, and the remedy that follows describes work already done. What is
+# true is that this line-based reader does not FOLLOW the reference
 @test "an aliased section header is not called a scalar" {
   printf 'defaults: &v\n  ui_mode: "stream-only"\nnetwork:\n  public_ip: "10.54.54.1"\nviewer: *v\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -498,6 +589,12 @@ teardown() {
 # that does not exist, with the operator's own text spliced in as the source.
 # Behaviour was unaffected -- so not a bypass, but a log saying something that
 # is not true, which is the class every other fix in this file is about.
+# why: The supplier variable was never initialised and was read as
+# `${flat_ui_mode_supplier:-}` in a script that is the container ENTRYPOINT,
+# so `docker run -e flat_ui_mode_supplier=...` with NO `/etc/host.yaml`
+# mounted printed a fabricated diagnostic about a file that does not exist,
+# with operator text spliced into the boot log. Behaviour was unaffected --
+# not a bypass, but a log saying something untrue
 @test "a flat_ui_mode_supplier in the environment invents no host.yaml note" {
   run test -f /etc/host.yaml
   assert_failure
@@ -516,6 +613,13 @@ teardown() {
 # workload; quietly rewriting part of the environment it passes on is the one
 # thing it must not do. The name it works with is internal now, so neither read
 # nor write touches the operator's.
+# why: Initialising the variable stopped the fabricated note, but under the
+# OBVIOUS name. A bare assignment does not create a fresh shell-local: an
+# inherited variable keeps its export attribute, so `docker run -e
+# flat_ui_mode_supplier=x` handed the CMD an EMPTIED variable it had set
+# itself. The entrypoint is the last thing between compose and the workload
+# and must not quietly rewrite the environment it passes on, so the name it
+# works with is now the internal `_flat_ui_mode_supplier`
 @test "an inherited flat_ui_mode_supplier reaches the exec'd command intact" {
   run test -f /etc/host.yaml
   assert_failure
@@ -529,6 +633,10 @@ teardown() {
 # assignment to the obvious name would definitely have fired: the warning is
 # still emitted, from the internal name, and the operator's variable passes
 # through untouched.
+# why: The same on the path that actually USES the supplier, which is where
+# an assignment to the obvious name would certainly have fired: the warning
+# is still emitted, still names the real supplier, and the operator's
+# variable reaches the `exec`'d command untouched
 @test "the flat-ui_mode warning does not rewrite the operator's variable" {
   printf 'network:\n  public_ip: "10.57.57.1"\nui_mode: "stream-only"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -547,6 +655,8 @@ teardown() {
 # whatever address the operator had just moved OUT of the env and INTO that
 # file -- exit 0, HTTP 200, nothing said. This stage runs as the non-root image
 # USER, which is what makes mode 000 mean anything here.
+# why: awk's failure was swallowed, so a mode-000 / wrong-owner file booted
+# silently on env/defaults and dialled an address nobody chose (exit 1)
 @test "an unreadable host.yaml fails the container, not falls back" {
   printf 'network:\n  public_ip: "10.44.44.44"\n' \
     | sudo tee /etc/host.yaml >/dev/null
@@ -556,6 +666,7 @@ teardown() {
   assert_output --partial 'not readable'
 }
 
+# why: Export-before-exec so the CMD serves the resolved dir
 @test "entrypoint exports the resolved VIEWER_UI_MODE for the CMD" {
   # The CMD reads ${VIEWER_UI_MODE}; the entrypoint must export the
   # host.yaml/env-resolved value before exec, so a child sees it.
@@ -566,6 +677,7 @@ teardown() {
   assert [ "${output}" = "stream-only" ]
 }
 
+# why: Validation (exit 1)
 @test "non-numeric SIGNALING_PORT is rejected" {
   SIGNALING_PORT="80x" run /entrypoint.sh true
   assert_failure
@@ -576,21 +688,26 @@ teardown() {
 # SyntaxError in an ES module (strict mode). The chunk then fails to parse and
 # the viewer is a black page -- from a container that started successfully and
 # answers HTTP 200, which is all the runtime smoke ever asked.
+# why: `049100` renders as the bare token `049100`, a strict-mode
+# SyntaxError -> black page from a container that started fine (exit 1)
 @test "SIGNALING_PORT with a leading zero is rejected" {
   SIGNALING_PORT="049100" run /entrypoint.sh true
   assert_failure
 }
 
+# why: 1..65535, same rule MEDIA_PORT always had (exit 1)
 @test "out-of-range SIGNALING_PORT is rejected" {
   SIGNALING_PORT="99999" run /entrypoint.sh true
   assert_failure
 }
 
+# why: Same bare-token substitution, same SyntaxError (exit 1)
 @test "MEDIA_PORT with a leading zero is rejected" {
   VIEWER_UI_MODE="stream-only" MEDIA_PORT="047998" run /entrypoint.sh true
   assert_failure
 }
 
+# why: `SERVE_PORT=0` would serve the viewer on a port nobody chose (exit 1)
 @test "out-of-range SERVE_PORT is rejected" {
   SERVE_PORT="0" run /entrypoint.sh true
   assert_failure
@@ -600,11 +717,15 @@ teardown() {
 # scope the listen ADDRESS. Requiring a bare integer removed the ability to
 # bind loopback only, leaving the published image able to listen on every
 # interface and nothing else.
+# why: `serve -l` takes an endpoint, and that is the only way to scope the
+# listen ADDRESS (`tcp://127.0.0.1:5173` binds loopback only)
 @test "SERVE_PORT accepts a tcp:// listen endpoint" {
   SERVE_PORT="tcp://127.0.0.1:5173" run /entrypoint.sh true
   assert_success
 }
 
+# why: Host with no port, and a host with a bad port, both fail fast (exit
+# 1)
 @test "a malformed tcp:// serve endpoint is rejected" {
   # Host but no port.
   SERVE_PORT="tcp://127.0.0.1" run /entrypoint.sh true
@@ -620,6 +741,11 @@ teardown() {
 # repo (and would widen a charset the CMD's `sh -c` expands), and a Windows
 # named pipe cannot exist in the linux/amd64 image that gets published. The
 # message must say so rather than report a bad integer.
+# why: `serve --help` documents four endpoint forms; only the two NETWORK
+# ones are supported. A UNIX socket is unreachable by the browser and by
+# every HTTP gate here, a Windows named pipe cannot exist in the published
+# linux/amd64 image, and the message says that instead of reporting a bad
+# integer (exit 1)
 @test "a unix:/pipe: serve endpoint is refused by name" {
   SERVE_PORT="unix:/tmp/owv.sock" run /entrypoint.sh true
   assert_failure
@@ -630,21 +756,25 @@ teardown() {
   assert_output --partial "unsupported serve endpoint"
 }
 
+# why: Enum validation (exit 1)
 @test "invalid VIEWER_UI_MODE is rejected" {
   VIEWER_UI_MODE="bogus" run /entrypoint.sh true
   assert_failure
 }
 
+# why: Optional-knob validation (exit 1)
 @test "non-numeric MEDIA_PORT is rejected" {
   VIEWER_UI_MODE="stream-only" MEDIA_PORT="80x" run /entrypoint.sh true
   assert_failure
 }
 
+# why: 1..65535 (exit 1)
 @test "out-of-range MEDIA_PORT is rejected" {
   VIEWER_UI_MODE="stream-only" MEDIA_PORT="70000" run /entrypoint.sh true
   assert_failure
 }
 
+# why: Validation IS the escaping (security)
 @test "SIGNALING_SERVER with shell/sed metacharacters is rejected" {
   SIGNALING_SERVER="a;rm -rf /|b" run /entrypoint.sh true
   assert_failure
@@ -667,6 +797,13 @@ teardown() {
 # smoke-tests with `RUN`, which is build time. The trade is stated rather than
 # skipped -- a spec that starts and stops a real container belongs with the
 # host-side runners (script/ci/), and there is no home for it there today.
+# why: MEASURED on the published `0.3.0` image: `docker top` shows `sh -c
+# serve ...` as PID 1, `docker kill -s TERM` leaves the container running,
+# and `docker stop` takes 10.2 s ending in SIGKILL. With `exec` the same
+# image stops in 0.24 s, exit 0. Asserts the MECHANISM in `/lint/Dockerfile`
+# (counted both ways, so a fourth CMD without `exec` is red) because the
+# behaviour needs a container lifecycle and nothing in this repo runs one --
+# bats runs inside an image, `runtime-test` smoke-tests at build time
 @test "env: every CMD that serves the bundle execs it (PID 1 gets SIGTERM)" {
   run grep -cE '^CMD \["sh", "-c", "exec serve ' /lint/Dockerfile
   assert_success

@@ -127,6 +127,112 @@ _sibling_workflow() {
   printf '%s\n' "$2" > "${WORKFLOW_DIR}/$1"
 }
 
+# why: Structural lock on the RELEASE INVARIANT, read off
+# `.github/workflows/main.yaml` itself. The rule (#70, after `v0.3.0-rc1`
+# published with no picture ever verified for it) is absolute: no version
+# may publish without the Tier B picture gate having passed on that commit
+# -- no override, no `continue-on-error`, no status-function escape, and an
+# unavailable GPU runner BLOCKS the release. Until this file existed that
+# rule was defended by prose: it lived in `if:` / `needs:` expressions and
+# comments in one workflow and nothing read them, so `|| github.event_name
+# == 'workflow_dispatch'` added to a gate while debugging, or
+# `tier-b-visual-e2e` dropped from a `needs:` list, left every other gate
+# green with the protection gone. The reading is done by
+# `script/ci/check_release_gates.py`, a real YAML parse (PyYAML), fronted by
+# `script/ci/check_release_gates.sh`, which verifies the one dependency out
+# loud and refuses with exit 2 -- never a skip -- when `python3` or PyYAML
+# is missing. PyYAML is added by the `devel-test` Dockerfile stage as
+# `python3-yaml` and never ships: `runtime` is `FROM devel-base`,
+# `devel-test` is `FROM devel`, and nothing is `FROM devel-test`. The
+# workflow is `COPY`d to `/workflows/main.yaml` and `script/ci/` to `/ci/`,
+# the same mechanism the other specs use for their inputs. No GPU, no tag
+# push, no GitHub, no network: it runs on every PR. **Why a parser and not a
+# grep.** The first version of this spec claimed the invariant and did not
+# deliver it: property 2 was a substring test, so the very `||` the sentence
+# above names walked past it. An independent reviewer wrote 23 mutations the
+# author had not anticipated and 12 were not caught, four of which publish
+# or release with no picture verified while all fourteen tests stayed green.
+# What changed then: `needs:` is read as a LIST and matched by membership (a
+# decoy job merely NAMED after the gate no longer satisfies it); a
+# requirement is a MANDATORY TOP-LEVEL CONJUNCT rather than a substring (a
+# gate wrapped into a `||`, or one `||` appended to the end of a whole
+# condition, is caught); STEP level is examined, so a gate job whose work
+# step is skipped is no longer a passed gate; the set of jobs that must
+# carry the gate is DERIVED from the file rather than listed by name; the
+# GPU runner, the report-only jobs and the tag globs' ability to match a
+# real version are asserted; and two semantically equivalent spellings that
+# were reported as violations are now accepted, because a gate that cries
+# wolf on a correct edit teaches maintainers to route around it. That
+# hardening was 885 lines of bash and awk, and a reviewer landed 21 more
+# mutations past it -- four of which removed the picture gate entirely while
+# the checker printed "holds the release invariant". Almost none of the 21
+# were mistakes in an individual rule; they were properties of reading YAML
+# with line regexes: (a) trailing comments, since stripping whole-line
+# comments and then testing substrings over raw values means one `#`
+# satisfies or evades the check; (b) `if:` / `"if":` / `'if':` / `if :`
+# being four YAML spellings of one key, at step level AND at job level, in
+# both places where ABSENCE is what the property asserts; (c) parenthesis
+# counting that was not string-literal aware, so one `(` inside a quoted
+# string pinned depth off zero and hid every top-level operator after it;
+# (d) a job header with a trailing comment not being a job header, its body
+# silently attributed to the job above it. A real parser answers (a), (b)
+# and (d) outright and reduces (c) to one tokeniser the checker owns. A real
+# parser closed 28 of 35 live bypasses. A third reviewer then landed 39
+# fresh mutations against THAT and 15 still walked through, in five groups:
+# (e) case-sensitive matching of a case-INSENSITIVE language, so `if:
+# ALWAYS()` on `call-release` was invisible to the one property that keeps a
+# status function off that job -- paired with a work step suffixed `||
+# true`, the entire invariant, defeated by two capital letters, while the
+# checker printed "holds the release invariant"; (f) the gate's work
+# identified by COUNTING steps that name something under `script/ci/` rather
+# than by IDENTITY, so `|| true`, `--help`, `--version`, a `set +e; ...;
+# exit 0` wrapper, a different helper entirely, and three flavours of
+# unconditional decoy beside a guarded real work step all satisfied the
+# count with no picture taken; (g) shell-comment stripping applied when
+# DERIVING publishing, where losing the signal means the job is never
+# required to stand behind the gate at all -- a `#` inside a double-quoted
+# shell string swallowed the `docker push` after it; (h) `PUBLISH_RUN_RE`
+# being an enumeration (`docker image push`, `buildah push`, `podman push`,
+# `gh api -X POST .../releases`, and a shell line continuation that defeated
+# every row at once); (i) questions asked in one shape of a construct that
+# has four -- a `!`-negated tag glob compiled as a literal, a `paths:`
+# filter never considered, a `runs-on:` runner-group mapping and a
+# matrix-driven `runs-on` both reported as valid edits gone wrong. **Case
+# names below describe what each case DOES.** They used to carry a
+# reviewer's identifiers, reconstructed from a brief rather than from the
+# review's corpus; a later reviewer who had the corpus found 24 of 25
+# sitting on a different mutation than the one they claimed, five of them on
+# green cases whose named bypass was still live. The labels and the claim
+# that went with them are deleted rather than repaired. **What the checker
+# cannot see** is stated in exactly one place: the `WHAT THIS CANNOT SEE`
+# section of `script/ci/check_release_gates.py`'s header, twelve numbered
+# items. It names in those words what survives this round: the gate's work
+# can still be a NO-OP in any job other than the two whose driver is pinned
+# by identity; `PUBLISH_RUN_RE` is an enumeration that does not converge;
+# the checker still reads ONE workflow file, now loudly rather than silently
+# (the stage copies the directory and a case asserts its contents, so a
+# second workflow is a red test, but nothing reads it); and four things
+# around the pinned drivers are named there one by one, including a step
+# that prepares the ground for a later step without naming the driver, and
+# `container:` / `services:` on the job. It is not restated here, and this
+# section is not the place to look it up -- four restatements in four
+# documents is precisely how that list drifted into four different lists,
+# none of which named the comment channel, the single most productive attack
+# in the last review. The list is deliberately narrow, because an
+# over-claimed gate is worse than a narrow one: it stops people looking.
+# Every property is proved TWICE -- once against the shipped workflow (it
+# must hold) and once against a copy with that one property removed (the
+# checker must name its `[id]`). An assertion that cannot fail is the
+# failure this repo has been bitten by three times, so `_mutate` hard-fails
+# when its `sed` matches nothing rather than asserting against an unmodified
+# file. Twenty-six cases assert the checker SUCCEEDS -- on semantically
+# identical rewrites, and on legal edits an earlier version reported as
+# violations -- and each is paired with a failing case in the same spelling
+# so the acceptance cannot widen into a blanket pass.
+
+
+# why: The spec is worthless if either input is missing; the wrapper, the
+# Python checker and the workflow are all asserted
 @test "gates: the checker and the workflow are both in the image" {
   assert_file_exists "${CHECK}"
   assert_file_exists "${CHECKER_PY}"
@@ -166,6 +272,10 @@ _sibling_workflow() {
 # run as the non-root user. That is a permission error dressed as a syntax
 # error -- the test would fail for a reason that has nothing to do with the
 # checker. This compiles in memory and touches no filesystem.
+# why: The checker is Python now and shellcheck's `/ci/*.sh` glob cannot
+# lint it. A syntax error would otherwise reach a maintainer as "exit 2 on
+# every workflow", which reads like a broken input rather than a broken
+# checker
 @test "gates: the checker byte-compiles" {
   run python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
     "${CHECKER_PY}"
@@ -176,11 +286,15 @@ _sibling_workflow() {
 # `devel-test` stage installs python3-yaml; nothing shipped is FROM this
 # stage, so this is also the assertion that the install landed where it was
 # meant to.
+# why: The one dependency, asserted in the image that is supposed to have
+# it. `devel-test` installs `python3-yaml` and nothing is `FROM devel-test`,
+# so this is also the proof the install landed where it was meant to
 @test "gates: the image the checker runs in has PyYAML" {
   run python3 -c 'import yaml; print(yaml.__version__)'
   assert_success
 }
 
+# why: Every property holds on `main.yaml` as committed
 @test "gates: the shipped workflow holds the release invariant" {
   run bash "${CHECK}" "${WORKFLOW}"
   assert_success
@@ -193,12 +307,16 @@ _sibling_workflow() {
 # "invariant holds" for a workflow that protects nothing. Every one of these
 # is exit 2, distinct from a violation's exit 1, and every one says something
 # before it goes.
+# why: Vacuity guard: a checker that "passes" on a file it never read
+# reports an invariant that protects nothing (exit 2, distinct from a
+# violation's exit 1)
 @test "gates: a workflow that cannot be read is an error, not a pass" {
   run bash "${CHECK}" "${TMP}/does-not-exist.yaml"
   assert_failure 2
   assert_output --partial "cannot read workflow"
 }
 
+# why: Same guard for a file whose jobs are gone (exit 2)
 @test "gates: a workflow with no jobs is an error, not a vacuous pass" {
   printf 'name: Empty\non:\n  push:\njobs:\n' > "${TMP}/empty.yaml"
   run bash "${CHECK}" "${TMP}/empty.yaml"
@@ -208,6 +326,8 @@ _sibling_workflow() {
 
 # New with the parser: a file that is not YAML at all used to be read line by
 # line and reported on regardless.
+# why: New with the parser: a file that is not YAML at all used to be read
+# line by line and reported on regardless (exit 2)
 @test "gates: a workflow that is not valid YAML is an error, not a pass" {
   printf 'jobs:\n  a: [\n' > "${TMP}/bad.yaml"
   run bash "${CHECK}" "${TMP}/bad.yaml"
@@ -219,6 +339,10 @@ _sibling_workflow() {
 # job with `if:` twice would be read as one condition here and another by the
 # maintainer reading top to bottom, and the disagreement is invisible both
 # ways.
+# why: A duplicate key is last-wins in PyYAML and rejected by GitHub, so a
+# job with `if:` twice is one condition to the checker and another to the
+# maintainer reading top to bottom -- and the disagreement is invisible both
+# ways (exit 2)
 @test "gates: a duplicate key in a job is refused rather than silently resolved" {
   _mutate "/^  publish-image:\$/a\\    if: false"
   run bash "${CHECK}" "${MUTATED}"
@@ -230,6 +354,10 @@ _sibling_workflow() {
 # nothing when its parser is missing is the silent green board this whole file
 # exists to end -- so the missing-PyYAML path is exercised with a python3 that
 # cannot import it.
+# why: The dependency check is a REFUSAL. A checker that quietly does
+# nothing when its parser is missing is the silent green board this file
+# exists to end, so the path is exercised with a `python3` that cannot
+# import it -- exit 2, saying "NOT verified"
 @test "gates: a python3 without PyYAML is refused, not skipped" {
   mkdir -p "${TMP}/fakebin"
   printf '%s\n' '#!/bin/sh' 'exit 1' > "${TMP}/fakebin/python3"
@@ -242,6 +370,8 @@ _sibling_workflow() {
 
 # ---------------------------------------------------------------- publish --
 
+# why: `[publish-image-needs-tier-b]` -- an image pushed for a commit whose
+# picture was never verified
 @test "gates: dropping tier-b from publish-image's needs is caught" {
   _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]/needs: [call-docker-build, call-release, require-picture-evidence]/'
   run bash "${CHECK}" "${MUTATED}"
@@ -254,6 +384,9 @@ _sibling_workflow() {
 # function also stops a SKIPPED need from skipping this job -- so the explicit
 # `result == 'success'` is the only thing left blocking an image whose picture
 # gate never ran.
+# why: `[publish-image-requires-tier-b-success]` -- its `!cancelled()` means
+# a SKIPPED gate no longer skips the job, so the explicit `result ==
+# 'success'` is the only thing left blocking the push
 @test "gates: dropping publish-image's tier-b success requirement is caught" {
   _mutate '/&& needs\.tier-b-visual-e2e\.result == /d'
   run bash "${CHECK}" "${MUTATED}"
@@ -264,6 +397,11 @@ _sibling_workflow() {
 # M1: the requirement is still THERE, character for character, but it is now
 # one alternative of a disjunction -- a hand-typed publish_image_tag satisfies
 # it with the gate skipped, failed, or never run.
+# why: **M1**, uncaught before: `(needs.tier-b-visual-e2e.result ==
+# 'success' || inputs.publish_image_tag != '')`. The required string is
+# present character for character, but it is now an ALTERNATIVE a hand-typed
+# tag satisfies on its own. The check is a top-level `&&` term, not a
+# substring
 @test "gates: the tier-b success requirement demoted to an alternative is caught" {
   _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& (needs.tier-b-visual-e2e.result == 'success' || inputs.publish_image_tag != '')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -274,6 +412,10 @@ _sibling_workflow() {
 # M55: nothing is removed and nothing is wrapped -- one `||` is appended to the
 # END of the condition. `&&` binds tighter than `||`, so the whole gate chain
 # collapses into one side of a disjunction and the other side publishes alone.
+# why: **M55**, uncaught before: `[publish-image-gate-is-not-optional]`.
+# Nothing removed, nothing wrapped -- one `||` at the END. `&&` binds
+# tighter, so the whole gate chain becomes one side of a disjunction and the
+# other side publishes alone
 @test "gates: a top-level || appended to publish-image's whole condition is caught" {
   _mutate "/^              && inputs.publish_image_tag != ''))\$/a\\      || inputs.publish_image_tag != ''"
   run bash "${CHECK}" "${MUTATED}"
@@ -283,6 +425,8 @@ _sibling_workflow() {
 
 # ---------------------------------------------------------------- release --
 
+# why: `[call-release-needs-tier-b]` -- a Release cut for a commit whose
+# picture was never verified
 @test "gates: dropping tier-b from call-release's needs is caught" {
   _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, require-picture-evidence]/'
   run bash "${CHECK}" "${MUTATED}"
@@ -296,6 +440,10 @@ _sibling_workflow() {
 # an unavailable GPU runner blocks a release. Adding one here reads like a
 # harmless robustness tweak and quietly converts a blocked release into a
 # published one.
+# why: `[call-release-carries-no-status-function]` -- the load-bearing
+# ABSENCE: with no `always()` / `success()` / `failure()` / `cancelled()`,
+# GitHub's default skip propagation applies, and that default is the whole
+# mechanism by which an unavailable GPU runner blocks a release
 @test "gates: adding a status function to call-release's if is caught" {
   _mutate "s#^      startsWith(github.ref, 'refs/tags/')\$#      always() \&\& startsWith(github.ref, 'refs/tags/')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -305,6 +453,9 @@ _sibling_workflow() {
 
 # ------------------------------------------------------------------ gates --
 
+# why: `[gate-job-has-no-continue-on-error]` -- turns a gate into a
+# suggestion, at job or step level, on the named gate jobs AND on every
+# derived publishing job
 @test "gates: continue-on-error on a gate job is caught" {
   _mutate '/^  tier-b-visual-e2e:$/a\    continue-on-error: true'
   run bash "${CHECK}" "${MUTATED}"
@@ -317,6 +468,11 @@ _sibling_workflow() {
 # absent, and it has no continue-on-error precisely because it has nothing.
 # Reading that message sends a maintainer looking for a flag that is not
 # there.
+# why: `[gate-job-is-defined]` -- a new id, split out because a missing gate
+# job used to be reported under `[gate-job-has-no-continue-on-error]`, which
+# is not what happened: the job is absent, and it has no `continue-on-error`
+# precisely because it has nothing. That message sends a maintainer looking
+# for a flag that is not there
 @test "gates: a gate job that is gone is reported as gone" {
   awk '/^  publish-image:$/ { d = 1 } d && /^  tier-b-visual-e2e:$/ { d = 0 } !d' \
     "${WORKFLOW}" > "${MUTATED}"
@@ -336,6 +492,10 @@ _sibling_workflow() {
 # step that boots a producer and looks at a frame is skipped, the job
 # concludes `success`, publish-image is satisfied and the image is published
 # with no picture ever taken.
+# why: **M9**, uncaught before: `[gate-job-work-step-is-unconditional]`.
+# `if: github.event_name == 'schedule'` on the STEP (not the job): the job
+# runs, the step that looks at a frame is skipped, the job is `success`, and
+# the image publishes with no picture ever taken
 @test "gates: an if: on the Tier B acceptance STEP is caught" {
   _mutate "/^      - name: Tier B visual acceptance/a\\        if: github.event_name == 'schedule'"
   run bash "${CHECK}" "${MUTATED}"
@@ -346,6 +506,8 @@ _sibling_workflow() {
 # M54: the same shape on verify-tag-shape's only working step. The shape check
 # never runs, the job succeeds, and a tag the image-tag deriver cannot publish
 # reaches call-release -- the exact ordering failure that job exists to stop.
+# why: **M54**, uncaught before: same id. The shape check never runs, the
+# job succeeds, and a malformed tag reaches the Release
 @test "gates: if: false on verify-tag-shape's only step is caught" {
   _mutate "s#^        if: \${{ github.ref_type == 'tag' }}\$#        if: false#"
   run bash "${CHECK}" "${MUTATED}"
@@ -355,6 +517,9 @@ _sibling_workflow() {
 
 # The other half of that property: deleting the work step entirely must not be
 # a pass either. A gate job with nothing in it is a gate in name only.
+# why: The other half of that property: a gate job with no work left in it
+# is a gate in name only. A `--print-<something>` query does not keep the
+# count non-zero
 @test "gates: deleting the Tier B acceptance step is caught" {
   _mutate '/^      - name: Tier B visual acceptance/,/^      - name: Upload evidence/{/^      - name: Upload evidence/!d}'
   run bash "${CHECK}" "${MUTATED}"
@@ -366,6 +531,9 @@ _sibling_workflow() {
 # to turn a silently blocked release into a red run. Nothing may need one: a
 # job that waits on them would inherit an always()-gated dependency, which is
 # the escape the picture-gate rule forbids.
+# why: `[no-job-needs-a-report-only-job]` -- `release-blocked-report` /
+# `nightly-tier-b-report` use `always()` and exist only to ADD a failure; a
+# job that waits on one inherits that `always()`
 @test "gates: making a report-only job a dependency is caught" {
   _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]/needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence, release-blocked-report]/'
   run bash "${CHECK}" "${MUTATED}"
@@ -384,6 +552,13 @@ _sibling_workflow() {
 # `publish-image-carries-no-always`. The rename is the point of the case
 # below: the property is about what the condition MEANS in a cancelled run,
 # and naming it after one literal is what let a second literal through.
+# why: **M16**, uncaught before:
+# `[publish-image-status-function-is-narrow]`. Property 4 checked
+# `call-release` only. `always()` also runs the job in a CANCELLED run, and
+# a cancelled Tier B (evicted from the GPU concurrency group as a pending
+# member) is a documented case here. The id was
+# `[publish-image-carries-no-always]` until M5 below: naming the property
+# after one literal is what let a second literal through
 @test "gates: always() in place of publish-image's !cancelled() is caught" {
   _mutate 's/^      !cancelled()$/      always()/'
   run bash "${CHECK}" "${MUTATED}"
@@ -395,6 +570,12 @@ _sibling_workflow() {
 # merely NAMED after the gate satisfied it. Two independent properties catch
 # this -- needs is a LIST and membership is exact, and nothing may need a job
 # whose own condition carries a status function.
+# why: **M33**, uncaught before: `[call-release-needs-tier-b]` +
+# `[no-job-needs-a-status-gated-job]`. An `always()`-gated
+# `tier-b-visual-e2e-summary` satisfied a SUBSTRING search of `needs:`, so a
+# Release was cut for a commit whose Tier B failed. `needs:` is now a list
+# matched by membership, and nothing may need a job whose own condition
+# carries a status function
 @test "gates: a decoy job named after the gate does not satisfy a needs" {
   {
     sed 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e-summary, require-picture-evidence]/' \
@@ -418,6 +599,10 @@ _sibling_workflow() {
 
 # Reading `needs:` as a list rather than a string is only an improvement if it
 # still reads the OTHER valid spellings of the same list.
+# why: Reading `needs:` as a list is only an improvement if it still reads
+# the other valid spellings of the same list: `["a", "b"]` is `[a, b]`, and
+# a membership test that keeps the quotes reports a correct workflow as
+# missing its gate
 @test "gates: a quoted needs list is read as the same list" {
   _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: ["verify-tag-shape", "verify-tag-on-main", "call-docker-build", "tier-b-visual-e2e", "require-picture-evidence"]/'
   run bash "${CHECK}" "${MUTATED}"
@@ -428,6 +613,9 @@ _sibling_workflow() {
 # A `needs:` naming a job that is not in the file is a workflow GitHub refuses
 # to run; this checker must not read the dangling name's absent condition as
 # "no status function" and report the invariant as held.
+# why: `[needs-name-a-job-that-exists]` -- GitHub refuses such a workflow,
+# and the checker would otherwise read the dangling name's absent `if:` as
+# "no status function"
 @test "gates: a needs naming a job that does not exist is caught" {
   _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main\]$/needs: [verify-tag-shape-v2, verify-tag-on-main]/'
   run bash "${CHECK}" "${MUTATED}"
@@ -438,6 +626,11 @@ _sibling_workflow() {
 # M2. A name list cannot see a new entry: this job logs in to GHCR and pushes
 # an image, needs only the build, and is behind no gate whatsoever. The set of
 # jobs that can publish is DERIVED from the file.
+# why: **M2**, uncaught before:
+# `[publishing-job-is-behind-the-picture-gate]`. A `publish-image-hotfix:`
+# job that logs in to GHCR and pushes, `needs: [call-docker-build]` only,
+# was invisible to a name list. The publishing set is now derived from the
+# file
 @test "gates: a NEW publishing job with no picture gate is caught" {
   _append_job <<'JOB'
   publish-image-hotfix:
@@ -463,6 +656,8 @@ JOB
 # The vacuity guard for that derivation: a checker that can no longer find
 # ANYTHING that publishes must say so rather than report an invariant holding
 # over a workflow it has stopped understanding.
+# why: `[publishing-jobs-are-identifiable]` -- a gate that can no longer
+# find the thing it gates is reporting on nothing
 @test "gates: a workflow whose jobs publish nothing is an error, not a pass" {
   printf 'name: X\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' \
     > "${TMP}/nopub.yaml"
@@ -474,6 +669,9 @@ JOB
 # M50. Property 6 forbids DEPENDING on the report-only jobs. It said nothing
 # about them existing, so deleting both was invisible -- and nothing else in
 # the repo would notice either, because by design nothing depends on them.
+# why: **M50**, uncaught before: `[report-only-jobs-still-exist]`. Nothing
+# depends on them by design, so deleting both broke no other check and
+# silently restored the silence they were added to end
 @test "gates: deleting the report-only jobs is caught" {
   _mutate '/^  release-blocked-report:$/,$d'
   run bash "${CHECK}" "${MUTATED}"
@@ -483,6 +681,8 @@ JOB
 
 # Half a deletion is the same loss: a report that can no longer observe a need
 # which did not succeed reports nothing.
+# why: Same id: narrowing `!= 'success'` to one result is the same loss as
+# deleting the job
 @test "gates: a report-only job that can no longer observe the gate is caught" {
   _mutate "s/^      && needs.tier-b-visual-e2e.result != 'success'\$/      \&\& needs.tier-b-visual-e2e.result == 'failure'/"
   run bash "${CHECK}" "${MUTATED}"
@@ -493,6 +693,9 @@ JOB
 # M52. The gate's whole job is to boot a real Kit producer and assert a real
 # browser renders a non-black frame from it, and no hosted runner has NVENC --
 # so moving it to ubuntu-latest does not make the gate slower, it removes it.
+# why: **M52**, uncaught before: `[tier-b-runs-on-the-gpu-runner]`. No
+# hosted runner has NVENC, so `runs-on: ubuntu-latest` does not slow the
+# gate down, it removes it
 @test "gates: moving the picture gate off the GPU runner is caught" {
   _mutate 's/^    runs-on: \[self-hosted, gpu\]$/    runs-on: ubuntu-latest/'
   run bash "${CHECK}" "${MUTATED}"
@@ -502,6 +705,8 @@ JOB
 
 # ------------------------------------------------------- tag reachability --
 
+# why: `[workflow-triggers-on-tag-push]` -- a tag that does not start the
+# workflow never reaches the gate
 @test "gates: removing the tag push trigger is caught" {
   _mutate "/^      - 'v\[0-9\]/d"
   run bash "${CHECK}" "${MUTATED}"
@@ -512,6 +717,11 @@ JOB
 # M20. Property 7 asked whether `on.push.tags` had any items in it, not
 # whether a real version tag matches one. Both shapes this repo cuts are
 # probed, because the incident behind the rule was an rc.
+# why: **M20**, uncaught before: `[tag-globs-match-a-real-version]`.
+# Presence was all that was checked, so `- 'never-matches-anything'` passed
+# while `v1.2.3` started no workflow at all -- fails safe AND silently. Real
+# tags are now tried against the patterns, translated from GitHub's filter
+# syntax to an ERE
 @test "gates: tag globs that match no real version are caught" {
   _mutate "s/^      - 'v\[0-9\].*\$/      - 'never-matches-anything'/"
   run bash "${CHECK}" "${MUTATED}"
@@ -519,6 +729,8 @@ JOB
   assert_output --partial "[tag-globs-match-a-real-version]"
 }
 
+# why: Same id, `v1.2.3-rc1`: the incident behind this rule was an rc, so a
+# glob set that quietly stops matching pre-releases is the same hole
 @test "gates: tag globs that stop matching pre-release tags are caught" {
   _mutate "/^      - 'v\[0-9\]+.\[0-9\]+.\[0-9\]+-\*'\$/d"
   run bash "${CHECK}" "${MUTATED}"
@@ -527,6 +739,8 @@ JOB
   assert_output --partial "v1.2.3-rc1"
 }
 
+# why: `[tier-b-reachable-on-every-tag-push]` -- the gate must run for every
+# tag push, not some
 @test "gates: tier-b losing its bare tag-push alternative is caught" {
   _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || startsWith(github.ref, 'refs/heads/')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -536,6 +750,9 @@ JOB
 
 # The subtler half: the tag alternative is still THERE, but ANDed instead of
 # ORed, so the condition is false for an ordinary tag push.
+# why: Same id, subtler mutation: the alternative is still there but ANDed,
+# so the condition is false for an ordinary tag push. A substring grep
+# passes this; splitting the expression at parenthesis depth 0 does not
 @test "gates: tier-b's tag alternative becoming a top-level AND is caught" {
   _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      \&\& startsWith(github.ref, 'refs/tags/')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -548,6 +765,10 @@ JOB
 # M22: `github.ref_type == 'tag'` -- rejected by round 4 even though
 # verify-tag-shape ten lines away in the same file guards its own step with
 # exactly that spelling.
+# why: **M22**, a FALSE POSITIVE before: rejected as a violation even though
+# `verify-tag-shape` ten lines away in the same file guards its own step
+# with exactly that spelling. Tag-ref tests are matched against a set of
+# spellings, and the error message names the set
 @test "gates: github.ref_type == 'tag' is accepted as the tag-ref test" {
   _mutate "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || github.ref_type == 'tag'#"
   run bash "${CHECK}" "${MUTATED}"
@@ -595,6 +816,9 @@ JOB
 # tier-b-visual-e2e needs verify-tag-shape, and a SKIPPED need skips its
 # dependent. verify-tag-shape carries no job-level `if:` for exactly that
 # reason -- the tag check is guarded per-step instead.
+# why: `[verify-tag-shape-has-no-job-level-if]` -- the gate needs it, and a
+# SKIPPED need skips its dependent, so it carries no job-level `if:` by
+# design (the tag check is guarded per-step)
 @test "gates: giving verify-tag-shape a job-level if is caught" {
   _mutate "/^  verify-tag-shape:\$/a\\    if: \${{ github.ref_type == 'tag' }}"
   run bash "${CHECK}" "${MUTATED}"
@@ -616,6 +840,11 @@ JOB
 # survives in a trailing comment, which is all the "is there still work here"
 # check was reading -- so the job ran, did nothing, reported success, and the
 # image published with no picture taken.
+# why: **C3**, uncaught in round 5: `[gate-job-work-step-is-unconditional]`.
+# The gate's work step runs `true` and the helper it should run survives in
+# a TRAILING COMMENT, which was all the "is there still work here" check
+# read. The job ran, did nothing, reported success, and the image published
+# with no picture taken
 @test "gates: the Tier B work step neutered by a trailing comment is caught" {
   _mutate 's|^        run: bash script/ci/tier_b_visual_e2e.sh$|        run: "true"  # bash script/ci/tier_b_visual_e2e.sh|'
   run bash "${CHECK}" "${MUTATED}"
@@ -626,6 +855,9 @@ JOB
 # The GPU pin defeated the same way: `self-hosted` and `gpu` are both
 # still in the line, in the comment, and the gate ran on a hosted runner with
 # no NVENC -- which does not slow the picture check down, it removes it.
+# why: **C4**: `[tier-b-runs-on-the-gpu-runner]`, defeated the same way --
+# `runs-on: ubuntu-latest # was [self-hosted, gpu]`. Both words the check
+# looked for are still on the line, in the comment
 @test "gates: the GPU pin defeated by a trailing comment is caught" {
   _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    runs-on: ubuntu-latest  # was [self-hosted, gpu]|'
   run bash "${CHECK}" "${MUTATED}"
@@ -636,6 +868,10 @@ JOB
 # Both report-only jobs neutered: their condition is now `false`, and the
 # `!= 'success'` the shape check looked for survives in the comment. A blocked
 # release goes back to being a grey job on a green-looking run.
+# why: **C5**: `[report-only-jobs-still-exist]`. Both report conditions
+# become `&& false` with the `!= 'success'` the shape check wanted surviving
+# in the comment, so a blocked release goes back to a grey job on a
+# green-looking run
 @test "gates: a report-only job neutered by a trailing comment is caught" {
   _mutate "s|^      && needs.tier-b-visual-e2e.result != 'success'\$|      \&\& false  # needs.tier-b-visual-e2e.result != 'success'|"
   run bash "${CHECK}" "${MUTATED}"
@@ -648,6 +884,11 @@ JOB
 # became invisible -- here, on the step that actually pushes. The job reports
 # success having published nothing, and a tag cuts a Release with no image
 # behind it: the exact state this workflow's own header argues against.
+# why: **T1**: `[publishing-step-is-unconditional]`, a new id. `steps:` with
+# a trailing comment is not `steps:` to a line regex, so nothing below it
+# was parsed and every step-level `if:` in `publish-image` became invisible
+# -- here on the step that actually pushes. The job reports success having
+# published nothing, and a tag cuts a Release with no image behind it
 @test "gates: a commented steps: hiding an if: on the push step is caught" {
   _mutate '/^  publish-image:$/,/^  tier-b-visual-e2e:$/{s|^    steps:$|    steps:  # the publish work|}' \
           '/^      - name: Build and push the runtime image$/a\        if: false'
@@ -663,6 +904,11 @@ JOB
 # the lines it leaks land in publish-image, which is behind the gate already
 # -- nothing else in the file changes its verdict, which is what made this
 # silent.
+# why: **J1**: `[publishing-job-is-behind-the-picture-gate]`. A job header
+# with a trailing comment is not a job header to a line regex, so the job
+# was invisible to the job list, never derived as publishing and never
+# required to carry the gate, while its body was silently attributed to the
+# job above it
 @test "gates: a job header with a trailing comment is still a job" {
   awk '
     /^  tier-b-visual-e2e:$/ && !done {
@@ -701,6 +947,7 @@ JOB
   assert_output --partial "[gate-job-work-step-is-unconditional]"
 }
 
+# why: **U2**: same id, the single-quoted `'if':` spelling
 @test "gates: a single-quoted 'if': on the Tier B work step is caught" {
   _mutate "/^      - name: Tier B visual acceptance/a\\        'if': false"
   run bash "${CHECK}" "${MUTATED}"
@@ -708,6 +955,7 @@ JOB
   assert_output --partial "[gate-job-work-step-is-unconditional]"
 }
 
+# why: **D1**: same id, the spaced `if :` spelling
 @test "gates: a spaced 'if :' on the Tier B work step is caught" {
   _mutate '/^      - name: Tier B visual acceptance/a\        if : false'
   run bash "${CHECK}" "${MUTATED}"
@@ -727,6 +975,7 @@ JOB
   assert_output --partial "[call-release-carries-no-status-function]"
 }
 
+# why: **B2**: same id, the single-quoted spelling at job level
 @test "gates: a single-quoted 'if': hiding a status function on call-release is caught" {
   _mutate "/^  call-release:\$/,/^  publish-image:\$/{s|^    if: >-\$|    'if': >-|}" \
           "s#^      startsWith(github.ref, 'refs/tags/')\$#      always() \&\& startsWith(github.ref, 'refs/tags/')#"
@@ -735,6 +984,7 @@ JOB
   assert_output --partial "[call-release-carries-no-status-function]"
 }
 
+# why: **E1**: same id, the spaced spelling at job level
 @test "gates: a spaced 'if :' hiding a status function on call-release is caught" {
   _mutate '/^  call-release:$/,/^  publish-image:$/{s|^    if: >-$|    if : >-|}' \
           "s#^      startsWith(github.ref, 'refs/tags/')\$#      always() \&\& startsWith(github.ref, 'refs/tags/')#"
@@ -753,6 +1003,7 @@ JOB
   assert_output --partial "[verify-tag-shape-has-no-job-level-if]"
 }
 
+# why: **E3**: same id, the spaced spelling
 @test "gates: a spaced 'if :' on verify-tag-shape is caught" {
   _mutate '/^  verify-tag-shape:$/a\    if : false'
   run bash "${CHECK}" "${MUTATED}"
@@ -770,6 +1021,11 @@ JOB
 # An unbalanced `(` inside a string pins depth ABOVE zero, so the `||`
 # appended after it is invisible and the whole gate chain becomes one
 # alternative of a disjunction.
+# why: **G1**: `[publish-image-gate-is-not-optional]`. The round-5 tokeniser
+# counted every `(` in the text, quoted strings included, so an unbalanced
+# `(` inside a string literal pinned depth above zero, the `||` appended
+# after it was invisible, and the whole gate chain became one alternative of
+# a disjunction
 @test "gates: a '(' inside a string hiding a top-level || is caught" {
   _mutate "/^              && inputs.publish_image_tag != ''))\$/a\\      \&\& !contains(github.ref_name, '(')\n      || inputs.publish_image_tag != ''"
   run bash "${CHECK}" "${MUTATED}"
@@ -779,6 +1035,8 @@ JOB
 
 # The same in the other direction: a `)` inside a string drives depth
 # BELOW zero, with the same effect and from the opposite side.
+# why: **F1**: same id, from the opposite side -- a `)` inside a string
+# drives depth BELOW zero for the same effect
 @test "gates: a ')' inside a string hiding a top-level || is caught" {
   _mutate "/^              && inputs.publish_image_tag != ''))\$/a\\      \&\& !contains(github.ref_name, ')')\n      || inputs.publish_image_tag != ''"
   run bash "${CHECK}" "${MUTATED}"
@@ -789,6 +1047,9 @@ JOB
 # ... and the acceptance half, so the fix is a tokeniser and not a ban on
 # parentheses in strings: a condition that legitimately mentions one still
 # passes.
+# why: The acceptance half, so the fix is a string-literal-aware tokeniser
+# and not a ban on parentheses in strings: a condition that legitimately
+# mentions one still passes
 @test "gates: a parenthesis inside a string literal is not a bypass by itself" {
   _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& needs.tier-b-visual-e2e.result == 'success'\n      \&\& !contains(github.ref_name, '(')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -799,6 +1060,10 @@ JOB
 # A condition whose parentheses do not balance outside its strings cannot be
 # split into terms at all. Guessing at one and reporting the invariant as held
 # is the failure mode; refusing is not.
+# why: `[condition-is-a-well-formed-expression]` -- a new id. A condition
+# whose parentheses do not balance outside its strings cannot be split into
+# terms at all; guessing at one and reporting the invariant as held is the
+# failure mode, refusing is not
 @test "gates: an unbalanced condition is refused rather than mis-split" {
   _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& (needs.tier-b-visual-e2e.result == 'success'#"
   run bash "${CHECK}" "${MUTATED}"
@@ -810,6 +1075,11 @@ JOB
 # contiguously in the raw text, so a substring search over the job body could
 # not find it and the job was never derived as one that publishes. The parser
 # folds the scalar before anything looks at it.
+# why: **F2**: `[publishing-job-is-behind-the-picture-gate]`. A publishing
+# command split across a folded scalar never appears contiguously in the raw
+# text, so a substring search over the job body could not find it and the
+# job was never derived as publishing. The parser folds the scalar before
+# anything looks at it
 @test "gates: a publishing command folded across lines is still publishing" {
   _append_job <<'JOB'
   publish-npm:
@@ -834,6 +1104,9 @@ JOB
 # all ordinary spellings none of the nine matched.
 
 # `permissions: write-all` is one token and grants every scope there is.
+# why: **N4**: same id. The publishing set was called DERIVED but was a
+# search for nine literal strings, and `permissions: write-all` is one token
+# that grants every scope there is
 @test "gates: permissions: write-all is a publishing job" {
   _append_job <<'JOB'
   publish-anything:
@@ -853,6 +1126,9 @@ JOB
 # A workflow-level `permissions:` block is the grant every job WITHOUT its
 # own block runs with. Reading only job-level blocks meant a workflow that
 # handed write to everything looked read-only.
+# why: **N5**: same id. A workflow-level `permissions:` block is the grant
+# every job WITHOUT its own block runs with, so reading only job-level
+# blocks made a workflow that handed write to everything look read-only
 @test "gates: a workflow-level permissions grant reaches every job" {
   {
     sed '2i\permissions:\n  contents: write\n  packages: write' "${WORKFLOW}"
@@ -872,6 +1148,8 @@ JOB
 
 # `docker buildx build --push` names neither `docker push` nor
 # `push: true`, which were the two docker spellings on the list.
+# why: **H1**: same id. `docker buildx build --push` names neither `docker
+# push` nor `push: true`, the two docker spellings on the list
 @test "gates: docker buildx build --push is publishing" {
   _append_job <<'JOB'
   publish-buildx:
@@ -889,6 +1167,8 @@ JOB
 
 # `push:` with an expression value could be true on any run; the list held
 # the literal `push: true`.
+# why: **H2**: same id. A `push:` whose value is an expression could be true
+# on any run; the list held the literal `push: true`
 @test "gates: push: with an expression value is publishing" {
   _append_job <<'JOB'
   publish-expr:
@@ -909,6 +1189,9 @@ JOB
 # ... and the acceptance half of the same widening: `push: false` is a build
 # that does not push, and reporting it as a publishing job would teach a
 # maintainer that the derivation is noise.
+# why: The acceptance half of that widening: `push: false` is a build that
+# does not push, and reporting it as a publishing job would teach a
+# maintainer that the derivation is noise
 @test "gates: a build that explicitly does not push is not a publishing job" {
   _append_job <<'JOB'
   build-only:
@@ -932,6 +1215,11 @@ JOB
 # round-5 check tested for the literal `always(`, so the same escape under
 # another name walked through -- and a cancelled Tier B, evicted from the GPU
 # concurrency group as a pending member, is a documented case here.
+# why: **M5**: `[publish-image-status-function-is-narrow]`. `!failure()` is
+# true in a cancelled run, exactly like `always()`, and round 5 tested for
+# the literal `always(` -- so the same escape walked through under another
+# name. That is why the id names the PROPERTY the condition must have rather
+# than one banned literal
 @test "gates: !failure() in place of publish-image's !cancelled() is caught" {
   _mutate 's/^      !cancelled()$/      !failure()/'
   run bash "${CHECK}" "${MUTATED}"
@@ -942,6 +1230,9 @@ JOB
 # ... and the acceptance half: the two other spellings of the SAME narrow test
 # must not be reported as violations, or the property becomes a ban on one
 # literal all over again.
+# why: The acceptance half: another spelling of the SAME narrow test must
+# not be reported as a violation, or the property becomes a ban on one
+# literal all over again
 @test "gates: cancelled() == false is accepted as the narrow status test" {
   _mutate 's/^      !cancelled()$/      cancelled() == false/'
   run bash "${CHECK}" "${MUTATED}"
@@ -961,6 +1252,9 @@ JOB
 
 # `continue-on-error: false` is the DEFAULT written out loud. The check
 # was a substring search for the word.
+# why: **I1**, a legal edit round 5 reported as a violation:
+# `continue-on-error: false` is the DEFAULT written out loud, and the check
+# was a substring search for the word
 @test "gates: continue-on-error: false is not a violation" {
   _mutate '/^  tier-b-visual-e2e:$/a\    continue-on-error: false'
   run bash "${CHECK}" "${MUTATED}"
@@ -971,6 +1265,9 @@ JOB
 # A trailing comment after a needs list was split on whitespace along with
 # the list, and the words in it were reported as jobs that do not exist ("#",
 # "the", "picture", "gate").
+# why: **I2**, legal edit: a trailing comment after a `needs:` list was
+# split on whitespace along with the list, and the words in it were reported
+# as jobs that do not exist -- "#", "the", "picture", "gate"
 @test "gates: a trailing comment after needs: is not four missing jobs" {
   _mutate 's|^    needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]$|    needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence]  # the picture gate|'
   run bash "${CHECK}" "${MUTATED}"
@@ -982,6 +1279,10 @@ JOB
 # resolves a bare `on` to the boolean true, which is why the quoted form
 # exists. Reading only the bare spelling reported a workflow with no triggers
 # at all.
+# why: **P3**, legal edit: `'on':` is the YAML-1.1-safe spelling of the
+# trigger key -- YAML 1.1 resolves a bare `on` to the boolean true, which is
+# why the quoted form exists -- and reading only the bare spelling reported
+# a workflow with no triggers at all
 @test "gates: the quoted 'on': trigger key is read" {
   _mutate "3s|^on:\$|'on':|"
   run bash "${CHECK}" "${MUTATED}"
@@ -993,6 +1294,11 @@ JOB
 # optional whitespace was load-bearing: `result=='success'` and
 # `startsWith(github.ref,'refs/tags/')` are the same expressions the workflow
 # already contains, written without spaces GitHub does not require.
+# why: **P4**, legal edit: expressions were compared as strings against
+# literal spellings, so the optional whitespace was load-bearing.
+# `result=='success'` and `startsWith(github.ref,'refs/tags/')` are the
+# expressions the workflow already contains, written without spaces GitHub
+# does not require
 @test "gates: equivalent expressions without optional whitespace pass" {
   _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& needs.tier-b-visual-e2e.result=='success'#" \
           "s#^      || startsWith(github.ref, 'refs/tags/')\$#      || startsWith(github.ref,'refs/tags/')#"
@@ -1004,6 +1310,9 @@ JOB
 # ... and the pairing that stops the whitespace-insensitivity widening into
 # "any expression containing the right words": the same spelling with the
 # operand changed is still caught.
+# why: `[publish-image-requires-tier-b-success]` -- the pairing that stops
+# P4's whitespace-insensitivity widening into "any expression containing the
+# right words": the same spelling with the operand changed is still caught
 @test "gates: whitespace insensitivity does not accept a different expression" {
   _mutate "s#^      && needs.tier-b-visual-e2e.result == 'success'\$#      \&\& needs.tier-b-visual-e2e.result=='failure'#"
   run bash "${CHECK}" "${MUTATED}"
@@ -1032,6 +1341,14 @@ JOB
 # Paired with a work step that cannot fail, that is the entire invariant
 # defeated by two capital letters, and the round-6 checker printed "holds the
 # release invariant" for it.
+# why: `[call-release-carries-no-status-function]` +
+# `[gate-job-runs-its-driver-verbatim]`. GitHub expression function names
+# are case-INSENSITIVE and the match was not, so `if: ALWAYS() &&
+# startsWith(...)` was invisible to the property whose whole job is to keep
+# a status function off `call-release` -- and that ABSENCE is what keeps
+# GitHub's default skip propagation, which is what makes an unavailable GPU
+# runner block the release. Paired with a work step suffixed `|| true`, it
+# is the entire invariant
 @test "gates: ALWAYS() on call-release is a status function like any other" {
   _mutate "s#^      startsWith(github.ref, 'refs/tags/')\$#      ALWAYS() \&\& startsWith(github.ref, 'refs/tags/')#" \
           "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh || true@"
@@ -1041,6 +1358,8 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id, the mixed-case spelling: the fix is a case-insensitive
+# match, not a second literal
 @test "gates: Always() in mixed case is a status function like any other" {
   _mutate "s#^      startsWith(github.ref, 'refs/tags/')\$#      Always() \&\& startsWith(github.ref, 'refs/tags/')#"
   run bash "${CHECK}" "${MUTATED}"
@@ -1050,6 +1369,9 @@ JOB
 
 # The same root cause pointed the other way, at publish-image, where the
 # property is "the ONLY status function here is the narrow !cancelled()".
+# why: `[publish-image-status-function-is-narrow]` -- the same root cause
+# pointed at the job where the property is "the only status function here is
+# the narrow `!cancelled()`"
 @test "gates: ALWAYS() in place of publish-image's !cancelled() is caught" {
   _mutate 's/^      !cancelled()$/      ALWAYS()/'
   run bash "${CHECK}" "${MUTATED}"
@@ -1062,6 +1384,10 @@ JOB
 # attacker wants and CLOSED for one a maintainer might legitimately write.
 # `STARTSWITH(GitHub.ref, ...)` is the same tag-ref test the workflow already
 # has, and reporting it as a violation is a false positive.
+# why: The acceptance half, and the reason case-sensitivity was worth fixing
+# rather than working around: it failed OPEN for the spelling an attacker
+# wants and CLOSED for one a maintainer might write. `STARTSWITH(GitHub.ref,
+# ...)` is the tag-ref test the workflow already has
 @test "gates: STARTSWITH in capitals is still the tag-ref test" {
   _mutate "s@startsWith(github.ref, 'refs/tags/')@STARTSWITH(GitHub.ref, 'refs/tags/')@g"
   run bash "${CHECK}" "${MUTATED}"
@@ -1069,6 +1395,7 @@ JOB
   assert_output --partial "holds the release invariant"
 }
 
+# why: Same acceptance, on the narrow status test
 @test "gates: !CANCELLED() in capitals is still the narrow status test" {
   _mutate 's/^      !cancelled()$/      !CANCELLED()/'
   run bash "${CHECK}" "${MUTATED}"
@@ -1089,6 +1416,10 @@ JOB
 # THIS command runs, unconditionally, and nothing else in the job invokes the
 # same script in another spelling. See GATE_WORK_DRIVERS.
 
+# why: `[gate-job-runs-its-driver-verbatim]` -- a new id. The old property
+# COUNTED steps naming something under `script/ci/`, so the driver with `||
+# true` after it still counted. The gate ran, swallowed its own failure,
+# reported success, and the image published with no picture taken
 @test "gates: the Tier B driver suffixed with || true is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh || true@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1096,6 +1427,8 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id: `--help` exits 0 at once, and the count could not tell it
+# from the job's work
 @test "gates: the Tier B driver reduced to --help is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh --help@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1103,6 +1436,7 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id, the `--version` spelling
 @test "gates: the Tier B driver reduced to --version is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh --version@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1110,6 +1444,8 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id: `set +e; ...; exit 0` keeps the driver on the line and
+# throws its result away
 @test "gates: the Tier B driver wrapped in set +e and exit 0 is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: set +e; bash script/ci/tier_b_visual_e2e.sh; exit 0@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1119,6 +1455,9 @@ JOB
 
 # The count could not tell one script/ci/ helper from another, so pointing the
 # picture gate's work step at the tag deriver satisfied it exactly.
+# why: Same id: the count could not tell `tier_b_visual_e2e.sh` from
+# `derive_image_tag.sh`, so pointing the picture gate's work step at the tag
+# deriver satisfied it exactly
 @test "gates: the Tier B work step pointed at a different helper is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/derive_image_tag.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1131,6 +1470,9 @@ JOB
 # actually look at a frame moves behind an `if:` that is never true -- as
 # `run: $CMD` with the command in `env:`, as a third-party action, and as a
 # plain inline `run:`.
+# why: Same id: an UNCONDITIONAL `echo` naming `script/ci/` keeps the old
+# count satisfied while `run: $CMD`, with the command in `env:`, sits behind
+# an `if:` that is never true
 @test "gates: an echo decoy plus the real work behind env indirection is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: echo 'the driver lives under script/ci/'\n        env:\n          CMD: bash script/ci/tier_b_visual_e2e.sh\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: eval \"\$CMD\"@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1138,6 +1480,7 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id, with the real work as a third-party action
 @test "gates: an echo decoy plus a guarded third-party action is caught" {
   _mutate "s#^        run: bash script/ci/tier_b_visual_e2e.sh\$#        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        uses: some/visual-acceptance-action@v1#"
   run bash "${CHECK}" "${MUTATED}"
@@ -1145,6 +1488,7 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
+# why: Same id, with the real work as a plain inline `run:`
 @test "gates: an echo decoy plus a guarded inline run is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: ./take-the-picture.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1155,6 +1499,9 @@ JOB
 # The same pin on the OTHER driver job. verify-tag-shape runs the deriver
 # before anything irreversible happens; `|| true` there lets a tag the
 # deriver cannot publish reach the GPU gate and the Release.
+# why: Same id on the OTHER driver job: `verify-tag-shape` runs the deriver
+# before anything irreversible, and `|| true` there lets a tag the deriver
+# cannot publish reach the GPU gate and the Release
 @test "gates: the tag deriver suffixed with || true is caught" {
   _mutate "s@^        run: bash script/ci/derive_image_tag.sh\$@        run: bash script/ci/derive_image_tag.sh || true@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1165,6 +1512,10 @@ JOB
 # A `--print-<x>` QUERY is the one other spelling the job may contain -- this
 # repo pulls the producer image the driver names -- and it must be
 # unconditional too: a skipped query fails the step that consumes it.
+# why: Same id. A `--print-<x>` query is the one other spelling the job may
+# contain -- this repo pulls the producer image the driver names -- and it
+# must be unconditional too, because a skipped query fails the step that
+# consumes it
 @test "gates: an if: on the driver's --print- query is caught" {
   _mutate "s|^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$|        if: \${{ github.event_name == 'never' }}\n        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1175,6 +1526,10 @@ JOB
 # ... and the acceptance half, so "exact" does not mean "byte-identical".
 # Whitespace inside the command is not meaning; an ARGUMENT is, which is why
 # every case above is a violation and this one is not.
+# why: The acceptance half, so "exact" does not mean "byte-identical":
+# whitespace inside the command is not meaning, an ARGUMENT is. Adding one
+# is a violation whose message says to record the new spelling in
+# `GATE_WORK_DRIVERS`
 @test "gates: extra whitespace inside the driver invocation still passes" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash   script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1198,6 +1553,10 @@ JOB
 
 # GitHub's documented custom-shell form is `command [...options] {0}`, so the
 # driver is PRINTED and never runs, while the step and the job report success.
+# why: `[gate-driver-runs-unmodified]` -- GitHub's documented custom-shell
+# form is `command [...options] {0}`, so the pinned driver is PRINTED and
+# never runs while the step and the job report success. The pin compared a
+# STRING; four sibling keys decide what that string does
 @test "gates: shell: cat {0} on the Tier B work step is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: cat {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1206,6 +1565,7 @@ JOB
 }
 
 # The same hole spelled as something that reads like a lint tweak in review.
+# why: Same id: syntax-check only, and it reads as a lint tweak in review
 @test "gates: shell: bash -n {0} on the Tier B work step is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: bash -n {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1215,6 +1575,8 @@ JOB
 
 # The verbatim string, resolved against another tree -- a fixture holding a
 # stub of the same path.
+# why: Same id: the verbatim string resolved against another tree -- a
+# fixture holding a stub of the same path
 @test "gates: working-directory: on the Tier B work step is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        working-directory: test/fixtures/stub-tree\n        run: bash script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1226,6 +1588,10 @@ JOB
 # TIER_B_BOOT_TIMEOUT from its environment (script/ci/tier_b_visual_e2e.sh),
 # so a step-level env: makes the "picture" one of whatever image the editor
 # chose -- with the pinned line, and the gate's own name, intact.
+# why: Same id: the driver reads `TIER_B_PRODUCER_IMAGE` /
+# `TIER_B_VIEWER_IMAGE` / `TIER_B_BOOT_TIMEOUT` from its environment, so the
+# "picture" becomes one of whatever image the editor chose, with the pinned
+# line intact
 @test "gates: env: on the Tier B work step is caught" {
   _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        env:\n          TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\n        run: bash script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1234,6 +1600,7 @@ JOB
 }
 
 # ... and the same variable one level up, which no step-level rule can see.
+# why: Same id, one level up, where no step-level rule can see it
 @test "gates: a job-level env: on the picture gate is caught" {
   _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    env:\n      TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1243,6 +1610,8 @@ JOB
 
 # ... and two levels up, where it reaches every job in the file including
 # this one.
+# why: Same id, two levels up, where it reaches every job in the file
+# including this one
 @test "gates: a workflow-level env: reaching the picture gate is caught" {
   _mutate "s@^jobs:\$@env:\n  TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\njobs:@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1253,6 +1622,8 @@ JOB
 # THE THREE THAT NEVER TOUCH THE PINNED LINE. A reviewer reading the diff
 # sees a `defaults:` block and a `run:` line that still says exactly what it
 # always said.
+# why: Same id. THE PINNED LINE IS UNTOUCHED: the diff shows only a
+# `defaults:` block
 @test "gates: a job-level defaults.run.shell on the picture gate is caught" {
   _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    defaults:\n      run:\n        shell: cat {0}@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1260,6 +1631,7 @@ JOB
   assert_output --partial "[gate-driver-runs-unmodified]"
 }
 
+# why: Same id, and it is one block at the top of the file
 @test "gates: a workflow-level defaults.run.shell is caught" {
   _mutate "s@^jobs:\$@defaults:\n  run:\n    shell: cat {0}\njobs:@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1267,6 +1639,8 @@ JOB
   assert_output --partial "[gate-driver-runs-unmodified]"
 }
 
+# why: Same id: the driver resolved from another tree, again with no edit to
+# the step
 @test "gates: a workflow-level defaults.run.working-directory is caught" {
   _mutate "s@^jobs:\$@defaults:\n  run:\n    working-directory: test/fixtures/stub-tree\njobs:@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1282,6 +1656,11 @@ JOB
 # query -- this repo pulls the producer image the driver names -- and none
 # for a decoy that merely carries the substring somewhere in the same body
 # while invoking the driver as `--help`.
+# why: `[gate-job-runs-its-driver-verbatim]` -- clause (c) was `"--print-"
+# in run`, a SUBSTRING test, so any unconditional step containing that
+# literal anywhere got a free pass to invoke the driver in any spelling. Now
+# every occurrence of the script in the step must itself be a `--print-<x>`
+# query
 @test "gates: a --print- decoy carrying a --help invocation is caught" {
   _mutate "s@^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$@        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\n      - name: Warm the driver up\n        run: echo --print-nothing \&\& bash script/ci/tier_b_visual_e2e.sh --help || true@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1301,6 +1680,8 @@ JOB
 
 # An env: on a step of the gate job that does NOT invoke the driver cannot
 # change what the driver does: it is a different process.
+# why: Acceptance pair for the `env:` refusal: a step that does not invoke
+# the driver is a different process and cannot change what the driver does
 @test "gates: env: on a non-driver step of the gate job still passes" {
   _mutate "s@^        run: ./script/build.sh -t e2e-test\$@        env:\n          DOCKER_BUILDKIT: '1'\n        run: ./script/build.sh -t e2e-test@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1311,6 +1692,9 @@ JOB
 # `defaults:` on a job that runs no pinned driver is an ordinary edit. The
 # refusal is scoped to the two GATE_WORK_DRIVERS jobs and to the workflow
 # level, which reaches them.
+# why: Acceptance pair for the `defaults:` refusal, which is scoped to the
+# two `GATE_WORK_DRIVERS` jobs and to the workflow level that reaches them
+# -- not to the file
 @test "gates: defaults.run.shell on a job with no pinned driver still passes" {
   _mutate "s@^  publish-image:\$@  publish-image:\n    defaults:\n      run:\n        shell: bash@"
   run bash "${CHECK}" "${MUTATED}"
@@ -1330,6 +1714,11 @@ JOB
 # Publishing is now derived from the RAW `run:` body. The trade is stated in
 # limitation 4: a genuinely commented-out `docker push` marks the job as one
 # that must stand behind the gate, which costs a `needs:` line.
+# why: `[publishing-job-is-behind-the-picture-gate]`. Shell-comment
+# stripping ends a line at a whitespace-preceded `#`, which is right for
+# recognising gate WORK and exactly wrong for deriving PUBLISHING -- losing
+# the signal means the job is never required to stand behind the gate at
+# all. Publishing is now derived from the RAW `run:` body
 @test "gates: a # inside a shell string does not hide the docker push after it" {
   _append_job <<'JOB'
   publish-after-echo:
@@ -1346,6 +1735,7 @@ JOB
   assert_output --partial "publish-after-echo"
 }
 
+# why: Same id, with `gh release create` as the swallowed command
 @test "gates: a # inside a shell string does not hide the gh release after it" {
   _append_job <<'JOB'
   release-after-echo:
@@ -1369,6 +1759,8 @@ JOB
 # because each pattern matches within a single line. Continuations are joined
 # before matching now. The enumeration still does not converge, and
 # limitation 4 says so in those words.
+# why: Same id: `docker image push` is the subcommand spelling the table did
+# not hold
 @test "gates: docker image push is publishing" {
   _append_job <<'JOB'
   publish-image-subcommand:
@@ -1389,6 +1781,11 @@ JOB
 # is `regctl image copy`. A row that looks like coverage and provides none is
 # worse than an admitted gap, because the name appearing in the table is what
 # stops anyone checking.
+# why: `[publishing-job-is-behind-the-picture-gate]` -- `PUBLISH_RUN_RE`
+# carried a row that matched NOTHING REAL: `regctl (push|copy)`, and regctl
+# has neither subcommand. A row that looks like coverage and provides none
+# is worse than an admitted gap, because the name in the table is what stops
+# anyone checking
 @test "gates: regctl image copy is publishing" {
   _append_job <<'JOB'
   publish-regctl:
@@ -1404,6 +1801,7 @@ JOB
   assert_output --partial "publish-regctl"
 }
 
+# why: Same id, the other real spelling
 @test "gates: regctl artifact put is publishing" {
   _append_job <<'JOB'
   publish-regctl-artifact:
@@ -1424,6 +1822,10 @@ JOB
 # than leaving it to whichever spelling the push happens to use. Added with
 # the row it tests, because a row nothing exercises is precisely the failure
 # the two cases above exist to correct.
+# why: Same id: a registry login in a job that publishes nothing is not a
+# normal pattern -- the same reasoning that puts `docker/login-action` in
+# `PUBLISH_USES`. Added with the row it tests, because a row nothing
+# exercises is the failure the two cases above correct
 @test "gates: regctl registry login is publishing" {
   _append_job <<'JOB'
   login-regctl:
@@ -1442,6 +1844,8 @@ JOB
 # ... and the acceptance half: a regctl READ is not a publish. Without this,
 # widening the row to `regctl <anything>` would report every registry query
 # as a job that must stand behind the picture gate.
+# why: Acceptance pair: a registry READ is not a publish, so the corrected
+# rows did not widen into `regctl <anything>`
 @test "gates: regctl image digest is not publishing" {
   _append_job <<'JOB'
   inspect-regctl:
@@ -1455,6 +1859,7 @@ JOB
   assert_output --partial "holds the release invariant"
 }
 
+# why: Same id
 @test "gates: buildah push is publishing" {
   _append_job <<'JOB'
   publish-buildah:
@@ -1470,6 +1875,7 @@ JOB
   assert_output --partial "publish-buildah"
 }
 
+# why: Same id
 @test "gates: podman push is publishing" {
   _append_job <<'JOB'
   publish-podman:
@@ -1485,6 +1891,8 @@ JOB
   assert_output --partial "publish-podman"
 }
 
+# why: Same id: `gh api -X POST /repos/<r>/releases` cuts a Release with no
+# `gh release` on the line at all
 @test "gates: a REST write to the releases API is publishing" {
   _append_job <<'JOB'
   publish-rest:
@@ -1500,6 +1908,9 @@ JOB
   assert_output --partial "publish-rest"
 }
 
+# why: Same id, and the one that defeated EVERY row at once rather than one
+# of them: each pattern matches within a single line, so a trailing `\` hid
+# all of them. Continuations are joined before matching
 @test "gates: a push split by a shell line continuation is still publishing" {
   _append_job <<'JOB'
   publish-continued:
@@ -1523,6 +1934,10 @@ JOB
 # value and reached with `eval "$CMD"` was invisible. `env:` values are now
 # searched for publishing signals -- deliberately, and only for publishing:
 # see publish_search_text.
+# why: Same id: `step_text()` read `run` and `uses` only, so a command
+# written as an `env:` value and reached with `eval "$CMD"` was invisible.
+# `env:` values are searched for publishing signals -- deliberately, and
+# only for publishing
 @test "gates: a push written as an env value is still publishing" {
   _append_job <<'JOB'
   publish-indirect:
@@ -1543,6 +1958,9 @@ JOB
 # Job-level `env:` is read too, and reported as the JOB's rather than as some
 # arbitrary step's -- a command written twenty lines above the steps would
 # otherwise send a maintainer to the wrong place.
+# why: Same id, with the command in the JOB's `env:` rather than the step's
+# -- reported as the job's, because a command written twenty lines above the
+# steps would otherwise send a maintainer to the wrong step
 @test "gates: a push written as a job-level env value is still publishing" {
   _append_job <<'JOB'
   publish-indirect-job-env:
@@ -1567,6 +1985,11 @@ JOB
 # publish with no Release behind it. Deriving that GET as "the publishing
 # act" would report the guard itself as a violation, so the REST pattern is
 # scoped to an explicit write method.
+# why: The acceptance half, and the one that matters most here: this repo's
+# own `publish-image` READS `/repos/<r>/releases/tags/v<version>` from
+# behind an `if:`, to refuse a publish with no Release behind it. Deriving
+# that GET as the publishing act would report the guard itself as a
+# violation, so the REST pattern is scoped to an explicit write method
 @test "gates: a GET against the releases API is not publishing" {
   _append_job <<'JOB'
   read-only-release-probe:
@@ -1588,6 +2011,11 @@ JOB
 # `- '!v[0-9]+.[0-9]+.[0-9]+-*'` silently excluded every release candidate
 # while the property whose own comment reads PRESENCE IS NOT REACHABILITY
 # passed. The incident this whole file exists for (#70) was an rc.
+# why: `[tag-globs-match-a-real-version]` -- `glob_to_regex()` had no `!`
+# case, so a NEGATIVE pattern compiled to a literal one and matched nothing.
+# Appending `- '!v[0-9]+.[0-9]+.[0-9]+-*'` silently excluded every release
+# candidate while the property whose own comment reads PRESENCE IS NOT
+# REACHABILITY passed. The incident behind this whole file was an rc
 @test "gates: a negative tag glob that excludes every rc is caught" {
   _mutate "s|^      - 'v\[0-9\]+.\[0-9\]+.\[0-9\]+-\*'\$|      - 'v[0-9]+.[0-9]+.[0-9]+-*'\n      - '!v[0-9]+.[0-9]+.[0-9]+-*'|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1598,6 +2026,8 @@ JOB
 # ... and the acceptance half, so honouring `!` does not become "any `!` is a
 # violation": a negation that excludes something this repo never cuts leaves
 # both probe tags reachable.
+# why: The acceptance half, so honouring `!` does not become "any `!` is a
+# violation"
 @test "gates: a negation that excludes no real version still passes" {
   _mutate "s|^      - 'v\[0-9\]+.\[0-9\]+.\[0-9\]+-\*'\$|      - 'v[0-9]+.[0-9]+.[0-9]+-*'\n      - '!vnope[0-9]'|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1609,6 +2039,11 @@ JOB
 # evaluated. Whether GitHub applies one to a TAG push is not settled from the
 # workflow text, and under the reading that matters an unmatchable filter
 # silences every tag push while the tag patterns still look right.
+# why: `[tag-trigger-has-no-path-filter]` -- a new id. Whether GitHub
+# applies a `paths:` filter to a TAG push is not settled from the workflow
+# text, and under the reading that matters an unmatchable filter silences
+# every tag push while the tag patterns still look right. Refused rather
+# than guessed
 @test "gates: a paths filter on the tag trigger is refused" {
   _mutate "s|^  pull_request:\$|    paths:\n      - 'does/not/exist/**'\n  pull_request:|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1637,6 +2072,11 @@ JOB
 # inconsistency the expression change argued against, one round earlier. It
 # failed CLOSED (a correct edit reported as a violation), so it was noise
 # rather than a hole; noise is still how a check gets switched off.
+# why: GitHub matches runner labels case-insensitively and this file did
+# not, while matching expressions case-insensitively -- the exact
+# inconsistency the expression change argued against one round earlier. It
+# failed CLOSED, so noise rather than a hole; noise is still how a check
+# gets switched off
 @test "gates: runner labels in mixed case are the same runner" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, GPU]|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1646,6 +2086,8 @@ JOB
 
 # ... and its failing half, so case-insensitivity did not become "any label
 # set will do": the GPU label still has to be there, in some case.
+# why: `[tier-b-runs-on-the-gpu-runner]` -- the failing half, so
+# case-insensitivity did not become "any label set will do"
 @test "gates: a mixed-case label set that has lost the GPU is still caught" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, Ubuntu-Latest]|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1653,6 +2095,10 @@ JOB
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
 }
 
+# why: `{group: gpu-hosts, labels: [self-hosted, gpu]}` is documented GitHub
+# syntax and `as_list()` on a mapping yielded `str(dict)`, so it was
+# reported as a gate that had left the GPU -- a false positive that would
+# fire the day the org moves the GPU host into a runner group
 @test "gates: a runner group that still declares the labels passes" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: {group: gpu-hosts, labels: [self-hosted, gpu]}|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1660,6 +2106,8 @@ JOB
   assert_output --partial "holds the release invariant"
 }
 
+# why: Same false positive for `runs-on: ${{ matrix.runner }}`, now resolved
+# against the job's own `strategy.matrix`
 @test "gates: a matrix whose every runner is the GPU runner passes" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    strategy:\n      matrix:\n        runner: [[self-hosted, gpu]]\n    runs-on: \${{ matrix.runner }}|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1672,6 +2120,9 @@ JOB
 # are in a group is a repo setting, limitation 6); a matrix with one hosted
 # entry runs the gate off the GPU for that entry; an expression from outside
 # the file is not determined here at all.
+# why: `[tier-b-runs-on-the-gpu-runner]` -- the failing half. Which machines
+# are in a group is a repo SETTING, which the checker cannot read, so a
+# group with no labels comes back as unresolved rather than as a silent pass
 @test "gates: a runner group with no labels is not proof of a GPU runner" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: {group: gpu-hosts}|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1679,6 +2130,8 @@ JOB
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
 }
 
+# why: Same id: EVERY value the matrix could take must satisfy the
+# requirement, or the gate runs off the GPU for half its variants
 @test "gates: a matrix with one hosted runner is caught" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    strategy:\n      matrix:\n        runner: [[self-hosted, gpu], [ubuntu-latest]]\n    runs-on: \${{ matrix.runner }}|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1686,6 +2139,8 @@ JOB
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
 }
 
+# why: Same id: an expression whose value is decided by an input or a caller
+# is not determined here, and is reported rather than guessed
 @test "gates: a runs-on expression from outside this file is caught" {
   _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: \${{ inputs.runner }}|"
   run bash "${CHECK}" "${MUTATED}"
@@ -1702,6 +2157,11 @@ JOB
 # the leaked-job input below. A checker that says nothing and exits non-zero teaches a
 # maintainer to re-run it until it is quiet, which is worse than one that
 # passes: it is a gate with a retry button. Every exit says something.
+# why: The awk implementation this replaced could die with status 141 and NO
+# OUTPUT AT ALL -- a SIGPIPE between two of its own helpers, deterministic
+# on the J1 input above. A checker that says nothing and exits non-zero
+# teaches a maintainer to re-run it until it is quiet, which is a gate with
+# a retry button. Every exit says something, and only 0, 1 and 2 are defined
 @test "gates: the checker never exits without saying why" {
   awk '
     /^  tier-b-visual-e2e:$/ && !done {

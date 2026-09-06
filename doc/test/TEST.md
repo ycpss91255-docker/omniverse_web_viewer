@@ -1,8 +1,19 @@
 # TEST.md
 
-**437 tests** total: **325 bats** (repo-level smoke, `test/bats/smoke/devel-test/`, run in the `devel-test` stage) + **102 node** (per-package unit, `node --test`, run in the package builds and `devel-test`) + **10 Playwright** (browser e2e, `test/e2e/`: **9 tier-1** -- config dial + status states, run per-PR in the `e2e-test` extra stage -- plus **1 tier-B** visual acceptance against a real Kit producer, run nightly on a self-hosted GPU runner and on every release).
+> **No suite total is recorded here, and that is the decision** (aligned
+> with base ADR-00000028 sec. 1). An aggregate over the working tree names
+> nothing it measured, so it is wrong between every commit and its resync,
+> and the line that carried it was one every branch had to edit. Ask the
+> run instead: the CI build reports what it ran, and a released version's
+> figure belongs to that release.
+>
+> Bats test descriptions are authored beside the tests as `# why:` markers
+> in the spec files, not in this document; a future `sync-doc-counts.sh`
+> will regenerate the bats catalogue sections from those markers.
 
 Layout follows base ADR-00000012, the tool-first convention as of base v0.42.0: `test/<tool>/<category>/<stage>/` at the multi-tool repo level, where the leaf names the Dockerfile stage the specs are built to run in, so the specs a stage owns are exactly the ones its `COPY` names. Each npm package still carries its own single-tool `test/`, and `test/e2e/` stays flat (one tool, one category, three suites split by Playwright project rather than by directory; its runners resolve self-relatively).
+
+<!-- generated: catalogue sections -->
 
 ## test/bats/smoke/devel-test/omniverse_web_viewer_env.bats (55)
 
@@ -329,6 +340,8 @@ Every property is proved TWICE -- once against the shipped workflow (it must hol
 | `dropping a declared checkout's with: is caught` | Same id, the other direction: removing or altering a declared input is as much a change as adding one |
 
 `script/ci/check_release_gates.sh` and `script/ci/check_release_gates.py` are the checker, not counted specs.
+
+<!-- generated: catalogue sections -->
 
 ## packages/stream-core/test/ (30, node --test)
 
