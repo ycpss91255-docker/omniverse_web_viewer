@@ -48,11 +48,18 @@ To override the default host IP or ports, edit `config/docker/setup.conf`:
 
 ```ini
 [environment]
-SIGNALING_SERVER = <host-ip>
-SIGNALING_PORT = 49100
-SERVE_PORT = 5173
-VIEWER_UI_MODE = usd-viewer
+env_1 = SIGNALING_SERVER=<host-ip>
+env_2 = SIGNALING_PORT=49100
+env_3 = SERVE_PORT=5173
+env_4 = VIEWER_UI_MODE=usd-viewer
 ```
+
+The `env_N = KEY=VALUE` shape is the grammar, not a style: `setup.sh`
+collects only keys beginning `env_`, and a key in this section that does not
+is dropped with **no warning and exit 0**. Written as `SIGNALING_SERVER =
+<host-ip>` -- which four versions of this file told you to write -- `apply`
+succeeds, `compose.yaml` carries nothing, and the viewer silently dials
+`127.0.0.1` and serves HTTP 200 with a picture that never arrives.
 
 Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 
