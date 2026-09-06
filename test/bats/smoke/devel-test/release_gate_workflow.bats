@@ -284,7 +284,7 @@ _sibling_workflow() {
 # ---------------------------------------------------------------- release --
 
 @test "gates: dropping tier-b from call-release's needs is caught" {
-  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, require-picture-evidence]/'
+  _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, require-picture-evidence]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[call-release-needs-tier-b]"
@@ -397,7 +397,7 @@ _sibling_workflow() {
 # whose own condition carries a status function.
 @test "gates: a decoy job named after the gate does not satisfy a needs" {
   {
-    sed 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e-summary, require-picture-evidence]/' \
+    sed 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: [verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e-summary, require-picture-evidence]/' \
       "${WORKFLOW}"
     printf '%s\n' \
       "  tier-b-visual-e2e-summary:" \
@@ -419,7 +419,7 @@ _sibling_workflow() {
 # Reading `needs:` as a list rather than a string is only an improvement if it
 # still reads the OTHER valid spellings of the same list.
 @test "gates: a quoted needs list is read as the same list" {
-  _mutate 's/needs: \[verify-tag-shape, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: ["verify-tag-shape", "verify-tag-on-main", "call-docker-build", "tier-b-visual-e2e", "require-picture-evidence"]/'
+  _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main, call-docker-build, tier-b-visual-e2e, require-picture-evidence\]/needs: ["verify-tag-shape", "verify-tag-on-main", "call-docker-build", "tier-b-visual-e2e", "require-picture-evidence"]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
