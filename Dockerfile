@@ -443,7 +443,7 @@ FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
 # Build kcov here against glibc so it runs natively. Tracked upstream as
 # base#1149; when base ships a portable binary, delete this stage and
 # COPY --from=test-tools-stage instead.
-# hadolint ignore=DL3008,DL3003
+# hadolint ignore=DL3006,DL3008,DL3003
 FROM ${BASE_IMAGE} AS kcov-builder
 ARG KCOV_VERSION=v43
 RUN apt-get update && \
