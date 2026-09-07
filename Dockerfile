@@ -437,6 +437,26 @@ CMD ["sh", "-c", "exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${EXAMPLE_PORT}"]
 # hadolint ignore=DL3006
 FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
 
+# kcov from source (glibc). Base's test-tools image ships kcov compiled on
+# Alpine/musl; that binary cannot execute on this repo's Ubuntu devel-test
+# ("cannot execute: required file not found" -- ld-musl-x86_64.so.1 absent).
+# Build kcov here against glibc so it runs natively. Tracked upstream as
+# base#1149; when base ships a portable binary, delete this stage and
+# COPY --from=test-tools-stage instead.
+# hadolint ignore=DL3008,DL3003
+FROM ${BASE_IMAGE} AS kcov-builder
+ARG KCOV_VERSION=v43
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        cmake make g++ binutils-dev libiberty-dev libcurl4-openssl-dev \
+        libssl-dev libdw-dev libelf-dev zlib1g-dev python3 git ca-certificates && \
+    git clone --depth 1 -b "${KCOV_VERSION}" \
+        https://github.com/SimonKagstrom/kcov /tmp/kcov && \
+    cmake -S /tmp/kcov -B /tmp/kcov/build -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    make -C /tmp/kcov/build -j"$(nproc)" && \
+    make -C /tmp/kcov/build install && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/kcov
+
 FROM devel AS devel-test
 
 USER root
@@ -483,6 +503,7 @@ RUN apt-get update && \
 
 COPY --from=test-tools-stage /usr/local/bin/shellcheck /usr/local/bin/shellcheck
 COPY --from=test-tools-stage /usr/local/bin/hadolint /usr/local/bin/hadolint
+COPY --from=kcov-builder /usr/local/bin/kcov /usr/local/bin/kcov
 
 COPY .hadolint.yaml /lint/.hadolint.yaml
 COPY Dockerfile /lint/Dockerfile
