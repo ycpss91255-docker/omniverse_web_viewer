@@ -40,8 +40,8 @@ just build
 just run -t runtime -d
 
 # 3. Open Chrome -> http://<host-ip>:5173
-#    usd-viewer (default): click the landing screen to choose a view
-#    stream-only: auto-connects into the full-screen stream, no click
+#    stream-only (default): auto-connects into the full-screen stream, no click
+#    usd-viewer: click the landing screen to choose a view
 ```
 
 如需覆盖默认的主机 IP 或端口，请编辑 `config/docker/setup.conf`：
@@ -51,7 +51,7 @@ just run -t runtime -d
 env_1 = SIGNALING_SERVER=<host-ip>
 env_2 = SIGNALING_PORT=49100
 env_3 = SERVE_PORT=5173
-env_4 = VIEWER_UI_MODE=usd-viewer
+env_4 = VIEWER_UI_MODE=stream-only
 ```
 
 `env_N = KEY=VALUE` 是语法，不是排版风格：`setup.sh` 只收集以 `env_` 开头的
@@ -102,7 +102,7 @@ docker run --rm -d --name owv \
 | `SIGNALING_PORT` | `49100` | WebRTC 信令端口（必须与 Kit 应用的 `--/app/livestream/port` 一致） |
 | `MEDIA_PORT` | null（协商） | WebRTC 媒体端口 — 未设置则通过 SDP 协商，设置则固定（D1，仅 `stream-only` 应用适用） |
 | `SERVE_PORT` | `5173` | 静态文件服务器监听的端口 |
-| `VIEWER_UI_MODE` | `usd-viewer` | 应用选择器：`usd-viewer`（上游 sample，交互式）或 `stream-only`（我们自家的全屏自动连接应用，用于 Isaac Sim / 无头消费端） |
+| `VIEWER_UI_MODE` | `stream-only` | 应用选择器：`usd-viewer`（上游 sample，交互式）或 `stream-only`（我们自家的全屏自动连接应用，用于 Isaac Sim / 无头消费端） |
 
 `VIEWER_UI_MODE` 选择 entrypoint 提供哪个应用，它不会被注入到资源中。`SIGNALING_SERVER`、`SIGNALING_PORT` 与 `MEDIA_PORT` 是被注入的 sentinel：构建会将每个带有 sentinel 的 chunk 保存为 `*.js.tmpl`，entrypoint 在每次启动时重新渲染 `*.js.tmpl -> *.js`（具幂等性 — 重启或值变更会在下次启动被采用）。校验即是转义处理：无效值会让容器失败（`exit 1`），而非烤进损坏的 JS。会被拒绝的有：`SIGNALING_SERVER` 含 `A-Za-z0-9.-` 以外的字符；`SIGNALING_PORT`、`MEDIA_PORT`、`SERVE_PORT` 任一不是「1..65535 且不带前导零」的整数 — 因此 `80x`、`0`、`99999`、`049100` 都会失败。前导零这一条并非吹毛求疵：端口 sentinel 是不带引号代入的，`049100` 会渲染成裸的 `049100` token，在 strict mode 是 `SyntaxError`，容器启动正常但查看器一片黑。`SERVE_PORT` 只在有设置时检查（`example` stage 用的是 `EXAMPLE_PORT`），且可以是单纯的端口号或 `serve -l` 的 endpoint — `SERVE_PORT=tcp://127.0.0.1:5173` 只绑 loopback，这是唯一能让查看器不监听所有网卡的方式。支持的形式正好两种：`<port>` 与 `tcp://<host>:<port>`。`serve -l` 另外还列了两种，两种都是「指名拒绝」而非漏掉：UNIX domain socket（`unix:/path/to/socket.sock`）没有任何本容器的消费方能寻址得到（浏览器打的是 URL，镜像自身的 serve 冒烟与两个 e2e runner 都是 curl `http://127.0.0.1:<port>`），而 Windows 具名管道（`pipe:\\.\pipe\Name`）在发布的 linux/amd64 镜像里根本不可能存在。媒体 sentinel 仅存在于 `stream-only` bundle（其 `streamTarget.json`）；`usd-viewer` 仅带 server + port，并通过 SDP 协商媒体。已提供服务的 bundle 只以该次渲染为目标来源：`?server=`/`?port=`/`?media=` query string 仅是 `npm run dev` 的便利功能，build 出来的 bundle 会忽略它，因此无法用一条链接把运行中的 viewer 指向别的主机。
 

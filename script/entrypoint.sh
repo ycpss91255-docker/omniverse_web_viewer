@@ -425,7 +425,7 @@ fi
 # unset = the library negotiates media via SDP (D1 back-compat).
 SIGNALING_SERVER="${SIGNALING_SERVER:-127.0.0.1}"
 SIGNALING_PORT="${SIGNALING_PORT:-49100}"
-VIEWER_UI_MODE="${VIEWER_UI_MODE:-usd-viewer}"
+VIEWER_UI_MODE="${VIEWER_UI_MODE:-stream-only}"
 
 # The deferred half of the flat-ui_mode note above: emitted here so it can name
 # the resolved mode. Fires only when /etc/host.yaml carried a column-0
