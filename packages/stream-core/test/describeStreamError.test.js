@@ -2,10 +2,15 @@
 //
 // The shapes below are not invented. They were read out of the streaming
 // library bundle that ships in this repo's image
-// (/app/stream-only/dist/assets/omniverse-webrtc-streaming-library-*.js):
-// eighteen `throw{action:...,status:...,info:"..."}` sites, where `info`
-// carries the only sentence a user could act on. Both viewers rendered these
-// with `String(e)`, which is "[object Object]".
+// (/app/stream-only/dist/assets/ov-web-rtc-*.js): twenty-two
+// `throw{action:...,status:...,info:"..."}` sites, where `info` carries the
+// only sentence a user could act on. Both viewers rendered these with
+// `String(e)`, which is "[object Object]".
+//
+// Re-counted against `ov-web-rtc` 6.8.2 under #98 rather than assumed to carry
+// over: 22 plain-object throw sites there, up from 18 in 5.6.0, plus 10 real
+// `Error` throws (3 in 5.6.0) -- so the `message` case below is now a live
+// path, not just a guard.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { describeStreamError } from '../src/describeStreamError.js';

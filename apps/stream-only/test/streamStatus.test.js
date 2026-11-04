@@ -250,28 +250,31 @@ test('stopped() re-shows the readout as a recoverable, waiting state (#56, #60)'
   ctl.stopped(); // producer went away mid-session
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
-  // It describes what the viewer is doing -- waiting to see whether frames
-  // resume -- and nothing more (#60).
-  assert.match(statusEl.textContent, /waiting/i);
+  // It says the stream is reconnecting, which under ov-web-rtc 6.x is what is
+  // actually happening: `maxReconnects` drives real attempts there (#98).
+  assert.match(statusEl.textContent, /reconnect/i);
   // Recoverable, not terminal: the stream may still come back inside the
   // escalation window (#58), so no error class yet.
   assert.equal(statusEl.classList.contains('error'), false);
 });
 
-// The recoverable copy used to read "stream stopped -- reconnecting...", which
-// was false: `maxReconnects` reaches the library as `maxSessionStartRetry` and
-// is consumed only by the session-START retry decision, so a producer that dies
-// after the stream is up is never reconnected to. The message promised a
-// recovery that could not happen, for the whole ~15 s before the terminal state
-// (#59) replaced it. Locked as a regression: no claim of an automatic reconnect
-// in either producer-loss state.
-test('no producer-loss state claims a reconnect is under way (#60)', () => {
+// #60 refused the word "reconnecting" in BOTH producer-loss states, and was
+// right to: under the 5.x library nothing reconnected mid-session. That premise
+// is gone, not merely inconvenient -- #98 moved to `@nvidia/ov-web-rtc` 6.x,
+// where `maxReconnects` is a real connection-attempt budget spaced by
+// `reconnectDelay`, so the recoverable state now describes something the
+// library is genuinely doing and its silence was the understatement. The test
+// is replaced rather than weakened, because half of the property still holds
+// and is still worth locking: the TERMINAL state is reached only after that
+// budget is spent, so by then nothing is retrying and claiming otherwise would
+// be the #60 mistake in the other direction.
+test('the recoverable state says reconnecting, the terminal state does not (#98)', () => {
   const statusEl = fakeStatusEl();
   const clock = fakeClock();
   const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, clockOptions(clock));
 
   ctl.stopped();
-  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
+  assert.match(statusEl.textContent, /reconnect/i);
 
   clock.fire(); // escalated to the terminal state
   assert.doesNotMatch(statusEl.textContent, /reconnect/i);
@@ -573,10 +576,14 @@ test('frames that stop arriving announce the recoverable state, with no onStop (
 
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
-  assert.match(statusEl.textContent, /waiting/i);
-  // Recoverable, not terminal, and no reconnect claim (#57, #60).
+  // The media-detected loss announces the SAME recoverable copy as onStop does,
+  // which since #98 says the stream is reconnecting -- true under 6.x, where
+  // the library really is retrying. The #60-era companion assertion here
+  // (doesNotMatch /reconnect/) is dropped rather than kept alongside this one:
+  // its premise inverted, and holding both would be a contradiction.
+  assert.match(statusEl.textContent, /reconnect/i);
+  // Recoverable, not terminal.
   assert.equal(statusEl.classList.contains('error'), false);
-  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
   // ... and it armed the ordinary #58 escalation, not some second mechanism.
   assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 1);
 });
@@ -849,7 +856,7 @@ test('a connect retry does not overwrite an announced producer loss (#63)', () =
 
   // The loss state owns the readout until a frame clears it or it escalates:
   // an attempt that has produced no picture is not news over a loss that has.
-  assert.match(statusEl.textContent, /waiting/i);
+  assert.match(statusEl.textContent, /reconnect/i);
   assert.equal(clock.pending.length, 1);
   assert.equal(clock.pending[0].id, armed.id);
   assert.equal(clock.pending[0].ms, FAKE_DELAY_MS);
@@ -988,7 +995,7 @@ test('a recovered viewer is a live viewer again: a later stall re-announces and 
   // machine works again from here, including the states that produced the
   // wrong verdict in the first place.
   pollTimes(clock, FAKE_SAMPLES);
-  assert.match(statusEl.textContent, /waiting/i);
+  assert.match(statusEl.textContent, /reconnect/i);
   assert.equal(statusEl.classList.contains('error'), false);
 
   clock.fireEvery(FAKE_DELAY_MS);
@@ -1129,7 +1136,7 @@ test('the guard is not a mute: a picture that stops after a retry still escalate
   // machine out of service -- the media path still announces and still escalates
   // (#57 / #58 / #62 intact).
   pollTimes(clock, FAKE_SAMPLES + 1);
-  assert.match(statusEl.textContent, /waiting/i);
+  assert.match(statusEl.textContent, /reconnect/i);
   assert.equal(statusEl.classList.contains('error'), false);
 
   clock.fireEvery(FAKE_DELAY_MS);

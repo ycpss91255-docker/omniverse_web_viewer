@@ -4,7 +4,7 @@
 
 一个自包含的示例站点，将实时的 Isaac Sim / Kit 串流直接嵌入到一个“真实网站”页面中。它既是一个**展示范例**（带 header + 布局以及实时串流面板），也是一份**开发者参考**（干净、可直接复制粘贴的集成代码）。
 
-与主查看器不同，本示例是纯 **vanilla TypeScript + Vite**，只有**两个运行时依赖** -- `stream-core`（共用的连接内核，npm workspace 的 sibling package）与 `@nvidia/omniverse-webrtc-streaming-library`。没有 React、没有 bootstrap、没有选择界面：它执行的是纯串流的直接连接。
+与主查看器不同，本示例是纯 **vanilla TypeScript + Vite**，只有**两个运行时依赖** -- `stream-core`（共用的连接内核，npm workspace 的 sibling package）与 `@nvidia/ov-web-rtc`。没有 React、没有 bootstrap、没有选择界面：它执行的是纯串流的直接连接。
 
 ## 布局
 

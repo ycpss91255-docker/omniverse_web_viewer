@@ -4,7 +4,7 @@
 
 ライブの Isaac Sim / Kit ストリームを「実際のウェブサイト」ページに直接埋め込む、自己完結型のサンプルサイトです。これは **ショーケース**（ヘッダー + レイアウトとライブストリームパネル）であると同時に、**開発者向けリファレンス**（クリーンでコピー&ペーストできる統合コード）でもあります。
 
-メインビューアとは異なり、このサンプルは純粋な **vanilla TypeScript + Vite** であり、**ランタイム依存は 2 つ**です -- `stream-core`（共有の接続カーネル。npm workspace の sibling パッケージ）と `@nvidia/omniverse-webrtc-streaming-library`。React も bootstrap も選択画面もありません。ストリーム専用の直接接続を行います。
+メインビューアとは異なり、このサンプルは純粋な **vanilla TypeScript + Vite** であり、**ランタイム依存は 2 つ**です -- `stream-core`（共有の接続カーネル。npm workspace の sibling パッケージ）と `@nvidia/ov-web-rtc`。React も bootstrap も選択画面もありません。ストリーム専用の直接接続を行います。
 
 ## レイアウト
 

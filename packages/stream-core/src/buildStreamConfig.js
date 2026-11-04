@@ -43,21 +43,43 @@ export function buildStreamConfig(server, port, mediaPort = null) {
   const cfg = {
     videoElementId: 'remote-video',
     audioElementId: 'remote-audio',
-    authenticate: true,
-    // Deliberately kept at 20 (the library default is 5), reviewed under #58.
-    // Despite the name this is NOT a mid-session reconnect budget: in the
-    // shipped bundle `maxReconnects` is passed straight through as
-    // `maxSessionStartRetry` and is only consumed by the session-START retry
-    // decision (`sessionStartRetryLeft` in onSessionStartResult). A producer
-    // that dies AFTER the stream is up never re-enters that path, so lowering
-    // it would not make the terminal state arrive any sooner -- that state is
-    // now derived locally in apps/stream-only/src/streamStatus.js. The viewer
-    // copy was corrected to match (#60): the recoverable readout no longer
-    // claims to be reconnecting, because this budget buys no such thing. What
-    // it does buy is startup grace: a viewer opened before the Kit app finishes
-    // booting keeps retrying the initial session setup instead of giving up
-    // after 5 attempts.
-    maxReconnects: 20,
+    // false, and it should always have been (#98). This prop asks whether the
+    // stream REVERSE PROXY requires a JWT: setting it makes the library append
+    // `Authorization-Bearer.<accessToken>` to the websocket's
+    // Sec-WebSocket-Protocol list. This viewer dials a Kit app directly on a
+    // host IP -- no proxy in front of it, no token to send -- so `true` named a
+    // mechanism that is not in the path. The library's own default is false.
+    //
+    // It survived because 5.6.0 did not validate the pair: `true` with no
+    // `accessToken` connected anyway, so the flag was wrong and inert at once.
+    // 6.x validates and refuses the connect with "Invalid prop accessToken:
+    // must be provided if the authenticate prop is true." Caught by the
+    // config-dial e2e, which is the only layer that actually dials: the prop
+    // exists in both versions with the same name and type, so no type check
+    // and no manifest assertion could have seen this.
+    authenticate: false,
+    // 6, not the 20 this carried against the 5.x library (#98). Under
+    // `@nvidia/ov-web-rtc` 6.x this IS a mid-session reconnect budget: the
+    // library spaces attempts by `reconnectDelay` (~2 s by default) and logs
+    // them as "Reconnection attempt (N of M)". The 5.x internals the old value
+    // was reasoned from -- `maxSessionStartRetry`, `sessionStartRetryLeft`,
+    // `onSessionStartResult` -- do not exist in 6.8.2 at all.
+    //
+    // The number is set by the window it has to fit inside, not by taste.
+    // apps/stream-only/src/streamStatus.js declares the source gone after
+    // TERMINAL_ESCALATION_MS (15 s). At ~2 s per attempt, 20 would spend ~40 s
+    // retrying, so the viewer would print "the source is gone. Reload once it
+    // is back." while the library was still retrying and might yet succeed.
+    // 6 x ~2 s is ~12 s, inside the window: the recoverable readout is true
+    // while the library retries, and the terminal readout is true because by
+    // then it has given up. Raising this means moving that window with it --
+    // a unit spec pins the two together so the pair cannot drift apart.
+    //
+    // What it costs is attempts 7..20, which 6.x would have been willing to
+    // make. That is the deliberate trade: a user told "reconnecting" for 12 s
+    // and then "gone" is better served than one watching a dead picture for
+    // 40 s, which is the failure #58 set the window to 15 s to avoid.
+    maxReconnects: 6,
     signalingServer: host,
     signalingPort,
     mediaServer: host,

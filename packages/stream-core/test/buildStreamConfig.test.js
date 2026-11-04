@@ -14,7 +14,32 @@ test('builds a DIRECT config for a valid server + numeric port', () => {
   assert.equal(typeof cfg.signalingPort, 'number');
   assert.equal(cfg.videoElementId, 'remote-video');
   assert.equal(cfg.audioElementId, 'remote-audio');
-  assert.equal(cfg.authenticate, true);
+  // false, not true (#98). `authenticate` asks whether the stream REVERSE
+  // PROXY requires a JWT, and setting it adds `Authorization-Bearer.<token>`
+  // to the websocket's Sec-WebSocket-Protocol list. This viewer dials a Kit app
+  // directly on a host IP: no proxy, no JWT, nothing to put in that header.
+  // 5.6.0 accepted `true` with no `accessToken` and connected anyway, so the
+  // flag was wrong and inert at the same time; 6.x validates it and refuses the
+  // connect outright with "Invalid prop accessToken: must be provided if the
+  // authenticate prop is true." The config-dial e2e is what caught it -- no
+  // type signature could, because the prop exists in both versions with the
+  // same name and type.
+  assert.equal(cfg.authenticate, false);
+});
+
+// The reconnect budget had no assertion at all, which is how it survived a
+// library change that redefined it. Under 5.x it reached the library as
+// `maxSessionStartRetry` and bought only startup grace; under ov-web-rtc 6.x
+// (#98) it is a real connection-attempt budget spaced by `reconnectDelay`
+// (~2 s), so the product of the two is how long the viewer spends reconnecting.
+// It is pinned HERE because that product has to stay inside
+// TERMINAL_ESCALATION_MS (15 s) in apps/stream-only/src/streamStatus.js: if the
+// budget outlasts the window, the viewer declares the source gone while the
+// library is still successfully retrying. 6 x ~2 s is ~12 s, inside 15 s.
+// Raising this means revisiting that window, not just this number.
+test('pins the reconnect budget inside the terminal escalation window (#98)', () => {
+  const cfg = buildStreamConfig('127.0.0.1', 49100);
+  assert.equal(cfg.maxReconnects, 6);
 });
 
 test('accepts a numeric string port and coerces it to a number', () => {

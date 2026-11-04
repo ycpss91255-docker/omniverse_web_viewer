@@ -91,6 +91,25 @@ teardown() {
   assert_failure
 }
 
+# The manifests are asserted in the node specs, and they are declarations. This
+# is the only check that looks at what actually SHIPS -- and the streaming
+# library is the one dependency in this repo whose behaviour has repeatedly had
+# to be read out of the built bundle rather than trusted from its docs (the
+# `onTerminate` and `maxReconnects` findings behind #58 / #60 / #98 all came
+# from grepping this file). `connectStream` imports it dynamically, so Vite
+# emits it as its own chunk named after the package: 5.x shipped as
+# `omniverse-webrtc-streaming-library-<hash>.js`, 6.x as `ov-web-rtc-<hash>.js`.
+# Both halves matter: the new chunk present, and the renamed old one absent, so
+# a stale layer or a half-finished swap that leaves two copies is caught.
+# why: The shipped bundle carries the 6.x library chunk and not the renamed 5.x
+# one -- manifests are declarations, this is the artifact (#98)
+@test "stream-only bundle ships the ov-web-rtc chunk, not the renamed 5.x one" {
+  run bash -c "ls '${STREAM_ASSETS}'/ | grep -q 'ov-web-rtc'"
+  assert_success
+  run bash -c "ls '${STREAM_ASSETS}'/ | grep -q 'omniverse-webrtc-streaming-library'"
+  assert_failure
+}
+
 # why: stream-only carries server/port/media (from `streamTarget.json`)
 @test "stream-only build preserves all three sentinels in templates" {
   run grep -rF "__OWV_SERVER__" "${STREAM_ASSETS}/" --include="*.js.tmpl"
@@ -178,8 +197,28 @@ teardown() {
   # Sentinel is gone; the omitted media port becomes the literal null.
   run grep -rF "__OWV_MEDIA_PORT__" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
-  # The rendered mediaPort value is the literal null (JSON value, not sentinel).
-  run bash -c "grep -rhoE 'mediaPort\"?: *null' ${STREAM_ASSETS}/*.js"
+  # The rendered value is the literal null -- not a quoted string, not a dropped
+  # key -- so the library negotiates media via SDP (D1).
+  #
+  # The slot is read out of the TEMPLATE rather than assumed to sit next to the
+  # `mediaPort` key. The previous form, `grep -E 'mediaPort"?: *null'`, was
+  # really asserting minifier LAYOUT: it passed only while esbuild inlined the
+  # value at the use site. #98's dependency swap changed the chunk graph enough
+  # that it began hoisting the three injected values into variables instead
+  # (`se="127.0.0.1",ce=49100,ae=null`), and the assertion went red over a
+  # render that was entirely correct.
+  #
+  # Deriving the identifier from the template keeps this independent of both the
+  # mangled name and the hoisting decision. If a future build inlines the
+  # sentinel instead of assigning it, the identifier match finds nothing and the
+  # `assert [ -n ... ]` below fails loudly -- which is the right outcome: the
+  # shape changed and someone should look, rather than the case silently
+  # passing on a weaker claim.
+  local media_var
+  media_var="$(grep -rhoE '[A-Za-z_$][A-Za-z0-9_$]*="__OWV_MEDIA_PORT__"' \
+    "${STREAM_ASSETS}"/*.js.tmpl | head -1 | cut -d= -f1)"
+  assert [ -n "${media_var}" ]
+  run grep -rhoF "${media_var}=null" "${STREAM_ASSETS}"/*.js
   assert_success
 }
 

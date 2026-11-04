@@ -35,6 +35,6 @@ export async function connectStream(streamConfig, handlers = {}, _connect) {
   if (_connect) {
     return _connect(cfg);
   }
-  const { AppStreamer, StreamType } = await import('@nvidia/omniverse-webrtc-streaming-library');
+  const { AppStreamer, StreamType } = await import('@nvidia/ov-web-rtc');
   return AppStreamer.connect({ streamConfig: cfg, streamSource: StreamType.DIRECT });
 }

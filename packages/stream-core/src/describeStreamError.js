@@ -4,14 +4,22 @@
 // WHY THIS EXISTS. Both viewers rendered a failed connect as
 // `connection failed: ${String(e)}`, and the library does not reject with
 // Errors. Read out of the bundle that ships in this repo's image
-// (/app/stream-only/dist/assets/omniverse-webrtc-streaming-library-*.js),
-// there are eighteen sites of the form
+// (/app/stream-only/dist/assets/ov-web-rtc-*.js), there are twenty-two sites
+// of the form
 //
 //     throw{action:je.start,status:Oe.error,info:"Failed to connect to current stream"}
 //
 // -- plain objects, with the only actionable sentence in `info`. `String()` of
 // one of those is "[object Object]", so every real connect failure reached the
 // user as `connection failed: [object Object]` and the reason was discarded.
+//
+// Re-checked against `ov-web-rtc` 6.8.2 under #98, because this whole module
+// rests on a claim about what the library throws and a renamed package is no
+// reason to assume it still holds. It does: 22 plain-object `throw{` sites
+// there, up from 18 in 5.6.0. 6.x also throws real `Error`s in 10 places (3 in
+// 5.6.0), which is why the `message` fallback below is not dead code -- it is
+// now the path for a tenth of the library's throw sites rather than a
+// defensive afterthought.
 //
 // It lives in stream-core because stream-core is the only module that touches
 // the library, so it is the only one that has any business knowing the shape

@@ -18,19 +18,33 @@
 // handler is not verifiable from this repo, so it is treated as a bare signal.
 //
 // The terminal state is derived HERE, not received (issue #58). #56/#57 reached
-// terminated() only from the library's `onTerminate` handler; THIS LIBRARY BUILD
-// NEVER INVOKES IT. Evidence, from the bundle actually shipped in the runtime
-// image (/app/stream-only/dist/assets/omniverse-webrtc-streaming-library-*.js):
-// `onTerminate` occurs exactly 4 times -- twice as the error-code enum name
+// terminated() only from the library's `onTerminate` handler, and the 5.x build
+// NEVER INVOKED IT: in that bundle
+// (/app/stream-only/dist/assets/omniverse-webrtc-streaming-library-*.js)
+// `onTerminate` occurred exactly 4 times -- twice as the error-code enum name
 // `SessionTerminatedByAnotherClient`, once inside the matching error message
 // string, and once as the null entry in the defaults object
-// (`onUpdate:null,onStart:null,onStop:null,onTerminate:null,...`). There is no
-// call site, while `onStart` (52), `onUpdate` (13) and `onStop` (7, with a real
-// `onStopResult.bind(this)` dispatch) all have one. Confirmed live too: with the
-// Kit producer SIGKILLed the viewer stayed on the recoverable message forever.
-// So: stopped() arms a bounded escalation timer and, if no frame renders inside
-// that window, escalates to terminated() locally. Do not wire the terminal state
-// back to `onTerminate` on the assumption that it fires -- re-run the grep first.
+// (`onUpdate:null,onStart:null,onStop:null,onTerminate:null,...`) -- no call
+// site at all, while `onStart` (52), `onUpdate` (13) and `onStop` (7, with a
+// real `onStopResult.bind(this)` dispatch) all had one. Confirmed live too:
+// with the Kit producer SIGKILLed the viewer stayed on the recoverable message
+// forever.
+//
+// That instruction said to re-run the grep before trusting the callback again.
+// #98 did, against `ov-web-rtc` 6.8.2 (`ov-web-rtc-*.js`), and it has changed:
+// `onTerminate` is registered via `attachCallbacks({...onTerminate...})` and has
+// TWO real invocation sites, both dispatching `action: TERMINATE`.
+//
+// The design does NOT move onto it. Two reasons, and the first is the durable
+// one: state derived from the picture the user is actually looking at does not
+// depend on which library build is underneath, which is the whole lesson of
+// #58/#62/#63. The second is evidentiary -- a call site in a bundle is not an
+// observation that the callback fires in THIS failure mode (a producer dying
+// mid-session), and that has not been watched on a real host yet. So
+// stopped() still arms a bounded escalation timer and escalates locally if no
+// frame renders inside the window. If `onTerminate` is ever observed firing
+// against a real dying producer, the place for it is the ACCELERATOR role
+// `onStop` already has -- never the sole trigger.
 //
 // The ENTRY to the loss states is derived here too (issue #62). Until then the
 // only way in was the library's `onStop`, which is the same failure mode one
@@ -106,15 +120,22 @@
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
 // Recoverable: the stream may still come back, and a frame that renders inside
-// the escalation window hides the readout again. It deliberately does NOT say
-// "reconnecting" (issue #60): nothing reconnects. `maxReconnects` reaches the
-// library as `maxSessionStartRetry` and is consumed only by the session-START
-// retry decision, so a producer that dies AFTER the stream is up is never
-// reconnected to -- the old wording promised a recovery that could not happen
-// for the whole escalation window. What IS true, either way, is that the viewer
-// is waiting to see whether frames resume; if none do, the escalation below
-// replaces this with the actionable terminal message.
-const STOPPED_TEXT = 'stream stopped -- waiting for frames to resume...';
+// the escalation window hides the readout again. It says "reconnecting" because
+// under `@nvidia/ov-web-rtc` 6.x that is what the library is actually doing
+// (#98) -- `maxReconnects` is a real attempt budget there, spaced by
+// `reconnectDelay`.
+//
+// #60 refused this word and was right to at the time: the 5.x library passed
+// `maxReconnects` through as `maxSessionStartRetry`, consumed only by the
+// session-START decision, so a producer that died after the stream was up was
+// never reconnected to and the word promised a recovery that could not happen.
+// The migration reversed that premise rather than making it inconvenient.
+//
+// The budget is sized to finish INSIDE the escalation window (see
+// buildStreamConfig: 6 attempts at ~2 s is ~12 s against a 15 s window), which
+// is what keeps both messages honest -- this one while the library is retrying,
+// and the terminal one below when it replaces this because the library stopped.
+const STOPPED_TEXT = 'stream stopped -- reconnecting...';
 // Terminal: the escalation window elapsed with no frame, so the producer is
 // treated as gone. Only a reload can recover, so this stays on screen as an
 // error.
@@ -146,10 +167,20 @@ export const TERMINAL_ESCALATION_MS = 15_000;
  * because a stream that never starts reaches no loss trigger at all.
  *
  * Longer than TERMINAL_ESCALATION_MS on purpose: a viewer opened before the Kit
- * app has finished booting is the ordinary case, the library keeps retrying
- * session start meanwhile (`maxReconnects` -> `maxSessionStartRetry`, 20), and
- * declaring failure over a producer that is merely slow to come up would be the
- * #60 mistake in the other direction. It must also outlast the window in which
+ * app has finished booting is the ordinary case, and declaring failure over a
+ * producer that is merely slow to come up would be the #60 mistake in the other
+ * direction.
+ *
+ * The length used to be justified partly by the library retrying session start
+ * meanwhile (`maxReconnects` -> `maxSessionStartRetry`, 20). That mechanism does
+ * not exist in ov-web-rtc 6.x -- `maxSessionStartRetry`, `sessionStartRetryLeft`
+ * and `onSessionStartResult` are all absent from the 6.8.2 bundle (#98) -- so
+ * that half of the reasoning is withdrawn rather than reworded. The NUMBER is
+ * unchanged, and what still defends it is below: the config-dial window and the
+ * #73 trade. What 6.x does against a producer that never answers at all has to
+ * be re-established by watching a real host, not by reading the bundle.
+ *
+ * It must also outlast the window in which
  * the config-dial e2e dials a DEAD host and asserts `#stream-status` carries no
  * `error` class -- that suite finishes in well under a second per mode, so the
  * margin is large, and a unit spec locks the lower bound.
