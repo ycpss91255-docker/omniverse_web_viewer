@@ -65,10 +65,11 @@ teardown() {
   assert [ "${SERVE_PORT}" = "5173" ]
 }
 
-# why: App-selector default (D7). stream-only is the default because
-# usd-viewer is built from an archived upstream whose blank-screen failure
-# against a non-USD-Viewer Kit app will never be fixed (web-viewer-sample#17,
-# closed NOT_PLANNED). See #97.
+# stream-only is the default since #97. usd-viewer is the upstream
+# web-viewer-sample built unmodified, and that repo is archived: its
+# blank-screen failure against any non-USD-Viewer Kit app was closed
+# NOT_PLANNED, so it is a poor place to land an operator who set nothing.
+# why: App-selector default (D7)
 @test "VIEWER_UI_MODE env defaults to stream-only" {
   assert [ "${VIEWER_UI_MODE}" = "stream-only" ]
 }
@@ -100,9 +101,10 @@ teardown() {
   assert_success
 }
 
-# why: Render path: sentinels gone from `*.js`, kept in `*.js.tmpl`.
-# stream-only is the default (#97), so the default render covers all THREE
-# sentinels -- it is the mode that carries the media sentinel (D1).
+# The default is stream-only since #97, and that is the mode carrying the
+# media sentinel (D1) -- so unlike the usd-viewer default it replaced, the
+# default render has all THREE sentinels to clear, not two.
+# why: Render path: sentinels gone from `*.js`, kept in `*.js.tmpl`
 @test "default mode (stream-only) renders defaults + clears sentinels" {
   run /entrypoint.sh true
   assert_success
@@ -120,9 +122,9 @@ teardown() {
   assert_success
 }
 
-# why: Mode isolation -- inactive app untouched. Same proof as before #97,
-# in the opposite direction: the default render must land in stream-only and
-# leave usd-viewer pristine.
+# Same proof as before #97, in the opposite direction: the default render
+# must land in stream-only and leave usd-viewer pristine.
+# why: Mode isolation -- inactive app untouched
 @test "default mode renders ONLY the stream-only dir, not usd-viewer" {
   # Distinctive server that must only appear in the active (stream-only) dir.
   SIGNALING_SERVER="10.1.1.1" run /entrypoint.sh true
@@ -133,10 +135,10 @@ teardown() {
   assert_failure
 }
 
-# why: Distinctive-IP render proof. The mode is named explicitly: this test
-# asserts usd-viewer's render path, and since #97 made stream-only the default
-# it can no longer get there by omission. Keeping it pinned is also what keeps
-# the usd-viewer render path covered at all.
+# The mode is named explicitly: this asserts usd-viewer's render path, and
+# since #97 made stream-only the default it can no longer get there by
+# omission. Keeping it pinned is what keeps that path covered at all.
+# why: Distinctive-IP render proof
 @test "usd-viewer applies SIGNALING_SERVER env override" {
   VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
   assert_success

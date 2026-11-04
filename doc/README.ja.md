@@ -40,8 +40,8 @@ just build
 just run -t runtime -d
 
 # 3. Open Chrome -> http://<host-ip>:5173
-#    usd-viewer (default): click the landing screen to choose a view
-#    stream-only: auto-connects into the full-screen stream, no click
+#    stream-only (default): auto-connects into the full-screen stream, no click
+#    usd-viewer: click the landing screen to choose a view
 ```
 
 デフォルトのホスト IP やポートを変更するには、`config/docker/setup.conf` を編集してください:
@@ -51,7 +51,7 @@ just run -t runtime -d
 env_1 = SIGNALING_SERVER=<host-ip>
 env_2 = SIGNALING_PORT=49100
 env_3 = SERVE_PORT=5173
-env_4 = VIEWER_UI_MODE=usd-viewer
+env_4 = VIEWER_UI_MODE=stream-only
 ```
 
 `env_N = KEY=VALUE` は書式の好みではなく文法です。`setup.sh` が収集するのは
@@ -103,7 +103,7 @@ docker run --rm -d --name owv \
 | `SIGNALING_PORT` | `49100` | WebRTC シグナリングポート（Kit アプリの `--/app/livestream/port` と一致させる必要があります） |
 | `MEDIA_PORT` | null（ネゴシエーション） | WebRTC メディアポート — 未設定なら SDP でネゴシエーション、設定すると固定（D1、`stream-only` アプリのみ） |
 | `SERVE_PORT` | `5173` | 静的ファイルサーバーがリッスンするポート |
-| `VIEWER_UI_MODE` | `usd-viewer` | アプリセレクタ：`usd-viewer`（上流 sample、インタラクティブ）または `stream-only`（自前のフルスクリーン自動接続アプリ。Isaac Sim / ヘッドレス利用者向け） |
+| `VIEWER_UI_MODE` | `stream-only` | アプリセレクタ：`usd-viewer`（上流 sample、インタラクティブ）または `stream-only`（自前のフルスクリーン自動接続アプリ。Isaac Sim / ヘッドレス利用者向け） |
 
 `VIEWER_UI_MODE` は entrypoint がどのアプリを配信するかを選択するもので、アセットには注入されません。`SIGNALING_SERVER`、`SIGNALING_PORT`、`MEDIA_PORT` は注入されるセンチネルです: ビルドはセンチネルを含む各チャンクを `*.js.tmpl` として保存し、entrypoint は起動のたびに `*.js.tmpl -> *.js` を再レンダリングします（冪等 — 再起動や値の変更は次回起動時に反映）。バリデーションがエスケープそのものです: 無効な値はコンテナを失敗させ（`exit 1`）、壊れた JS を焼き込みません。拒否されるのは: `A-Za-z0-9.-` 以外の文字を含む `SIGNALING_SERVER`、および `SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT` のいずれかが「先頭ゼロなしの 1..65535 の整数」でない場合です — したがって `80x`、`0`、`99999`、`049100` はすべて失敗します。先頭ゼロの規則は些末ではありません: ポートのセンチネルは引用符なしで置換されるため、`049100` は裸の `049100` トークンとしてレンダリングされ、strict mode では `SyntaxError` となり、コンテナは正常に起動したのにビューアは真っ黒になります。`SERVE_PORT` は設定されている場合のみ検査されます（`example` ステージは `EXAMPLE_PORT` で配信します）。また、素のポート番号でも `serve -l` のエンドポイントでも構いません — `SERVE_PORT=tcp://127.0.0.1:5173` はループバックのみにバインドし、これがビューアを全インターフェースで待ち受けさせない唯一の方法です。対応する形式はちょうど 2 つ、`<port>` と `tcp://<host>:<port>` です。`serve -l` はさらに 2 形式を挙げていますが、どちらもうっかりではなく明示的に拒否します: UNIX ドメインソケット（`unix:/path/to/socket.sock`）はこのコンテナの利用者から到達できず（ブラウザは URL を叩き、イメージ自身の serve スモークも 2 つの e2e ランナーも `http://127.0.0.1:<port>` を curl します）、Windows の名前付きパイプ（`pipe:\\.\pipe\Name`）は公開される linux/amd64 イメージには存在し得ないためです。メディアセンチネルは `stream-only` バンドル（その `streamTarget.json`）にのみ存在し、`usd-viewer` は server + port のみを持ち、メディアは SDP でネゴシエーションします。配信されるバンドルはそのレンダリング結果のみをターゲットとします: `?server=`/`?port=`/`?media=` のクエリ文字列は `npm run dev` 用の利便機能であり、ビルドされたバンドルでは無視されるため、リンク 1 本で稼働中のビューアを別のホストへ向け直すことはできません。
 

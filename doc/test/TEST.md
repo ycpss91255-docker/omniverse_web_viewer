@@ -26,12 +26,12 @@ Two-app config-injection model (S5): the build preserves sentinel-bearing chunks
 | `SIGNALING_SERVER env defaults to 127.0.0.1` | Runtime env default |
 | `SIGNALING_PORT env defaults to 49100` | Runtime env default |
 | `SERVE_PORT env defaults to 5173` | Runtime env default |
-| `VIEWER_UI_MODE env defaults to usd-viewer` | App-selector default (D7) |
+| `VIEWER_UI_MODE env defaults to stream-only` | App-selector default (D7) |
 | `both app dist dirs exist (devel has both modes)` | `/app/usd-viewer/dist` + `/app/stream-only/dist` both present |
 | `usd-viewer build preserves server/port templates, no media sentinel` | Per-app sentinel shape: usd-viewer carries server/port ONLY |
 | `stream-only build preserves all three sentinels in templates` | stream-only carries server/port/media (from `streamTarget.json`) |
-| `default mode (usd-viewer) renders defaults + clears sentinels` | Render path: sentinels gone from `*.js`, kept in `*.js.tmpl` |
-| `default mode renders ONLY the usd-viewer dir, not stream-only` | Mode isolation -- inactive app untouched |
+| `default mode (stream-only) renders defaults + clears sentinels` | Render path: sentinels gone from `*.js`, kept in `*.js.tmpl` |
+| `default mode renders ONLY the stream-only dir, not usd-viewer` | Mode isolation -- inactive app untouched |
 | `usd-viewer applies SIGNALING_SERVER env override` | Distinctive-IP render proof |
 | `usd-viewer applies SIGNALING_PORT env override` | Distinctive-PORT render proof -- every other port assertion used 49100, which is the baked default |
 | `VIEWER_UI_MODE=stream-only renders the stream-only dir` | App selector switches the render target |
