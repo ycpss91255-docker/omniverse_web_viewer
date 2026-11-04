@@ -576,10 +576,14 @@ test('frames that stop arriving announce the recoverable state, with no onStop (
 
   assert.equal(statusEl.classList.contains('hidden'), false);
   assert.match(statusEl.textContent, /stopped/i);
+  // The media-detected loss announces the SAME recoverable copy as onStop does,
+  // which since #98 says the stream is reconnecting -- true under 6.x, where
+  // the library really is retrying. The #60-era companion assertion here
+  // (doesNotMatch /reconnect/) is dropped rather than kept alongside this one:
+  // its premise inverted, and holding both would be a contradiction.
   assert.match(statusEl.textContent, /reconnect/i);
-  // Recoverable, not terminal; the reconnect claim is true here now (#98).
+  // Recoverable, not terminal.
   assert.equal(statusEl.classList.contains('error'), false);
-  assert.doesNotMatch(statusEl.textContent, /reconnect/i);
   // ... and it armed the ordinary #58 escalation, not some second mechanism.
   assert.equal(clock.pending.filter((t) => t.ms === FAKE_DELAY_MS).length, 1);
 });

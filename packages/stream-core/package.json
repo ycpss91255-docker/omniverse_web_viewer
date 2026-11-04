@@ -13,7 +13,7 @@
     "lint": "eslint . --ext .ts,.js --max-warnings 0"
   },
   "peerDependencies": {
-    "@nvidia/omniverse-webrtc-streaming-library": "5.6.0"
+    "@nvidia/ov-web-rtc": "6.8.2"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^7.7.0",

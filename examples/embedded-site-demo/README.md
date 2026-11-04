@@ -9,7 +9,7 @@ integration code).
 
 Unlike the main viewer, this example is plain **vanilla TypeScript + Vite** with
 **two runtime dependencies** -- `stream-core` (the shared connect kernel, an npm
-workspace sibling) and `@nvidia/omniverse-webrtc-streaming-library`. No React, no
+workspace sibling) and `@nvidia/ov-web-rtc`. No React, no
 bootstrap, no selection screen: it does a stream-only direct connect.
 
 ## Layout
