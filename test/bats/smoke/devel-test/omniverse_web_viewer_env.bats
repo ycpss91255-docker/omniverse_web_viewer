@@ -65,9 +65,12 @@ teardown() {
   assert [ "${SERVE_PORT}" = "5173" ]
 }
 
-# why: App-selector default (D7)
-@test "VIEWER_UI_MODE env defaults to usd-viewer" {
-  assert [ "${VIEWER_UI_MODE}" = "usd-viewer" ]
+# why: App-selector default (D7). stream-only is the default because
+# usd-viewer is built from an archived upstream whose blank-screen failure
+# against a non-USD-Viewer Kit app will never be fixed (web-viewer-sample#17,
+# closed NOT_PLANNED). See #97.
+@test "VIEWER_UI_MODE env defaults to stream-only" {
+  assert [ "${VIEWER_UI_MODE}" = "stream-only" ]
 }
 
 # why: `/app/usd-viewer/dist` + `/app/stream-only/dist` both present
@@ -97,36 +100,45 @@ teardown() {
   assert_success
 }
 
-# why: Render path: sentinels gone from `*.js`, kept in `*.js.tmpl`
-@test "default mode (usd-viewer) renders defaults + clears sentinels" {
+# why: Render path: sentinels gone from `*.js`, kept in `*.js.tmpl`.
+# stream-only is the default (#97), so the default render covers all THREE
+# sentinels -- it is the mode that carries the media sentinel (D1).
+@test "default mode (stream-only) renders defaults + clears sentinels" {
   run /entrypoint.sh true
   assert_success
   # Sentinels gone from rendered *.js (the *.js.tmpl keep them).
-  run grep -rF "__OWV_SERVER__" "${USD_ASSETS}/" --include="*.js"
+  run grep -rF "__OWV_SERVER__" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
-  run grep -rF "__OWV_PORT__" "${USD_ASSETS}/" --include="*.js"
+  run grep -rF "__OWV_PORT__" "${STREAM_ASSETS}/" --include="*.js"
+  assert_failure
+  run grep -rF "__OWV_MEDIA_PORT__" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
   # Defaults applied: server 127.0.0.1, port 49100.
-  run grep -rF "127.0.0.1" "${USD_ASSETS}/" --include="*.js"
+  run grep -rF "127.0.0.1" "${STREAM_ASSETS}/" --include="*.js"
   assert_success
-  run grep -rF "49100" "${USD_ASSETS}/" --include="*.js"
+  run grep -rF "49100" "${STREAM_ASSETS}/" --include="*.js"
   assert_success
 }
 
-# why: Mode isolation -- inactive app untouched
-@test "default mode renders ONLY the usd-viewer dir, not stream-only" {
-  # Distinctive server that must only appear in the active (usd-viewer) dir.
+# why: Mode isolation -- inactive app untouched. Same proof as before #97,
+# in the opposite direction: the default render must land in stream-only and
+# leave usd-viewer pristine.
+@test "default mode renders ONLY the stream-only dir, not usd-viewer" {
+  # Distinctive server that must only appear in the active (stream-only) dir.
   SIGNALING_SERVER="10.1.1.1" run /entrypoint.sh true
   assert_success
-  run grep -rF "10.1.1.1" "${USD_ASSETS}/" --include="*.js"
-  assert_success
   run grep -rF "10.1.1.1" "${STREAM_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.1.1.1" "${USD_ASSETS}/" --include="*.js"
   assert_failure
 }
 
-# why: Distinctive-IP render proof
+# why: Distinctive-IP render proof. The mode is named explicitly: this test
+# asserts usd-viewer's render path, and since #97 made stream-only the default
+# it can no longer get there by omission. Keeping it pinned is also what keeps
+# the usd-viewer render path covered at all.
 @test "usd-viewer applies SIGNALING_SERVER env override" {
-  SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
   assert_success
   run grep -rF "10.11.12.13" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -140,7 +152,7 @@ teardown() {
 # why: Distinctive-PORT render proof -- every other port assertion used
 # 49100, which is the baked default
 @test "usd-viewer applies SIGNALING_PORT env override" {
-  SIGNALING_PORT="49277" run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_PORT="49277" run /entrypoint.sh true
   assert_success
   run grep -rF "49277" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -182,11 +194,13 @@ teardown() {
   # First render with one server, then a different one. The second value
   # must win AND the first must be gone -- proves it re-renders from the
   # pristine template, not the previously-rendered *.js.
-  SIGNALING_SERVER="10.20.20.20" run /entrypoint.sh true
+  # Mode pinned explicitly: idempotency is mode-independent, but since #97
+  # moved the default this must name the dir it asserts on.
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.20.20.20" run /entrypoint.sh true
   assert_success
   run grep -rF "10.20.20.20" "${USD_ASSETS}/" --include="*.js"
   assert_success
-  SIGNALING_SERVER="10.30.30.30" run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.30.30.30" run /entrypoint.sh true
   assert_success
   run grep -rF "10.30.30.30" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -198,7 +212,7 @@ teardown() {
 @test "host.yaml public_ip takes precedence over env" {
   printf 'network:\n  public_ip: "10.99.99.99"\n' \
     | sudo tee /etc/host.yaml >/dev/null
-  SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.11.12.13" run /entrypoint.sh true
   assert_success
   run grep -rF "10.99.99.99" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -210,7 +224,7 @@ teardown() {
 @test "host.yaml inline comment is stripped from the value" {
   printf 'network:\n  public_ip: "10.88.88.88"  # LEAKCOMMENT\n' \
     | sudo tee /etc/host.yaml >/dev/null
-  run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
   assert_success
   run grep -rF "10.88.88.88" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -280,8 +294,13 @@ teardown() {
   run /entrypoint.sh true
   assert_failure
   assert_output --partial "top-level 'public_ip:'"
-  # And it must not have quietly dialled the default instead.
+  # And it must not have quietly dialled the default instead. Checked in BOTH
+  # app dirs: the entrypoint refused, so the value belongs in neither, and
+  # naming only the inactive dir would make this assertion vacuous whenever
+  # the default moves (as it did in #97).
   run grep -rF "10.9.9.9" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+  run grep -rF "10.9.9.9" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
 }
 
@@ -474,7 +493,10 @@ teardown() {
   refute_output --partial "indent it under 'network:'"
   assert_output --partial "give the empty 'public_ip:' already inside 'network:' a value"
   # And it must not have quietly dialled anything from the column-0 key.
+  # Both dirs, for the same reason as the FLAT-key test above.
   run grep -rF "10.9.9.9" "${USD_ASSETS}/" --include="*.js"
+  assert_failure
+  run grep -rF "10.9.9.9" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
 }
 
