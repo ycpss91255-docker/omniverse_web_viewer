@@ -234,10 +234,14 @@ ENV HOME="/home/${USER_NAME}"
 
 # Interim runtime ENV defaults (until Phase-2 base-A2 .env). MEDIA_PORT has
 # NO default: unset = null = the library negotiates media via SDP (D1).
+# VIEWER_UI_MODE defaults to stream-only (#97): usd-viewer is built from an
+# archived upstream whose blank-screen failure against a non-USD-Viewer Kit app
+# is permanently unfixed, so it is a poor place to land an operator who set
+# nothing. usd-viewer stays selectable.
 ENV SIGNALING_SERVER="127.0.0.1"
 ENV SIGNALING_PORT="49100"
 ENV SERVE_PORT="5173"
-ENV VIEWER_UI_MODE="usd-viewer"
+ENV VIEWER_UI_MODE="stream-only"
 
 WORKDIR "${HOME}/work"
 
@@ -317,7 +321,9 @@ WORKDIR "${HOME}/work"
 ENV SIGNALING_SERVER="127.0.0.1"
 ENV SIGNALING_PORT="49100"
 ENV SERVE_PORT="5173"
-ENV VIEWER_UI_MODE="usd-viewer"
+# Matches runtime's default (#97). devel-test is FROM devel, so this is the
+# value the bats smoke suite observes as "the shipped default".
+ENV VIEWER_UI_MODE="stream-only"
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "exec serve -s /app/${VIEWER_UI_MODE}/dist -l ${SERVE_PORT}"]
@@ -427,6 +433,12 @@ WORKDIR "${HOME}/work"
 ENV SIGNALING_SERVER="127.0.0.1"
 ENV SIGNALING_PORT="49100"
 ENV EXAMPLE_PORT="8080"
+# NOT the shipped default, and deliberately left at usd-viewer when #97 moved
+# that default to stream-only. This stage has no usd-viewer app: it copies the
+# embedded-site demo's dist INTO /app/usd-viewer/dist (above) purely so the
+# generic entrypoint path /app/${VIEWER_UI_MODE}/dist resolves without
+# special-casing. This is a path alias, not a mode choice -- pointing it at
+# stream-only would name a directory this stage does not build.
 ENV VIEWER_UI_MODE="usd-viewer"
 
 ENTRYPOINT ["/entrypoint.sh"]
