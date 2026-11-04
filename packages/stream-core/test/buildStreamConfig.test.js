@@ -17,6 +17,21 @@ test('builds a DIRECT config for a valid server + numeric port', () => {
   assert.equal(cfg.authenticate, true);
 });
 
+// The reconnect budget had no assertion at all, which is how it survived a
+// library change that redefined it. Under 5.x it reached the library as
+// `maxSessionStartRetry` and bought only startup grace; under ov-web-rtc 6.x
+// (#98) it is a real connection-attempt budget spaced by `reconnectDelay`
+// (~2 s), so the product of the two is how long the viewer spends reconnecting.
+// It is pinned HERE because that product has to stay inside
+// TERMINAL_ESCALATION_MS (15 s) in apps/stream-only/src/streamStatus.js: if the
+// budget outlasts the window, the viewer declares the source gone while the
+// library is still successfully retrying. 6 x ~2 s is ~12 s, inside 15 s.
+// Raising this means revisiting that window, not just this number.
+test('pins the reconnect budget inside the terminal escalation window (#98)', () => {
+  const cfg = buildStreamConfig('127.0.0.1', 49100);
+  assert.equal(cfg.maxReconnects, 6);
+});
+
 test('accepts a numeric string port and coerces it to a number', () => {
   const cfg = buildStreamConfig('host.local', '49100');
   assert.equal(cfg.signalingPort, 49100);

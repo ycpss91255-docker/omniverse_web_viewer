@@ -23,7 +23,7 @@ setup() {
 
 # why: Exactly 2 runtime deps
 @test "example: depends on stream-core + the streaming library only" {
-  run node -e 'const d=require("'"${EXAMPLE_DIR}"'/package.json").dependencies||{};const k=Object.keys(d).sort();process.exit(k.length===2&&k[0]==="@nvidia/omniverse-webrtc-streaming-library"&&k[1]==="stream-core"?0:1)'
+  run node -e 'const d=require("'"${EXAMPLE_DIR}"'/package.json").dependencies||{};const k=Object.keys(d).sort();process.exit(k.length===2&&k[0]==="@nvidia/ov-web-rtc"&&k[1]==="stream-core"?0:1)'
   assert_success
 }
 

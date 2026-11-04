@@ -91,6 +91,25 @@ teardown() {
   assert_failure
 }
 
+# The manifests are asserted in the node specs, and they are declarations. This
+# is the only check that looks at what actually SHIPS -- and the streaming
+# library is the one dependency in this repo whose behaviour has repeatedly had
+# to be read out of the built bundle rather than trusted from its docs (the
+# `onTerminate` and `maxReconnects` findings behind #58 / #60 / #98 all came
+# from grepping this file). `connectStream` imports it dynamically, so Vite
+# emits it as its own chunk named after the package: 5.x shipped as
+# `omniverse-webrtc-streaming-library-<hash>.js`, 6.x as `ov-web-rtc-<hash>.js`.
+# Both halves matter: the new chunk present, and the renamed old one absent, so
+# a stale layer or a half-finished swap that leaves two copies is caught.
+# why: The shipped bundle carries the 6.x library chunk and not the renamed 5.x
+# one -- manifests are declarations, this is the artifact (#98)
+@test "stream-only bundle ships the ov-web-rtc chunk, not the renamed 5.x one" {
+  run bash -c "ls '${STREAM_ASSETS}'/ | grep -q 'ov-web-rtc'"
+  assert_success
+  run bash -c "ls '${STREAM_ASSETS}'/ | grep -q 'omniverse-webrtc-streaming-library'"
+  assert_failure
+}
+
 # why: stream-only carries server/port/media (from `streamTarget.json`)
 @test "stream-only build preserves all three sentinels in templates" {
   run grep -rF "__OWV_SERVER__" "${STREAM_ASSETS}/" --include="*.js.tmpl"
