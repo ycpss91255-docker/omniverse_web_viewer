@@ -43,7 +43,21 @@ export function buildStreamConfig(server, port, mediaPort = null) {
   const cfg = {
     videoElementId: 'remote-video',
     audioElementId: 'remote-audio',
-    authenticate: true,
+    // false, and it should always have been (#98). This prop asks whether the
+    // stream REVERSE PROXY requires a JWT: setting it makes the library append
+    // `Authorization-Bearer.<accessToken>` to the websocket's
+    // Sec-WebSocket-Protocol list. This viewer dials a Kit app directly on a
+    // host IP -- no proxy in front of it, no token to send -- so `true` named a
+    // mechanism that is not in the path. The library's own default is false.
+    //
+    // It survived because 5.6.0 did not validate the pair: `true` with no
+    // `accessToken` connected anyway, so the flag was wrong and inert at once.
+    // 6.x validates and refuses the connect with "Invalid prop accessToken:
+    // must be provided if the authenticate prop is true." Caught by the
+    // config-dial e2e, which is the only layer that actually dials: the prop
+    // exists in both versions with the same name and type, so no type check
+    // and no manifest assertion could have seen this.
+    authenticate: false,
     // 6, not the 20 this carried against the 5.x library (#98). Under
     // `@nvidia/ov-web-rtc` 6.x this IS a mid-session reconnect budget: the
     // library spaces attempts by `reconnectDelay` (~2 s by default) and logs

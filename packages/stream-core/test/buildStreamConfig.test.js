@@ -14,7 +14,17 @@ test('builds a DIRECT config for a valid server + numeric port', () => {
   assert.equal(typeof cfg.signalingPort, 'number');
   assert.equal(cfg.videoElementId, 'remote-video');
   assert.equal(cfg.audioElementId, 'remote-audio');
-  assert.equal(cfg.authenticate, true);
+  // false, not true (#98). `authenticate` asks whether the stream REVERSE
+  // PROXY requires a JWT, and setting it adds `Authorization-Bearer.<token>`
+  // to the websocket's Sec-WebSocket-Protocol list. This viewer dials a Kit app
+  // directly on a host IP: no proxy, no JWT, nothing to put in that header.
+  // 5.6.0 accepted `true` with no `accessToken` and connected anyway, so the
+  // flag was wrong and inert at the same time; 6.x validates it and refuses the
+  // connect outright with "Invalid prop accessToken: must be provided if the
+  // authenticate prop is true." The config-dial e2e is what caught it -- no
+  // type signature could, because the prop exists in both versions with the
+  // same name and type.
+  assert.equal(cfg.authenticate, false);
 });
 
 // The reconnect budget had no assertion at all, which is how it survived a

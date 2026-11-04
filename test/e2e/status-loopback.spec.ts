@@ -270,7 +270,7 @@ test('real frames hide the readout through the real stylesheet (#53)', async ({ 
   expect(await statusDisplay(page)).toBe('none');
 });
 
-test('stalled frames announce the recoverable state, resumed frames clear it (#60, #62)', async ({
+test('stalled frames announce the recoverable state, resumed frames clear it (#60, #62, #98)', async ({
   page,
 }) => {
   test.setTimeout(90_000);
@@ -282,11 +282,12 @@ test('stalled frames announce the recoverable state, resumed frames clear it (#6
   await stallFrames(page);
 
   await expect(status).toBeVisible({ timeout: RECOVERABLE_TIMEOUT_MS });
-  await expect(status).toContainText(/waiting for frames/i);
-  // Recoverable, so still the base styling -- not the error red (#57), and no
-  // claim that anything is reconnecting (#60): nothing does.
+  await expect(status).toContainText(/reconnect/i);
+  // Recoverable, so still the base styling -- not the error red (#57). The
+  // reconnect claim is asserted POSITIVELY now: #60 refused the word because
+  // the 5.x library had no mid-session reconnect path, and #98's move to
+  // ov-web-rtc 6.x gave it one, so the silence became the understatement.
   await expect(status).not.toHaveClass(/error/);
-  await expect(status).not.toContainText(/reconnect/i);
   expect(await statusColor(page)).toBe(BASE_COLOR);
 
   await resumeFrames(page);
@@ -309,7 +310,7 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
 
   await stallFrames(page);
 
-  await expect(status).toContainText(/waiting for frames/i, {
+  await expect(status).toContainText(/reconnect/i, {
     timeout: RECOVERABLE_TIMEOUT_MS,
   });
   const recoverableColor = await statusColor(page);
@@ -348,7 +349,17 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
   // did not restart decoding in the element (observed, not assumed -- the frame
   // counter stayed at zero for 20 s). Handing the page a fresh stream is also
   // the case that actually occurs.
-  await startLoopback(page);
+  //
+  // Held against teardown (#98). The library nulls `#remote-video.srcObject` at
+  // the start of every session-start attempt, which is what
+  // `holdAgainstTeardown` exists for -- and under ov-web-rtc 6.x it keeps
+  // attempting: `maxReconnects` is a real budget there, spaced ~2 s, where 5.x
+  // retried only the initial session setup. So by this point the library is
+  // actively reconnecting, and an unheld loopback has its media nulled out from
+  // under it before a frame can decode (observed: the counter stayed at 0 for
+  // the full 20 s window). The hold ignores teardowns only; real media still
+  // reaches the element, so nothing about the app's own path is faked.
+  await startLoopback(page, true);
   await expectFramesFlowing(page);
 
   await expect(status).toBeHidden({ timeout: RECOVERABLE_TIMEOUT_MS });
@@ -411,8 +422,14 @@ test('a session-start retry cannot repaint over a live picture (#75)', async ({ 
   const attempts: string[] = [];
   const startedAt = Date.now();
   const at = (): string => `+${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
+  // Matched on 'connection attempt', which covers BOTH of 6.x's lines --
+  // "Initial connection attempt" and "Reconnection attempt (N of M)". The
+  // previous matcher was the 5.6.0 wording, 'initializing signaling
+  // connection', which ov-web-rtc 6.8.2 does not emit at all (grepped: 1 hit in
+  // the 5.6.0 bundle, 0 in 6.8.2), so the poll below timed out having counted
+  // nothing and the spec failed over its own instrumentation (#98).
   page.on('console', (msg) => {
-    if (msg.text().includes('initializing signaling connection')) {
+    if (/connection attempt/i.test(msg.text())) {
       attempts.push(at());
     }
   });
