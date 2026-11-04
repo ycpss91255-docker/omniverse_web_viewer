@@ -236,13 +236,17 @@ teardown() {
 
 # why: App selector via host.yaml
 @test "host.yaml viewer.ui_mode selects the served app" {
-  printf 'viewer:\n  ui_mode: "stream-only"\n' \
+  # The selected mode must be the NON-default one, or this proves nothing:
+  # selecting the default renders to the same dir whether the host.yaml key was
+  # honoured or ignored, and the case passes either way. #97 moved the default
+  # to stream-only, so the value that demonstrates selection is usd-viewer.
+  printf 'viewer:\n  ui_mode: "usd-viewer"\n' \
     | sudo tee /etc/host.yaml >/dev/null
   SIGNALING_SERVER="10.3.3.3" run /entrypoint.sh true
   assert_success
-  run grep -rF "10.3.3.3" "${STREAM_ASSETS}/" --include="*.js"
-  assert_success
   run grep -rF "10.3.3.3" "${USD_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.3.3.3" "${STREAM_ASSETS}/" --include="*.js"
   assert_failure
 }
 
@@ -259,7 +263,7 @@ teardown() {
 @test "host.yaml public_ip in a FOREIGN section does not win" {
   printf 'livestream:\n  public_ip: "10.77.77.77"\nnetwork:\n  public_ip: "10.66.66.66"\n' \
     | sudo tee /etc/host.yaml >/dev/null
-  run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
   assert_success
   run grep -rF "10.66.66.66" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -274,7 +278,7 @@ teardown() {
   # refused to boot on a key that was never addressed to it.
   printf 'livestream:\n  ui_mode: "bogus"\n' \
     | sudo tee /etc/host.yaml >/dev/null
-  SIGNALING_SERVER="10.55.55.55" run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" SIGNALING_SERVER="10.55.55.55" run /entrypoint.sh true
   assert_success
   run grep -rF "10.55.55.55" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -315,7 +319,7 @@ teardown() {
 @test "a top-level key does not refuse when the section supplies the value" {
   printf 'network:\n  public_ip: "10.22.22.22"\npublic_ip: "10.9.9.9"\n' \
     | sudo tee /etc/host.yaml >/dev/null
-  run /entrypoint.sh true
+  VIEWER_UI_MODE="usd-viewer" run /entrypoint.sh true
   assert_success
   run grep -rF "10.22.22.22" "${USD_ASSETS}/" --include="*.js"
   assert_success
@@ -363,16 +367,20 @@ teardown() {
 # because the built-in default is itself a supported configuration and
 # refusing would block a valid boot too
 @test "a top-level ui_mode is named when nothing else supplies a mode" {
-  printf 'network:\n  public_ip: "10.51.51.1"\nui_mode: "stream-only"\n' \
+  # The misplaced value must be the NON-default mode. Written as the default
+  # it proves nothing: "ignored" and "honoured" would render to the same dir,
+  # and the case would pass whichever the entrypoint did. #97 moved the default
+  # to stream-only, so the witness is now usd-viewer.
+  printf 'network:\n  public_ip: "10.51.51.1"\nui_mode: "usd-viewer"\n' \
     | sudo tee /etc/host.yaml >/dev/null
   VIEWER_UI_MODE="" run /entrypoint.sh true
   assert_success
   assert_output --partial "top-level 'ui_mode:'"
   assert_output --partial "nothing else supplied one"
   # The misplaced key did NOT select the app: the built-in default is served.
-  run grep -rF "10.51.51.1" "${USD_ASSETS}/" --include="*.js"
-  assert_success
   run grep -rF "10.51.51.1" "${STREAM_ASSETS}/" --include="*.js"
+  assert_success
+  run grep -rF "10.51.51.1" "${USD_ASSETS}/" --include="*.js"
   assert_failure
 }
 
