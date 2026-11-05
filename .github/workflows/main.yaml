@@ -118,7 +118,6 @@ jobs:
       image_name: omniverse_web_viewer
       submodules: recursive
       build_runtime: true
-      test_tools_version: v0.41.0
       # Tier-1 browser config-dial e2e (#47): an extra Dockerfile stage
       # (FROM runtime) that boots the served dists in headless Chromium and
       # asserts the bundle dials the injected server/port (+ media). No GPU,
