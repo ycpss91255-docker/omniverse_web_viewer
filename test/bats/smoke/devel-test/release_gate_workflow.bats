@@ -127,6 +127,29 @@ _sibling_workflow() {
   printf '%s\n' "$2" > "${WORKFLOW_DIR}/$1"
 }
 
+# tier-b-visual-e2e has no steps of its own any more: it CALLS the org's
+# gpu-self-hosted.yml, and the checker pins that call (uses:, every with:
+# input, no secrets:) under [tier-b-calls-the-gpu-workflow]. The STEP-level
+# machinery the older cases below were written against -- the verbatim
+# driver pin, the refused step keys, the $GITHUB_* channels, the allow-list
+# -- is the same code for every GATE_WORK_DRIVERS job, so those cases now
+# mutate the evidence gate's pinned work step instead, which is the job the
+# picture gate's output reaches first.
+EVIDENCE_RUN='        run: bash script/ci/require_attestation.sh'
+EVIDENCE_STEP='      - name: Refuse a release whose picture left no evidence'
+
+# _call_input <line>: add one `with:` input line to the picture gate's call.
+_call_input() {
+  _mutate "s|^      prepare-script: bash script/ci/tier_b_prepare.sh\$|${1}\n      prepare-script: bash script/ci/tier_b_prepare.sh|"
+}
+
+# _prepare_copy: a writable copy of /ci/ (read-only in the image), so a case
+# can edit tier_b_prepare.sh and hand the checker the copy with --script-dir.
+_prepare_copy() {
+  cp -R /ci "${TMP}/ci"
+  PREPARE="${TMP}/ci/tier_b_prepare.sh"
+}
+
 # why: Structural lock on the RELEASE INVARIANT, read off
 # `.github/workflows/main.yaml` itself. The rule (#70, after `v0.3.0-rc1`
 # published with no picture ever verified for it) is absolute: no version
@@ -457,7 +480,7 @@ _sibling_workflow() {
 # suggestion, at job or step level, on the named gate jobs AND on every
 # derived publishing job
 @test "gates: continue-on-error on a gate job is caught" {
-  _mutate '/^  tier-b-visual-e2e:$/a\    continue-on-error: true'
+  _mutate '/^  verify-tag-shape:$/a\    continue-on-error: true'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-has-no-continue-on-error]"
@@ -487,17 +510,18 @@ _sibling_workflow() {
 # `needs:` or a `needs.*.result` check can see -- so a gate job that runs but
 # does NOTHING satisfies every one of them.
 #
-# M9: the Tier B acceptance STEP (not the job) is given
-# `if: github.event_name == 'schedule'`. On a tag push the job runs, the one
-# step that boots a producer and looks at a frame is skipped, the job
-# concludes `success`, publish-image is satisfied and the image is published
-# with no picture ever taken.
+# M9 was this mutation on the Tier B acceptance STEP. That job has no steps
+# now (it calls gpu-self-hosted.yml, whose run step has no `if:` and is not
+# in this file), so the case keeps the property on the evidence gate's work
+# step: the job runs, the step that refuses an empty attestation is skipped,
+# the job concludes `success`, and both publishers are satisfied.
 # why: **M9**, uncaught before: `[gate-job-work-step-is-unconditional]`.
-# `if: github.event_name == 'schedule'` on the STEP (not the job): the job
-# runs, the step that looks at a frame is skipped, the job is `success`, and
-# the image publishes with no picture ever taken
-@test "gates: an if: on the Tier B acceptance STEP is caught" {
-  _mutate "/^      - name: Tier B visual acceptance/a\\        if: github.event_name == 'schedule'"
+# `if: github.event_name == 'schedule'` on a gate job's work STEP (not the
+# job): the job runs, its work is skipped, the job is `success`, and the
+# image publishes with nothing checked. Asserted on the evidence gate, since
+# the Tier B job is a reusable-workflow call with no steps of its own
+@test "gates: an if: on a gate job's work STEP is caught" {
+  _mutate "/^${EVIDENCE_STEP}\$/a\\        if: github.event_name == 'schedule'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
@@ -518,10 +542,9 @@ _sibling_workflow() {
 # The other half of that property: deleting the work step entirely must not be
 # a pass either. A gate job with nothing in it is a gate in name only.
 # why: The other half of that property: a gate job with no work left in it
-# is a gate in name only. A `--print-<something>` query does not keep the
-# count non-zero
-@test "gates: deleting the Tier B acceptance step is caught" {
-  _mutate '/^      - name: Tier B visual acceptance/,/^      - name: Upload evidence/{/^      - name: Upload evidence/!d}'
+# is a gate in name only. Asserted on the evidence gate's work step
+@test "gates: deleting a gate job's work step is caught" {
+  _mutate "/^${EVIDENCE_STEP}\$/,\|^${EVIDENCE_RUN}\$|d"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
@@ -693,11 +716,13 @@ JOB
 # M52. The gate's whole job is to boot a real Kit producer and assert a real
 # browser renders a non-black frame from it, and no hosted runner has NVENC --
 # so moving it to ubuntu-latest does not make the gate slower, it removes it.
+# The job is a gpu-self-hosted.yml call, so "where it runs" is that call's
+# runner-labels input, else the input's ["self-hosted", "gpu"] default.
 # why: **M52**, uncaught before: `[tier-b-runs-on-the-gpu-runner]`. No
-# hosted runner has NVENC, so `runs-on: ubuntu-latest` does not slow the
-# gate down, it removes it
+# hosted runner has NVENC, so `runner-labels: '["ubuntu-latest"]'` on the
+# call does not slow the gate down, it removes it
 @test "gates: moving the picture gate off the GPU runner is caught" {
-  _mutate 's/^    runs-on: \[self-hosted, gpu\]$/    runs-on: ubuntu-latest/'
+  _call_input "      runner-labels: '[\"ubuntu-latest\"]'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
@@ -784,7 +809,7 @@ JOB
   awk -v repl="${new_if}" '
     /^  tier-b-visual-e2e:$/ { intb = 1 }
     intb && !done && /^    if: >-$/ { print repl; skip = 1; done = 1; next }
-    skip && /^    runs-on:/ { skip = 0 }
+    skip && /^    [^ ]/ { skip = 0 }
     skip { next }
     { print }
   ' "${WORKFLOW}" > "${MUTATED}"
@@ -804,7 +829,7 @@ JOB
   awk -v repl="${new_if}" '
     /^  tier-b-visual-e2e:$/ { intb = 1 }
     intb && !done && /^    if: >-$/ { print repl; skip = 1; done = 1; next }
-    skip && /^    runs-on:/ { skip = 0 }
+    skip && /^    [^ ]/ { skip = 0 }
     skip { next }
     { print }
   ' "${WORKFLOW}" > "${MUTATED}"
@@ -836,17 +861,19 @@ JOB
 # one of them. The parser makes the channel not exist: a comment is not part
 # of a value.
 
-# The gate's work step runs `true`. The helper it is supposed to run
+# A gate job's work step runs `true`. The helper it is supposed to run
 # survives in a trailing comment, which is all the "is there still work here"
 # check was reading -- so the job ran, did nothing, reported success, and the
-# image published with no picture taken.
+# image published with nothing checked. (Round 5 found it on the Tier B
+# acceptance step; that job is a reusable-workflow call now, so the case
+# rides on the evidence gate's step.)
 # why: **C3**, uncaught in round 5: `[gate-job-work-step-is-unconditional]`.
-# The gate's work step runs `true` and the helper it should run survives in
-# a TRAILING COMMENT, which was all the "is there still work here" check
+# A gate job's work step runs `true` and the helper it should run survives
+# in a TRAILING COMMENT, which was all the "is there still work here" check
 # read. The job ran, did nothing, reported success, and the image published
-# with no picture taken
-@test "gates: the Tier B work step neutered by a trailing comment is caught" {
-  _mutate 's|^        run: bash script/ci/tier_b_visual_e2e.sh$|        run: "true"  # bash script/ci/tier_b_visual_e2e.sh|'
+# with nothing checked
+@test "gates: a gate job's work step neutered by a trailing comment is caught" {
+  _mutate 's|^        run: bash script/ci/require_attestation.sh$|        run: "true"  # bash script/ci/require_attestation.sh|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
@@ -856,10 +883,10 @@ JOB
 # still in the line, in the comment, and the gate ran on a hosted runner with
 # no NVENC -- which does not slow the picture check down, it removes it.
 # why: **C4**: `[tier-b-runs-on-the-gpu-runner]`, defeated the same way --
-# `runs-on: ubuntu-latest # was [self-hosted, gpu]`. Both words the check
-# looked for are still on the line, in the comment
+# `runner-labels: '["ubuntu-latest"]' # was ["self-hosted", "gpu"]`. Both
+# words the check looked for are still on the line, in the comment
 @test "gates: the GPU pin defeated by a trailing comment is caught" {
-  _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    runs-on: ubuntu-latest  # was [self-hosted, gpu]|'
+  _call_input "      runner-labels: '[\"ubuntu-latest\"]'  # was [\"self-hosted\", \"gpu\"]"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
@@ -937,27 +964,30 @@ JOB
 # and at JOB level, and in both places the check being evaded is one where
 # ABSENCE means "fine".
 
-# The Tier B acceptance step is disabled outright. The job runs, the
-# one step that looks at a frame does not, the job reports success, and the
-# image publishes.
-@test "gates: a double-quoted \"if\": on the Tier B work step is caught" {
-  _mutate '/^      - name: Tier B visual acceptance/a\        "if": false'
+# A gate job's work step is disabled outright. The job runs, its work does
+# not, the job reports success, and the image publishes.
+# why: **U1**: `[gate-job-work-step-is-unconditional]`. `"if":` is one of
+# four valid YAML spellings of the key and a regex anchored on `if:` sees
+# one. A gate job's work step is disabled outright: the job runs, the work
+# does not, the job reports success and the image publishes
+@test "gates: a double-quoted \"if\": on a gate job's work step is caught" {
+  _mutate "/^${EVIDENCE_STEP}\$/a\\        \"if\": false"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
 }
 
 # why: **U2**: same id, the single-quoted `'if':` spelling
-@test "gates: a single-quoted 'if': on the Tier B work step is caught" {
-  _mutate "/^      - name: Tier B visual acceptance/a\\        'if': false"
+@test "gates: a single-quoted 'if': on a gate job's work step is caught" {
+  _mutate "/^${EVIDENCE_STEP}\$/a\\        'if': false"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
 }
 
 # why: **D1**: same id, the spaced `if :` spelling
-@test "gates: a spaced 'if :' on the Tier B work step is caught" {
-  _mutate '/^      - name: Tier B visual acceptance/a\        if : false'
+@test "gates: a spaced 'if :' on a gate job's work step is caught" {
+  _mutate "/^${EVIDENCE_STEP}\$/a\\        if : false"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-work-step-is-unconditional]"
@@ -1251,12 +1281,13 @@ JOB
 # proving the acceptance did not widen into a blanket pass.
 
 # `continue-on-error: false` is the DEFAULT written out loud. The check
-# was a substring search for the word.
+# was a substring search for the word. (On the evidence gate: the Tier B job
+# is a reusable-workflow call, where GitHub refuses the key outright.)
 # why: **I1**, a legal edit round 5 reported as a violation:
 # `continue-on-error: false` is the DEFAULT written out loud, and the check
 # was a substring search for the word
 @test "gates: continue-on-error: false is not a violation" {
-  _mutate '/^  tier-b-visual-e2e:$/a\    continue-on-error: false'
+  _mutate 's|^  require-picture-evidence:$|  require-picture-evidence:\n    continue-on-error: false|'
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
@@ -1351,7 +1382,7 @@ JOB
 # is the entire invariant
 @test "gates: ALWAYS() on call-release is a status function like any other" {
   _mutate "s#^      startsWith(github.ref, 'refs/tags/')\$#      ALWAYS() \&\& startsWith(github.ref, 'refs/tags/')#" \
-          "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh || true@"
+          "s@^${EVIDENCE_RUN}\$@${EVIDENCE_RUN} || true@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[call-release-carries-no-status-function]"
@@ -1415,66 +1446,73 @@ JOB
 # The answer is not a longer count. It is `gate-job-runs-its-driver-verbatim`:
 # THIS command runs, unconditionally, and nothing else in the job invokes the
 # same script in another spelling. See GATE_WORK_DRIVERS.
+#
+# The Tier B driver is no longer a step: it is the `run-script` input of the
+# gpu-self-hosted.yml call, pinned whitespace-collapsed in TIER_B_CALL_WITH,
+# so its spellings below are reported as [tier-b-calls-the-gpu-workflow].
+# The same spellings on a step-level driver are the evidence-gate cases.
 
-# why: `[gate-job-runs-its-driver-verbatim]` -- a new id. The old property
-# COUNTED steps naming something under `script/ci/`, so the driver with `||
-# true` after it still counted. The gate ran, swallowed its own failure,
-# reported success, and the image published with no picture taken
+# why: `[tier-b-calls-the-gpu-workflow]`. The old property COUNTED steps
+# naming something under `script/ci/`, so the driver with `|| true` after it
+# still counted. The gate ran, swallowed its own failure, reported success,
+# and the image published with no picture taken. The driver is the call's
+# `run-script` input now, compared exactly
 @test "gates: the Tier B driver suffixed with || true is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh || true@"
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: bash script/ci/tier_b_visual_e2e.sh || true@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # why: Same id: `--help` exits 0 at once, and the count could not tell it
 # from the job's work
 @test "gates: the Tier B driver reduced to --help is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh --help@"
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: bash script/ci/tier_b_visual_e2e.sh --help@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # why: Same id, the `--version` spelling
 @test "gates: the Tier B driver reduced to --version is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/tier_b_visual_e2e.sh --version@"
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: bash script/ci/tier_b_visual_e2e.sh --version@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # why: Same id: `set +e; ...; exit 0` keeps the driver on the line and
 # throws its result away
 @test "gates: the Tier B driver wrapped in set +e and exit 0 is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: set +e; bash script/ci/tier_b_visual_e2e.sh; exit 0@"
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: set +e; bash script/ci/tier_b_visual_e2e.sh; exit 0@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # The count could not tell one script/ci/ helper from another, so pointing the
-# picture gate's work step at the tag deriver satisfied it exactly.
+# picture gate's work at the tag deriver satisfied it exactly.
 # why: Same id: the count could not tell `tier_b_visual_e2e.sh` from
-# `derive_image_tag.sh`, so pointing the picture gate's work step at the tag
+# `derive_image_tag.sh`, so pointing the picture gate's work at the tag
 # deriver satisfied it exactly
-@test "gates: the Tier B work step pointed at a different helper is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash script/ci/derive_image_tag.sh@"
+@test "gates: the Tier B run-script pointed at a different helper is caught" {
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: bash script/ci/derive_image_tag.sh@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-its-driver-verbatim]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # The decoy family. In each of the three below an UNCONDITIONAL step naming
 # `script/ci/` keeps the old count satisfied while the thing that would
-# actually look at a frame moves behind an `if:` that is never true -- as
+# actually do the gate's work moves behind an `if:` that is never true -- as
 # `run: $CMD` with the command in `env:`, as a third-party action, and as a
-# plain inline `run:`.
+# plain inline `run:`. On the evidence gate's step, which is where a step
+# still exists to replace.
 # why: Same id: an UNCONDITIONAL `echo` naming `script/ci/` keeps the old
 # count satisfied while `run: $CMD`, with the command in `env:`, sits behind
 # an `if:` that is never true
 @test "gates: an echo decoy plus the real work behind env indirection is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: echo 'the driver lives under script/ci/'\n        env:\n          CMD: bash script/ci/tier_b_visual_e2e.sh\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: eval \"\$CMD\"@"
+  _mutate "s@^${EVIDENCE_RUN}\$@        run: echo 'the driver lives under script/ci/'\n        env:\n          CMD: bash script/ci/require_attestation.sh\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: eval \"\$CMD\"@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -1482,7 +1520,7 @@ JOB
 
 # why: Same id, with the real work as a third-party action
 @test "gates: an echo decoy plus a guarded third-party action is caught" {
-  _mutate "s#^        run: bash script/ci/tier_b_visual_e2e.sh\$#        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        uses: some/visual-acceptance-action@v1#"
+  _mutate "s#^${EVIDENCE_RUN}\$#        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        uses: some/visual-acceptance-action@v1#"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -1490,7 +1528,7 @@ JOB
 
 # why: Same id, with the real work as a plain inline `run:`
 @test "gates: an echo decoy plus a guarded inline run is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: ./take-the-picture.sh@"
+  _mutate "s@^${EVIDENCE_RUN}\$@        run: echo 'see script/ci/ for what this used to do'\n      - name: The real work, behind a condition\n        if: \${{ github.event_name == 'never' }}\n        run: ./take-the-picture.sh@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -1509,15 +1547,16 @@ JOB
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
-# A `--print-<x>` QUERY is the one other spelling the job may contain -- this
-# repo pulls the producer image the driver names -- and it must be
-# unconditional too: a skipped query fails the step that consumes it.
-# why: Same id. A `--print-<x>` query is the one other spelling the job may
-# contain -- this repo pulls the producer image the driver names -- and it
-# must be unconditional too, because a skipped query fails the step that
-# consumes it
+# A `--print-<x>` QUERY is the one other spelling a driver job may contain --
+# the Tier B prepare-script pulls the producer image its driver names -- and
+# it must be unconditional too: a skipped query fails the step that consumes
+# it. Asserted on a query added to the evidence gate, the remaining place a
+# driver query can be a STEP.
+# why: Same id. A `--print-<x>` query is the one other spelling a driver job
+# may contain, and it must be unconditional too, because a skipped query
+# fails the step that consumes it
 @test "gates: an if: on the driver's --print- query is caught" {
-  _mutate "s|^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$|        if: \${{ github.event_name == 'never' }}\n        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"|"
+  _mutate "s@^${EVIDENCE_RUN}\$@${EVIDENCE_RUN}\n      - name: Ask the driver\n        if: \${{ github.event_name == 'never' }}\n        run: echo \"\$(bash script/ci/require_attestation.sh --print-x)\"@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -1529,9 +1568,9 @@ JOB
 # why: The acceptance half, so "exact" does not mean "byte-identical":
 # whitespace inside the command is not meaning, an ARGUMENT is. Adding one
 # is a violation whose message says to record the new spelling in
-# `GATE_WORK_DRIVERS`
+# `TIER_B_CALL_WITH`
 @test "gates: extra whitespace inside the driver invocation still passes" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        run: bash   script/ci/tier_b_visual_e2e.sh@"
+  _mutate "s@^      run-script: bash script/ci/tier_b_visual_e2e.sh\$@      run-script: bash   script/ci/tier_b_visual_e2e.sh@"
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
@@ -1557,8 +1596,8 @@ JOB
 # form is `command [...options] {0}`, so the pinned driver is PRINTED and
 # never runs while the step and the job report success. The pin compared a
 # STRING; four sibling keys decide what that string does
-@test "gates: shell: cat {0} on the Tier B work step is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: cat {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+@test "gates: shell: cat {0} on a pinned work step is caught" {
+  _mutate "s@^${EVIDENCE_RUN}\$@        shell: cat {0}\n${EVIDENCE_RUN}@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -1566,8 +1605,8 @@ JOB
 
 # The same hole spelled as something that reads like a lint tweak in review.
 # why: Same id: syntax-check only, and it reads as a lint tweak in review
-@test "gates: shell: bash -n {0} on the Tier B work step is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        shell: bash -n {0}\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+@test "gates: shell: bash -n {0} on a pinned work step is caught" {
+  _mutate "s@^${EVIDENCE_RUN}\$@        shell: bash -n {0}\n${EVIDENCE_RUN}@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -1577,8 +1616,8 @@ JOB
 # stub of the same path.
 # why: Same id: the verbatim string resolved against another tree -- a
 # fixture holding a stub of the same path
-@test "gates: working-directory: on the Tier B work step is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        working-directory: test/fixtures/stub-tree\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+@test "gates: working-directory: on a pinned work step is caught" {
+  _mutate "s@^${EVIDENCE_RUN}\$@        working-directory: test/fixtures/stub-tree\n${EVIDENCE_RUN}@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -1586,33 +1625,37 @@ JOB
 
 # The driver reads TIER_B_PRODUCER_IMAGE, TIER_B_VIEWER_IMAGE and
 # TIER_B_BOOT_TIMEOUT from its environment (script/ci/tier_b_visual_e2e.sh),
-# so a step-level env: makes the "picture" one of whatever image the editor
-# chose -- with the pinned line, and the gate's own name, intact.
-# why: Same id: the driver reads `TIER_B_PRODUCER_IMAGE` /
-# `TIER_B_VIEWER_IMAGE` / `TIER_B_BOOT_TIMEOUT` from its environment, so the
-# "picture" becomes one of whatever image the editor chose, with the pinned
-# line intact
-@test "gates: env: on the Tier B work step is caught" {
-  _mutate "s@^        run: bash script/ci/tier_b_visual_e2e.sh\$@        env:\n          TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\n        run: bash script/ci/tier_b_visual_e2e.sh@"
+# so an env makes the "picture" one of whatever image the editor chose --
+# with the pinned line, and the gate's own name, intact. On the call, that
+# env is the `script-env` input, which the pinned input set does not have.
+# why: `[tier-b-calls-the-gpu-workflow]`: the driver reads
+# `TIER_B_PRODUCER_IMAGE` / `TIER_B_VIEWER_IMAGE` / `TIER_B_BOOT_TIMEOUT`
+# from its environment, so `script-env` on the call makes the "picture" one
+# of whatever image the editor chose, with the pinned run-script intact
+@test "gates: script-env on the picture gate's call is caught" {
+  _call_input "      script-env: TIER_B_PRODUCER_IMAGE=ghcr.io/somewhere/else:latest"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-driver-runs-unmodified]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
-# ... and the same variable one level up, which no step-level rule can see.
-# why: Same id, one level up, where no step-level rule can see it
+# ... and the same variable one level up. GitHub refuses `env:` on a job that
+# calls a reusable workflow, and so does the checker, by the call's key set.
+# why: `[tier-b-calls-the-gpu-workflow]`, one level up: `env:` on the call
+# job, which GitHub refuses and the pinned key set does not allow
 @test "gates: a job-level env: on the picture gate is caught" {
-  _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    env:\n      TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest@"
+  _mutate "s@^    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml\@main\$@    env:\n      TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\n    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml\@main@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-driver-runs-unmodified]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
-# ... and two levels up, where it reaches every job in the file including
-# this one.
-# why: Same id, two levels up, where it reaches every job in the file
-# including this one
-@test "gates: a workflow-level env: reaching the picture gate is caught" {
+# ... and two levels up, where it reaches every job in the file that runs
+# steps here -- both remaining driver jobs among them. (It does not reach a
+# called workflow: `env` is not passed across a `workflow_call`.)
+# why: `[gate-driver-runs-unmodified]`, two levels up, where it reaches
+# every job in the file that runs its own steps
+@test "gates: a workflow-level env: reaching a pinned driver is caught" {
   _mutate "s@^jobs:\$@env:\n  TIER_B_PRODUCER_IMAGE: ghcr.io/somewhere/else:latest\njobs:@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
@@ -1623,9 +1666,9 @@ JOB
 # sees a `defaults:` block and a `run:` line that still says exactly what it
 # always said.
 # why: Same id. THE PINNED LINE IS UNTOUCHED: the diff shows only a
-# `defaults:` block
-@test "gates: a job-level defaults.run.shell on the picture gate is caught" {
-  _mutate "s@^    runs-on: \[self-hosted, gpu\]\$@    runs-on: [self-hosted, gpu]\n    defaults:\n      run:\n        shell: cat {0}@"
+# `defaults:` block, on the evidence gate
+@test "gates: a job-level defaults.run.shell on a pinned driver job is caught" {
+  _mutate 's@^  require-picture-evidence:$@  require-picture-evidence:\n    defaults:\n      run:\n        shell: cat {0}@'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -1662,7 +1705,7 @@ JOB
 # every occurrence of the script in the step must itself be a `--print-<x>`
 # query
 @test "gates: a --print- decoy carrying a --help invocation is caught" {
-  _mutate "s@^        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\$@        run: docker pull \"\$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"\n      - name: Warm the driver up\n        run: echo --print-nothing \&\& bash script/ci/tier_b_visual_e2e.sh --help || true@"
+  _mutate "s@^${EVIDENCE_RUN}\$@${EVIDENCE_RUN}\n      - name: Warm the driver up\n        run: echo --print-nothing \&\& bash script/ci/require_attestation.sh --help || true@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -1678,19 +1721,19 @@ JOB
 # the decoy case above: what makes that one a violation is the `--help`
 # invocation, not the presence of a second step.
 
-# An env: on a step of the gate job that does NOT invoke the driver cannot
+# An env: on a step of a gate job that does NOT invoke the driver cannot
 # change what the driver does: it is a different process.
 # why: Acceptance pair for the `env:` refusal: a step that does not invoke
 # the driver is a different process and cannot change what the driver does
 @test "gates: env: on a non-driver step of the gate job still passes" {
-  _mutate "s@^        run: ./script/build.sh -t e2e-test\$@        env:\n          DOCKER_BUILDKIT: '1'\n        run: ./script/build.sh -t e2e-test@"
+  _mutate 's@^        uses: actions/checkout\@d23441a48e516b6c34aea4fa41551a30e30af803$@        uses: actions/checkout\@d23441a48e516b6c34aea4fa41551a30e30af803\n        env:\n          DOCKER_BUILDKIT: "1"@'
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
 }
 
 # `defaults:` on a job that runs no pinned driver is an ordinary edit. The
-# refusal is scoped to the two GATE_WORK_DRIVERS jobs and to the workflow
+# refusal is scoped to the GATE_WORK_DRIVERS jobs and to the workflow
 # level, which reaches them.
 # why: Acceptance pair for the `defaults:` refusal, which is scoped to the
 # two `GATE_WORK_DRIVERS` jobs and to the workflow level that reaches them
@@ -2060,28 +2103,23 @@ JOB
   assert_output --partial "no second 'on.push' to split into"
 }
 
-# --- root cause 12: runs-on read in two of its four shapes ----------------
-#
-# `as_list()` on a `runs-on:` MAPPING yields `str(dict)`, so the documented
-# `{group:, labels:}` syntax -- what the org will write the day the GPU host
-# moves into a runner group -- was reported as a gate that had left the GPU.
-# So was a matrix-driven `runs-on`. A check that reports valid edits as
-# violations is one people learn to switch off.
 # GitHub matches runner LABELS case-insensitively, and this file matched them
 # case-sensitively while matching expressions case-insensitively -- the exact
-# inconsistency the expression change argued against, one round earlier. It
-# failed CLOSED (a correct edit reported as a violation), so it was noise
-# rather than a hole; noise is still how a check gets switched off.
-# why: GitHub matches runner labels case-insensitively and this file did
-# not, while matching expressions case-insensitively -- the exact
-# inconsistency the expression change argued against one round earlier. It
-# failed CLOSED, so noise rather than a hole; noise is still how a check
-# gets switched off
+# inconsistency the expression change argued against, one round earlier.
+#
+# The picture gate is a gpu-self-hosted.yml call now, so its labels are the
+# call's `runner-labels` input (a JSON array) or that input's default. Every
+# runner-labels value is ALSO an input the pinned set does not declare, so
+# the acceptance half asserts only that the RUNNER check is satisfied.
+# why: GitHub matches runner labels case-insensitively, so
+# `runner-labels: '["Self-Hosted", "GPU"]'` is the same runner and must not
+# be reported as a gate that left the GPU. It is still an undeclared input
+# of the pinned call
 @test "gates: runner labels in mixed case are the same runner" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, GPU]|"
+  _call_input "      runner-labels: '[\"Self-Hosted\", \"GPU\"]'"
   run bash "${CHECK}" "${MUTATED}"
-  assert_success
-  assert_output --partial "holds the release invariant"
+  refute_output --partial "[tier-b-runs-on-the-gpu-runner]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 # ... and its failing half, so case-insensitivity did not become "any label
@@ -2089,60 +2127,82 @@ JOB
 # why: `[tier-b-runs-on-the-gpu-runner]` -- the failing half, so
 # case-insensitivity did not become "any label set will do"
 @test "gates: a mixed-case label set that has lost the GPU is still caught" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: [Self-Hosted, Ubuntu-Latest]|"
+  _call_input "      runner-labels: '[\"Self-Hosted\", \"Ubuntu-Latest\"]'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
 }
 
-# why: `{group: gpu-hosts, labels: [self-hosted, gpu]}` is documented GitHub
-# syntax and `as_list()` on a mapping yielded `str(dict)`, so it was
-# reported as a gate that had left the GPU -- a false positive that would
-# fire the day the org moves the GPU host into a runner group
-@test "gates: a runner group that still declares the labels passes" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: {group: gpu-hosts, labels: [self-hosted, gpu]}|"
+# why: `runs-on: {group:, labels:}` is documented GitHub syntax and
+# `as_list()` on a mapping yielded `str(dict)`. A job on a hosted group that
+# declares hosted labels is an ordinary job, not one on the shared runner
+@test "gates: a runner group that declares hosted labels passes" {
+  _append_job <<'YAML'
+
+  hosted-group:
+    runs-on: {group: build-farm, labels: [ubuntu-latest]}
+    steps:
+      - run: echo ordinary hosted work
+YAML
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
 }
 
-# why: Same false positive for `runs-on: ${{ matrix.runner }}`, now resolved
-# against the job's own `strategy.matrix`
-@test "gates: a matrix whose every runner is the GPU runner passes" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    strategy:\n      matrix:\n        runner: [[self-hosted, gpu]]\n    runs-on: \${{ matrix.runner }}|"
+# why: Same false positive for `runs-on: ${{ matrix.runner }}`, resolved
+# against the job's own `strategy.matrix`: every entry hosted, so passes
+@test "gates: a matrix whose every runner is hosted passes" {
+  _append_job <<'YAML'
+
+  hosted-matrix:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, [ubuntu-24.04]]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - run: echo ordinary hosted work
+YAML
   run bash "${CHECK}" "${MUTATED}"
   assert_success
   assert_output --partial "holds the release invariant"
 }
 
-# ... and the three failing halves, so neither acceptance widens into a
-# blanket pass. A group with NO labels is not resolvable here (which machines
-# are in a group is a repo setting, limitation 6); a matrix with one hosted
-# entry runs the gate off the GPU for that entry; an expression from outside
-# the file is not determined here at all.
-# why: `[tier-b-runs-on-the-gpu-runner]` -- the failing half. Which machines
-# are in a group is a repo SETTING, which the checker cannot read, so a
-# group with no labels comes back as unresolved rather than as a silent pass
-@test "gates: a runner group with no labels is not proof of a GPU runner" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: {group: gpu-hosts}|"
+# ... and the failing halves, so neither acceptance widens into a blanket
+# pass. runner-labels from an expression is not determined here; one that is
+# not a JSON array is not a label set at all.
+# why: `[tier-b-runs-on-the-gpu-runner]` -- runner-labels that are not a
+# JSON array of strings are not resolved into a label set, they are reported
+@test "gates: runner-labels that are not a JSON array are not proof of a GPU runner" {
+  _call_input "      runner-labels: self-hosted, gpu"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
 }
 
-# why: Same id: EVERY value the matrix could take must satisfy the
-# requirement, or the gate runs off the GPU for half its variants
-@test "gates: a matrix with one hosted runner is caught" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    strategy:\n      matrix:\n        runner: [[self-hosted, gpu], [ubuntu-latest]]\n    runs-on: \${{ matrix.runner }}|"
+# why: `[gate-job-runs-only-declared-steps]`: EVERY value the matrix could
+# take is read, so one self-hosted entry puts an undeclared job on the
+# shared runner
+@test "gates: a matrix with one self-hosted runner is caught" {
+  _append_job <<'YAML'
+
+  mixed-matrix:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, [self-hosted, gpu]]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - run: echo prepare the ground
+YAML
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
-# why: Same id: an expression whose value is decided by an input or a caller
-# is not determined here, and is reported rather than guessed
-@test "gates: a runs-on expression from outside this file is caught" {
-  _mutate "s|^    runs-on: \[self-hosted, gpu\]\$|    runs-on: \${{ inputs.runner }}|"
+# why: Same id as the GPU pin: runner-labels whose value is decided by an
+# input or a caller is not determined here, and is reported rather than
+# guessed
+@test "gates: a runner-labels expression from outside this file is caught" {
+  _call_input "      runner-labels: \${{ inputs.runner }}"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[tier-b-runs-on-the-gpu-runner]"
@@ -2204,6 +2264,12 @@ JOB
 # The answer is not a sixth spelling. It is to stop taking the job's word for
 # it: the acceptance spec writes an attestation only after sampling a frame
 # that cleared every threshold, and publish-image refuses to push without it.
+#
+# Since the picture gate became a gpu-self-hosted.yml call, the attestation
+# leaves the job as the `attestation` key of the called workflow's
+# `script-outputs` JSON, which holds only what its run-script (the pinned
+# driver) wrote to $GITHUB_OUTPUT. The evidence gate binds exactly
+# `${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}`.
 # All five bypasses fail that check at once, because all five end the same way
 # -- no frame, no attestation.
 #
@@ -2211,15 +2277,21 @@ JOB
 # lock. Cutting any link is exactly the edit an attacker (or a tired
 # maintainer) would make next.
 
-@test "gates: tier-b publishes its attestation as a job output" {
-  _mutate '/^    outputs:$/,/^      attestation:/d'
+# why: `[picture-leaves-evidence]`: script-outputs only means "what the
+# pinned driver wrote" when the job is THE call. Repointed elsewhere, the
+# binding names an output nobody here knows the source of
+@test "gates: tier-b's evidence comes from the pinned GPU workflow" {
+  _mutate 's|^    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml@main$|    uses: someone/else/.github/workflows/gpu-self-hosted.yml@main|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
 }
 
-@test "gates: the acceptance step keeps the id its output is read from" {
-  _mutate 's|^        id: acceptance$|        id: something-else|'
+# why: `[picture-leaves-evidence]`: the old job output. A call has no
+# `outputs.attestation`, so binding it reads the empty string forever -- a
+# gate that fails closed by accident is still not the chain
+@test "gates: binding the old job output instead of script-outputs is caught" {
+  _mutate "s@^      ATTESTATION: \\\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\$@      ATTESTATION: \${{ needs.tier-b-visual-e2e.outputs.attestation }}@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
@@ -2243,7 +2315,7 @@ JOB
 }
 
 @test "gates: an evidence gate reading nothing is caught" {
-  _mutate 's|^      ATTESTATION: \${{ needs.tier-b-visual-e2e.outputs.attestation }}$|      ATTESTATION: "ok"|'
+  _mutate "s@^      ATTESTATION: \\\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\$@      ATTESTATION: \"ok\"@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
@@ -2285,19 +2357,22 @@ JOB
 # silently teaches nobody, and the operator who wrote the edit deserves to be
 # told at the point they wrote it.
 
+# On the evidence gate's work step: the Tier B job has no steps to add one
+# to (a call refuses `steps:`), and these cases are about what one extra step
+# in a pinned driver job can do. The payloads aim at that job's driver.
 _gate_step() {
-  _mutate "s|^        run: bash script/ci/tier_b_visual_e2e.sh\$|        run: bash script/ci/tier_b_visual_e2e.sh\n      - name: prep\n        run: ${1}|"
+  _mutate "s|^${EVIDENCE_RUN}\$|${EVIDENCE_RUN}\n      - name: prep\n        run: ${1}|"
 }
 
 @test "gates: truncating the driver with a --print- token appended is caught" {
-  _gate_step "': > script/ci/tier_b_visual_e2e.sh --print-x'"
+  _gate_step "': > script/ci/require_attestation.sh --print-x'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
 @test "gates: overwriting the driver with a --print- token appended is caught" {
-  _gate_step "'echo true > script/ci/tier_b_visual_e2e.sh --print-producer-image'"
+  _gate_step "'echo true > script/ci/require_attestation.sh --print-producer-image'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -2311,14 +2386,14 @@ _gate_step() {
 }
 
 @test "gates: a redundant path separator does not hide a rewrite" {
-  _gate_step "'sed -i \"1a exit 0\" script/ci//tier_b_visual_e2e.sh'"
+  _gate_step "'sed -i \"1a exit 0\" script/ci//require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
 @test "gates: rewriting a sibling script in script/ci is caught" {
-  _gate_step "'sed -i \"1a exit 0\" script/ci/derive_image_tag.sh'"
+  _gate_step "'sed -i \"1a exit 0\" script/ci/tier_b_visual_e2e.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -2339,14 +2414,14 @@ _gate_step() {
 }
 
 @test "gates: a container: on the gate job is caught" {
-  _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    container:\n      image: ubuntu:24.04\n    runs-on: [self-hosted, gpu]|'
+  _mutate 's|^  require-picture-evidence:$|  require-picture-evidence:\n    container:\n      image: ubuntu:24.04|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
 }
 
 @test "gates: services: on the gate job is caught" {
-  _mutate 's|^    runs-on: \[self-hosted, gpu\]$|    services:\n      db:\n        image: postgres\n    runs-on: [self-hosted, gpu]|'
+  _mutate 's|^  require-picture-evidence:$|  require-picture-evidence:\n    services:\n      db:\n        image: postgres|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -2367,14 +2442,14 @@ _gate_step() {
 # fourth. These cases are the structural versions.
 
 @test "gates: a redundant separator before ci does not hide a rewrite" {
-  _gate_step "'sed -i \"1a exit 0\" script//ci/tier_b_visual_e2e.sh'"
+  _gate_step "'sed -i \"1a exit 0\" script//ci/require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
 @test "gates: a dot component in the path does not hide a rewrite" {
-  _gate_step "'sed -i \"1a exit 0\" script/./ci/tier_b_visual_e2e.sh'"
+  _gate_step "'sed -i \"1a exit 0\" script/./ci/require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -2405,15 +2480,19 @@ _gate_step() {
   assert_output --partial "[gate-driver-runs-unmodified]"
 }
 
-@test "gates: a constant standing in for the attestation output is caught" {
-  _mutate 's|^      attestation: \${{ steps.acceptance.outputs.attestation }}$|      attestation: "acceptance-ok"|'
+# why: `[picture-leaves-evidence]`: a constant in the binding is never
+# empty, so it attests to nothing
+@test "gates: a constant standing in for the attestation is caught" {
+  _mutate "s@^      ATTESTATION: \\\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\$@      ATTESTATION: \"acceptance-ok\"@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
 }
 
-@test "gates: the acceptance step's outcome is not its evidence" {
-  _mutate 's|^      attestation: \${{ steps.acceptance.outputs.attestation }}$|      attestation: ${{ steps.acceptance.outcome }}|'
+# why: `[picture-leaves-evidence]`: the Tier B job's `result` names the
+# job and is never empty -- a status dressed as evidence
+@test "gates: the Tier B job's result is not its evidence" {
+  _mutate "s@^      ATTESTATION: \\\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\$@      ATTESTATION: \${{ needs.tier-b-visual-e2e.result }}@"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
@@ -2426,7 +2505,7 @@ _gate_step() {
 
 
 @test "gates: a read-only command with a redirect onto the driver is caught" {
-  _gate_step "'cat /dev/null > script/ci/tier_b_visual_e2e.sh'"
+  _gate_step "'cat /dev/null > script/ci/require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
@@ -2453,24 +2532,24 @@ _gate_step() {
 #     Turing-complete language. The gate's work is pinned as an invocation
 #     instead, which is the mechanism that already works for the driver.
 
-_out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.attestation }}\$@      attestation: ${1}@"; }
+_bind_expr() { _mutate "s@^      ATTESTATION: \\\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\$@      ATTESTATION: ${1}@"; }
 
-@test "gates: an || fallback on the attestation output is caught" {
-  _out_expr "\${{ steps.acceptance.outputs.attestation || 'ok' }}"
+@test "gates: an || fallback on the attestation binding is caught" {
+  _bind_expr "\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation || 'ok' }}"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
 }
 
-@test "gates: concatenating onto the attestation output is caught" {
-  _out_expr "\${{ steps.acceptance.outputs.attestation }}\${{ github.sha }}"
+@test "gates: concatenating onto the attestation binding is caught" {
+  _bind_expr "\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}\${{ github.sha }}"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
 }
 
 @test "gates: one extra character on the attestation binding is caught" {
-  _mutate "s@^      ATTESTATION: \\\${{ needs.tier-b-visual-e2e.outputs.attestation }}\$@      ATTESTATION: \${{ needs.tier-b-visual-e2e.outputs.attestation }}.@"
+  _bind_expr "\${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}."
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"
@@ -2515,14 +2594,14 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 }
 
 @test "gates: an in-place rewriter is not a read-only mention" {
-  _gate_step "'shfmt -w script/ci/tier_b_visual_e2e.sh'"
+  _gate_step "'shfmt -w script/ci/require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-its-driver-verbatim]"
 }
 
 @test "gates: cd-ing into the driver's directory is caught" {
-  _mutate 's@^        run: bash script/ci/tier_b_visual_e2e.sh$@        run: bash script/ci/tier_b_visual_e2e.sh\n      - name: prep\n        run: |\n          cd script/ci\n          sed -i "1a exit 0" tier_b_visual_e2e.sh@'
+  _mutate 's@^        run: bash script/ci/require_attestation.sh$@        run: bash script/ci/require_attestation.sh\n      - name: prep\n        run: |\n          cd script/ci\n          sed -i "1a exit 0" require_attestation.sh@'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-driver-runs-unmodified]"
@@ -2556,21 +2635,21 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 # only reason that generalises -- nobody declared them.
 
 @test "gates: reaching the driver by basename through find is caught" {
-  _gate_step "'find . -name \"tier_b_visual_e2e.sh\" -exec sed -i \"2i exit 0\" {} +'"
+  _gate_step "'find . -name \"require_attestation.sh\" -exec sed -i \"2i exit 0\" {} +'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
 @test "gates: reaching the driver through a directory glob is caught" {
-  _gate_step "'sed -i \"2i exit 0\" script/*/tier_b_visual_e2e.sh'"
+  _gate_step "'sed -i \"2i exit 0\" script/*/require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
 @test "gates: an undeclared action in a gate job is caught" {
-  _mutate 's|^    steps:\n      # Pre-checkout self-heal|XXX|; s|^      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in$|      - uses: actions/setup-node@v4\n      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in|'
+  _mutate "s|^${EVIDENCE_STEP}\$|      - uses: actions/setup-node@v4\n${EVIDENCE_STEP}|"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
@@ -2584,14 +2663,7 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 }
 
 @test "gates: pushd into the driver's directory is caught" {
-  _gate_step "'pushd script/ci \&\& sed -i \"2i exit 0\" tier_b_visual_e2e.sh'"
-  run bash "${CHECK}" "${MUTATED}"
-  assert_failure 1
-  assert_output --partial "[gate-job-runs-only-declared-steps]"
-}
-
-@test "gates: a decoy step wearing the acceptance id is caught" {
-  _mutate 's|^        id: acceptance$|        id: real|; s|^      - name: Tier B visual acceptance (real producer -> real frames)$|      - name: decoy\n        id: acceptance\n        run: echo x\n\n      - name: Tier B visual acceptance (real producer -> real frames)|'
+  _gate_step "'pushd script/ci \&\& sed -i \"2i exit 0\" require_attestation.sh'"
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
@@ -2601,14 +2673,16 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 # shipped for one commit without a checkout: exit 127 on every run, and since
 # both publishers require its success, no release could ever be cut again.
 # Fails closed, which is the safe direction and no comfort -- it would have
-# been found on the next tag push, by a person, at the worst moment.
+# been found on the next tag push, by a person, at the worst moment. The
+# Tier B job's checkout is inside gpu-self-hosted.yml; what this file decides
+# about it is `submodules: recursive`, which TIER_B_CALL_WITH pins.
 @test "gates: every gate job that runs a repo script checks the repo out" {
   run bash "${CHECK}" "${WORKFLOW}"
   assert_success
   run grep -c 'uses: actions/checkout@' "${WORKFLOW}"
   assert_success
-  # tier-b-visual-e2e, verify-tag-shape, verify-tag-on-main, publish-image, require-picture-evidence
-  [ "${output}" -ge 5 ]
+  # verify-tag-shape, verify-tag-on-main, publish-image, require-picture-evidence
+  [ "${output}" -ge 4 ]
 }
 
 # The six cases that used to live near here asserted that a LEGITIMATE extra
@@ -2616,28 +2690,27 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 # the --print- query -- was not a bypass. They were right under a blocklist,
 # where the question was "does this step name something forbidden?", and they
 # are obsolete under an allow-list, where no undeclared step in a gate job is
-# permitted at all. Deleted rather than weakened: a case asserting a premise
-# that no longer holds is worse than no case, because it passes for the wrong
-# reason or fails for the right one and gets "fixed".
+# permitted at all.
 #
 # What replaces them is the contract itself. Editing a declared step is a
 # two-line change -- the workflow and the table -- and that is the cost the
 # allow-list charges in exchange for converging.
 @test "gates: editing a declared step without declaring it is caught" {
-  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test --no-cache|'
+  _mutate 's|^        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803$|        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803\n        with:\n          fetch-depth: 0|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
-@test "gates: the declared --print- query step is not read as a bypass" {
-  # The shipped workflow contains a step that legitimately names the driver
-  # (`docker pull "$(bash <driver> --print-producer-image)"`). It is declared,
-  # and the mutation sweep must not report it -- this is the whole workflow
-  # going green, asserted where a reader looking for that property finds it.
+# The Tier B prepare-script legitimately names the driver
+# (`docker pull "$(bash <driver> --print-producer-image)"`). It is declared in
+# TIER_B_PREPARE_LINES, and the shipped file must not be reported -- this is
+# the whole workflow going green, asserted where a reader looking for that
+# property finds it.
+@test "gates: the declared --print- query in the prepare script is not read as a bypass" {
   run bash "${CHECK}" "${WORKFLOW}"
   assert_success
-  run grep -c -- '--print-producer-image' "${WORKFLOW}"
+  run grep -c -- '--print-producer-image' /ci/tier_b_prepare.sh
   assert_success
   [ "${output}" -ge 1 ]
 }
@@ -2656,39 +2729,83 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
 # chained command. That is the blocklist's mistake wearing the allow-list's
 # clothes -- a pattern open at one end is open to everything past it. There is
 # no wildcard now; an entry is the whole step.
+#
+# The Tier B job's preparatory steps are a script now (tier_b_prepare.sh, the
+# call's prepare-script), and the same closed allow-list follows them there:
+# TIER_B_PREPARE_LINES, every command line exactly, in order. These cases
+# edit a copy of /ci/ and hand it to the checker with --script-dir.
 
 @test "gates: a declared prefix cannot carry a chained command" {
-  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/setup.sh apply \&\& find . -name "tier_b_visual_e2e.sh" -exec sed -i "2i exit 0" {} +|'
-  run bash "${CHECK}" "${MUTATED}"
+  _prepare_copy
+  sed -i 's|^./script/build.sh -t e2e-test$|./script/setup.sh apply \&\& find . -name "tier_b_visual_e2e.sh" -exec sed -i "2i exit 0" {} +|' "${PREPARE}"
+  run grep -c 'find . -name' "${PREPARE}"
+  assert_output "1"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-only-declared-steps]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 @test "gates: appending a command to a declared step is caught" {
-  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test; sed -i "2i exit 0" script/ci/tier_b_visual_e2e.sh|'
-  run bash "${CHECK}" "${MUTATED}"
+  _prepare_copy
+  sed -i 's|^./script/build.sh -t e2e-test$|./script/build.sh -t e2e-test; sed -i "2i exit 0" script/ci/tier_b_visual_e2e.sh|' "${PREPARE}"
+  run grep -c '2i exit 0' "${PREPARE}"
+  assert_output "1"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
   assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
 }
 
 @test "gates: changing a declared step's flags is caught" {
-  _mutate 's|^        run: ./script/build.sh -t e2e-test$|        run: ./script/build.sh -t e2e-test --no-cache|'
-  run bash "${CHECK}" "${MUTATED}"
+  _prepare_copy
+  sed -i 's|^./script/build.sh -t e2e-test$|./script/build.sh -t e2e-test --no-cache|' "${PREPARE}"
+  run grep -c -- '--no-cache' "${PREPARE}"
+  assert_output "1"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-only-declared-steps]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# A command nobody declared, on its own line -- the shape every round-11
+# payload took. Refused for the only reason that generalises.
+@test "gates: an undeclared command in the prepare script is caught" {
+  _prepare_copy
+  printf '%s\n' "find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +" >> "${PREPARE}"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# A prepare-script that is not there is not an empty allow-list that passes.
+@test "gates: a missing prepare script is caught" {
+  _prepare_copy
+  rm -f "${PREPARE}"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# The acceptance half: comments and blank lines are not commands, so
+# documenting the script is not a violation.
+@test "gates: comments and blank lines in the prepare script are not commands" {
+  _prepare_copy
+  printf '\n# a note for the next reader\n\n' >> "${PREPARE}"
+  run bash "${CHECK}" --script-dir "${TMP}/ci" "${WORKFLOW}"
+  assert_success
+  assert_output --partial "holds the release invariant"
 }
 
 # The @ref is part of the action. Matching the name alone would let a declared
 # step be repointed at a moving tag or a fork -- the supply-chain half of the
 # same hole.
 @test "gates: repointing a declared action at a moving ref is caught" {
-  _mutate 's|uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02|uses: actions/upload-artifact@main|'
+  _mutate 's|^        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803$|        uses: actions/checkout@main|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
 @test "gates: repointing a declared action at a fork is caught" {
-  _mutate 's|uses: actions/upload-artifact@|uses: evilfork/upload-artifact@|'
+  _mutate 's|^        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803$|        uses: evilfork/checkout@d23441a48e516b6c34aea4fa41551a30e30af803|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
@@ -2704,6 +2821,26 @@ _out_expr() { _mutate "s@^      attestation: \\\${{ steps.acceptance.outputs.att
     runs-on: [self-hosted, gpu]
     steps:
       - run: find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +
+JOB
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[gate-job-runs-only-declared-steps]"
+}
+
+# The same machine, reached the way every self-hosted job in the org now has
+# to reach it: a second call to gpu-self-hosted.yml. Calling a reusable
+# workflow normally exempts a job from this check (where it lands is in a
+# file this one does not read), but THIS workflow's whole purpose is the
+# shared GPU runner, so a caller that is not the picture gate is refused at
+# any ref.
+@test "gates: a second job calling the GPU workflow is caught" {
+  _append_job <<'JOB'
+  helper:
+    permissions:
+      contents: read
+    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml@v1
+    with:
+      run-script: find . -name 'tier_b_visual_e2e.sh' -exec sed -i '2i exit 0' {} +
 JOB
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
@@ -2968,15 +3105,134 @@ YAML
 # not, because the swapped tree's driver can print a well-shaped attestation
 # and require_attestation.sh only checks the shape.
 @test "gates: repointing a declared checkout at another ref is caught" {
-  _mutate 's|^        with:$|        with:\n          ref: refs/heads/not-the-tagged-commit|'
+  _mutate 's|^        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803$|        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803\n        with:\n          ref: refs/heads/not-the-tagged-commit|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[gate-job-runs-only-declared-steps]"
 }
 
-@test "gates: dropping a declared checkout's with: is caught" {
-  _mutate 's|^          submodules: recursive$|          submodules: false|'
+# The Tier B checkout lives in the called workflow; its submodules setting
+# is this call's input, and the producer's stream client is a submodule.
+@test "gates: changing the call's submodules input is caught" {
+  _mutate 's|^      submodules: recursive$|      submodules: false|'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
-  assert_output --partial "[gate-job-runs-only-declared-steps]"
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# ==========================================================================
+# THE PICTURE GATE AS A REUSABLE-WORKFLOW CALL
+# ==========================================================================
+#
+# tier-b-visual-e2e calls ycpss91255-docker/.github's gpu-self-hosted.yml at
+# @main -- the org's one entry point onto the self-hosted GPU runner, and the
+# only ref the runner group is to accept. What THIS repository decides is the
+# call, so the call is pinned whole: the uses: line, every with: input
+# (TIER_B_CALL_WITH), the key set, and `permissions: {contents: read}`.
+# What the called workflow's own steps do is limitation 1(b) in the checker's
+# header.
+
+@test "gates: the picture gate calling the GPU workflow at another ref is caught" {
+  _mutate 's|gpu-self-hosted.yml@main$|gpu-self-hosted.yml@v1|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: the picture gate calling a fork of the GPU workflow is caught" {
+  _mutate 's|^    uses: ycpss91255-docker/.github/|    uses: evilfork/.github/|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# The picture gate turned back into a direct `runs-on:` job: the shape that
+# bypasses the org's fork gate, and the one the runner-group lock will strand.
+@test "gates: the picture gate as a direct self-hosted job is caught" {
+  _mutate 's|^    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml@main$|    runs-on: [self-hosted, gpu]|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: exposing the job token to the driver is caught" {
+  _call_input "      expose-github-token: true"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: a registry login on the picture gate's call is caught" {
+  _call_input "      registry: ghcr.io"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: switching off the workspace reclaim is caught" {
+  _call_input "      reclaim-workspace: false"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: a secret passed to the picture gate's call is caught" {
+  _mutate 's|^      artifact-when: failure$|      artifact-when: failure\n    secrets:\n      run-script-secret: ${{ secrets.ANYTHING }}|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# The 45-minute step timeout is what turns an overrun into a step FAILURE,
+# and so into an evidence upload that carries producer.log; the 60-minute
+# job timeout is the backstop the orphan reaper is calibrated against.
+@test "gates: dropping the step timeout is caught" {
+  _mutate '/^      step-timeout-minutes: 45$/d'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: raising the job timeout is caught" {
+  _mutate 's|^      timeout-minutes: 60$|      timeout-minutes: 120|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# The evidence upload on failure OR cancellation. 'always' would also be a
+# correct upload; it is still a change to what the gate does, so it is
+# declared or refused.
+@test "gates: changing when the evidence uploads is caught" {
+  _mutate 's|^      artifact-when: failure$|      artifact-when: success|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+@test "gates: pointing the prepare-script elsewhere is caught" {
+  _mutate 's|^      prepare-script: bash script/ci/tier_b_prepare.sh$|      prepare-script: bash script/ci/derive_image_tag.sh|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# A called workflow runs with exactly the token its caller grants. Without a
+# job-level block that is the workflow's grant; with `contents: write` it is
+# push access from a shared, root-equivalent host.
+@test "gates: widening the picture gate's permissions is caught" {
+  _mutate '/^  tier-b-visual-e2e:$/,/^    uses:/{s|^      contents: read$|      contents: write|}'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-calls-the-gpu-workflow]"
+}
+
+# The acceptance half: reordering the with: mapping changes nothing GitHub
+# runs, so the pin compares inputs as a set of key/value pairs.
+@test "gates: a reordered with: block on the call still passes" {
+  _mutate '/^      submodules: recursive$/d' \
+          's|^      artifact-when: failure$|      artifact-when: failure\n      submodules: recursive|'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
 }
