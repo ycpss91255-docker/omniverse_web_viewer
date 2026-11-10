@@ -78,6 +78,27 @@ people looking.
     is given, and a second one is a decision for whoever adds it -- defend
     the invariant there too, or say why that file cannot publish. Reusable
     workflows and composite actions are not enumerated at all.
+
+    (b) THE PICTURE GATE ITSELF NOW LIVES IN A REUSABLE WORKFLOW, in another
+    repository: tier-b-visual-e2e calls
+    ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml@main,
+    the org's one entry point onto the self-hosted GPU runner. Its steps --
+    the fork-PR gate, the workspace reclaim, the checkout, the prepare and
+    run steps, the evidence upload, and the `toJSON(steps.suite.outputs)`
+    that becomes script-outputs -- are NOT read here. What IS pinned is
+    everything this repository decides: the `uses:` line exactly, every
+    `with:` input exactly (TIER_B_CALL_WITH, so the driver is still the
+    run-script and nothing like script-env reaches it), no `secrets:`,
+    `permissions: {contents: read}`, and the command lines of the
+    prepare-script (TIER_B_PREPARE_LINES). @main is a MOVING ref by design
+    -- the runner group is to be locked to that workflow at refs/heads/main,
+    so no other ref would reach the runner -- which means an edit merged to
+    ycpss91255-docker/.github changes what the picture gate does with no
+    diff in this repository and no run of this file. That is a trust in a
+    first-party repository's review, stated here rather than implied; the
+    evidence chain (item 14) still fails a run whose driver sampled no
+    frame, whoever's file broke it. The default runner labels are restated
+    as GPU_WORKFLOW_DEFAULT_LABELS and follow upstream only by hand.
  2. GitHub's EXPRESSION SEMANTICS are not evaluated. Conditions are split at
     parenthesis depth 0 by this file's own tokeniser (string-literal aware,
     whitespace-insensitive, and now CASE-insensitive -- `if: ALWAYS()` walked
@@ -88,9 +109,10 @@ people looking.
     spelling to that set -- and an inequivalent one that happens to
     canonicalise to a set member is not caught. `contains()`, `format()`,
     `fromJSON()` and every other function are opaque text.
- 3. Gate WORK is pinned by IDENTITY for exactly the two jobs in
-    GATE_WORK_DRIVERS (tier-b-visual-e2e, verify-tag-shape): each must carry
-    a step whose `run:` is that job's driver invocation verbatim,
+ 3. Gate WORK is pinned by IDENTITY for the jobs in GATE_WORK_DRIVERS
+    (verify-tag-shape, require-picture-evidence), and for tier-b-visual-e2e
+    as the run-script input of its pinned call (item 1(b)). Each driver job
+    must carry a step whose `run:` is that job's driver invocation verbatim,
     unconditional, with no second guarded copy of the same script. For EVERY
     OTHER gate or publishing job the older, weaker test still applies -- "an
     unconditional step whose `run:`/`uses:` names something under
@@ -103,7 +125,9 @@ people looking.
     a `#` inside a quoted shell string is treated as a comment here (it is
     NOT stripped when deriving publishing -- see 4).
 
-    ON THE TWO PINNED JOBS the pin is now an INVOCATION rather than a string:
+    ON THE PINNED DRIVER JOBS the pin is now an INVOCATION rather than a
+    string (on tier-b-visual-e2e, which has no steps, the same refusals are
+    the refused inputs of TIER_B_CALL_WITH -- see its comment):
     `shell:`, `working-directory:` and `env:` are refused on a step that
     invokes the driver, and `defaults.run` and `env:` are refused on those
     jobs and at workflow level, because all three of `shell: cat {0}`,
@@ -260,7 +284,8 @@ people looking.
     reached in round 8, when five single-step edits each left a workflow
     this file passed and a Tier B job that went green having sampled no
     frame. The chain -- spec samples a frame, writes an attestation; the
-    driver verifies it against this run's commit; the job exposes it; the
+    driver verifies it against this run's commit; the job exposes it (as
+    the `attestation` key of the called workflow's script-outputs); the
     require-picture-evidence job fails on empty; both publishers stand
     behind that job -- fails all five at once, without this file having to
     know any of them exist. It does not make the workflow unforgeable
@@ -270,6 +295,7 @@ people looking.
 ===========================================================================
 """
 
+import json
 import pathlib
 import re
 import sys
@@ -297,6 +323,78 @@ GATE_JOBS = (
 )
 
 TIER_B = "tier-b-visual-e2e"
+
+# --- the picture gate is a CALL, and the call is pinned ---------------------
+# tier-b-visual-e2e no longer has steps of its own. Every self-hosted job in
+# the org goes through ycpss91255-docker/.github's gpu-self-hosted.yml, which
+# carries the fork-PR gate, the workspace reclaim, the checkout and the
+# evidence upload; the org runner group trusted-self-hosted is to be locked to
+# that workflow at refs/heads/main. What this repo decides is only the CALL:
+# which workflow, at which ref, with which inputs. So that is what is pinned,
+# exactly, in the same spirit as GATE_JOB_ALLOWED_STEPS -- an input not in
+# this table is refused whatever it does:
+#
+#   script-env           sets the knobs the driver reads for itself
+#                        (TIER_B_PRODUCER_IMAGE and friends) -- the job-level
+#                        `env:` refusal, spelled as an input
+#   expose-github-token  puts the job token in the driver's environment on a
+#                        shared, root-equivalent host
+#   runner-labels        decides where the gate runs (see 10b)
+#   registry / setup-buildx
+#                        a registry login is a publishing signal (PUBLISH_USES)
+#   reclaim-workspace    turning it off leaves a previous job's root-owned
+#                        residue for checkout to trip over
+#   secrets:             run-script-secret reaches both scripts
+#
+# A changed VALUE is refused the same way: run-script IS the gate's work (the
+# old GATE_WORK_DRIVERS pin, moved here), and prepare-script runs arbitrary
+# commands before it. Values are compared whitespace-collapsed, nothing else.
+GPU_WORKFLOW = "ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml"
+GPU_WORKFLOW_REF = GPU_WORKFLOW + "@main"
+# gpu-self-hosted.yml's own `runner-labels` default. Restated here because it
+# is what 10b checks when the call passes no runner-labels; a change upstream
+# that this table does not follow is limitation 1(b).
+GPU_WORKFLOW_DEFAULT_LABELS = ("self-hosted", "gpu")
+TIER_B_DRIVER = "bash script/ci/tier_b_visual_e2e.sh"
+TIER_B_PREPARE = "bash script/ci/tier_b_prepare.sh"
+TIER_B_CALL_WITH = {
+    "prepare-script": TIER_B_PREPARE,
+    "run-script": TIER_B_DRIVER,
+    "timeout-minutes": "60",
+    "step-timeout-minutes": "45",
+    "submodules": "recursive",
+    "artifact-name": "tier-b-visual-e2e-evidence",
+    "artifact-path": ".tier-b-artifacts",
+    "artifact-when": "failure",
+}
+# The keys a job that calls a reusable workflow may carry at all here. GitHub
+# itself refuses `steps:`, `runs-on:`, `env:`, `container:`, `services:`,
+# `outputs:`, `timeout-minutes:` and `continue-on-error:` on such a job, so a
+# workflow that has them fails loudly there; refusing them here too means this
+# file never reasons about a shape GitHub would not run. `secrets:` and
+# `strategy:` are legal on a call and are refused because nothing here needs
+# them. `name:` is cosmetic.
+TIER_B_CALL_KEYS = frozenset(
+    ("name", "needs", "if", "permissions", "concurrency", "uses", "with")
+)
+TIER_B_CALL_PERMISSIONS = {"contents": "read"}
+
+# The prepare-script's COMMANDS, pinned. They used to be four declared steps
+# of the Tier B job (GATE_JOB_ALLOWED_STEPS); a call has no steps, so they are
+# a script now, and the allow-list follows them there. Every line of
+# script/ci/tier_b_prepare.sh that is not blank, not a comment and not the
+# shebang must be, in order, exactly one of these (whitespace-collapsed).
+# There is no wildcard and no prefix match, for the reason
+# GATE_JOB_ALLOWED_STEPS gives: a pattern open at one end is open to a chained
+# command.
+TIER_B_PREPARE_SCRIPT = "tier_b_prepare.sh"
+TIER_B_PREPARE_LINES = (
+    "set -euo pipefail",
+    "./script/setup.sh apply",
+    'sed -i "s|^WS_PATH=.*|WS_PATH=${GITHUB_WORKSPACE}|" .env.generated',
+    "./script/build.sh -t e2e-test",
+    'docker pull "$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)"',
+)
 
 # The gate jobs whose WORK IS ONE EXACT COMMAND, and what that command is.
 #
@@ -333,7 +431,8 @@ GATE_WORK_DRIVERS = {
     # about a Turing-complete language. "Is this job's work exactly this
     # command?" is not.
     "require-picture-evidence": "bash script/ci/require_attestation.sh",
-    TIER_B: "bash script/ci/tier_b_visual_e2e.sh",
+    # The Tier B driver is not here any more: tier-b-visual-e2e has no steps,
+    # so its work is pinned as the run-script input of TIER_B_CALL_WITH.
     "verify-tag-shape": "bash script/ci/derive_image_tag.sh",
 }
 
@@ -1075,6 +1174,47 @@ def runs_on_variants(wf, job):
             "runner it lands on is not determined here" % text
         )
     return [[text]], None
+
+
+def tier_b_runner_variants(wf):
+    """runs_on_variants() for the picture gate, which is a reusable CALL.
+
+    A job that `uses:` a reusable workflow has no runs-on; where it lands is
+    the called workflow's `runs-on`, which for gpu-self-hosted.yml is
+    `fromJSON(inputs.runner-labels)`. So the labels are read from this call's
+    `runner-labels` input, else that input's default
+    (GPU_WORKFLOW_DEFAULT_LABELS). Any other called workflow is not
+    resolvable here -- its runs-on is in a file this one does not read -- and
+    a job with no `uses:` is read as before.
+    """
+    body = wf.body(TIER_B)
+    uses = as_text(body.get("uses") or "").strip()
+    if not uses:
+        return runs_on_variants(wf, TIER_B)
+    if uses != GPU_WORKFLOW_REF:
+        return None, (
+            "it calls '%s', not %s, so where it runs is decided in a file "
+            "this checker does not read" % (uses, GPU_WORKFLOW_REF)
+        )
+    inputs = body.get("with")
+    raw = inputs.get("runner-labels") if isinstance(inputs, dict) else None
+    if raw is None:
+        return [list(GPU_WORKFLOW_DEFAULT_LABELS)], None
+    text = as_text(raw)
+    if "${{" in text:
+        return None, (
+            "runner-labels is the expression '%s', whose value is decided "
+            "outside this file" % text
+        )
+    try:
+        labels = json.loads(text)
+    except ValueError:
+        return None, "runner-labels '%s' is not a JSON array" % text
+    if not isinstance(labels, list) or not all(
+        isinstance(label, str) for label in labels
+    ):
+        return None, "runner-labels '%s' is not a JSON array of strings" % text
+    return [labels], None
 
 
 def _join_continuations(text):
@@ -1920,7 +2060,10 @@ def check(wf):
                     % (job, step_if, reason, step_label(step)),
                 )
 
-        if work_steps == 0 and job in (TIER_B, "verify-tag-shape"):
+        # The jobs whose work is one pinned driver. tier-b-visual-e2e is not
+        # one of them any more: it has no steps, and its work is the
+        # run-script input pinned by check_tier_b_call.
+        if work_steps == 0 and job in GATE_WORK_DRIVERS:
             violation(
                 "gate-job-work-step-is-unconditional",
                 "gate job '%s' no longer runs any script/ci/ helper, so there "
@@ -1943,7 +2086,8 @@ def check(wf):
     #
     # The one other spelling allowed by (c) is a `--print-<something>` QUERY,
     # which asks the driver for a value rather than doing the job (this
-    # repo's Tier B job pulls the producer image the driver names). It must
+    # repo's Tier B prepare-script pulls the producer image the driver names;
+    # in a step-level driver job the same query is a step). It must
     # itself be unconditional: a skipped query fails the step that uses it.
     for job in sorted(GATE_WORK_DRIVERS):
         if not wf.has(job):
@@ -2240,7 +2384,7 @@ def check(wf):
     # "boot a real Kit producer and assert a browser renders a non-black frame
     # from it", and no hosted runner has NVENC -- so `runs-on: ubuntu-latest`
     # here does not slow the gate down, it removes it.
-    variants, problem = runs_on_variants(wf, TIER_B)
+    variants, problem = tier_b_runner_variants(wf)
     if problem is not None:
         violation(
             "tier-b-runs-on-the-gpu-runner",
@@ -2327,6 +2471,9 @@ def check(wf):
                 % (job, reason, TIER_B, job_if or "<absent>"),
             )
 
+    # --- 10d. the picture gate is THE call, and nothing else -------------
+    check_tier_b_call(wf)
+
     # Last, and deliberately last: the one property that is not about text.
     check_picture_leaves_evidence(wf)
 
@@ -2355,8 +2502,9 @@ def check(wf):
 #   the acceptance spec samples a frame and writes an attestation
 #     -> the driver verifies it against this run's commit, emits it as a
 #        step output
-#       -> the Tier B job exposes that step output as a job output
-#         -> publish-image binds that job output and FAILS ON EMPTY
+#       -> the Tier B job exposes that step output (today: the `attestation`
+#          key of gpu-self-hosted.yml's script-outputs JSON)
+#         -> require-picture-evidence binds it and FAILS ON EMPTY
 #
 # All five bypasses break the same link -- no frame means no attestation means
 # an empty output -- without this checker having to know they exist. What is
@@ -2370,9 +2518,21 @@ def check(wf):
 # exists, and it is this commit's frame", which is where the actual v0.3.0-rc1
 # failure lived.
 ATTESTATION_OUTPUT = "attestation"
-ACCEPTANCE_STEP_ID = "acceptance"
-ACCEPTANCE_EXPR = "steps.%s.outputs.%s" % (ACCEPTANCE_STEP_ID, ATTESTATION_OUTPUT)
-ATTESTATION_REF = "needs.%s.outputs.%s" % (TIER_B, ATTESTATION_OUTPUT)
+# Link 3 now crosses a reusable-workflow boundary. gpu-self-hosted.yml returns
+# EVERY key its run-script step wrote to $GITHUB_OUTPUT as one JSON object,
+# `script-outputs` (`toJSON(steps.suite.outputs)` upstream); keys the
+# prepare-script writes are a different step and are NOT in it. The run-script
+# is pinned to the driver (TIER_B_CALL_WITH), so the only writer of that
+# object is the driver, and the key is read out of it here. `|| '{}'` is the
+# documented guard for a job that did not run: fromJSON('') would fail the
+# expression, while fromJSON('{}').attestation is '' -- and empty is what
+# require_attestation.sh refuses.
+SCRIPT_OUTPUTS = "script-outputs"
+ATTESTATION_REF = "fromJSON(needs.%s.outputs.%s || '{}').%s" % (
+    TIER_B,
+    SCRIPT_OUTPUTS,
+    ATTESTATION_OUTPUT,
+)
 EVIDENCE_JOB = "require-picture-evidence"
 
 
@@ -2384,52 +2544,22 @@ def check_picture_leaves_evidence(wf):
         # Its absence is already a violation elsewhere; do not double-report.
         return
 
-    # Link 3: the job exposes the evidence, sourced from the step that does
-    # the gate work. A job output wired to some other step would be evidence
-    # of nothing in particular.
-    outputs = wf.body(TIER_B).get("outputs")
-    attested = ""
-    if isinstance(outputs, dict):
-        attested = str(outputs.get(ATTESTATION_OUTPUT, "") or "")
-    if not attested:
+    # Links 2 and 3: the driver's output leaves the job. It used to be a job
+    # `outputs:` entry read from a step id, and both were checked here. A call
+    # has neither: the called workflow returns script-outputs, and what can
+    # write into it is decided by which command is the run-script. That is
+    # pinned, with the rest of the call, by check_tier_b_call -- so a call
+    # that is not THE call is reported here as well, because the evidence the
+    # publishers wait on would then come from somewhere this file did not
+    # pin.
+    if as_text(wf.body(TIER_B).get("uses") or "").strip() != GPU_WORKFLOW_REF:
         violation(
             vid,
-            "job '%s' does not declare an '%s' output, so the frame it "
-            "sampled cannot leave the job and no later job can require it. "
-            "A green job status is not a picture: it is equally green when "
-            "the driver was replaced, shadowed or pointed at another image."
-            % (TIER_B, ATTESTATION_OUTPUT),
-        )
-    elif " ".join(attested.split()) != "${{ %s }}" % ACCEPTANCE_EXPR:
-        # An id MENTIONED is not an output READ. `"acceptance-ok"` and
-        # `${{ steps.acceptance.outcome }}` both contain the id and are both
-        # permanently non-empty -- a constant dressed as evidence.
-        violation(
-            vid,
-            "job '%s' declares its '%s' output as %r, which is not %s. The "
-            "evidence must be the value the gate-work step produced; a "
-            "constant, or that step's `outcome`, is never empty and so "
-            "attests to nothing."
-            % (
-                TIER_B,
-                ATTESTATION_OUTPUT,
-                attested,
-                "${{ %s }}" % ACCEPTANCE_EXPR,
-            ),
-        )
-
-    # Link 2b: that step still carries the id the output reads from.
-    if not any(
-        str(step.get("id", "")) == ACCEPTANCE_STEP_ID
-        for step in wf.steps(TIER_B)
-        if isinstance(step, dict)
-    ):
-        violation(
-            vid,
-            "no step in '%s' has id '%s', so the job output above resolves to "
-            "the empty string -- and an empty attestation is exactly what a "
-            "job that sampled no frame produces. The two must not look alike."
-            % (TIER_B, ACCEPTANCE_STEP_ID),
+            "job '%s' does not call %s, so %s does not name an output this "
+            "file knows the source of. The attestation is the run-script's "
+            "own $GITHUB_OUTPUT, returned by that workflow; from anywhere "
+            "else it is a value that may never be empty."
+            % (TIER_B, GPU_WORKFLOW_REF, "${{ %s }}" % ATTESTATION_REF),
         )
 
     # Link 4: one job REQUIRES the evidence, in a way that can actually fail.
@@ -2557,21 +2687,9 @@ def check_picture_leaves_evidence(wf):
 # without it would let a declared step be pointed at `@main`, or at a fork,
 # which is the supply-chain half of the same hole.
 GATE_JOB_ALLOWED_STEPS = {
-    "tier-b-visual-e2e": (
-        "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
-        " with:submodules=recursive",
-        "uses:actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
-        " with:if-no-files-found=warn,name=tier-b-visual-e2e-evidence,"
-        "path=.tier-b-artifacts",
-        "run:docker run --rm -v \"${GITHUB_WORKSPACE}\":/w -w /w "
-        "busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d"
-        "11b1ab28616 sh -c ' rm -rf .tier-b-artifacts 2>/dev/null true'",
-        "run:./script/setup.sh apply sed -i "
-        "\"s|^WS_PATH=.*|WS_PATH=${GITHUB_WORKSPACE}|\" .env.generated",
-        "run:./script/build.sh -t e2e-test",
-        "run:docker pull \"$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)\"",
-        "run:bash script/ci/tier_b_visual_e2e.sh",
-    ),
+    # tier-b-visual-e2e is not here: it calls gpu-self-hosted.yml and has no
+    # steps. The four commands that used to be its declared steps are pinned
+    # in TIER_B_PREPARE_LINES, and the call itself in TIER_B_CALL_WITH.
     "verify-tag-shape": (
         "uses:actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
         "run:bash script/ci/derive_image_tag.sh",
@@ -2651,10 +2769,30 @@ def check_gate_steps_are_declared(wf):
             continue
         # A job that CALLS a reusable workflow declares no runs-on of its own;
         # where that workflow's own jobs land is decided in a file this one
-        # does not read, and header item 5 already says so. Skipping it here
+        # does not read, and header item 1 already says so. Skipping it here
         # keeps that limitation in one place instead of turning it into a
         # violation nobody can act on.
-        if as_text(wf.body(job).get("uses") or "").strip():
+        #
+        # With ONE exception, which is known without reading the other file:
+        # gpu-self-hosted.yml exists to put its caller on the shared GPU
+        # runner. A second job calling it is an undeclared job on that
+        # machine, the case this whole check is about, at any ref. The
+        # picture gate's own call is checked by check_tier_b_call.
+        uses = as_text(wf.body(job).get("uses") or "").strip()
+        if uses:
+            if job != TIER_B and uses.split("@", 1)[0].casefold() == (
+                GPU_WORKFLOW.casefold()
+            ):
+                violation(
+                    "gate-job-runs-only-declared-steps",
+                    "job '%s' calls %s, which runs on the shared self-hosted "
+                    "GPU runner, and it is not the picture gate. That runner "
+                    "is persistent and shared -- an undeclared job on it can "
+                    "edit the workspace the picture gate then runs in, while "
+                    "the gate's own call stays exactly as pinned. Fold the "
+                    "work into the gate's scripts, or run it on a hosted "
+                    "runner." % (job, uses),
+                )
             continue
         variants, problem = runs_on_variants(wf, job)
         if problem is not None:
@@ -2712,6 +2850,148 @@ def check_gate_steps_are_declared(wf):
                 "legitimate, declare it there, where a reviewer sees it."
                 % (job, signature[:200]),
             )
+
+
+# Where tier_b_prepare.sh is read from: beside this file, which is
+# script/ci/ in the repository and /ci/ in the devel-test image. main()'s
+# --script-dir replaces it, so release_gate_workflow.bats can hand the
+# checker an edited copy without a writable /ci/.
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def prepare_script_lines(text):
+    """The COMMAND lines of a prepare script, whitespace-collapsed.
+
+    Blank lines, whole-line comments and a first-line shebang are dropped;
+    everything else is a command. A trailing comment is NOT stripped: it is
+    then part of a line that matches no entry, which fails closed -- the
+    opposite trade from _strip_shell_comments, and on purpose, because this
+    is an allow-list.
+    """
+    lines = []
+    for number, line in enumerate(text.split("\n")):
+        collapsed = " ".join(line.split())
+        if not collapsed:
+            continue
+        if number == 0 and collapsed.startswith("#!"):
+            continue
+        if collapsed.startswith("#"):
+            continue
+        lines.append(collapsed)
+    return tuple(lines)
+
+
+def check_tier_b_call(wf):
+    """The picture gate is exactly the pinned gpu-self-hosted.yml call."""
+    vid = "tier-b-calls-the-gpu-workflow"
+    if not wf.has(TIER_B):
+        return
+    body = wf.body(TIER_B)
+
+    uses = as_text(body.get("uses") or "").strip()
+    if uses != GPU_WORKFLOW_REF:
+        violation(
+            vid,
+            "job '%s' must be `uses: %s` and is %s. The org's self-hosted GPU "
+            "runner is reached through that one workflow (the runner group is "
+            "to be locked to it at refs/heads/main), and it is what carries "
+            "the fork-PR gate and the workspace reclaim. Another ref, a fork, "
+            "or a direct `runs-on:` job is a gate this file cannot vouch for."
+            % (
+                TIER_B,
+                GPU_WORKFLOW_REF,
+                "'uses: %s'" % uses if uses else "a job with its own steps",
+            ),
+        )
+
+    extra = sorted(
+        as_text(key) for key in body if as_text(key) not in TIER_B_CALL_KEYS
+    )
+    if extra:
+        violation(
+            vid,
+            "job '%s' carries %s, which a pinned reusable-workflow call does "
+            "not. `secrets:` reaches the scripts as RUN_SCRIPT_SECRET; "
+            "`steps:`, `runs-on:`, `env:`, `container:` and the rest are keys "
+            "GitHub refuses on a call, or work this job does not do. Allowed: "
+            "%s" % (TIER_B, extra, sorted(TIER_B_CALL_KEYS)),
+        )
+
+    inputs = body.get("with")
+    got = {}
+    if isinstance(inputs, dict):
+        for key, value in inputs.items():
+            got[as_text(key)] = " ".join(as_text(value).split())
+    if got != TIER_B_CALL_WITH:
+        missing = sorted(set(TIER_B_CALL_WITH) - set(got))
+        added = sorted(set(got) - set(TIER_B_CALL_WITH))
+        changed = sorted(
+            key
+            for key in set(got) & set(TIER_B_CALL_WITH)
+            if got[key] != TIER_B_CALL_WITH[key]
+        )
+        violation(
+            vid,
+            "job '%s' passes `with:` inputs that are not the pinned set "
+            "(TIER_B_CALL_WITH). missing: %s; not declared: %s; changed: %s. "
+            "run-script IS the gate's work, prepare-script runs before it on "
+            "a shared root-equivalent host, and an input like script-env or "
+            "expose-github-token changes what the driver sees while every "
+            "line here still reads the same. If the change is legitimate, "
+            "declare it in TIER_B_CALL_WITH, where a reviewer sees it."
+            % (
+                TIER_B,
+                missing or "none",
+                added or "none",
+                ["%s=%r" % (key, got[key]) for key in changed] or "none",
+            ),
+        )
+
+    perms = body.get("permissions")
+    normalised = (
+        {as_text(k): as_text(v) for k, v in perms.items()}
+        if isinstance(perms, dict)
+        else perms
+    )
+    if normalised != TIER_B_CALL_PERMISSIONS:
+        violation(
+            vid,
+            "job '%s' must declare `permissions: {contents: read}` and "
+            "declares %r. The called workflow runs with exactly the token "
+            "this job grants, on a persistent, shared host; without a "
+            "job-level block it inherits whatever the workflow grants."
+            % (TIER_B, perms),
+        )
+
+    # The prepare-script's commands, against TIER_B_PREPARE_LINES.
+    path = _SCRIPT_DIR / TIER_B_PREPARE_SCRIPT
+    try:
+        text = path.read_text()
+    except OSError as error:
+        violation(
+            vid,
+            "cannot read %s (%s), so what the picture gate runs before its "
+            "driver is unknown. It is the prepare-script of the pinned call "
+            "and must exist beside this checker." % (path, error),
+        )
+        return
+    lines = prepare_script_lines(text)
+    if lines != TIER_B_PREPARE_LINES:
+        undeclared = [line for line in lines if line not in TIER_B_PREPARE_LINES]
+        violation(
+            vid,
+            "%s runs %s, which is not exactly TIER_B_PREPARE_LINES%s. It "
+            "runs on the shared GPU host BEFORE the driver, in the same "
+            "workspace, so one extra command can rewrite the driver or the "
+            "evidence gate while the call stays byte-identical. If the "
+            "change is legitimate, declare it in TIER_B_PREPARE_LINES."
+            % (
+                path,
+                list(lines),
+                " (undeclared: %s)" % undeclared if undeclared else
+                " (same commands, different order or count)",
+            ),
+        )
 
 
 RELEASE_WORKFLOW = "main.yaml"
@@ -2773,7 +3053,12 @@ def workflow_paths(target):
 
 
 def main(argv):
-    target = argv[1] if len(argv) > 1 else ".github/workflows"
+    global _SCRIPT_DIR
+    args = list(argv[1:])
+    if len(args) >= 2 and args[0] == "--script-dir":
+        _SCRIPT_DIR = pathlib.Path(args[1])
+        args = args[2:]
+    target = args[0] if args else ".github/workflows"
     release_path, siblings = workflow_paths(target)
 
     check(Workflow(release_path))

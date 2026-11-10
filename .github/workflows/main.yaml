@@ -94,13 +94,16 @@ on:
 # the push, so a retag of either would yield the registry credential and the
 # ability to publish arbitrary content to
 # ghcr.io/ycpss91255-docker/omniverse_web_viewer, which downstream consumers pin
-# and execute. `busybox` is pinned by digest for the same reason and one more:
-# that container runs as root with the workspace bind-mounted, BEFORE checkout,
-# on a persistent self-hosted GPU host.
+# and execute.
 #
 # `ycpss91255-docker/base/...` reusable workflows stay on version TAGS
 # deliberately: they are first-party, the tags are ours, and the refs are the
-# subject of their own tracked decisions (#37, #67, base#915). Bumping a pin
+# subject of their own tracked decisions (#37, #67, base#915). The one
+# exception is ycpss91255-docker/.github's gpu-self-hosted.yml, called at
+# @main: the org runner group trusted-self-hosted is to be locked to that
+# workflow at refs/heads/main, so it is the only ref that will reach the GPU
+# runner at all. That workflow pins its own actions and its busybox by
+# digest. Bumping a pin
 # means replacing both the SHA and the trailing version comment -- there is no
 # dependabot `github-actions` entry in this repo yet, so that is manual today.
 # ---------------------------------------------------------------------------
@@ -304,7 +307,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     env:
-      ATTESTATION: ${{ needs.tier-b-visual-e2e.outputs.attestation }}
+      # The driver's `attestation=` line, returned by gpu-self-hosted.yml as
+      # one key of its script-outputs JSON. `|| '{}'` keeps fromJSON from
+      # failing when that output is empty; the key is then absent, the value
+      # is '', and require_attestation.sh refuses -- empty fails CLOSED.
+      ATTESTATION: ${{ fromJSON(needs.tier-b-visual-e2e.outputs.script-outputs || '{}').attestation }}
     steps:
       # Without this the job cannot see the script it is pinned to, exits 127,
       # and -- because both publishers require its success -- deadlocks every
@@ -525,8 +532,9 @@ jobs:
   # a dead host; status states against a canvas the spec paints itself).
   #
   # NOT per-PR, on purpose: the producer boots Kit (minutes) and needs the GPU.
-  # Nightly, every RELEASE path, and explicit manual opt-in. `runs-on:
-  # [self-hosted, gpu]` because no hosted runner has NVENC.
+  # Nightly, every RELEASE path, and explicit manual opt-in. On the
+  # self-hosted GPU runner, through the org's gpu-self-hosted.yml reusable
+  # workflow, because no hosted runner has NVENC.
   #
   # The release path was added by #70. This job is the gate call-release and
   # publish-image hang off, so it must run wherever those two could run:
@@ -582,21 +590,11 @@ jobs:
       || startsWith(github.ref, 'refs/tags/')
       || (github.event_name == 'workflow_dispatch'
           && (inputs.run_tier_b || inputs.publish_image_tag != ''))
-    runs-on: [self-hosted, gpu]
-    timeout-minutes: 60
-    # The evidence, hoisted out of the job so publish-image can REQUIRE it.
-    # A green job status is not the picture: review round 8 produced five
-    # single-step edits to this file that keep this job green while removing
-    # the picture (truncating the driver, `sed -i '1a exit 0' script/ci/*.sh`,
-    # a $GITHUB_PATH shim over `bash`, a `container:` whose bash is a stub,
-    # $GITHUB_ENV aiming the producer at busybox). All five end with the
-    # acceptance spec never sampling a frame, so all five leave this output
-    # empty -- and publish-image refuses to push on an empty one.
-    outputs:
-      attestation: ${{ steps.acceptance.outputs.attestation }}
     # Checks out, builds and runs containers -- nothing more. Explicitly read,
     # because this job runs on a persistent, shared host where a repo-write
-    # token in the environment would turn GPU-host access into push access.
+    # token in the environment would turn GPU-host access into push access. A
+    # called workflow cannot widen this, and gpu-self-hosted.yml does not
+    # export the token to the scripts at all (expose-github-token is off).
     permissions:
       contents: read
     # One Kit on the GPU at a time, and never cancel mid-teardown -- a killed
@@ -604,79 +602,59 @@ jobs:
     concurrency:
       group: owv-tier-b-visual-e2e
       cancel-in-progress: false
-    steps:
-      # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in
-      # the workspace that breaks the non-root runner's checkout clean step.
-      # Mirrors isaac's stream-smoke; refs ycpss91255-docker/github_runner#77.
-      - name: Pre-checkout cleanup (clear stale root-owned residue)
-        run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}":/w -w /w busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616 sh -c '
-            rm -rf .tier-b-artifacts 2>/dev/null
-            true'
-
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          submodules: recursive
-
-      # base detect_ws_path mis-detects the self-CI _work/<repo>/<repo> layout;
-      # pin WS_PATH to the checkout root in the derived cache so the compose
-      # build resolves. Same fix isaac applies in stream-smoke (base#586).
-      - name: Generate .env + compose.yaml (pin WS_PATH)
-        run: |
-          ./script/setup.sh apply
-          sed -i "s|^WS_PATH=.*|WS_PATH=${GITHUB_WORKSPACE}|" .env.generated
-
-      # The same stage the per-PR gate builds. Building it here also re-runs the
-      # tier-1 in-image gate, so a Tier B run can never pass on a stale image.
-      - name: Build the e2e-test image (viewer + browser in one)
-        run: ./script/build.sh -t e2e-test
-
-      # Explicit, so a registry problem is distinguishable from an acceptance
-      # failure and a multi-GB pull does not eat the acceptance step's budget.
+    # The org's one entry point onto the self-hosted GPU runner. It carries
+    # the fork-PR gate, the root-owned-residue reclaim before checkout (which
+    # used to be this job's busybox step; checkout's clean then removes a
+    # previous run's .tier-b-artifacts), the checkout itself, and the
+    # failure/cancel upload. Its `runner-labels` default is
+    # ["self-hosted", "gpu"], because no hosted runner has NVENC.
+    #
+    # @main, not a SHA, on purpose: the runner group trusted-self-hosted is to
+    # be locked to that workflow AT refs/heads/main, so any other ref would
+    # be refused at the runner. check_release_gates.py pins this exact call:
+    # the uses: line, every `with:` key below and nothing else -- no
+    # script-env, no secrets, no runner-labels.
+    uses: ycpss91255-docker/.github/.github/workflows/gpu-self-hosted.yml@main
+    with:
+      # setup.sh apply + WS_PATH pin, the e2e-test build and the producer
+      # pull. Outside the step timeout, so a multi-GB pull does not eat the
+      # acceptance budget.
+      prepare-script: bash script/ci/tier_b_prepare.sh
+      # Boots the producer, waits for its streaming server, drives the
+      # browser, and tears down its own instance-scoped containers on every
+      # exit path. It writes `attestation=` to $GITHUB_OUTPUT, which the
+      # called workflow returns as the `script-outputs` JSON output.
       #
-      # The reference comes FROM the driver rather than being repeated here:
-      # the producer is pinned by DIGEST (it runs as root with
-      # `--network=host --ipc=host --gpus all` on this persistent shared GPU
-      # host, and GHCR tags are mutable -- see the driver's own note and the
-      # busybox pin above), and a second copy of that digest in this file is a
-      # thing that can drift from the one actually run.
-      - name: Pull the pinned producer image
-        run: docker pull "$(bash script/ci/tier_b_visual_e2e.sh --print-producer-image)"
-
-      # Boots the producer, waits for its streaming server, drives the browser,
-      # and tears down its own instance-scoped containers on every exit path.
-      #
-      # STEP-level timeout, inside the job's 60-minute budget. An overrun is
-      # then a step FAILURE -- the job ends `failure`, the upload below runs,
-      # and the driver is signalled (it exits 130/143 and writes producer.log
-      # on the way out). A job-level `timeout-minutes` overrun instead CANCELS
-      # the job, and `if: failure()` does not run in a cancelled job, so the
-      # single most expensive failure mode used to leave nothing behind. The
-      # job's own 60 stays as the backstop the orphan reaper's default
-      # (TIER_B_ORPHAN_MAX_AGE_MIN=120, twice the budget) is calibrated against.
-      - name: Tier B visual acceptance (real producer -> real frames)
-        id: acceptance
-        timeout-minutes: 45
-        run: bash script/ci/tier_b_visual_e2e.sh
-
-      # `cancelled()` as well as `failure()`: the job can still be cancelled
-      # from outside (the concurrency group, a manual cancel, the job backstop),
-      # and a cancelled Tier B is exactly the run whose evidence is worth having
-      # -- the next run's pre-checkout step deletes .tier-b-artifacts, so
-      # anything not uploaded here is gone.
-      #
-      # `if-no-files-found: warn` (the default) rather than `ignore`: the driver
-      # always writes producer.log, which it calls "the only diagnosis a nightly
-      # failure leaves behind", so an EMPTY upload means something went wrong
+      # The evidence, hoisted out of the job so publish-image can REQUIRE it.
+      # A green job status is not the picture: review round 8 produced five
+      # single-step edits to this file that keep this job green while
+      # removing the picture. All five end with the acceptance spec never
+      # sampling a frame, so all five leave that output empty -- and
+      # require-picture-evidence refuses on an empty one.
+      run-script: bash script/ci/tier_b_visual_e2e.sh
+      # The job's 60 stays as the backstop the orphan reaper's default
+      # (TIER_B_ORPHAN_MAX_AGE_MIN=120, twice the budget) is calibrated
+      # against.
+      timeout-minutes: 60
+      # STEP-level timeout on the run-script, inside the job's 60-minute
+      # budget. An overrun is then a step FAILURE -- the job ends `failure`,
+      # the upload runs, and the driver is signalled (it exits 130/143 and
+      # writes producer.log on the way out). A job-level overrun instead
+      # CANCELS the job; the called workflow's upload also runs on cancel,
+      # but a step failure is the path that leaves producer.log behind.
+      step-timeout-minutes: 45
+      submodules: recursive
+      # 'failure' is failure() OR cancelled() in the called workflow: the job
+      # can still be cancelled from outside (the concurrency group, a manual
+      # cancel, the job backstop), and a cancelled Tier B is exactly the run
+      # whose evidence is worth having -- the next run's checkout deletes
+      # .tier-b-artifacts, so anything not uploaded here is gone. The
+      # if-no-files-found default (warn, not ignore) stays: the driver always
+      # writes producer.log, so an EMPTY upload means something went wrong
       # before that and should not look identical to a real one.
-      - name: Upload evidence on failure or cancellation
-        if: ${{ failure() || cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: tier-b-visual-e2e-evidence
-          path: .tier-b-artifacts
-          if-no-files-found: warn
+      artifact-name: tier-b-visual-e2e-evidence
+      artifact-path: .tier-b-artifacts
+      artifact-when: failure
 
   # ------------------- blocked-release visibility (report only) -------------
   # NOT A GATE, and deliberately incapable of being one: nothing `needs` this
