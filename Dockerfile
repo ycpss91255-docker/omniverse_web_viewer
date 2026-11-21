@@ -670,6 +670,10 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
 
 WORKDIR /e2e
 COPY --chown="${USER}":"${GROUP}" test/e2e/ /e2e/
+# tier-b-visual.spec.ts 以 ../../script/ci/visual_thresholds.json 讀門檻值
+# （spec、driver 與 verify_tier_b_attestation.py 共用同一份，#88），從 /e2e
+# 解析就是 /script/ci/。少了這一行 spec 載入不了；run-in-image.sh 的載入檢查會擋。
+COPY --chown="${USER}":"${GROUP}" script/ci/visual_thresholds.json /script/ci/visual_thresholds.json
 
 # Install the e2e tooling (Playwright only -- no @nvidia) and the Chromium
 # browser plus its OS deps. `--with-deps` apt-installs the headless libs.

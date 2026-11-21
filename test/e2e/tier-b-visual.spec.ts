@@ -41,7 +41,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import visualThresholds from '../../script/ci/visual_thresholds.json';
+// `with { type: 'json' }` 不能省：Node 的 ESM 載入器拒絕沒有 import attribute
+// 的 JSON 模組（`needs an import attribute of "type: json"`）。
+import visualThresholds from '../../script/ci/visual_thresholds.json' with { type: 'json' };
 
 const BASE_URL = process.env.OWV_BASE_URL || 'http://127.0.0.1:5174';
 const ARTIFACT_DIR = process.env.OWV_ARTIFACT_DIR || '';
