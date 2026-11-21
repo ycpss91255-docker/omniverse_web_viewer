@@ -527,18 +527,72 @@ _sibling_workflow() {
   assert_output --partial "[gate-job-work-step-is-unconditional]"
 }
 
-# release-blocked-report / nightly-tier-b-report use `always()` and exist only
-# to turn a silently blocked release into a red run. Nothing may need one: a
-# job that waits on them would inherit an always()-gated dependency, which is
-# the escape the picture-gate rule forbids.
-# why: `[no-job-needs-a-report-only-job]` -- `release-blocked-report` /
-# `nightly-tier-b-report` use `always()` and exist only to ADD a failure; a
-# job that waits on one inherits that `always()`
+# release-blocked-report uses `always()` and exists only to turn a silently
+# blocked release into a red run. Nothing may need it: a job that waits on it
+# would inherit an always()-gated dependency, which is the escape the
+# picture-gate rule forbids. (nightly-tier-b-report went with the nightly
+# schedule, #106.)
+# why: `[no-job-needs-a-report-only-job]` -- `release-blocked-report` uses
+# `always()` and exists only to ADD a failure; a job that waits on it inherits
+# that `always()`
 @test "gates: making a report-only job a dependency is caught" {
   _mutate 's/needs: \[call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence\]/needs: [call-docker-build, call-release, tier-b-visual-e2e, require-picture-evidence, release-blocked-report]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[no-job-needs-a-report-only-job]"
+}
+
+# ---------------------------------------------------------------------------
+# #106（對齊 isaac#434）：沒有每晚排程，Tier B 依變更範圍在 PR 上跑。
+
+# why: `[no-schedule-or-trigger-path-filter]` -- 每晚跑的檢查沒有發揮作用：
+# Tier B 從 2026-09-06 起每晚都紅，兩個多月沒有人處理（#104）
+@test "gates: a nightly schedule coming back is caught" {
+  _mutate 's/^  workflow_dispatch:$/  schedule:\n    - cron: "0 20 * * *"\n  workflow_dispatch:/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[no-schedule-or-trigger-path-filter]"
+}
+
+# why: `[no-schedule-or-trigger-path-filter]` -- 觸發層的 paths 會讓整個
+# workflow 被略過，PR 上的狀態永遠停在 pending；兩種鍵、兩個事件都要認得
+@test "gates: a trigger-level path filter is caught" {
+  _mutate 's/^  pull_request:$/  pull_request:\n    paths: ["apps\/**"]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "on.pull_request.paths"
+
+  _mutate 's/^  push:$/  push:\n    paths-ignore: ["doc\/**"]/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "on.push.paths-ignore"
+}
+
+# why: `[tier-b-pr-runs-only-on-own-branches]` -- Tier B 在持久的 self-hosted
+# GPU host 上執行 PR 分支裡的 Dockerfile 與腳本，fork 來的 PR 不能跑
+@test "gates: Tier B on a PR without the fork guard is caught" {
+  _mutate 's/^          \&\& github\.event\.pull_request\.head\.repo\.full_name == github\.repository)$/          )/'
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-pr-runs-only-on-own-branches]"
+}
+
+# why: `[tier-b-pr-runs-by-scope]` -- 只改文件的 PR 不能佔用 GPU，選不選由
+# `changes` job 決定
+@test "gates: Tier B on a PR without the scope selection is caught" {
+  _mutate "/^          && needs\.changes\.outputs\.viewer == 'true'\$/d"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_failure 1
+  assert_output --partial "[tier-b-pr-runs-by-scope]"
+}
+
+# why: 同一個判斷運算元前後對調是同一件事，不能被當成違規
+@test "gates: the PR guards with their operands reversed are accepted" {
+  _mutate 's/github\.event\.pull_request\.head\.repo\.full_name == github\.repository)$/github.repository == github.event.pull_request.head.repo.full_name)/' \
+    "s/^          && needs\.changes\.outputs\.viewer == 'true'\$/          \&\& 'true' == needs.changes.outputs.viewer/"
+  run bash "${CHECK}" "${MUTATED}"
+  assert_success
+  assert_output --partial "holds the release invariant"
 }
 
 # M16. publish-image carries `!cancelled()` deliberately. `always()` is not the
