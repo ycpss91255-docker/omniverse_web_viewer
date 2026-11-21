@@ -671,7 +671,7 @@ _sibling_workflow() {
 # and the checker would otherwise read the dangling name's absent `if:` as
 # "no status function"
 @test "gates: a needs naming a job that does not exist is caught" {
-  _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main\]$/needs: [verify-tag-shape-v2, verify-tag-on-main]/'
+  _mutate 's/needs: \[verify-tag-shape, verify-tag-on-main, changes\]$/needs: [verify-tag-shape-v2, verify-tag-on-main, changes]/'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[needs-name-a-job-that-exists]"
@@ -2266,7 +2266,10 @@ JOB
 # maintainer) would make next.
 
 @test "gates: tier-b publishes its attestation as a job output" {
-  _mutate '/^    outputs:$/,/^      attestation:/d'
+  # Only the outputs block whose next line is the attestation: since #106 the
+  # `changes` job has an `outputs:` of its own earlier in the file, and a
+  # range starting at the first `outputs:` deleted everything in between.
+  _mutate '/^    outputs:$/{N;/\n      attestation:/d}'
   run bash "${CHECK}" "${MUTATED}"
   assert_failure 1
   assert_output --partial "[picture-leaves-evidence]"

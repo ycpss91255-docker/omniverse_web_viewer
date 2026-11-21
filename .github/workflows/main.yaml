@@ -24,12 +24,12 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
-  # Nightly, for the Tier B visual acceptance ONLY (#48). Every other job in
-  # this workflow is gated off `schedule` below -- a scheduled run must not
-  # rebuild and re-release the image, it exists to answer one question: does a
-  # real Kit producer's picture still reach a real browser?
-  schedule:
-    - cron: '0 20 * * *'
+  # 沒有 `schedule`（#106，對齊 isaac#434）。Tier B 以前每晚跑一次，從
+  # 2026-09-06 起每晚都紅、兩個多月沒有人處理（#104）：每晚跑的檢查沒有發揮
+  # 作用。現在改成依變更範圍在 PR 上跑（`changes` job），push 到 main 和 tag
+  # 一律全跑。也沒有觸發層的 `paths:` / `paths-ignore:`：整個 workflow 被觸發
+  # 層略過時，PR 上的狀態會永遠停在 pending。check_release_gates.py 會擋住這
+  # 三個鍵再次出現。
   workflow_dispatch:
     inputs:
       run_tier_b:
@@ -106,9 +106,38 @@ on:
 # ---------------------------------------------------------------------------
 
 jobs:
+  # ------------------------- 變更範圍（#106） --------------------------------
+  # 其他 job 依這裡的 `viewer` 決定要不要跑：push 到 main、tag、手動 dispatch
+  # 一律 true；PR 只要改到任何一個不是文件的檔案就是 true（規則與理由見
+  # script/ci/changed_scope.py）。刻意沒有 `if:`，所以它永遠會跑、不會被
+  # SKIPPED -- tier-b-visual-e2e needs 它，而一個被跳過的 need 會連帶跳過
+  # Tier B（見 tier-b-visual-e2e 上方關於 needs 的說明）。
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      viewer: ${{ steps.scope.outputs.viewer }}
+    steps:
+      - name: Checkout (full history, so base...head can be diffed)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Select what this run needs
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 script/ci/changed_scope.py | tee -a "${GITHUB_OUTPUT}"
+
   call-docker-build:
-    # Not on the nightly schedule: that trigger is for tier-b-visual-e2e only.
-    if: github.event_name != 'schedule'
+    # 只改文件的 PR 不 build（#106）。tag 上 `viewer` 一律是 true，所以發版
+    # 路徑的 build 不受影響；`changes` 沒成功時這裡被跳過，call-release 與
+    # publish-image 要求它 success，因此是 fail-closed。
+    needs: [changes]
+    if: needs.changes.outputs.viewer == 'true'
     # Builds and tests; pushes nothing (build-worker passes push: false to every
     # build and carries no registry login). Read is all it can justify.
     permissions:
@@ -143,8 +172,8 @@ jobs:
   # NO `if:` ON PURPOSE. This job must never be SKIPPED, because a skipped need
   # skips its dependents, and tier-b-visual-e2e's condition deliberately
   # carries no status function (see its own note). With no `if:` the job always
-  # runs and always succeeds off a tag ref, so needing it costs the nightly one
-  # cheap hosted job and changes nothing else. The tag check itself is guarded
+  # runs and always succeeds off a tag ref, so needing it costs a PR or a push
+  # one cheap hosted job and changes nothing else. The tag check itself is guarded
   # per-step instead.
   verify-tag-shape:
     runs-on: ubuntu-latest
@@ -524,50 +553,61 @@ jobs:
   # frame. Everything per-PR stops one step short of that (config dial against
   # a dead host; status states against a canvas the spec paints itself).
   #
-  # NOT per-PR, on purpose: the producer boots Kit (minutes) and needs the GPU.
-  # Nightly, every RELEASE path, and explicit manual opt-in. `runs-on:
-  # [self-hosted, gpu]` because no hosted runner has NVENC.
+  # 什麼時候跑（#106，對齊 isaac#434；以前是每晚 + 發版路徑 + 手動）：
+  #   - tag ref                 -> 發版路徑本身，一律跑
+  #   - push 到 main            -> 一律跑
+  #   - PR，且 `changes` 選到 viewer（改到任何一個不是文件的檔案），且 PR 的
+  #     head 是本 repo 的分支 -> 跑。fork 來的 PR 永遠不跑：這個 job 在持久的
+  #     self-hosted GPU host 上執行 PR 分支裡的 Dockerfile 與腳本
+  #   - workflow_dispatch 勾了 run_tier_b 或帶了 publish_image_tag -> 跑
+  # 以前 PR 上從來不跑，#88 的錯誤因此一路 merge 進 main，之後每晚都紅了兩個
+  # 多月（#104）。`runs-on: [self-hosted, gpu]` because no hosted runner has
+  # NVENC.
+  #
+  # 條件的形狀受 check_release_gates.py 約束：頂層只能有 `||`，而且其中一個
+  # 選項必須是單純的 tag 判斷，所以「tag 一律跑」不會被其他條件的 `&&` 吃掉。
   #
   # The release path was added by #70. This job is the gate call-release and
   # publish-image hang off, so it must run wherever those two could run:
   #   - a tag ref     -> the release path itself
   #   - a dispatch with a non-empty publish_image_tag -> the manual publish,
   #                      which would otherwise be a hole in the same rule
-  # Its ONLY `needs:` is verify-tag-shape, and that one is deliberately a job
-  # with no `if:` -- it always runs and therefore can never be SKIPPED, which
+  # Its `needs:` are verify-tag-shape, verify-tag-on-main and changes (#106),
+  # all deliberately jobs with no `if:` -- they always run and therefore can
+  # never be SKIPPED, which
   # is what lets this job keep a condition with no status function in it (a
   # skipped need would otherwise skip this job). It buys the thing the trigger
   # globs cannot express: a tag whose shape the image-tag deriver rejects never
   # reaches the GPU at all. Nothing else is a need. call-docker-build in
-  # particular is NOT, because it does not run on `schedule` and needing it
-  # would force a status function onto this gate's own condition; this job
+  # particular is NOT, because it is skipped on a docs-only PR (#106) and
+  # needing it would force a status function onto this gate's own condition;
+  # this job
   # rebuilds the e2e-test image from the checked-out tree anyway, so it can
   # never pass against a stale artifact. The cost is that on a tag push it
   # starts in parallel with call-docker-build rather than after it.
   #
-  # The other cost is that this gate now depends on a HOSTED job: off a tag ref
-  # verify-tag-shape only checks out the repo, but a checkout flake there ends
-  # it non-success and SKIPS this job. On a tag ref that is reported by
-  # release-blocked-report; on the nightly -- where there is no release to
-  # block, and where this job IS the point of the run -- it is reported by
-  # nightly-tier-b-report. Both are report-only: nothing needs them, so neither
-  # can wave anything through.
+  # The other cost is that this gate now depends on HOSTED jobs: a checkout
+  # flake in any of the three needs ends it non-success and SKIPS this job. On
+  # a tag ref that is reported by release-blocked-report, which is report-only:
+  # nothing needs it, so it cannot wave anything through. On a PR or a push to
+  # main the run is red anyway (`gate` fails on a `changes` that did not
+  # succeed).
   #
-  # The `concurrency` group below serialises the GPU: `cancel-in-progress:
-  # false` means a tag pushed while the nightly run is in flight QUEUES behind
-  # it instead of cancelling it. A release therefore waits for the GPU; that is
-  # the accepted price of the rule.
+  # concurrency 依 ref 分組（#106）：`owv-tier-b-visual-e2e-<ref>`。以前所有
+  # 執行共用一個 group，而 GitHub 會把 group 裡「還在等待中」的成員直接取消
+  # （`cancel-in-progress: false` 只保護正在跑的那一個）。PR 上也跑 Tier B 之
+  # 後，排隊的人會多很多，共用 group 會讓一個在等 GPU 的 tag 被後來的 PR 擠掉。
+  # 依 ref 分組之後，只有同一個 ref 的新執行會取代舊的等待中執行（同一個 PR
+  # 的新 push；tag 不會被推兩次），tag 不再被別人擠掉。GPU 的排隊交給 runner
+  # 本身：一個 runner 一次只跑一個 job，isaac 的 GPU job 也是這樣排。driver
+  # 的容器名稱與 port 都依執行個體隔離（見 tier_b_visual_e2e.sh），兩個 runner
+  # 同時跑也不會互相拆掉。
   #
-  # What `cancel-in-progress: false` does NOT protect is a job that is still
-  # PENDING. GitHub cancels the previously pending member of a group when a new
-  # run enters it, so with the nightly running and a tag queued behind it, a
-  # third entrant (a dispatch with run_tier_b, another tag) cancels the tag's
-  # Tier B outright. The consequence fails CLOSED -- call-release skips on a
-  # non-success need and publish-image requires `result == 'success'`, so
-  # nothing unsafe publishes -- but the pushed tag then produces no Release and
-  # no image, and the only trace is a GREY cancelled job. That is why
-  # `release-blocked-report` below exists: it turns that silence into a red
-  # run. Do not read it as an override; it can only ADD a failure.
+  # 被取消的 Tier B 仍然是 fail-closed：call-release skips on a non-success
+  # need and publish-image requires `result == 'success'`, so nothing unsafe
+  # publishes, and `release-blocked-report` below turns a silent tag-path
+  # cancellation into a red run. Do not read it as an override; it can only ADD
+  # a failure.
   #
   # stream-only ONLY. #48's acceptance criteria ask for both viewer modes, which
   # is wrong against an Isaac-family producer: #18 established that `usd-viewer`
@@ -576,10 +616,13 @@ jobs:
   # asserting a picture there would fail forever. usd-viewer keeps its existing
   # per-PR config-dial cover.
   tier-b-visual-e2e:
-    needs: [verify-tag-shape, verify-tag-on-main]
+    needs: [verify-tag-shape, verify-tag-on-main, changes]
     if: >-
-      github.event_name == 'schedule'
+      github.event_name == 'push'
       || startsWith(github.ref, 'refs/tags/')
+      || (github.event_name == 'pull_request'
+          && needs.changes.outputs.viewer == 'true'
+          && github.event.pull_request.head.repo.full_name == github.repository)
       || (github.event_name == 'workflow_dispatch'
           && (inputs.run_tier_b || inputs.publish_image_tag != ''))
     runs-on: [self-hosted, gpu]
@@ -599,10 +642,10 @@ jobs:
     # token in the environment would turn GPU-host access into push access.
     permissions:
       contents: read
-    # One Kit on the GPU at a time, and never cancel mid-teardown -- a killed
-    # run would orphan a GPU-holding container. Mirrors isaac's stream-smoke.
+    # 依 ref 分組（#106，理由見本 job 上方的說明），and never cancel
+    # mid-teardown -- a killed run would orphan a GPU-holding container.
     concurrency:
-      group: owv-tier-b-visual-e2e
+      group: owv-tier-b-visual-e2e-${{ github.ref }}
       cancel-in-progress: false
     steps:
       # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in
@@ -686,9 +729,11 @@ jobs:
   # that lets a release THROUGH.
   #
   # It exists because the gate can fail SILENTLY. A tag's Tier B that is still
-  # queued behind the nightly is cancelled outright when a third run enters the
-  # shared concurrency group (GitHub cancels the previously pending member;
-  # `cancel-in-progress: false` only protects a RUNNING job). Everything
+  # PENDING can be cancelled outright (GitHub cancels the previously pending
+  # member of a concurrency group; `cancel-in-progress: false` only protects a
+  # RUNNING job). Since #106 the group is per ref, which removes the case where
+  # some OTHER run evicted the tag's, but a cancellation from outside -- by
+  # hand, or the runner -- still lands here. Everything
   # downstream then fails closed and simply does not run: call-release skips on
   # a non-success need, publish-image requires `result == 'success'`. Correct --
   # but the pushed tag produces no Release and no image, and the only signal is
@@ -703,8 +748,8 @@ jobs:
   # case, so the step below picks its message from the result rather than
   # telling every reader to wait for the GPU runner.
   #
-  # Tag refs only: on the nightly and on dispatches there is no release to
-  # block, and a failing Tier B there is already red on its own.
+  # Tag refs only: on a PR, a push to main and a dispatch there is no release
+  # to block, and a failing Tier B there is already red on its own.
   release-blocked-report:
     needs: [tier-b-visual-e2e]
     if: >-
@@ -744,56 +789,27 @@ jobs:
           esac
           exit 1
 
-  # ------------------- nightly Tier B visibility (report only) --------------
-  # The same idea as release-blocked-report, for the OTHER path this gate runs
-  # on. That job is tag-refs-only, correctly: on the nightly there is no
-  # release to block. But the nightly is not a spare run -- it is the only
-  # thing that answers "is there still a picture?" between releases, and it can
-  # now fail to run for a reason that has nothing to do with the picture.
+  # ------------------------- 總結狀態（#106） --------------------------------
+  # PR 依範圍跳過 job 之後，需要一個不會因為被跳過而卡在 pending 的單一總結
+  # 狀態（GitHub 對 path-filtered required check 建議的做法；isaac#434 的
+  # `gate`）。`always()` 執行：success 與 skipped 算通過，failure 與 cancelled
+  # 算失敗，`changes` 沒成功也算失敗（規則見 script/ci/gate_result.py）。
+  # owv 目前沒有設 required check；之後要設 branch protection 時就指定它。
   #
-  # tier-b-visual-e2e `needs: [verify-tag-shape, verify-tag-on-main]`, a hosted ubuntu-latest job.
-  # That need is what lets the gate's own condition carry no status function,
-  # and off a tag ref verify-tag-shape does nothing but check out the repo --
-  # but a checkout flake there is enough to end it non-success, which SKIPS the
-  # nightly Tier B. It fails closed (a skipped gate can never publish anything)
-  # and the run is not green, but nothing SAYS the night's picture check did
-  # not happen; a reader sees a red hosted job and reasonably reads it as an
-  # infrastructure blip. A cancelled Tier B on the nightly -- the concurrency
-  # group evicting it as a pending member -- is quieter still.
-  #
-  # Same discipline as release-blocked-report and for the same reason: NOTHING
-  # `needs` this job, so it can only ADD a failure and can never let anything
-  # through. The `always()` is what lets it observe a need that did not
-  # succeed. It is scoped to `schedule` so it cannot overlap the tag-path
-  # report, whose gating and wording are untouched by this job's existence.
-  nightly-tier-b-report:
-    needs: [tier-b-visual-e2e]
-    if: >-
-      always()
-      && github.event_name == 'schedule'
-      && needs.tier-b-visual-e2e.result != 'success'
+  # NOT A RELEASE GATE: nothing `needs` this job. call-release and
+  # publish-image keep needing tier-b-visual-e2e directly, so this `always()`
+  # can never let a release through.
+  gate:
+    needs: [changes, call-docker-build, verify-tag-shape, verify-tag-on-main, tier-b-visual-e2e]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Say that tonight's picture check did not pass, and why
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Every selected job succeeded
         env:
-          TIER_B_RESULT: ${{ needs.tier-b-visual-e2e.result }}
-        run: |
-          set -euo pipefail
-          missed="The nightly tier-b-visual-e2e ended '${TIER_B_RESULT}', so nothing verified tonight that a real browser still renders a real frame from a real producer."
-          case "${TIER_B_RESULT}" in
-            failure)
-              echo "::error::${missed} This is a FAILED gate, not a scheduling problem: read the job log and the uploaded evidence (frame PNG, luma stats, browser trace, producer log). A release cut before this is fixed will be blocked by the same gate."
-              ;;
-            cancelled)
-              echo "::error::${missed} 'cancelled' usually means the job was evicted from the owv-tier-b-visual-e2e concurrency group as a PENDING member (cancel-in-progress: false only protects a RUNNING job). Re-run this workflow with run_tier_b once the GPU runner is free."
-              ;;
-            skipped)
-              echo "::error::${missed} 'skipped' means the job never started -- an unavailable self-hosted GPU runner, or its need verify-tag-shape (a hosted job whose only work off a tag ref is a checkout) not succeeding. A checkout flake there is enough to silence the whole nightly, which is why this report exists. Re-run this workflow with run_tier_b."
-              ;;
-            *)
-              echo "::error::${missed} Result '${TIER_B_RESULT}' is not one this report knows how to explain; read the tier-b-visual-e2e job log."
-              ;;
-          esac
-          exit 1
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 script/ci/gate_result.py

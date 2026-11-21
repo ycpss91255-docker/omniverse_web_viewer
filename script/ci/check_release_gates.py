@@ -404,7 +404,17 @@ _PRINT_QUERY_RE = re.compile(r"^--print-[A-Za-z0-9][A-Za-z0-9._-]*$")
 # `needs:` one: that would make a job whose whole design is to fail loudly
 # into something a downstream job waits on, and its always() would then
 # propagate where the gate rule forbids a status function.
-REPORT_ONLY_JOBS = ("release-blocked-report", "nightly-tier-b-report")
+#
+# nightly-tier-b-report 隨每晚排程一起移除（#106）：沒有 schedule，就沒有
+# 「今晚的畫面檢查沒跑到」這種需要另外回報的情況。
+REPORT_ONLY_JOBS = ("release-blocked-report",)
+
+# 觸發條件裡不能出現的鍵（#106，對齊 isaac#434）。
+#   - schedule：每晚跑的檢查沒有發揮作用 -- Tier B 從 2026-09-06 起每晚都紅，
+#     兩個多月沒有人處理（#104）。檢查改成依變更範圍在 PR 上跑。
+#   - paths / paths-ignore：整個 workflow 被觸發層略過時，PR 上的狀態會永遠
+#     停在 pending；範圍判斷放在 `changes` job 裡。
+FORBIDDEN_TRIGGER_KEYS = ("schedule", "paths", "paths-ignore")
 
 # Permission scopes that let a job leave something PERMANENT behind. A job
 # holding one of these at `write` can publish whether or not this file
@@ -842,6 +852,30 @@ TIER_B_NOT_SUCCESS_TESTS = frozenset(
     (
         "needs.tier-b-visual-e2e.result!='success'",
         "'success'!=needs.tier-b-visual-e2e.result",
+    )
+)
+
+
+# Tier B 在 PR 上跑時必須同時帶的兩個條件（#106）。每個集合收同一個判斷的
+# 兩種寫法（運算元前後對調），和上面幾個集合一樣先 canon_key() 再比對。
+PR_EVENT_TESTS = frozenset(
+    (
+        "github.event_name=='pull_request'",
+        "'pull_request'==github.event_name",
+    )
+)
+# fork 來的 PR 不能讓 self-hosted GPU host 執行它分支裡的 Dockerfile 與腳本。
+PR_OWN_BRANCH_TESTS = frozenset(
+    (
+        "github.event.pull_request.head.repo.full_name==github.repository",
+        "github.repository==github.event.pull_request.head.repo.full_name",
+    )
+)
+# 只改文件的 PR 不佔用 GPU：選不選由 `changes` job 決定。
+PR_SCOPE_TESTS = frozenset(
+    (
+        "needs.changes.outputs.viewer=='true'",
+        "'true'==needs.changes.outputs.viewer",
     )
 )
 
@@ -1568,6 +1602,36 @@ def check(wf):
     published = publishing_jobs(wf)
     published_names = [name for name, _ in published]
 
+    # --- 0a. no nightly schedule, no trigger-level path filter (#106) ------
+    on = get_on(wf.doc)
+    if isinstance(on, dict):
+        for event, spec in on.items():
+            if event in FORBIDDEN_TRIGGER_KEYS:
+                violation(
+                    "no-schedule-or-trigger-path-filter",
+                    "on.%s is back. A schedule is a check nobody reads (Tier B "
+                    "was red every night for two months, #104); run it per "
+                    "PR by scope instead, through the `changes` job (#106)."
+                    % event,
+                )
+            if isinstance(spec, dict):
+                for key in spec:
+                    if key in FORBIDDEN_TRIGGER_KEYS:
+                        violation(
+                            "no-schedule-or-trigger-path-filter",
+                            "on.%s.%s filters at the trigger, which skips the "
+                            "whole workflow and leaves a PR's status pending "
+                            "forever. Select by scope in the `changes` job "
+                            "instead (#106)." % (event, key),
+                        )
+    elif isinstance(on, (list, str)):
+        events = [on] if isinstance(on, str) else on
+        if "schedule" in events:
+            violation(
+                "no-schedule-or-trigger-path-filter",
+                "on: lists schedule. Run Tier B per PR by scope instead (#106).",
+            )
+
     # --- 0. every condition in the file is a well-formed expression -------
     # An expression whose parentheses do not balance outside its string
     # literals cannot be split into terms, so every structural property below
@@ -1830,6 +1894,41 @@ def check(wf):
                 "check on MEANING rather than on wording. if: %s"
                 % (TIER_B, tier_b_if),
             )
+
+    # --- 8a. on a PR, Tier B runs only for this repo's branches, by scope --
+    # (#106) Tier B runs on PRs now. Every top-level alternative of its
+    # condition that names the pull_request event must ALSO require the PR to
+    # come from this repository (a fork's Dockerfile and scripts never reach
+    # the persistent GPU host) and the `changes` job to have selected the
+    # viewer (a docs-only PR never takes the GPU). An alternative that admits
+    # PRs without naming the event -- `github.event_name != 'push'`, say --
+    # is not something this can see; that limit is stated, not hidden.
+    if tier_b_if:
+        for term in top_terms(tier_b_if, "|"):
+            # canon(), not unwrap(): unwrap() only strips `${{ }}`, so the
+            # alternative's own outer parentheses survived it and the whole
+            # term came back as ONE conjunct -- the guard was never seen,
+            # and the mutation cases below caught exactly that.
+            conjuncts = {canon_key(c) for c in top_terms(canon(term), "&")}
+            if not conjuncts & PR_EVENT_TESTS:
+                continue
+            if not conjuncts & PR_OWN_BRANCH_TESTS:
+                violation(
+                    "tier-b-pr-runs-only-on-own-branches",
+                    "%s runs on pull_request without requiring "
+                    "github.event.pull_request.head.repo.full_name == "
+                    "github.repository in the same alternative, so a fork's "
+                    "code would run on the self-hosted GPU host. term: %s"
+                    % (TIER_B, term.strip()),
+                )
+            if not conjuncts & PR_SCOPE_TESTS:
+                violation(
+                    "tier-b-pr-runs-by-scope",
+                    "%s runs on pull_request without requiring "
+                    "needs.changes.outputs.viewer == 'true' in the same "
+                    "alternative, so a docs-only PR would take the GPU. "
+                    "term: %s" % (TIER_B, term.strip()),
+                )
 
     # --- 9. the one need that must never be skipped -----------------------
     # tier-b-visual-e2e needs verify-tag-shape, and a SKIPPED need skips its
