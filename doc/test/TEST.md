@@ -367,7 +367,7 @@ The kernel's contract -- the ONLY package touching the NVIDIA streaming library 
 
 Three suites, three Playwright projects, two gates. Standalone and `@nvidia`-free (outside the npm workspaces). All drive the REAL dist served by the `runtime` image.
 
-- **Tier 1 (9, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate.
+- **Tier 1 (9, per-PR, no GPU)** -- `config-dial.spec.ts` + `status-loopback.spec.ts`. `run-in-image.sh` renders the sentinel templates via the production entrypoint with distinctive test values (`10.20.30.40:49100`, media `47998`), serves each mode, then runs Playwright against it. It names its two projects explicitly, so the Tier B project can share the directory without ever being picked up by the per-PR gate. 它另外會對 Tier B 的 project 執行一次 `playwright test --list`：只載入 spec、不執行、不開瀏覽器，所以 Tier B spec 載入失敗（例如 #88 之後 `visual_thresholds.json` 沒進 image、JSON import 少了 import attribute，讓每晚的 GPU job 紅了兩個多月）會在 per-PR 階段就讓 build 失敗。
 - **Tier B (1, nightly, self-hosted GPU)** -- `tier-b-visual.spec.ts`. `run-tier-b.sh` serves `stream-only` pointed at a REAL Kit producer and asserts real frames render.
 
 ### `config-dial.spec.ts` (2) -- project `chromium`
