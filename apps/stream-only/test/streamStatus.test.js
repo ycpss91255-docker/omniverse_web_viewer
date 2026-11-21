@@ -1168,3 +1168,233 @@ test('dead from the start: an element that reports progress but never advances s
   assert.match(statusEl.textContent, /no video/i);
   assert.match(statusEl.textContent, /reload/i);
 });
+
+// --- the library's own verdict, and every verdict made true (issue #101) ---
+// Measured against ov-web-rtc 6.8.2 with the shipped config: the connect window
+// declared "it never started" at 20 s while the library went on retrying until
+// 49 s against a refused port and 83 s against a black-holed host. #98 had
+// sized the reconnect budget against the window as "6 x ~2 s is ~12 s"; each
+// attempt actually costs ~10 s of an internal sign-in timeout that no public
+// config field reaches, so the budget cannot be computed from this side.
+// Two things follow:
+//   - gaveUp() takes the library's STOPPED -- which it reports only once every
+//     reconnect attempt is exhausted -- and declares at once. It replaces the
+//     window's guess with the fact the window was guessing at.
+//   - every verdict also stops the library, through the injected `abandon`. A
+//     verdict is only true if nothing is still trying; when the controller gets
+//     there first (a ceiling, because the library said nothing), it makes that
+//     true itself instead of announcing something that is not yet so.
+
+function abandonSpy() {
+  const spy = () => {
+    spy.calls += 1;
+  };
+  spy.calls = 0;
+  return spy;
+}
+
+test('gaveUp() in the connect window declares never-started at once, not when the window elapses (#101)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  ctl.gaveUp();
+
+  assert.match(statusEl.textContent, /never started/i);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.deepEqual(clock.pending, [], 'the window it replaced must not fire as well');
+});
+
+test('gaveUp() after a loss declares the stream ended at once (#101)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, connectOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.emit('playing');
+  ctl.stopped();
+  assert.match(statusEl.textContent, /reconnect/i, 'the recoverable state comes first');
+
+  ctl.gaveUp();
+
+  assert.match(statusEl.textContent, /source is gone/i);
+  assert.equal(statusEl.classList.contains('error'), true);
+  assert.deepEqual(clock.pending, []);
+});
+
+test('gaveUp() over a stream that did start says it ended, never that it never started (#101)', () => {
+  // A frame rendered -- which cancels the connect window -- and the library
+  // gives up before any loss was announced, so no window is pending at all.
+  // "It never started" would be false: it started.
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, connectOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.emit('playing');
+  assert.deepEqual(clock.pending, []);
+
+  ctl.gaveUp();
+
+  assert.match(statusEl.textContent, /source is gone/i);
+  assert.doesNotMatch(statusEl.textContent, /never started/i);
+});
+
+test('gaveUp() is a claim, so a picture that is playing outranks it (#101)', () => {
+  // The same rule as #75: a verdict is a conclusion about the media, and the
+  // media wins. In production this pairing cannot occur -- the library's
+  // session IS the picture -- but nothing here may depend on a callback being
+  // right.
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeStreamingVideoEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, {
+    ...recoveryOptions(clock),
+    abandon,
+  });
+
+  videoEl.renderFrame();
+  videoEl.emit('playing'); // hide(); the watchdog takes its baseline
+  videoEl.renderFrame(); // and the picture is moving
+  ctl.gaveUp();
+
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.equal(statusEl.classList.contains('hidden'), true);
+  assert.equal(abandon.calls, 0, 'stopping the library would take the picture away');
+});
+
+test('gaveUp() after the terminal state changes nothing (#101)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, {
+    ...connectOptions(clock),
+    abandon,
+  });
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  clock.fireEvery(FAKE_CONNECT_MS); // the ceiling gets there first
+  const declared = statusEl.textContent;
+  ctl.gaveUp(); // and the library's STOPPED arrives after it
+
+  assert.equal(statusEl.textContent, declared);
+  assert.equal(abandon.calls, 1, 'one verdict, one stop');
+});
+
+test('the connect ceiling stops the library when it declares (#101)', () => {
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, {
+    ...connectOptions(clock),
+    abandon,
+  });
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  assert.equal(abandon.calls, 0, 'nothing is stopped while the attempt is in flight');
+  clock.fireEvery(FAKE_CONNECT_MS);
+
+  assert.equal(abandon.calls, 1);
+  assert.match(statusEl.textContent, /never started/i);
+});
+
+test('the loss ceiling stops the library when it declares (#101)', () => {
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeVideoEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, {
+    ...connectOptions(clock),
+    abandon,
+  });
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  videoEl.emit('playing');
+  ctl.stopped();
+  assert.equal(abandon.calls, 0, 'the recoverable state leaves the library retrying');
+  clock.fireEvery(FAKE_DELAY_MS);
+
+  assert.equal(abandon.calls, 1);
+  assert.match(statusEl.textContent, /source is gone/i);
+});
+
+test('the library\'s own verdict stops it too, so "terminal implies stopped" does not depend on ordering (#101)', () => {
+  // When STOPPED came first the library has already stopped, and terminating a
+  // stopped stream is harmless. Calling it unconditionally is what makes the
+  // invariant a property of this state machine rather than a fact about which
+  // of two callbacks happened to arrive first.
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, {
+    ...connectOptions(clock),
+    abandon,
+  });
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  ctl.gaveUp();
+
+  assert.equal(abandon.calls, 1);
+});
+
+test('the media guard that withdraws a verdict does not stop the library (#101)', () => {
+  // #75's guard: a window armed by a claim (here, a session-start retry landing
+  // in the gap between two frames) elapses over a picture that is playing, and
+  // the verdict is withdrawn. Stopping the library there would take away the
+  // picture the guard just decided to keep.
+  const statusEl = fakeStatusEl();
+  const videoEl = fakeStreamingVideoEl();
+  const clock = fakeClock();
+  const abandon = abandonSpy();
+  const ctl = createStatusController(statusEl, videoEl, silentLogger, {
+    ...recoveryOptions(clock),
+    abandon,
+  });
+
+  videoEl.renderFrame();
+  videoEl.emit('playing'); // hide(); the watchdog baselines at one frame
+  ctl.connecting('connecting to 1.2.3.4:49100...'); // a retry in the gap: no movement yet
+  videoEl.renderFrame(); // the picture moves on
+  clock.fireEvery(FAKE_CONNECT_MS);
+
+  assert.equal(statusEl.classList.contains('error'), false);
+  assert.equal(abandon.calls, 0);
+});
+
+test('a controller built without abandon still declares (#101)', () => {
+  // Every spec above #101 passes no abandon, and neither does a DOM-free
+  // caller. The verdict must not depend on it being there.
+  const statusEl = fakeStatusEl();
+  const clock = fakeClock();
+  const ctl = createStatusController(statusEl, fakeVideoEl(), silentLogger, connectOptions(clock));
+
+  ctl.connecting('connecting to 1.2.3.4:49100...');
+  ctl.gaveUp();
+
+  assert.match(statusEl.textContent, /never started/i);
+});
+
+test('both ceilings outlast the library\'s measured reconnect budget (#101)', () => {
+  // With maxReconnects 5 (packages/stream-core/src/buildStreamConfig.js) the
+  // library gives up ~37 s after its first attempt against a refused port and
+  // ~71 s against a black-holed host -- measured against ov-web-rtc 6.8.2, not
+  // derived from the config, because the per-attempt cost is an internal
+  // timeout the config cannot see. Both windows are now ceilings, for a library
+  // that never reports STOPPED. Below that budget a ceiling would become the
+  // trigger again: still true, since it stops the library before declaring,
+  // but cutting short a recovery the library was still able to make -- the
+  // opposite of what #101 decided.
+  const MEASURED_BLACKHOLE_BUDGET_MS = 71_000;
+  assert.ok(
+    CONNECT_ESCALATION_MS > MEASURED_BLACKHOLE_BUDGET_MS,
+    `connect ceiling ${CONNECT_ESCALATION_MS} would cut the library's budget short`,
+  );
+  assert.ok(
+    TERMINAL_ESCALATION_MS > MEASURED_BLACKHOLE_BUDGET_MS,
+    `loss ceiling ${TERMINAL_ESCALATION_MS} would cut the library's budget short`,
+  );
+});
