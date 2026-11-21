@@ -58,28 +58,30 @@ export function buildStreamConfig(server, port, mediaPort = null) {
     // exists in both versions with the same name and type, so no type check
     // and no manifest assertion could have seen this.
     authenticate: false,
-    // 6, not the 20 this carried against the 5.x library (#98). Under
-    // `@nvidia/ov-web-rtc` 6.x this IS a mid-session reconnect budget: the
-    // library spaces attempts by `reconnectDelay` (~2 s by default) and logs
-    // them as "Reconnection attempt (N of M)". The 5.x internals the old value
-    // was reasoned from -- `maxSessionStartRetry`, `sessionStartRetryLeft`,
-    // `onSessionStartResult` -- do not exist in 6.8.2 at all.
+    // How long the viewer keeps genuinely trying (#101). Under
+    // `@nvidia/ov-web-rtc` 6.x this is a real reconnect budget -- logged as
+    // "Reconnection attempt (N of M)" -- where 5.x passed it through as
+    // `maxSessionStartRetry` and bought only startup grace (#98).
     //
-    // The number is set by the window it has to fit inside, not by taste.
-    // apps/stream-only/src/streamStatus.js declares the source gone after
-    // TERMINAL_ESCALATION_MS (15 s). At ~2 s per attempt, 20 would spend ~40 s
-    // retrying, so the viewer would print "the source is gone. Reload once it
-    // is back." while the library was still retrying and might yet succeed.
-    // 6 x ~2 s is ~12 s, inside the window: the recoverable readout is true
-    // while the library retries, and the terminal readout is true because by
-    // then it has given up. Raising this means moving that window with it --
-    // a unit spec pins the two together so the pair cannot drift apart.
+    // #98 set it to 6 so that "6 x ~2 s is ~12 s" would finish inside the 15 s
+    // escalation window. That reasoning is WITHDRAWN, not reworded: it was
+    // measured to be wrong. Each attempt costs ~10 s of the library's internal
+    // sign-in timeout (`let e=1e4` in the bundle; not `reconnectDelay`, not
+    // `connectivityTimeout`, and not a public config field) plus the 2 s delay.
+    // With 6, the library retried until 49 s against a refused port and 83 s
+    // against a black-holed host, while the viewer had declared the source
+    // gone at 20 s -- the untrue statement this number had been chosen to
+    // prevent.
     //
-    // What it costs is attempts 7..20, which 6.x would have been willing to
-    // make. That is the deliberate trade: a user told "reconnecting" for 12 s
-    // and then "gone" is better served than one watching a dead picture for
-    // 40 s, which is the failure #58 set the window to 15 s to avoid.
-    maxReconnects: 6,
+    // The budget is therefore not computable from this config, and nothing is
+    // sized against it any more: the viewer's verdict now waits for the
+    // library's own STOPPED (connectStream's `onGaveUp`). 5 is the library's own
+    // default, written down so a library release cannot move it silently. It
+    // measures at ~37 s against a refused port (a Kit process that is down)
+    // and ~71 s against a black-holed host (one that is unreachable), which
+    // outlasts a cold Kit boot (~22 s to first frame on the rc2 tag run), so a
+    // producer that is restarting is picked up without a reload.
+    maxReconnects: 5,
     signalingServer: host,
     signalingPort,
     mediaServer: host,

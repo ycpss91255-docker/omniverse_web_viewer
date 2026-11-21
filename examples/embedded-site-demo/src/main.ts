@@ -54,10 +54,12 @@ function start(): void {
   // The demo has no frame watchdog (that is streamStatus.js, which the viewer
   // app owns), so this readout is not cleared by a rendered frame. It stays
   // until the connect settles -- deliberately less than the app, and honest
-  // about it rather than claiming more.
+  // about it rather than claiming more. connectStream returns a handle since
+  // #101; the demo needs only its `connected` promise, which settles when the
+  // library has stopped trying, so it has no verdict of its own to keep true.
   connectStream(streamConfig, {
     onStart: () => showStatus(`connecting to ${server}:${port}...`),
-  }).catch((e: unknown) =>
+  }).connected.catch((e: unknown) =>
     // NOT String(e) -- see the same note in apps/stream-only/src/main.ts.
     showStatus(`connection failed: ${describeStreamError(e)}`, true));
 }
