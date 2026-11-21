@@ -134,6 +134,18 @@ run_mode() {
 
 trap stop_server EXIT
 
+# Tier B 的 spec 只在 GPU host 上執行，但它能不能被「載入」不需要 GPU。
+# #88 把門檻值抽到 script/ci/visual_thresholds.json 之後，spec 在 e2e-test
+# image 裡根本載入不了（檔案沒複製進來、import 也少了 JSON 的 import
+# attribute），而 per-PR 這裡刻意不選 chromium-tier-b，所以沒有任何 PR 看到
+# 錯誤；它只在每晚的 GPU job 裡紅了兩個多月。`--list` 會載入每一個 spec 檔、
+# 不執行任何測試、也不開瀏覽器，所以載入錯誤在這裡就會讓 build 失敗。
+echo "=== e2e: load check for the GPU-only Tier B spec (no run) ==="
+(
+  cd "${E2E_DIR}"
+  npx playwright test --list --project=chromium-tier-b
+)
+
 # stream-only, with MEDIA_PORT pinned (D1: asserts the media knob round-trips).
 run_mode "stream-only" 5174 "${TEST_MEDIA_PORT}"
 
