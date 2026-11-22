@@ -2,7 +2,7 @@
 
 **[English](../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
-Omniverse Kit ストリーミングアプリケーション（Isaac Sim、USD Viewer など）向けの、汎用かつ Kit 非依存のブラウザベース WebRTC ビューアサイドカー。イメージは [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) 上に構築され、起動時に `VIEWER_UI_MODE` で次の 2 つの静的アプリのいずれかを選択して配信します:
+Omniverse Kit ストリーミングアプリケーション（Isaac Sim、USD Viewer など）向けの、汎用かつ Kit 非依存のブラウザベース WebRTC ビューアサイドカー。イメージは [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base) 上に構築され、起動時に `VIEWER_UI_MODE` で次の 2 つの静的アプリのいずれかを選択して配信します:
 
 - **`usd-viewer`** — NVIDIA の [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2 を未改変でビルド。ランディング画面、フル USD Viewer UI、任意アプリのストリーミングを提供し、すべてインタラクティブに（クリックで）到達します。
 - **`stream-only`** — `stream-core` パッケージ上に構築した自前のフルスクリーン自動接続アプリ。クリック不要でストリームへ直行します。Isaac Sim および任意のヘッドレスストリーム利用者向け。
@@ -68,15 +68,17 @@ HTTP 200 を返し、映像は永遠に来ません。
 git tag を打つたびに、同じ commit から同じ CI run のなかで GitHub Release **と**対応するコンテナイメージの両方が公開されます。したがって両者は常に対で存在します — イメージからその元になった release をたどれますし、release からそのイメージも分かります：
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **パス変更（2026-11-22）：** GitHub organization が `ycpss91255-docker` から `ycpss91255-lab` に改名されました。イメージの新しいパスは `ghcr.io/ycpss91255-lab/omniverse_web_viewer` です。旧 `ghcr.io/ycpss91255-docker/...` は取得できなくなったため、固定している参照を更新してください。
 
 イメージの tag は release のバージョンから先頭の `v` を除いたものです。この値は CI が git tag から導出するもので、人が入力することはありません。だからこそ release とイメージがずれることがありません：
 
 | Git tag | イメージ |
 |---------|----------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 リリース候補も公開されます。正式な tag を切る前に実際に検証されるのは rc だからです。
 
@@ -90,7 +92,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 そのうえで Chrome から `http://<host-ip>:5173` を開きます。設定できる項目は下記の環境変数の表のとおりです。

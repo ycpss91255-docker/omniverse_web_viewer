@@ -347,7 +347,7 @@ warn_flat_key() {
 # Per-host config (mounted by caller from config/host.yaml). When
 # present, network.public_ip overrides the SIGNALING_SERVER env var --
 # keeps a single source of truth for the host IP across all containers
-# that read the same yaml (e.g. ycpss91255-docker/isaac#65).
+# that read the same yaml (e.g. ycpss91255-lab/isaac#65).
 # viewer.ui_mode follows the same precedence as public_ip: host.yaml
 # viewer.ui_mode > VIEWER_UI_MODE env > built-in default. A host.yaml
 # with only a network section leaves the viewer value untouched

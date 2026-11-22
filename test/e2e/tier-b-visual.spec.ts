@@ -8,7 +8,7 @@
 //   - status-loopback.spec.ts proves the viewer REACTS correctly to media, but
 //     the media is a canvas the spec itself paints -- it proves the reaction,
 //     not the picture.
-// Here the media comes from `ghcr.io/ycpss91255-docker/isaac-stream-source`
+// Here the media comes from `ghcr.io/ycpss91255-lab/isaac-stream-source`
 // (isaac#223 / isaac PR #243): a pinned Kit streaming experience rendering a
 // deterministic scene -- DomeLight + DistantLight over a 12x12 procedurally
 // built checkerboard floor, fixed camera, RTX auto-exposure disabled -- chosen

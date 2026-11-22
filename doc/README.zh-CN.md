@@ -2,7 +2,7 @@
 
 **[English](../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
-通用、与 Kit 解耦的浏览器 WebRTC 查看器 sidecar，用于 Omniverse Kit 串流应用程序（Isaac Sim、USD Viewer 等）。镜像构建于 [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) 之上，启动时依 `VIEWER_UI_MODE` 选择下列两个静态应用之一来提供服务：
+通用、与 Kit 解耦的浏览器 WebRTC 查看器 sidecar，用于 Omniverse Kit 串流应用程序（Isaac Sim、USD Viewer 等）。镜像构建于 [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base) 之上，启动时依 `VIEWER_UI_MODE` 选择下列两个静态应用之一来提供服务：
 
 - **`usd-viewer`** — NVIDIA 的 [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2，未经修改构建。提供着陆界面、完整 USD Viewer UI 以及任意应用串流，全部以交互方式（点击）进入。
 - **`stream-only`** — 我们自家的全屏自动连接应用，构建于 `stream-core` 包之上。直接进入串流、无需点击；专为 Isaac Sim 与任何无头串流消费端设计。
@@ -67,15 +67,17 @@ env_4 = VIEWER_UI_MODE=stream-only
 每个 git tag 都会在同一次 CI run、以同一个 commit，同时发布 GitHub Release **和**对应的容器镜像，两者永远成对存在 — 拿到镜像可以回溯它的 release，拿到 release 也能找到它的镜像：
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **路径变更（2026-11-22）：** GitHub 组织已由 `ycpss91255-docker` 改名为 `ycpss91255-lab`。镜像新路径为 `ghcr.io/ycpss91255-lab/omniverse_web_viewer`，旧的 `ghcr.io/ycpss91255-docker/...` 已无法拉取，请更新已有的固定引用。
 
 镜像的 tag 就是 release 版本号去掉开头的 `v`。这个值由 CI 从 git tag 推导得出，不是人工填写，release 与镜像因此不可能对不上：
 
 | Git tag | 镜像 |
 |---------|------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 Release candidate 同样会发布：正式 tag 出来之前，真正被验证的就是 rc。
 
@@ -89,7 +91,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 然后用 Chrome 打开 `http://<host-ip>:5173`。可调参数即下方环境变量表所列。

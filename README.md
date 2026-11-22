@@ -2,7 +2,7 @@
 
 **[English](README.md)** | **[繁體中文](doc/README.zh-TW.md)** | **[简体中文](doc/README.zh-CN.md)** | **[日本語](doc/README.ja.md)**
 
-A generic, Kit-agnostic browser-based WebRTC viewer sidecar for Omniverse Kit streaming applications (Isaac Sim, USD Viewer, etc.). Built on [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base), the image serves one of two static apps selected at boot by `VIEWER_UI_MODE`:
+A generic, Kit-agnostic browser-based WebRTC viewer sidecar for Omniverse Kit streaming applications (Isaac Sim, USD Viewer, etc.). Built on [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base), the image serves one of two static apps selected at boot by `VIEWER_UI_MODE`:
 
 - **`usd-viewer`** — NVIDIA's [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2, built UNMODIFIED. Provides the landing screen, the full USD Viewer UI, and any-app streaming — all reached interactively (click).
 - **`stream-only`** — our own full-screen, auto-connect app built over the `stream-core` package. Boots straight into the stream with no click; intended for Isaac Sim and any headless stream consumer.
@@ -68,15 +68,17 @@ Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 Every git tag publishes a GitHub Release **and** a matching container image, from the same commit in the same CI run, so the two always exist as a pair — given an image you can find its source release, and given a release you can find its image:
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **Path change (2026-11-22):** the GitHub org was renamed from `ycpss91255-docker` to `ycpss91255-lab`. The image now lives at `ghcr.io/ycpss91255-lab/omniverse_web_viewer`; the old `ghcr.io/ycpss91255-docker/...` path is no longer pullable, so update any pinned references.
 
 The image tag is the release version with the leading `v` removed. CI derives it from the git tag; nobody types it in, which is what keeps a release and its image from drifting apart:
 
 | Git tag | Image |
 |---------|-------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 Release candidates are published as well, since the rc is what gets verified before the final tag is cut.
 
@@ -90,7 +92,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 Then open Chrome at `http://<host-ip>:5173`. The knobs are the environment variables documented below.

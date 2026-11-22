@@ -2,7 +2,7 @@
 
 **[English](../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
-通用、與 Kit 解耦的瀏覽器 WebRTC 檢視器 sidecar，用於 Omniverse Kit 串流應用程式（Isaac Sim、USD Viewer 等）。映像檔建置於 [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) 之上，啟動時依 `VIEWER_UI_MODE` 選擇下列兩個靜態應用程式之一來提供服務：
+通用、與 Kit 解耦的瀏覽器 WebRTC 檢視器 sidecar，用於 Omniverse Kit 串流應用程式（Isaac Sim、USD Viewer 等）。映像檔建置於 [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base) 之上，啟動時依 `VIEWER_UI_MODE` 選擇下列兩個靜態應用程式之一來提供服務：
 
 - **`usd-viewer`** — NVIDIA 的 [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2，未經修改建置。提供著陸畫面、完整 USD Viewer UI 以及任意應用程式串流，全部以互動方式（點擊）進入。
 - **`stream-only`** — 我們自家的全螢幕自動連線應用程式，建構於 `stream-core` 套件之上。直接進入串流、無需點擊；專為 Isaac Sim 與任何無頭串流消費端設計。
@@ -67,15 +67,17 @@ env_4 = VIEWER_UI_MODE=stream-only
 每個 git tag 都會在同一次 CI run、以同一個 commit，同時發佈 GitHub Release **與**對應的容器映像檔，兩者永遠成對存在 — 拿到映像檔可以回推它的 release，拿到 release 也找得到它的映像檔：
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **路徑變更（2026-11-22）：** GitHub 組織已由 `ycpss91255-docker` 改名為 `ycpss91255-lab`。映像檔新路徑為 `ghcr.io/ycpss91255-lab/omniverse_web_viewer`，舊的 `ghcr.io/ycpss91255-docker/...` 已無法拉取，請更新既有的固定引用。
 
 映像檔的 tag 就是 release 版號去掉開頭的 `v`。這個值由 CI 從 git tag 推導而來，不是人工填寫，release 與映像檔因此不可能對不上：
 
 | Git tag | 映像檔 |
 |---------|--------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 Release candidate 同樣會發佈：正式 tag 出來之前，真正被驗證的就是 rc。
 
@@ -89,7 +91,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 接著用 Chrome 開啟 `http://<host-ip>:5173`。可調參數即下方環境變數表所列。
