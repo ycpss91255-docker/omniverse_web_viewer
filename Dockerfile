@@ -584,7 +584,7 @@ COPY .github/workflows/ /workflows/
 # image, for the same reason and by the same mechanism.
 #
 # The four READMEs told the user to write `SIGNALING_SERVER = <host-ip>` under
-# `[environment]` in config/docker/setup.conf. The grammar is `env_N =
+# `[environment]` in setup.toml. The grammar is `env_N =
 # KEY=VALUE`: base's setup.sh collects only keys beginning `env_`, and one
 # that does not is dropped with no warning and exit 0. Following the primary
 # override instruction therefore produced a viewer silently dialling
@@ -596,7 +596,7 @@ COPY .github/workflows/ /workflows/
 # that, when wrong, silently misconfigures the product.
 COPY README.md /doc/README.md
 COPY doc/README.zh-TW.md doc/README.zh-CN.md doc/README.ja.md /doc/
-COPY config/docker/setup.conf /doc/setup.conf
+COPY setup.toml /doc/setup.toml
 
 COPY --from=test-tools-stage /opt/bats /opt/bats
 COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats

@@ -20,7 +20,7 @@
 #
 # So the assertion is narrow on purpose: every KEY in the READMEs'
 # `[environment]` example must be one setup.sh actually collects, and the keys
-# the example names must exist in the shipped setup.conf. A README that drifts
+# the example names must exist in the shipped setup.toml. A README that drifts
 # from the file it tells you to edit is a red test.
 
 setup() {
@@ -32,7 +32,7 @@ setup() {
     "${DOC_DIR}/README.zh-CN.md"
     "${DOC_DIR}/README.ja.md"
   )
-  SETUP_CONF="${DOC_DIR}/setup.conf"
+  SETUP_CONF="${DOC_DIR}/setup.toml"
 }
 
 # _environment_block <file>: the lines between `[environment]` and the end of
@@ -48,7 +48,7 @@ _environment_block() {
 # why: The operator-facing claims that MISCONFIGURE THE PRODUCT when they
 # are wrong. Not a doc-sync tool and not a spell check: the four READMEs
 # each told the user to write `SIGNALING_SERVER = <host-ip>` under
-# `[environment]` in `config/docker/setup.conf`, and the grammar is `env_N =
+# `[environment]` in `setup.toml`, and the grammar is `env_N =
 # KEY=VALUE` -- base's `setup.sh` collects only keys beginning `env_`, and
 # one that does not is dropped with no warning and exit 0. Reproduced on a
 # scratch copy before this spec was written: with the README's form
@@ -58,12 +58,12 @@ _environment_block() {
 # got a viewer dialling `127.0.0.1`, HTTP 200, and no picture --
 # indistinguishable from a broken producer. It shipped for four versions
 # because nothing in this repo reads a README. The `devel-test` stage
-# `COPY`s the four READMEs and `setup.conf` to `/doc/`, below the lint RUNs
+# `COPY`s the four READMEs and `setup.toml` to `/doc/`, below the lint RUNs
 # for the same layer-invalidation reason the workflow COPY gives.
 
 
 # why: The spec is worthless if its inputs are missing
-@test "readme: the docs and setup.conf are both in the image" {
+@test "readme: the docs and setup.toml are both in the image" {
   for f in "${READMES[@]}"; do
     [ -f "${f}" ] || { echo "missing: ${f}" >&2; return 1; }
   done
@@ -81,7 +81,16 @@ _environment_block() {
       key="${line%%=*}"
       key="${key// /}"
       case "${key}" in
-        env_[0-9]*) ;;
+        env_[0-9]*)
+          # TOML: the value must be a quoted string, or setup.toml fails to parse.
+          case "${line#*=}" in
+            [[:space:]]\"*\") ;;
+            *)
+              echo "${f}: '${line}' -- setup.toml values are TOML strings, quote the value" >&2
+              return 1
+              ;;
+          esac
+          ;;
         *)
           echo "${f}: '${line}' -- setup.sh collects only env_N keys, so this" >&2
           echo "  is dropped with no warning and the operator gets 127.0.0.1" >&2
@@ -94,16 +103,17 @@ _environment_block() {
   [ "${found}" -eq 1 ]
 }
 
-# why: The README cannot name a variable the shipped `setup.conf` does not
+# why: The README cannot name a variable the shipped `setup.toml` does not
 # set
-@test "readme: every variable the example names exists in setup.conf" {
+@test "readme: every variable the example names exists in setup.toml" {
   local line var
   while IFS= read -r line; do
-    var="${line#*=}"          # env_1 = SIGNALING_SERVER=<host-ip>
-    var="${var%%=*}"          # SIGNALING_SERVER
+    var="${line#*=}"          # env_1 = "SIGNALING_SERVER=<host-ip>"
+    var="${var%%=*}"          # "SIGNALING_SERVER
     var="${var// /}"
-    grep -qE "^env_[0-9]+ *= *${var}=" "${SETUP_CONF}" || {
-      echo "README names ${var} but setup.conf has no env_N for it" >&2
+    var="${var//\"/}"
+    grep -qE "^env_[0-9]+ *= *\"${var}=" "${SETUP_CONF}" || {
+      echo "README names ${var} but setup.toml has no env_N for it" >&2
       return 1
     }
   done < <(_environment_block "${READMES[0]}")
@@ -111,7 +121,7 @@ _environment_block() {
 
 # why: The other direction: the file the README points at must itself hold
 # the grammar
-@test "readme: setup.conf's own [environment] keys are all env_N" {
+@test "readme: setup.toml's own [environment] keys are all env_N" {
   run bash -c "sed -n '/^\[environment\]/,/^\[/p' '${SETUP_CONF}' \
                  | grep -E '^[A-Za-z][A-Za-z0-9_]* *=' \
                  | grep -vE '^env_[0-9]+ *='"

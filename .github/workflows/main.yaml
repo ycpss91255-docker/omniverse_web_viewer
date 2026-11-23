@@ -142,12 +142,11 @@ jobs:
     # build and carries no registry login). Read is all it can justify.
     permissions:
       contents: read
-    uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v0.43.0-rc6
+    uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@v0.43.0-rc6
     with:
       image_name: omniverse_web_viewer
       submodules: recursive
       build_runtime: true
-      test_tools_version: v0.41.0
       # Tier-1 browser config-dial e2e (#47): an extra Dockerfile stage
       # (FROM runtime) that boots the served dists in headless Chromium and
       # asserts the bundle dials the injected server/port (+ media). No GPU,
@@ -280,7 +279,7 @@ jobs:
     # upstream -- but here means THIS job, not the whole workflow.
     permissions:
       contents: write
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.43.0-rc6
+    uses: ycpss91255-lab/base/.github/workflows/release-worker.yaml@v0.43.0-rc6
     with:
       archive_name_prefix: omniverse_web_viewer
 
