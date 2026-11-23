@@ -357,7 +357,7 @@ _drop "${PRODUCER_NAME}"
 # FrameGrabFailed.` about 16 s in, the session gone and every sampled frame
 # black. isaac#233 records the same signature from the other side (a hand-built
 # stream container missing --ipc=host, Kit SIGKILLed on first client connect);
-# the isaac repo itself sets `ipc = host` in config/docker/setup.conf, which is
+# the isaac repo itself sets `ipc = host` in setup.toml, which is
 # why its own compose-run stacks never hit this and a bare `docker run` does.
 #
 # Deliberately NOT --rm: the container's log is the only diagnosis a nightly
