@@ -223,7 +223,7 @@ RUN SUDO_FORCE_REMOVE=yes apt-get purge -y git sudo && \
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
 # Host-side log tee helper (base#328 / base#368). No-op when [logging]
 # local_path is unset; sourced unconditionally by script/entrypoint.sh.
-COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
+COPY --chmod=0755 .base/dist/script/docker/runtime/ /usr/local/lib/base/
 
 # Both app dists at the path the entrypoint serves: /app/<mode>/dist.
 COPY --from=usd-viewer-build --chown="${USER}":"${GROUP}" /app/usd-viewer/dist /app/usd-viewer/dist
@@ -275,8 +275,8 @@ ARG CONFIG_DIR="/tmp/config"
 ARG CONFIG_SRC="config"
 
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
-COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
-COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/config "${CONFIG_DIR}"
+COPY --chmod=0755 .base/dist/script/docker/runtime/ /usr/local/lib/base/
+COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/dist/config "${CONFIG_DIR}"
 COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
 
 # Per-stage sudo grant (see the note in `sys`). Passwordless sudo in an
@@ -389,7 +389,7 @@ ARG ENTRYPOINT_FILE="script/entrypoint.sh"
 COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
 # Same log tee helper as the runtime/devel stages: this stage builds from
 # devel-base, so those COPYs are not inherited and must be repeated.
-COPY --chmod=0755 .base/script/docker/runtime/logging.sh /usr/local/lib/base/logging.sh
+COPY --chmod=0755 .base/dist/script/docker/runtime/ /usr/local/lib/base/
 
 USER "${USER}"
 ENV HOME="/home/${USER_NAME}"
@@ -471,6 +471,7 @@ RUN apt-get update && \
 
 FROM devel AS devel-test
 
+# hadolint ignore=DL3066
 USER root
 
 # PyYAML, for script/ci/check_release_gates.py -- the release-invariant
@@ -524,8 +525,8 @@ COPY Dockerfile /lint/Dockerfile
 COPY script/*.sh /lint/
 # base#406: all helper libs (_lib.sh, i18n.sh, _tui_conf.sh, ...) now
 # live under lib/; the wrappers themselves under wrapper/.
-COPY .base/script/docker/lib /lint/lib
-COPY .base/script/docker/wrapper /lint/wrapper
+COPY .base/dist/script/docker/lib /lint/lib
+COPY .base/dist/script/docker/wrapper /lint/wrapper
 # CI helpers (#66): script/ci/ lands at /ci/ rather than /lint/ because it is
 # also EXECUTED here -- derive_image_tag.bats runs the deriver in-image, which
 # is the only proof of the tag -> image-tag mapping available without pushing
@@ -618,7 +619,8 @@ ENV BATS_LIB_PATH="/usr/lib/bats"
 #
 # Both trees flatten into /smoke_test/, so `load "${BATS_TEST_DIRNAME}/
 # test_helper"` keeps resolving to the shared helper from .base.
-COPY .base/test/smoke/ /smoke_test/
+COPY .base/dist/test/bats/smoke/shared/ /smoke_test/
+COPY .base/dist/test/bats/smoke/devel-test/ /smoke_test/
 COPY test/bats/smoke/devel-test/ /smoke_test/
 
 # Example source is checked by example_demo.bats (contract + node --test);
@@ -658,6 +660,7 @@ ARG GROUP="${USER_GROUP}"
 ENV PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
 
 # Root for the apt install Playwright's `install --with-deps chromium` performs.
+# hadolint ignore=DL3066
 USER root
 
 # `runtime` deletes npm/npx so the SHIPPED image does not carry a package
