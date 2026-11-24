@@ -1,0 +1,583 @@
+#!/usr/bin/env bats
+#
+# schema_spec.bats — unit tests for the setup.conf validation registry
+# (lib/schema.sh, epic).
+#
+# `_schema_validate <section> <key> <value>` is the single validation
+# gate routed through by BOTH setup.sh (set/add) and the TUI. The
+# registry maps a canonical (section,key) to the validator that lives in
+# _tui_conf.sh; the dispatcher normalises per-service logging sections
+# and numbered list keys before lookup.
+#
+# why: Covers the setup.conf validation registry (`lib/schema.sh`, #560):
+# the single `_schema_validate <section> <key> <value>` gate that both
+# setup.sh (`set` / `add`) and the TUI route through. Verifies registry
+# dispatch (scalar exact-match + numbered-list prefix normalisation),
+# per-service `[logging.<svc>]` section normalisation, the empty-value
+# policy (default allow / clear; `deploy.gpu_count` rejects empty), and the
+# full union of validated keys -- including the keys that were historically
+# free-form in setup.sh (`build.network` / `build.arg_` /
+# `deploy.gpu_runtime` + `runtime` alias / `network.network_name` /
+# `devices.device_` / `security.cap_add_` / `cap_drop_`). Phase 2 (#561)
+# adds the section-list single source: `SCHEMA_SECTIONS` (ordered list),
+# `_schema_is_section` (membership), `_schema_section_keys` (a section's
+# registered keys derived from `SCHEMA_VALIDATOR`).
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+
+  # shellcheck disable=SC1091
+  source /source/dist/script/docker/lib/schema.sh
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_validate — list keys (numbered suffix normalised to prefix)
+# ════════════════════════════════════════════════════════════════════
+
+@test "_schema_validate routes network.port_N to _validate_port_mapping (accept)" {
+  run _schema_validate network port_1 "8080:80"
+  [ "${status}" -eq 0 ]
+}
+
+@test "_schema_validate routes network.port_N to _validate_port_mapping (reject)" {
+  run _schema_validate network port_1 "not-a-port"
+  [ "${status}" -ne 0 ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_validate — scalar keys (exact match) + empty-value policy
+# ════════════════════════════════════════════════════════════════════
+
+@test "_schema_validate routes deploy.gpu_count to _validate_gpu_count (accept)" {
+  run _schema_validate deploy gpu_count "all"
+  [ "${status}" -eq 0 ]
+}
+
+@test "_schema_validate routes deploy.gpu_count to _validate_gpu_count (reject)" {
+  run _schema_validate deploy gpu_count "-1"
+  [ "${status}" -ne 0 ]
+}
+
+# why: empty exception
+@test "_schema_validate rejects empty deploy.gpu_count (empty policy = validate)" {
+  run _schema_validate deploy gpu_count ""
+  [ "${status}" -ne 0 ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_validate — per-service logging section normalisation
+# ([logging.<svc>] shares the [logging] key validators) + empty=allow
+# ════════════════════════════════════════════════════════════════════
+
+@test "_schema_validate routes logging.driver to _validate_log_driver (accept)" {
+  run _schema_validate logging driver "json-file"
+  [ "${status}" -eq 0 ]
+}
+
+@test "_schema_validate routes logging.driver to _validate_log_driver (reject)" {
+  run _schema_validate logging driver "bad driver!"
+  [ "${status}" -ne 0 ]
+}
+
+# why: empty default
+@test "_schema_validate allows empty logging.driver (empty policy = allow)" {
+  run _schema_validate logging driver ""
+  [ "${status}" -eq 0 ]
+}
+
+@test "_schema_validate normalises logging.<svc> to the logging key set (reject)" {
+  run _schema_validate logging.test driver "bad driver!"
+  [ "${status}" -ne 0 ]
+}
+
+@test "_schema_validate normalises logging.<svc> to the logging key set (accept)" {
+  run _schema_validate logging.devel driver "journald"
+  [ "${status}" -eq 0 ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_validate — full registry coverage (parity with the validators
+# that setup.sh AND the TUI wire). Table-driven: each row is
+# "<section>|<key>|<value>|<expect: ok|fail>". This is the union: keys
+# the TUI validated but setup.sh historically accepted (target_arch /
+# build_network / gpu_runtime / runtime alias / network.name /
+# devices.device_ / security.cap_add_ / cap_drop_) are now rejected by
+# BOTH paths — the divergence closes.
+# ════════════════════════════════════════════════════════════════════
+
+# The canonical registry keys the rows of one table actually exercised,
+# recorded by _assert_schema as it runs, one per line.
+#
+# Two tables below are titled "every registered key", and that was a claim
+# about a TRANSCRIBED list: on 1c9ccb2 the accept table named 40 of the 47
+# rows of `SCHEMA_VALIDATOR` and the reject table 39, and registering a
+# forty-eighth key with no sample at all left this file at 30 ok / 0 not ok
+# -- both of those tests among them. A title that asserts exhaustiveness
+# over a hand-listed population is the defect base#1090 is about, in its
+# strongest form, because the title is the thing a reader trusts.
+#
+# So the rows stay (they carry the samples, including the several a key with
+# more than one accepted spelling needs, and values no table syntax could
+# hold -- an embedded newline among them) and the POPULATION is derived: the
+# set of keys the rows reached is held EQUAL to the registry's own key set,
+# by _assert_schema_covers_registry below. A key registered without a sample
+# now fails the table that claims to cover it.
+_SCHEMA_COVERED=""
+
+# Helper: assert _schema_validate verdict for one row, and record which
+# registry key the row reached.
+#
+# The key is resolved through the production normaliser rather than
+# assembled here, so a row written as `network port_1` records
+# `network.port_` and a row written as `logging.devel driver` records
+# `logging.driver` -- the same readings the gate itself makes. A row whose
+# key is free-form resolves to the empty string and records nothing, which
+# is correct: it covers no registry row.
+_assert_schema() {
+  local _section="$1" _key="$2" _value="$3" _expect="$4"
+  local _canon=""
+  _schema_canonical_key "${_section}" "${_key}" _canon
+  [[ -n "${_canon}" ]] && _SCHEMA_COVERED+="${_canon}"$'\n'
+  if _schema_validate "${_section}" "${_key}" "${_value}"; then
+    [[ "${_expect}" == "ok" ]] \
+      || { echo "expected FAIL but ACCEPTED: ${_section}.${_key} = '${_value}'"; return 1; }
+  else
+    [[ "${_expect}" == "fail" ]] \
+      || { echo "expected ACCEPT but REJECTED: ${_section}.${_key} = '${_value}'"; return 1; }
+  fi
+}
+
+# _assert_schema_covers_registry <what> -- the recorded set equals the
+# registry's key set, or say which keys are unsampled.
+#
+# One direction is all there is to check: _schema_canonical_key only ever
+# resolves to a key the registry carries, so the recorded set cannot hold a
+# name the registry does not. The other direction is the one that rots, and
+# an empty recorded set fails it loudly -- every registered key reported
+# missing -- rather than passing as "nothing to compare".
+_assert_schema_covers_registry() {
+  local _what="${1:?_assert_schema_covers_registry: missing table name}"
+  local _registered _covered _missing
+  _registered="$(printf '%s\n' "${!SCHEMA_VALIDATOR[@]}" | sort -u)"
+  _covered="$(printf '%s' "${_SCHEMA_COVERED}" | sed '/^$/d' | sort -u)"
+  _missing="$(comm -23 <(printf '%s\n' "${_registered}") <(printf '%s\n' "${_covered}"))"
+  [[ -z "${_missing}" ]] || {
+    echo "the ${_what} table reached $(printf '%s\n' "${_covered}" | sed '/^$/d' | wc -l) of the registry's $(printf '%s\n' "${_registered}" | wc -l) keys, and its name says every one. Registered with no ${_what} sample:"
+    printf '  %s\n' ${_missing}
+    return 1
+  }
+}
+
+# why: union coverage (accept), with the population DERIVED. The title
+# claims every registered key, and the claim is now checked: the keys the
+# rows reach are held equal to `SCHEMA_VALIDATOR`'s own key set, so a key
+# registered without a sample fails here instead of being covered by a
+# sentence
+@test "_schema_validate accepts every registered key's valid sample" {
+  _SCHEMA_COVERED=""
+  _assert_schema project name "my-project" ok
+  _assert_schema deploy gpu_count "all" ok
+  _assert_schema deploy gpu_count "2" ok
+  _assert_schema network port_1 "8080:80" ok
+  _assert_schema logging driver "json-file" ok
+  _assert_schema logging wrapper_transcript "true" ok
+  _assert_schema logging wrapper_transcript "false" ok
+  _assert_schema logging wrapper_transcript_keep "20" ok
+  _assert_schema logging wrapper_transcript_days "14" ok
+  _assert_schema resources shm_size "2gb" ok
+  _assert_schema lifecycle restart "unless-stopped" ok
+  _assert_schema lifecycle init "true" ok
+  _assert_schema lifecycle init "false" ok
+  _assert_schema lifecycle watchdog_check "rosnode ping -a" ok
+  _assert_schema lifecycle watchdog_interval "30" ok
+  _assert_schema lifecycle watchdog_timeout "10" ok
+  _assert_schema lifecycle watchdog_start_period "0" ok
+  _assert_schema lifecycle watchdog_failures "3" ok
+  _assert_schema lifecycle watchdog_on_fail "restart-container" ok
+  _assert_schema lifecycle watchdog_on_fail "restart-service" ok
+  _assert_schema lifecycle watchdog_max_restarts "5" ok
+  _assert_schema lifecycle watchdog_notify "curl -X POST https://hook" ok
+  _assert_schema build target_arch "arm64" ok
+  _assert_schema build network "host" ok
+  _assert_schema build arg_1 "FOO=bar" ok
+  _assert_schema deploy gpu_mode "force" ok
+  _assert_schema deploy gpu_capabilities "gpu compute" ok
+  _assert_schema deploy gpu_runtime "nvidia" ok
+  _assert_schema deploy runtime "auto" ok
+  _assert_schema deploy dri_groups "auto" ok
+  _assert_schema deploy dri_groups "off" ok
+  _assert_schema deploy dri_groups "44" ok
+  _assert_schema deploy dri_groups "44 104" ok
+  _assert_schema gui mode "off" ok
+  _assert_schema image rule_1 "@basename" ok
+  _assert_schema network network_name "my_net" ok
+  _assert_schema network mode "host" ok
+  _assert_schema network mode "container:db" ok
+  _assert_schema network ipc "shareable" ok
+  _assert_schema network ipc "container:db" ok
+  _assert_schema network pid "host" ok
+  _assert_schema network pid "private" ok
+  _assert_schema network pid "container:db" ok
+  _assert_schema logging max_size "10m" ok
+  _assert_schema logging max_file "3" ok
+  _assert_schema logging compress "true" ok
+  _assert_schema logging local_path "/var/log/app" ok
+  _assert_schema logging container_log_keep "20" ok
+  _assert_schema logging container_log_days "14" ok
+  _assert_schema volumes mount_1 "/data:/data:ro" ok
+  _assert_schema devices device_1 "/dev/snd:/dev/snd" ok
+  _assert_schema devices cgroup_rule_1 "c 81:* rmw" ok
+  _assert_schema environment env_1 "FOO=bar" ok
+  _assert_schema tmpfs tmpfs_1 "/run:size=64m" ok
+  _assert_schema additional_contexts context_1 "repo=.." ok
+  _assert_schema security cap_add_1 "SYS_ADMIN" ok
+  _assert_schema security cap_drop_1 "NET_RAW" ok
+  _assert_schema security privileged "false" ok
+  _assert_schema security security_opt_1 "seccomp:unconfined" ok
+
+  _assert_schema_covers_registry "accept"
+}
+
+# The invalid samples, held as DATA rather than as calls, so the per-stage
+# gate below can replay exactly the population this table covers instead of
+# keeping a second list beside it that rots on its own (base#1268). A row is
+# "<section>|<key>|<value>"; the value is everything after the SECOND bar, so
+# a sample carrying a bar or an embedded newline is still one row.
+declare -ga _SCHEMA_REJECT_ROWS=(
+  'project|name|My.Project'
+  'deploy|gpu_count|-1'
+  'network|port_1|not-a-port'
+  'logging|driver|bad driver!'
+  'logging|wrapper_transcript|maybe'
+  'logging|wrapper_transcript_keep|0'
+  'logging|wrapper_transcript_days|abc'
+  $'lifecycle|watchdog_notify|has\nnewline'
+  'resources|shm_size|huge'
+  'lifecycle|restart|sometimes'
+  'lifecycle|init|garbage'
+  'lifecycle|watchdog_interval|0'
+  'lifecycle|watchdog_timeout|-5'
+  'lifecycle|watchdog_start_period|-1'
+  'lifecycle|watchdog_failures|abc'
+  'lifecycle|watchdog_on_fail|restart-host'
+  'lifecycle|watchdog_max_restarts|1.5'
+  $'lifecycle|watchdog_check|has\nnewline'
+  'build|target_arch|sparc'
+  'build|network|carrier-pigeon'
+  'build|arg_1|1BAD=x'
+  'deploy|gpu_mode|on'
+  'deploy|gpu_capabilities|gpu bogus'
+  # base#1267: the empty string is one of the values this key refuses, and
+  # it is refused HERE rather than short-circuited by the empty-value
+  # policy -- SCHEMA_EMPTY marks the key `validate`, so an empty value
+  # reaches the validator like any other. A capability list the generator
+  # cannot carry is not a clear-the-key gesture.
+  'deploy|gpu_capabilities|'
+  'deploy|gpu_runtime|podman'
+  'deploy|runtime|podman'
+  'deploy|dri_groups|on'
+  'deploy|dri_groups|44,104'
+  'deploy|dri_groups|44 render'
+  'gui|mode|of'
+  'image|rule_1|whatever'
+  'network|network_name|-bad'
+  'network|mode|foo: bar'
+  'network|mode|bogus'
+  'network|ipc|bogus'
+  'network|ipc|bridge'
+  'network|pid|shareable'
+  'network|pid|bogus'
+  'logging|max_size|10petabytes'
+  'logging|max_file|0'
+  'logging|compress|maybe'
+  $'logging|local_path|has\nnewline'
+  'logging|container_log_keep|0'
+  'logging|container_log_days|abc'
+  'volumes|mount_1|noslash'
+  'devices|device_1|noslash'
+  'devices|cgroup_rule_1|bogus'
+  'environment|env_1|1BAD=x'
+  'tmpfs|tmpfs_1|relative/path'
+  'additional_contexts|context_1|noequals'
+  'security|cap_add_1|lowercase'
+  'security|cap_drop_1|has space'
+  'security|privileged|yes'
+  'security|security_opt_1|anything goes'
+)
+
+# Replay every row of _SCHEMA_REJECT_ROWS with <section_prefix> pasted in
+# front of the section name, asserting each is refused. The empty prefix is
+# the plain top-level reading; "stage:<name>." is the per-stage one.
+_assert_schema_reject_rows() {
+  local _prefix="${1-}"
+  local _row _rest _section _key _value
+  for _row in "${_SCHEMA_REJECT_ROWS[@]}"; do
+    _section="${_row%%|*}"
+    _rest="${_row#*|}"
+    _key="${_rest%%|*}"
+    _value="${_rest#*|}"
+    _assert_schema "${_prefix}${_section}" "${_key}" "${_value}" fail || return 1
+  done
+}
+
+# why: union coverage (reject), with the population DERIVED for the same
+# reason the accept table's is: the title claims every registered key, so
+# the keys the rows reach are held equal to the registry's own key set
+@test "_schema_validate rejects every registered key's invalid sample" {
+  _SCHEMA_COVERED=""
+  # Non-vacuity: an empty or truncated row table would refuse nothing and
+  # cover nothing, and the coverage assertion below would be comparing two
+  # empty sets. The floor is well under the live row count.
+  [ "${#_SCHEMA_REJECT_ROWS[@]}" -ge 50 ] \
+    || fail "_SCHEMA_REJECT_ROWS holds ${#_SCHEMA_REJECT_ROWS[@]} rows; the table did not load"
+  _assert_schema_reject_rows ""
+
+  _assert_schema_covers_registry "reject"
+}
+
+# why: base#1268 -- the per-stage namespace was outside the gate entirely.
+# `_edit_stage_list` hands `_edit_list_entry` the section as
+# `stage:<name>.<section>`, `_schema_canonical_key` knew how to normalise
+# only `logging.<svc>`, so every per-stage key resolved to the empty string
+# and `_schema_validate` returned 0 on its free-form branch -- a validated
+# call site that could not refuse anything. The claim is the paired one, over
+# the SAME rows the unprefixed table uses rather than a second list: a value
+# the top level refuses is refused under `stage:<name>.` too. The coverage
+# assertion is what makes it a statement about resolution and not about these
+# rows -- it is satisfied only when every registered key resolved THROUGH the
+# prefix, so a normaliser that handled some sections and not others fails
+# here naming the ones it missed
+@test "_schema_validate refuses a stage:<name>. prefixed key the top level refuses (base#1268)" {
+  _SCHEMA_COVERED=""
+  [ "${#_SCHEMA_REJECT_ROWS[@]}" -ge 50 ] \
+    || fail "_SCHEMA_REJECT_ROWS holds ${#_SCHEMA_REJECT_ROWS[@]} rows; the table did not load"
+  _assert_schema_reject_rows "stage:dev."
+
+  _assert_schema_covers_registry "per-stage reject"
+}
+
+# why: base#1268 -- the normalisation itself, asked of the one function that
+# owns the rule, next to the `logging.<svc>` case it already carried. The
+# third reading is the boundary: `stage:dev` names no section, so it stays
+# free-form rather than being read as a bare `dev`
+@test "_schema_canonical_key strips a stage:<name>. section prefix (base#1268)" {
+  local _canon=""
+  _schema_canonical_key "stage:dev.network" mode _canon
+  [ "${_canon}" = "network.mode" ]
+  _schema_canonical_key "stage:dev.volumes" mount_3 _canon
+  [ "${_canon}" = "volumes.mount_" ]
+  _schema_canonical_key "stage:dev.logging" driver _canon
+  [ "${_canon}" = "logging.driver" ]
+  _schema_canonical_key "stage:dev" mode _canon
+  [ "${_canon}" = "" ]
+}
+
+# Embedded-newline values must be rejected by every value-bearing
+# validator, mirroring the [logging] local_path guard above (line ~140).
+# A real newline in any of these flows verbatim into compose.yaml's
+# environment: / additional_contexts: / volumes: / devices: lists, where
+# it injects an extra YAML line (a setup.conf injection vector).
+@test "_schema_validate rejects embedded-newline values (YAML injection) (#687)" {
+  _assert_schema environment env_1 $'FOO=a\nBAR=x' fail
+  _assert_schema additional_contexts context_1 $'name=v\ninject' fail
+  _assert_schema additional_contexts context_1 $'repo=.\ninject' fail
+  _assert_schema volumes mount_1 $'/d:/d\ninject' fail
+  _assert_schema devices device_1 $'/dev/x:/dev/x\ninject' fail
+  _assert_schema tmpfs tmpfs_1 $'/tmp\n      - /evil' fail
+}
+
+# The numeric validators are deliberately shape-only: they constrain the
+# *form* (digits, colon, optional protocol) but delegate range/bound
+# checking to docker at `compose up` time. This test PINS that contract so
+# a future tightening (range check) or loosening (accepting non-numeric)
+# is observable rather than silent.
+@test "_schema_validate numeric validators are shape-only, not range-bound (#687)" {
+  # In-shape-but-out-of-range integers are accepted (delegated to docker):
+  _assert_schema network port_1 "0:0" ok
+  _assert_schema network port_1 "70000:80" ok
+  _assert_schema network port_1 "99999999999:80" ok
+  _assert_schema deploy gpu_count "999999999999999999999" ok
+  _assert_schema logging max_file "999999" ok
+  # Shape violations are still rejected, so the contract is shape, not free-form:
+  _assert_schema network port_1 "0:" fail
+  _assert_schema deploy gpu_count "1.5" fail
+  _assert_schema logging max_file "0" fail
+}
+
+# why: clear-key semantics
+@test "_schema_validate allows empty (clear) for every list + clearable scalar key" {
+  _assert_schema resources shm_size "" ok
+  _assert_schema lifecycle restart "" ok
+  _assert_schema lifecycle watchdog_check "" ok
+  _assert_schema lifecycle watchdog_notify "" ok
+  _assert_schema lifecycle watchdog_interval "" ok
+  _assert_schema build target_arch "" ok
+  _assert_schema build arg_1 "" ok
+  _assert_schema network network_name "" ok
+  _assert_schema network mode "" ok
+  _assert_schema network ipc "" ok
+  _assert_schema network pid "" ok
+  _assert_schema volumes mount_1 "" ok
+  _assert_schema devices device_1 "" ok
+  _assert_schema environment env_1 "" ok
+  _assert_schema tmpfs tmpfs_1 "" ok
+  _assert_schema security cap_add_1 "" ok
+}
+
+# why: default-accept
+@test "_schema_validate accepts free-form (unregistered) keys" {
+  # security.security_opt_ and image.rule_ used to sit here: both have a
+  # closed value set their consumer dispatches on, so both are registered
+  # now and the free-form default no longer covers them. tmpfs.tmpfs_ sat
+  # here too until base#1095: it was the last SECTION with no validator of
+  # any kind, which is not the same thing as a free-form key, and its
+  # value reached compose.yaml. What is left is a key no section declares,
+  # which is the only population this branch still answers for.
+  _assert_schema environment not_a_registered_key "anything goes" ok
+}
+
+# ════════════════════════════════════════════════════════════════════
+# SCHEMA_SECTIONS — ordered section list (epic)
+#
+# Single source for "which sections exist, in what order". setup.sh's
+# _setup_known_section and the TUI dispatch derive from it so adding a
+# section here makes it known/dispatchable without hand-editing them.
+# ════════════════════════════════════════════════════════════════════
+
+# why: ordered section list (#561)
+@test "SCHEMA_SECTIONS lists every setup.conf section in file order (#561)" {
+  local _expected="project image build deploy lifecycle gui network security resources environment tmpfs devices volumes additional_contexts logging"
+  [ "${SCHEMA_SECTIONS[*]}" = "${_expected}" ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_is_section — SCHEMA_SECTIONS membership predicate
+# ════════════════════════════════════════════════════════════════════
+
+# why: membership accept (#561)
+@test "_schema_is_section accepts a registered section with typed keys (#561)" {
+  run _schema_is_section build
+  [ "${status}" -eq 0 ]
+}
+
+# why: membership accept, list-key-only section (#561). The title said
+# "free-form-only" until base#1095: image.rule_ has had a validator for
+# a while, and the only genuinely keyless section (tmpfs) now has one
+# too, so the name was describing a state the tree had left.
+@test "_schema_is_section accepts a section whose only key is a list key (image) (#561)" {
+  run _schema_is_section image
+  [ "${status}" -eq 0 ]
+}
+
+# why: membership reject (#561)
+@test "_schema_is_section rejects an unknown section (#561)" {
+  run _schema_is_section nonsense
+  [ "${status}" -ne 0 ]
+}
+
+# why: logging.<svc> not a base section (#561)
+@test "_schema_is_section rejects a per-service logging variant (#561)" {
+  # [logging.<svc>] is not a base section; its known-ness is the
+  # _setup_known_section special case, not this membership predicate.
+  run _schema_is_section logging.foo
+  [ "${status}" -ne 0 ]
+}
+
+# why: single source (#561)
+@test "_schema_is_section tracks SCHEMA_SECTIONS additions (single source) (#561)" {
+  SCHEMA_SECTIONS+=(brandnew)
+  run _schema_is_section brandnew
+  [ "${status}" -eq 0 ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _schema_section_keys <section> <outarray> — registered keys per
+# section, derived from SCHEMA_VALIDATOR by canonical-key prefix.
+# Order is unspecified (assoc-array iteration), so tests sort.
+# ════════════════════════════════════════════════════════════════════
+
+# _sorted_keys <section> -> echoes the section's keys, sorted, space-joined.
+_sorted_keys() {
+  local -a _k=()
+  _schema_section_keys "${1}" _k
+  (( ${#_k[@]} == 0 )) && return 0
+  printf '%s\n' "${_k[@]}" | sort | tr '\n' ' '
+}
+
+# why: keys by prefix (#561)
+@test "_schema_section_keys returns scalar+list keys for build (#561)" {
+  [ "$(_sorted_keys build)" = "arg_ network target_arch " ]
+}
+
+# why: keys by prefix (#561)
+@test "_schema_section_keys returns all logging keys (#561, #606)" {
+  [ "$(_sorted_keys logging)" = "compress container_log_days container_log_keep driver local_path max_file max_size wrapper_transcript wrapper_transcript_days wrapper_transcript_keep " ]
+}
+
+# why: keys incl. runtime alias (#561)
+@test "_schema_section_keys returns deploy keys incl. legacy alias (#561)" {
+  [ "$(_sorted_keys deploy)" = "dri_groups gpu_capabilities gpu_count gpu_mode gpu_runtime runtime " ]
+}
+
+@test "_schema_section_keys returns the rule_ list key for image (#561, #876)" {
+  # [image] was free-form-only until rule_N got a validator; it now
+  # yields exactly the one registered list key.
+  [ "$(_sorted_keys image)" = "rule_ " ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Registry completeness: keys whose resolver has a fixed value set
+#
+# An unregistered key was accepted with ANY value and the resolver then
+# discarded it in a catch-all branch, so `setup set gui.mode of` exited
+# 0, printed a success line and left the GUI following host detection.
+# The same value passed as `--gui of` was rejected. These pin the
+# conf/CLI-set path to the resolver's real value set.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_schema_validate gates gui.mode the way the --gui flag does (#876)" {
+  _assert_schema gui mode "auto" ok
+  _assert_schema gui mode "force" ok
+  _assert_schema gui mode "off" ok
+  _assert_schema gui mode "of" fail
+  _assert_schema gui mode "true" fail
+}
+
+@test "_schema_validate gates the [deploy] keys the resolver reads (#876)" {
+  _assert_schema deploy gpu_mode "auto" ok
+  _assert_schema deploy gpu_mode "force" ok
+  _assert_schema deploy gpu_mode "off" ok
+  _assert_schema deploy gpu_mode "on" fail
+  _assert_schema deploy gpu_capabilities "gpu compute utility graphics" ok
+  _assert_schema deploy gpu_capabilities "all" ok
+  _assert_schema deploy gpu_capabilities "gpu bogus" fail
+  _assert_schema deploy dri_groups "auto" ok
+  _assert_schema deploy dri_groups "off" ok
+  _assert_schema deploy dri_groups "on" fail
+}
+
+@test "_schema_validate gates the [security] keys the resolver reads (#876)" {
+  _assert_schema security privileged "true" ok
+  _assert_schema security privileged "false" ok
+  _assert_schema security privileged "yes" fail
+  _assert_schema security security_opt_1 "seccomp:unconfined" ok
+  _assert_schema security security_opt_1 "apparmor=unconfined" ok
+  _assert_schema security security_opt_1 "no-new-privileges:true" ok
+  _assert_schema security security_opt_1 "anything goes" fail
+  _assert_schema security security_opt_1 "noseparator" fail
+}
+
+@test "_schema_validate gates image.rule_N against the dispatch prefixes (#876)" {
+  _assert_schema image rule_1 "prefix:docker_" ok
+  _assert_schema image rule_1 "suffix:_ws" ok
+  _assert_schema image rule_1 "string:my-image" ok
+  _assert_schema image rule_1 "@basename" ok
+  _assert_schema image rule_1 "@default:fallback" ok
+  # detect_image_name has no branch for these: they are skipped in
+  # silence and the run ends on the 'unknown' fallback.
+  _assert_schema image rule_1 "whatever" fail
+  _assert_schema image rule_1 "prefix:" fail
+  _assert_schema image rule_1 "@basename-ish" fail
+}

@@ -1,0 +1,1710 @@
+#!/usr/bin/env bash
+#
+# watch/lib.sh - the pin registry: it reads the declaration sites, it is
+# not a list of them.
+#
+# Sourced library (no main). Provides the marker grammar, the reader that
+# derives the watched-tool table from the files that declare each version,
+# and the detector that finds a version declaration NOT covered by a
+# marker. pins.sh (CLI), check.sh (upstream comparison) and
+# script/test/drivers/pin_coverage.sh (the lint) all read this one file.
+#
+# ── Why derived rather than listed ──────────────────────────────────────────
+#
+# A hand-maintained roster of "tools we watch" decays the moment somebody
+# adds a pin without opening it -- the same failure mode as the downstream
+# roster, the release archive's path list and the lint-tool table, each of
+# which this repo has already had to convert from a list into a derivation.
+# So there is no roster. Every watched version is declared where it is
+# USED, on a marker comment attached to the line that names the version,
+# and the table is whatever those markers say today.
+#
+# That alone would still decay in the other direction -- a pin added with
+# no marker is invisible, and invisible is exactly the state this whole
+# mechanism exists to end. So the derivation is paired with a DETECTOR:
+# every line in the scanned trees whose shape is "a third-party version
+# this repo names" must be the target of a marker. The pin-coverage lint
+# fails the build when one is not. Adding a pin without declaring how to
+# watch it is therefore not something a reviewer has to notice.
+#
+# ── The marker grammar ──────────────────────────────────────────────────────
+#
+# A marker is a comment line. Its TARGET is the next line that is neither
+# blank nor a comment, and the version lives on that target line:
+#
+#   # tool-pin: <name> <resolver> <coordinate> [pattern=<re>] [skip=<v>,...]
+#                [sha256=<ARG>@<source>]...
+#   ARG FOO_VERSION=1.2.3
+#
+#   # tool-pin: unpinned <name> -- <why it cannot be pinned here>
+#   RUN apk add --no-cache bash git
+#
+#   # tool-pin: ignore -- <why this is not a third-party version>
+#   ARG OURS=1.0
+#
+# `unpinned` is not an off switch. It is a DECLARATION that this dependency
+# floats, and `check.sh` prints every one of them on every run, under its
+# own heading, forever. Silence is what the audit found; a floating
+# dependency that nobody has to be reminded of is how it got there.
+#
+# `sha256=<ARG>@<source>` (repeatable) names a checksum ARG in the same file
+# that must change with the version. `<source>` is `asset:<url>` (digest of
+# the downloaded asset) or `file:<url>:<asset>` (digest read from an upstream
+# checksum file); `{version}` in the url is the new version. `pins.sh --set`
+# regenerates every named ARG with the version (base#1676).
+#
+# `skip=<v>[,<v>...]` records a version this repo has deliberately refused.
+# It exists because of the opposite defect: dependabot never re-raises a
+# version pair whose PR was closed, so closing one PR opts the repo out of
+# that bump permanently and NOTHING in the config says so. Here the refusal
+# is a line in the file that declares the pin, next to the version it
+# refuses, visible to the next reader and checked by the lint.
+#
+# ── Resolvers ───────────────────────────────────────────────────────────────
+#
+#   github-release <owner>/<repo>   the latest non-prerelease release's tag
+#   dockerhub <namespace>/<repo>    the highest tag matching `pattern=`
+#
+# `pattern=` is a POSIX ERE anchored by the resolver against a whole tag.
+# It is what makes "latest alpine" mean the latest 3.x SERIES tag rather
+# than `edge` or `latest`, and it is per-pin because what counts as a
+# comparable tag is a property of the upstream, not of this repo.
+
+# Sourced more than once in one shell (pins.sh from a spec that has
+# already sourced the lint driver, say), the `readonly` declarations below
+# would abort the caller. Guard rather than drop the readonly: the
+# constants being immutable is what stops a caller from redefining the
+# grammar out from under the lint.
+if [[ -n "${_PIN_LIB_SOURCED:-}" ]]; then
+  return 0
+fi
+_PIN_LIB_SOURCED=1
+
+# The go.mod scanner and the readability guard refuse through the shared
+# logger (base#1463). A caller that already sourced it (test.sh through
+# _lib.sh) keeps its copy; a bare `source lib.sh` -- check.sh, pins.sh, a
+# spec -- brings it in from the dist tree beside this file.
+if ! declare -F _log_err >/dev/null; then
+  # shellcheck source=dist/script/docker/lib/log.sh
+  source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/../../dist/script/docker/lib/log.sh"
+fi
+
+# ── Marker vocabulary ───────────────────────────────────────────────────────
+
+# The marker's opening token. One string, so the reader, the lint's
+# failure message and the specs cannot spell it three ways.
+readonly _PIN_MARKER='tool-pin:'
+
+# A marker is a comment whose BODY OPENS with that token. Prose that
+# merely mentions it -- this file, a Dockerfile header explaining the
+# convention, a failure message quoting it -- is not a marker. Anchoring
+# rather than substring-matching is what lets the mechanism be documented
+# in the same trees it scans.
+readonly _PIN_MARKER_RE="^[[:space:]]*#+[[:space:]]*${_PIN_MARKER}"
+
+# In a go.mod a comment is `//` (a `#` line is a Go syntax error), so a
+# marker there is a `//` comment line opening with the token (base#1463).
+readonly _PIN_GO_MOD_MARKER_RE="^[[:space:]]*//[[:space:]]*${_PIN_MARKER}"
+
+# The three declaration states. `pinned` is comparable against upstream;
+# `unpinned` is reported as floating and never compared; `ignore` is "this
+# line's shape matched the detector but it is not a third-party version".
+readonly _PIN_STATE_PINNED='pinned'
+readonly _PIN_STATE_UNPINNED='unpinned'
+readonly _PIN_STATE_IGNORE='ignore'
+
+# Every resolver `check.sh` implements. Named here rather than there
+# because the LINT has to reject an unknown resolver at the declaration
+# site: a typo caught weeks later by a scheduled run is a pin nobody was
+# watching in the meantime. A unit spec asserts check.sh dispatches every
+# entry.
+readonly _PIN_RESOLVERS=(
+  github-release
+  dockerhub
+)
+
+# What is walked: THE FILES THIS REPO TRACKS. There is no list here, and
+# that is the point -- see _pin_tracked.
+#
+# The population went through the same three corrections everything else
+# in this file did. It was a roster of scan ROOTS (`dockerfile`,
+# `dist/dockerfile`, `.github/workflows`) and two live pins sat outside
+# it, both of them versions this repo BAKES INTO FILES IT SHIPS
+# DOWNSTREAM. So it inverted: walk the whole checkout, and keep a PRUNE
+# roster of trees not to read -- `.git`, `log`, `.prev-release`,
+# `.claude` -- with a guard asserting each of them was gitignored and
+# untracked, so the roster could not quietly grow to cover something the
+# repo ships.
+#
+# That inversion was right about the direction and wrong about the
+# artefact. A prune roster is still hand-kept, and hand-kept lists in this
+# mechanism fail the same way every time: correct when written, with
+# nothing to notice when the world moves. It moved. `just test coverage`
+# writes kcov's HTML report into `coverage/` INSIDE the checkout, so on
+# the CI coverage shard -- and on any machine that had run coverage
+# locally -- the walk read kcov's own bundled jquery, handlebars and
+# `bcov.css`, and reported jQuery's `m="2.1.1"` as an undeclared
+# third-party version. Same for the generated-workflow lint, which shares
+# this walk: it read a `uses:` line out of a kcov HTML rendering of one of
+# this repo's scripts. Adding `coverage` to the roster would have passed,
+# and the guard would have accepted it, and the NEXT generated directory
+# would have reproduced it exactly.
+#
+# The roster's own justification says why that was never the fix. It
+# exempted `.claude/` because "scanning it would make the lint's verdict
+# depend on whose machine it ran on, which is the one thing a gate must
+# not do" -- and a leftover `coverage/` is precisely that dependency,
+# which the roster did not prevent and could not have.
+#
+# So the population is DERIVED and the roster is gone. A version in a file
+# the repo does not track is not a version this repo declares: nothing
+# ships it, nobody pulls it, and it is on this machine by accident.
+# `git ls-files` answers that exactly. Both questions the prune guard
+# existed to ask -- is this tree ignored, is anything in it tracked --
+# dissolve with it, and the one it could not reach is now answered right:
+# a force-added tracked file inside an ignored tree IS tracked, so it IS
+# scanned.
+#
+# The failure mode still inverts the safe way. A tree added tomorrow is
+# scanned the moment it is STAGED -- `git ls-files` reads the index, not
+# a commit, so `just test` sees a new file as soon as `git add` does, one
+# step before it could reach a PR -- and it is exempt for exactly as long
+# as it is not. There is nothing to forget to edit, and nothing a person
+# can edit to make a shipped file stop being read.
+
+# What is NOT read -- and nothing else. This was a list of the shapes a
+# declaration MAY live in (`Dockerfile*`, `*.y{a,}ml`, `*.sh`), which is
+# the roster failure one level up from the scan roots, with the same
+# tell: a justfile is this repo's control surface, 13 are tracked,
+# `_pin_is_declaration` answers TRUE for a `docker run` line in one, and
+# not one was ever walked. So this inverts too. Forgetting to touch this
+# list when a shape arrives means the new shape IS read and the lint
+# fires, rather than the new shape being quietly exempt.
+#
+# Two exemptions, each for a reason that is a property of the SHAPE
+# rather than of what happens to sit in it today:
+#
+#   Prose (`*.md`, `*.adoc`, `README`, `LICENSE`). Nothing executes it. A
+#   document QUOTES `docker run --rm alpine:3.21` -- that is what a
+#   document is for -- and a version in one is stale the way a sentence
+#   is stale, which is a doc-review problem and not a supply-chain one.
+#
+#   `*.bats`. A spec's heredoc IS the fixture the code under test parses,
+#   and the marker grammar cannot reach inside one: a marker's target is
+#   the next non-comment line, so declaring a fixture's `FROM` means
+#   inserting a comment INTO the fixture and changing what the test feeds
+#   its subject. That is the grammar, not a preference. Some 60 lines
+#   here spell `FROM ubuntu:24.04` for a Dockerfile parser to read, and
+#   demanding an `ignore` marker on each would teach every reader to
+#   reach for `ignore` first.
+#
+#   What that second one costs is real and bounded, and is recorded here
+#   because it is the next reader's question: two system specs really do
+#   BUILD `FROM alpine:3.20` and `FROM ubuntu:24.04`, and neither is
+#   watched. An image a TEST builds fails the test when it rots --
+#   loudly, in the run that uses it. That is the opposite of the failure
+#   this watch exists for, which is a version baked into a file this repo
+#   SHIPS going stale in silence in somebody else's repo.
+#
+#   Go tests (`*_test.go`, base#1530), for the same two reasons. A Go
+#   test is a spec, and Go has no `#` comment, so no marker can stand
+#   above a line in one at all: an expected diagnostic such as
+#   "t.toml:1:7: " has the image-reference shape and could only be
+#   reworded to dodge the detector. A non-test `.go` file is still read.
+#
+#   TOML files (`*.toml`) below a `testdata` directory (base#1530, for
+#   base#1441). A TOML case's bytes are what the test feeds its subject,
+#   and a vendored one (the toml-test cases under internal/gate/testdata)
+#   keeps upstream's bytes, so a marker line inserted into it changes the
+#   case. Only a whole path component named `testdata` counts:
+#   `mytestdata/`, `testdata2/` and a file named `testdata` are still
+#   read. Any other file kind below `testdata` is read too; the
+#   config-gen corpus `.tsv` files there carry markers.
+#
+# The lint checks this list rather than trusting it: a `tool-pin:` marker
+# in an exempt file is a failure, so "exempt the shape the awkward pin
+# lives in" cannot quietly become a way to stop watching a pin.
+#
+# Globs matched against a path's BASENAME, by _pin_is_exempt_shape. They
+# were `find` predicates while the population came from `find`; both
+# halves of the walk now partition one list of tracked paths, so the
+# predicate has to be answerable about a string rather than about a
+# directory entry. The `testdata` TOML shape above needs the directory
+# part too, so it is not a glob here: _pin_is_exempt_shape tests it.
+readonly _PIN_SCAN_EXEMPT_SHAPES=(
+  '*.md' '*.adoc' 'README' 'LICENSE' '*.bats' '*_test.go'
+)
+
+# ── Declaration shapes the detector recognises ──────────────────────────────
+#
+# Deliberately NOT "every version-shaped token anywhere". The boundary is
+# a third-party version THIS REPO NAMES THAT DEPENDABOT CANNOT BUMP:
+# dependabot reads `uses:` version refs in WORKFLOW FILES and does that job
+# well (its login-action PR is open and current), so duplicating it would
+# produce two mechanisms disagreeing about one dependency. What it provably
+# cannot see is an assignment whose value is a version -- a Dockerfile
+# `ARG` or a shell `local` / `readonly` / `declare` / `export` alike -- a
+# FROM tag, an image reference wherever it is written, a release-download
+# URL, a `git clone -b <tag>`, a `uses:` ref that is a BRANCH rather than
+# a version, and ANY of those written inside a shell script that generates
+# a file.
+#
+# Every shape below is decided by what the LINE says. Only one consults
+# the file at all, and only to locate DEPENDABOT'S OWN SCOPE.
+#
+# That is this detector's fourth correction and all four are the same
+# correction. The first version listed the DIRECTORIES to look in and two
+# live pins sat outside them. The second listed the FILE SHAPES and the
+# repo's own control surface was not among them. The third listed the
+# CONTEXTS an image may be named in -- a `docker run|pull|create|build`
+# on the same line -- and a compose `image:`, a workflow `container:` and
+# the `sed` that rewrites a downstream `FROM` line were all outside it,
+# including the very line this change hoisted. The fourth listed one
+# KEYWORD, `ARG`, while the reader below already extracted a version from
+# five, and while this file's own advice is to hoist a literal onto a line
+# of its own -- which produces `local` / `readonly` / `export`, none of
+# which the detector could see. Each list was complete when it was written
+# and each one went QUIET rather than red when the world moved past it.
+# There is no fifth-context-proof list, so there is no list: an image
+# reference is recognised by being one, and an assignment by assigning a
+# version.
+#
+# The three shapes after the original four were not additions of scope.
+# They were the forms the staleness this whole mechanism was built for was
+# ACTUALLY written in: hadolint and shellcheck were release-download URLs
+# and the three bats helpers were `clone -b` tags, all of which this change
+# hoisted into ARGs -- while the guard meant to stop them coming back could
+# not see any of them. A guard blind to the shape of the defect it exists
+# to prevent is worth very little.
+
+# A value that IS a version number: `1.2.3`, `v0.10.0`, `3.21`, `v43`.
+#
+# Two forms, and the split is the whole content of the rule. A `v` prefix
+# is a version marker on its own, however few components follow it --
+# nobody writes `v1000` for a UID -- so `v43` (kcov's real pin) and `v7`
+# (a major action ref) are versions. Without that prefix at least one DOT
+# is required, because nothing else separates a release from `ARG
+# USER_UID=1000`, `PORT=8080` or a year.
+#
+# The cost of that second clause is stated rather than hidden: a bare
+# `2024` is accepted as not-a-version, and a single-component upstream
+# release written without its `v` is the one shape this cannot see. The
+# alternative -- treating every bare integer as a release -- flags every
+# count, port and UID in the tree, and a guard nobody can leave on guards
+# nothing.
+#
+# The dot-only form was the previous rule in full, and it made this
+# repo's OWN `ARG KCOV_VERSION=v43` invisible to the lint that exists to
+# prove every pin is watched.
+readonly _PIN_VERSION_RE='^(v[0-9]+(\.[0-9]+)*|[0-9]+(\.[0-9]+)+)([+~.-][A-Za-z0-9.]+)?$'
+
+# An image reference with an explicit, version-shaped tag, WHEREVER it is
+# written: `alpine:3.21`, `bats/bats:1.13.0`, `ghcr.io/ns/img:1.2.3`. One
+# shape for the namespaced and the namespace-less form, and no context
+# test -- the token is the declaration, and the places one can be written
+# (a Dockerfile `FROM`, an `ARG` default, a compose `image:`, a workflow
+# `container:`, a `docker run`, a justfile recipe, a `sed` expression that
+# writes any of those into a file this repo ships) do not enumerate.
+#
+# Group 2 is the name, group 3 the tag. A digit-leading tag is required:
+# `alpine:latest` and `${TEST_TOOLS_IMAGE}` name no version this can
+# compare, and the second is our own image anyway.
+readonly _PIN_IMAGE_REF_RE='(^|[[:space:]"'"'"'|=(,<[])([a-z0-9][a-z0-9._/-]*):([0-9][A-Za-z0-9._-]*)'
+
+# What that shape matches and which is NOT an upstream version. Each is a
+# property of the TOKEN, or of the flag that introduces it -- never of the
+# rest of the line, because a test on the rest of the line is the thing
+# that just failed three times.
+#
+# A name that is entirely digits: `-p 8080:8080`, `--user 1000:1000`,
+# `12:30`. No image is named by a number, and port publishing and UID:GID
+# plumbing are core idiom in this repo, so this is the difference between
+# a guard and a nuisance.
+readonly _PIN_IMAGE_NUMERIC_NAME_RE='^[0-9]+$'
+
+# A digest: `sha256:0123abcd...`. Already immutable, so there is no newer
+# one to propose.
+readonly _PIN_IMAGE_DIGEST_RE='^[0-9a-f]{32,}$'
+
+# A name introduced by `-t` / `--tag`: `docker build -t base:0.1 .`. That
+# names an image this repo PRODUCES, and you cannot depend on a version
+# you are creating. A rule about the flag, not a list of our own image
+# names -- which is why it keeps working when we invent another one.
+readonly _PIN_IMAGE_BUILT_RE='(^|[[:space:]])(-t|--tag)[[:space:]=]+["'"'"']?'
+
+# A `uses:` ref that is neither a version tag nor a 40-hex commit --
+# i.e. a branch, which dependabot has no way to advance.
+readonly _PIN_USES_RE='uses:[[:space:]]*[A-Za-z0-9][A-Za-z0-9._-]*/[^[:space:]@]+@([^[:space:]#]+)'
+readonly _PIN_USES_VERSION_RE='^(v?[0-9]+([._][0-9A-Za-z.-]*)?|[0-9a-f]{40})$'
+
+# The only place a file's IDENTITY still decides anything, and it is not
+# this repo's roster to keep: dependabot reads `uses:` refs out of
+# .github/workflows/, so that is exactly and only where a VERSION ref is
+# somebody else's job. In a heredoc a generator writes, in a justfile, in
+# a manifest, nothing but this watch can ever advance one.
+readonly _PIN_DEPENDABOT_SCOPE_RE='^\.github/workflows/[^/]+\.ya?ml$'
+
+# A release asset URL that names the version in its PATH:
+# `.../releases/download/v2.12.0/hadolint-Linux-x86_64`. This is not a
+# fifth shape bolted on -- it is the shape three of this repo's four
+# staleness cases were actually written in before they were hoisted into
+# ARGs, and the guard that is supposed to stop them coming back could not
+# see it. Only a LITERAL counts: `releases/download/${FOO_VERSION}/` is
+# the ARG's version, already covered by the ARG's own marker.
+readonly _PIN_RELEASE_URL_RE='releases/download/v?[0-9][A-Za-z0-9._-]*/'
+
+# `git clone --depth 1 -b v2.1.0 ...` -- the other pre-hoist shape, and
+# the one the three bats helper libraries were pinned in. Anchored on the
+# word `clone` by the caller so a `-b` flag to some other command cannot
+# masquerade as a tag.
+readonly _PIN_CLONE_REF_RE='(^|[[:space:]])(-b|--branch)[[:space:]]+["'"'"']?v?[0-9][A-Za-z0-9._-]*'
+
+# The assignment shapes whose version is the WHOLE right-hand side: a
+# Dockerfile `ARG`, and a shell assignment with or without a declaration
+# keyword. Both DECOUPLE the version from the marker's coordinate, which
+# is what lets a marker name `library/alpine` upstream while the line
+# spells `3.21`. That decoupling is why hoisting a literal onto a line of
+# its own is the standard fix for a version the reader cannot address.
+#
+# ONE regex, read by both halves. The reader used it to EXTRACT a pin's
+# current value from all five keywords; the detector had a separate,
+# narrower test that recognised `ARG` alone. So the convention this file
+# recommends -- hoist the literal onto its own line -- produced the exact
+# shape the completeness guard was blind to, and two versions this repo
+# writes into every downstream Dockerfile it migrates lost their cover
+# without the lint noticing. A shared regex is what makes "the lint and
+# the watch cannot disagree about what a pin is" true rather than
+# intended.
+readonly _PIN_ASSIGN_RE='^([[:space:]]*(ARG|local|readonly|declare|export)?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=)(.*)$'
+
+# A versioned ACTION reference as a whole value: `<owner>/<repo>@<ref>`,
+# with any number of path segments in between. Capture 1 is the action,
+# capture 3 the ref. The required `/` is what keeps a bare word ahead of an
+# `@` -- an email address, a `user@host` -- from reading as an action.
+#
+# It is here rather than in the lint that compares refs for the reason
+# `_PIN_ASSIGN_RE` is here: an assignment of one is a DECLARATION SITE (the
+# shape below), and it is also the value that lint resolves a variable to.
+# Two spellings of "what an action ref is" would let the guard and the
+# reader disagree about which lines are pins.
+readonly _PIN_ACTION_REF_RE='^([A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)+)@([A-Za-z0-9._-]+)$'
+
+# ── Reader ──────────────────────────────────────────────────────────────────
+
+# _pin_is_exempt_shape <repo-root-relative-path>
+#
+# TRUE when the path's BASENAME matches one of the exempt shapes, or the
+# path is a `*.toml` file below a directory component exactly named
+# `testdata`. Both halves of the walk partition one list of paths through
+# this, so a file is read by exactly one of them and neither can drift.
+_pin_is_exempt_shape() {
+  local _base="${1##*/}" _glob
+  [[ "/${1}" == */testdata/* && "${_base}" == *.toml ]] && return 0
+  for _glob in "${_PIN_SCAN_EXEMPT_SHAPES[@]}"; do
+    # Deliberately unquoted: _glob IS a pattern.
+    # shellcheck disable=SC2053
+    [[ "${_base}" == ${_glob} ]] && return 0
+  done
+  return 1
+}
+
+# _pin_absent <path> -- rc 0 iff the path is known not to exist: neither it
+# nor a dangling link is there, and its nearest existing ancestor is a
+# directory that can be searched, so the failed lookup is not a denied one.
+_pin_absent() {
+  local _p="${1}" _d
+  [[ -e "${_p}" || -L "${_p}" ]] && return 1
+  _d="${_p}"
+  while [[ ! -e "${_d}" ]]; do
+    case "${_d}" in
+      */*) _d="${_d%/*}"; [[ -n "${_d}" ]] || _d=/ ;;
+      *) _d=. ;;
+    esac
+  done
+  [[ -d "${_d}" && -x "${_d}" ]]
+}
+
+# _pin_tracked <repo-root>
+#
+# Print every file this repo TRACKS at <repo-root>, repo-root-relative,
+# one per line, LC_ALL=C sorted. This is the whole population both walks
+# partition -- see the section head above for why it is `git ls-files`
+# and not a roster.
+#
+# Returns 2, printing what to supply, when tracked-ness cannot be
+# established. "Nothing is tracked" and "nobody could look" are the two
+# answers a caller must never confuse, and only one of them is allowed to
+# read as a clean tree.
+#
+# ── Only blobs ──────────────────────────────────────────────────────────
+#
+# Index modes 100644 and 100755 and nothing else. A 120000 entry is a
+# SYMLINK, and this repo tracks eight of them -- `script/run.sh` and its
+# siblings point into `dist/script/docker/wrapper/`. Reading through one
+# reads a file already in the population under a second name, which does
+# not just duplicate work: every marker in it yields a second record with
+# a different `file`, and the lint's duplicate-NAME check would fire on
+# the repo's own pins. A symlink is a pointer to content, not content.
+# 160000 (a submodule) is excluded by the same rule and for the same
+# reason -- it is another repository's content, tracked here as a commit
+# id.
+#
+# The rule is held on BOTH roads into this function, not only on the one
+# that can read modes: the carried list is filtered against the tree
+# instead. A rule enforced on one road is a verdict that depends on which
+# road the environment took.
+#
+# ── Only what the work tree still holds ─────────────────────────────────
+#
+# A tracked path the work tree no longer has is a deletion not yet
+# committed: it declares nothing, so it is left out on both roads. A
+# go.mod bump whose tidy wants no go.sum removes a tracked go.sum, and
+# the bump's own read-back would otherwise refuse the tree as
+# pin_file_unreadable (base#1440). A file that is there but cannot be
+# read is still refused, and so is one behind a directory that cannot be
+# searched: _pin_absent answers only when the lookup can tell.
+#
+# ── Where the answer comes from, and why it is never absent ─────────────
+#
+# The check needs git, and the suite's own container bind-mounts the
+# checkout WITHOUT a resolvable `.git`: a worktree's `.git` is a FILE
+# naming a path outside the mount, so `git -C /source rev-parse
+# --git-dir` answers `fatal: not a git repository:
+# <host-path>/.git/worktrees/<name>`. git is installed there; the
+# repository is what is missing.
+#
+# So the answer is computed where git works and carried to where it does
+# not: script/test/test.sh sets PIN_TRACKED_ROOT and PIN_TRACKED_FILES on
+# the HOST before the compose run. (It is the same handoff the removed
+# prune roster used, one question earlier. `PIN_PRUNE_TRACKED` carried
+# that guard's VERDICT and no longer exists anywhere; nothing reads it,
+# and setting it does nothing.) git WINS when it is readable, so a stale or
+# hand-set list can never silence a file git can see. The handoff is
+# keyed to the root it describes and is ignored for any other, because a
+# list of one tree's tracked files is not an answer about a different
+# tree -- a fixture root would otherwise inherit the repository's.
+#
+# When neither source can answer, this refuses. A guard whose default on
+# an environment it cannot inspect is "clean" is fail-open, and this one
+# decides which files every check downstream of it reads.
+_pin_tracked() {
+  local _root="${1}"
+  local _rec _mode _path
+  local -a _found=()
+  if git -C "${_root}" rev-parse --git-dir >/dev/null 2>&1; then
+    while IFS= read -r -d '' _rec; do
+      _mode="${_rec%% *}"
+      [[ "${_mode}" == '100644' || "${_mode}" == '100755' ]] || continue
+      _path="${_rec#*$'\t'}"
+      _pin_absent "${_root}/${_path}" && continue
+      _found+=("${_path}")
+    done < <(git -C "${_root}" ls-files -s -z)
+  elif [[ "${PIN_TRACKED_ROOT:-}" == "${_root}" \
+       && -n "${PIN_TRACKED_FILES:-}" ]]; then
+    while IFS= read -r _path; do
+      # The blobs-only rule again, asked of the TREE because a carried
+      # list has no index modes to read. Without this the rule would hold
+      # on one of the two roads into this function, and the same checkout
+      # would answer differently depending on which one an environment
+      # took -- a verdict that depends on how you got here is the defect
+      # the derived population exists to end, not a detail of the
+      # handoff. The failure it produces is not subtle: a symlink to a
+      # file that declares a pin yields a second record for that pin
+      # under a second name, and the lint's duplicate-NAME check fails on
+      # the repo's own declarations.
+      if [[ -n "${_path}" && ! -L "${_root}/${_path}" ]] \
+         && ! _pin_absent "${_root}/${_path}"; then
+        _found+=("${_path}")
+      fi
+    done <<< "${PIN_TRACKED_FILES}"
+  else
+    printf 'pin registry: cannot tell what %s tracks -- it is not a readable git repository and no host-computed list arrived for it in PIN_TRACKED_FILES. The tracked set IS the scan population, so an unanswered one is not a detail to skip. Run the lint on the host, or set PIN_TRACKED_ROOT=%s and PIN_TRACKED_FILES the way script/test/test.sh does for the compose run.\n' \
+      "${_root}" "${_root}" >&2
+    return 2
+  fi
+  [[ "${#_found[@]}" -eq 0 ]] && return 0
+  printf '%s\n' "${_found[@]}" | LC_ALL=C sort -u
+}
+
+# _pin_files <repo-root>
+#
+# Print every scanned file, repo-root-relative, one per line, sorted:
+# every TRACKED file that is not of an exempt shape. A Dockerfile,
+# workflow, script, justfile or config committed tomorrow, at any depth,
+# under any name, is scanned without touching this file -- and an
+# untracked one is not scanned on anybody's machine.
+#
+# A tree that yields nothing at all is an error rather than an empty
+# table: every caller would read "no pins declared" as a clean repo, which
+# is the one answer this mechanism must never give by accident. It is
+# distinct from "could not look", which _pin_tracked reports as 2 and this
+# passes straight through.
+_pin_files() {
+  local _root="${1}"
+  local _path _tracked _rc=0
+  local -a _found=()
+  _tracked="$(_pin_tracked "${_root}")" || _rc=$?
+  if [[ "${_rc}" -ne 0 ]]; then
+    return "${_rc}"
+  fi
+  while IFS= read -r _path; do
+    [[ -n "${_path}" ]] || continue
+    if ! _pin_is_exempt_shape "${_path}"; then
+      _found+=("${_path}")
+    fi
+  done <<< "${_tracked}"
+  if [[ "${#_found[@]}" -eq 0 ]]; then
+    printf 'pin registry: no scannable file under %s\n' \
+      "${_root}" >&2
+    return 1
+  fi
+  printf '%s\n' "${_found[@]}"
+}
+
+# _pin_exempt_files <repo-root>
+#
+# The other half of that partition: every TRACKED file the scan EXEMPTS,
+# repo-root-relative and sorted. The lint reads it to prove no `tool-pin:`
+# marker was written where nothing reads it -- which is how the exemption
+# list is CHECKED rather than trusted.
+#
+# Empty is a normal answer here, unlike _pin_files: a tree with no prose
+# and no specs in it is a tree, not a broken walk. "Could not look" is
+# still not empty -- it propagates as 2.
+_pin_exempt_files() {
+  local _root="${1}"
+  local _path _tracked _rc=0
+  local -a _found=()
+  _tracked="$(_pin_tracked "${_root}")" || _rc=$?
+  if [[ "${_rc}" -ne 0 ]]; then
+    return "${_rc}"
+  fi
+  while IFS= read -r _path; do
+    [[ -n "${_path}" ]] || continue
+    if _pin_is_exempt_shape "${_path}"; then
+      _found+=("${_path}")
+    fi
+  done <<< "${_tracked}"
+  [[ "${#_found[@]}" -eq 0 ]] && return 0
+  printf '%s\n' "${_found[@]}"
+}
+
+# _pin_unquote <value> -- strip one layer of matching quotes.
+_pin_unquote() {
+  local _v="${1}"
+  if [[ "${_v}" == \"*\" || "${_v}" == \'*\' ]]; then
+    _v="${_v:1:${#_v}-2}"
+  fi
+  printf '%s' "${_v}"
+}
+
+# _pin_rhs_value <rhs> -- the value on an assignment's right-hand side,
+# with any trailing comment AND the whitespace in front of it removed.
+# Dropping the comment alone leaves that whitespace attached to the
+# version, and it does not stay local: it flows into the reported
+# `from` field, into the branch name a bump builds and into whatever CI
+# feeds from `pins.sh --value`.
+_pin_rhs_value() {
+  local _v="${1%%[[:space:]]#*}"
+  _v="${_v%"${_v##*[![:space:]]}"}"
+  printf '%s' "${_v}"
+}
+
+# _pin_rhs_tail <rhs> -- everything _pin_rhs_value dropped: the spacing
+# and the trailing comment. `--set` puts it back verbatim, because the
+# comment on a pin's line is where a "held at this version because ..."
+# rationale lives -- the one line a reviewer of a bump proposal most needs
+# to still be there.
+_pin_rhs_tail() {
+  local _v
+  _v="$(_pin_rhs_value "${1}")"
+  printf '%s' "${1#"${_v}"}"
+}
+
+# _pin_assign_value <line> -- the value <line> assigns, unquoted and with
+# any trailing comment removed; non-zero when <line> assigns nothing.
+#
+# The assignment half of _pin_extract_value, split out because two callers
+# need it WITHOUT a coordinate: _pin_read, filling the value column of an
+# `unpinned` record (which carries no coordinate at all), and the
+# generated-workflow lint, asking what one variable the registry declares
+# holds. Anchoring on the shared regex is what keeps all three agreeing
+# about which lines are assignments.
+_pin_assign_value() {
+  local _line="${1}"
+  [[ "${_line}" =~ ${_PIN_ASSIGN_RE} ]] || return 1
+  _pin_unquote "$(_pin_rhs_value "${BASH_REMATCH[3]}")"
+}
+
+# _pin_assign_name <line> -- the variable name <line> assigns to; non-zero
+# when <line> assigns nothing.
+#
+# Read off the shared regex's first capture -- the whole `[<keyword> ]NAME=`
+# head -- rather than by adding a capture group to it: every caller of
+# `${_PIN_ASSIGN_RE}` addresses the right-hand side as `BASH_REMATCH[3]`,
+# so a new group in the middle would silently re-point all of them.
+_pin_assign_name() {
+  local _line="${1}" _head
+  [[ "${_line}" =~ ${_PIN_ASSIGN_RE} ]] || return 1
+  _head="${BASH_REMATCH[1]%=}"
+  _head="${_head%"${_head##*[![:space:]]}"}"
+  printf '%s' "${_head##*[[:space:]]}"
+}
+
+# _pin_extract_value <target-line> <coordinate>
+#
+# The version the target line currently carries.
+#
+#   ARG <NAME>=<value>   ->  <value>, unquoted, comment stripped
+#   <NAME>=<value>       ->  the same, for a shell declaration site
+#   anything else        ->  the token following <coordinate>, separated by
+#                            `:` (an image tag) or `@` (a ref)
+#
+# Anchoring the second form on the coordinate is what keeps extraction
+# precise on a line that also carries flags, paths and other colons.
+_pin_extract_value() {
+  local _line="${1}" _coord="${2}"
+  if _pin_assign_value "${_line}"; then
+    return 0
+  fi
+  local _re="${_coord}[:@]([A-Za-z0-9][A-Za-z0-9._-]*)"
+  if [[ "${_line}" =~ ${_re} ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# ── go.mod: a structural scanner (base#1463) ───────────────────────────────
+#
+# config-gen's go.mod declares third-party versions the way no other file
+# here does: a `require` entry, alone on its line or inside a `require (`
+# block, with `//` comments. No line shape above can see one, and a line
+# regex would read the wrong thing out of a block, a quoted path or a glued
+# comment. So go.mod is read by a SCANNER: a bash port of the lexer in Go's
+# modfile package (words, `"` strings, `//` comments, the punctuation
+# `( ) [ ] { } ,`), plus a state machine over a CLOSED set of verbs.
+#
+# Every verb takes one of three paths, and there is no fourth:
+#
+#   require                emitted, after the entry and version checks;
+#   module, go, toolchain, held to the checks Go's own parser makes and
+#   godebug, exclude,      never emitted: module, go and toolchain take
+#   retract                one argument of their value grammar, not
+#                          repeated; godebug, exclude and retract, in
+#                          line and block form alike (base#1488), take
+#                          one `key=value` argument (else godebug_usage),
+#                          the require entry's arity and quote checks with
+#                          Go's own version and path-major checks (not
+#                          the require's record policy), and one version
+#                          or a `[low, high]`
+#                          interval, each version any token Go reads,
+#                          with no version grammar (a piece missing:
+#                          retract_interval; a token after the version
+#                          or interval: retract_trailer);
+#   anything else          refused BY NAME (replace, tool, ignore) or as
+#                          unknown_verb.
+#
+# So no directive anywhere in the file is skipped unread: a file Go rejects
+# for a malformed `exclude a` is refused here too, not read for the valid
+# require beside it. A spelling the port does not model is refused, never
+# guessed at, which is what keeps a drift between this port and Go on the
+# refusing side. script/test/config_gen_steps/20-gomod-oracle.sh holds the
+# scanner to `go mod edit -json` over test/fixtures/gomod/.
+
+# _pin_go_mod_refuse <line> <reason> -- the scanner's one refusal record,
+# for the file in the caller's `_gm_file`.
+_pin_go_mod_refuse() {
+  _log_err pin go_mod_unsupported_syntax "file=${_gm_file}" "line=${1}" "reason=${2}" \
+    "display=go_mod_unsupported_syntax: ${_gm_file}:${1}: go.mod syntax the pin registry does not read (${2})"
+}
+
+# _pin_refuse_unreadable <file> -- the one record for a file the registry
+# cannot read, shared by the go.mod scanner and _pin_read: an unreadable
+# file is not one that declares nothing.
+_pin_refuse_unreadable() {
+  _log_err pin pin_file_unreadable "file=${1}" \
+    "display=pin_file_unreadable: ${1} cannot be read; an unreadable file is not one that declares nothing"
+}
+
+# _pin_go_mod_bad_byte_line <file> -- the line number of the file's first
+# byte outside tab, LF, printable ASCII and a CR directly before an LF (or
+# ending the file); nothing when there is none. rc 2 when od cannot read
+# the file, so a failed read is never taken for a clean one.
+#
+# It reads the FILE's bytes, not a line bash has read: a bash variable
+# cannot hold a NUL, so a check on the read-in copy never sees one, and
+# `require a v1.0.0<NUL>` -- which Go rejects -- read as a clean entry
+# (review round 1, base#1463). Every other byte is one bash and Go may read
+# differently, so it can only refuse, never emit a record.
+_pin_go_mod_bad_byte_line() {
+  local _bytes
+  _bytes="$(od -An -v -tu1 -- "${1}")" || return 2
+  awk '
+    BEGIN { ln = 1; cr = 0 }
+    {
+      for (i = 1; i <= NF; i++) {
+        b = $i + 0
+        if (cr && b != 10) { print ln; exit }
+        cr = 0
+        if (b == 10) { ln++; continue }
+        if (b == 13) { cr = 1; continue }
+        if (b == 9 || (b >= 32 && b <= 126)) continue
+        print ln
+        exit
+      }
+    }' <<< "${_bytes}"
+}
+
+# _pin_go_mod_opens_block -- true when the line in the caller's
+# `_gm_kind`/`_gm_text` is `<verb> (`, the block form.
+_pin_go_mod_opens_block() {
+  [[ "${_gm_text[1]:-}" == '(' && "${_gm_kind[1]:-}" == p ]]
+}
+
+# _pin_go_mod_lex <line> <lineno> -- split one go.mod line into the
+# caller's `_gm_kind` (w word, s string, p punctuation), `_gm_text`,
+# `_gm_start` (each token's byte offset in the line, which is how a bump
+# rewrites one token in place) and `_gm_comment` (the `//` comment, or
+# empty). Non-zero, with the refusal
+# logged, on a lexer error Go makes or a spelling the port does not model.
+# A token never spans lines in Go's lexer (a string stops at a newline, a
+# comment runs to one), so a line at a time is exact.
+_pin_go_mod_lex() {
+  local _s="${1}" _ln="${2}" _i=0 _j _n _c
+  local LC_ALL=C
+  _gm_kind=()
+  _gm_text=()
+  _gm_start=()
+  _gm_comment=""
+  # _pin_go_mod_bad_byte_line has already held the file's bytes to tab,
+  # printable ASCII and a CR that ends its line, so the line is exactly
+  # those bytes and the CR is the only one left to drop.
+  _s="${_s%$'\r'}"
+  _n="${#_s}"
+  while (( _i < _n )); do
+    _c="${_s:_i:1}"
+    if [[ "${_c}" == ' ' || "${_c}" == $'\t' ]]; then
+      _i=$(( _i + 1 ))
+      continue
+    fi
+    if [[ "${_s:_i:2}" == '//' ]]; then
+      _gm_comment="${_s:_i}"
+      _gm_comment="${_gm_comment%"${_gm_comment##*[![:space:]]}"}"
+      return 0
+    fi
+    if [[ "${_s:_i:2}" == '/*' ]]; then _pin_go_mod_refuse "${_ln}" c_comment; return 1; fi
+    if [[ "${_c}" == '`' ]]; then _pin_go_mod_refuse "${_ln}" backquote; return 1; fi
+    case "${_c}" in
+      '(' | ')' | '[' | ']' | '{' | '}' | ',')
+        _gm_kind+=(p)
+        _gm_text+=("${_c}")
+        _gm_start+=("${_i}")
+        _i=$(( _i + 1 ))
+        continue
+        ;;
+    esac
+    _j=$(( _i + 1 ))
+    if [[ "${_c}" == '"' ]]; then
+      while (( _j < _n )) && [[ "${_s:_j:1}" != '"' ]]; do
+        # An escaped quote or backslash stays in the string (base#1488):
+        # the pair is consumed whole, so the token ends at the true closing
+        # quote.
+        if [[ "${_s:_j:2}" == "\\\"" || "${_s:_j:2}" == "\\\\" ]]; then _j=$(( _j + 2 )); continue; fi
+        if [[ "${_s:_j:1}" == "\\" ]]; then _pin_go_mod_refuse "${_ln}" quote_escape; return 1; fi
+        _j=$(( _j + 1 ))
+      done
+      if (( _j >= _n )); then _pin_go_mod_refuse "${_ln}" unterminated_quote; return 1; fi
+      _j=$(( _j + 1 ))
+      _gm_kind+=(s)
+      _gm_text+=("${_s:_i:_j-_i}")
+      _gm_start+=("${_i}")
+      _i="${_j}"
+      continue
+    fi
+    # A word runs to whitespace, punctuation or a comment, as Go's isIdent
+    # does. It also stops at `/*` and a backquote, so the checks at the top
+    # of the loop refuse those wherever they sit. A quote inside a word is
+    # a word character to the lexer and an error to the parser; the verb
+    # checks below refuse it.
+    while (( _j < _n )); do
+      _c="${_s:_j:1}"
+      case "${_c}" in
+        ' ' | $'\t' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '`') break ;;
+      esac
+      [[ "${_s:_j:2}" == '//' || "${_s:_j:2}" == '/*' ]] && break
+      _j=$(( _j + 1 ))
+    done
+    _gm_kind+=(w)
+    _gm_text+=("${_s:_i:_j-_i}")
+    _gm_start+=("${_i}")
+    _i="${_j}"
+  done
+  return 0
+}
+
+# _pin_go_mod_version_ok <path> <version>
+#
+# 0 only for a version Go keeps BYTE-IDENTICAL for <path>. Go canonicalises
+# (`v1.2` -> `v1.2.0`, `+meta` dropped) and special-cases `+incompatible`
+# and gopkg.in, so a record copied from the text would disagree with what
+# Go reads; each of those is refused by name instead. It splits rather
+# than matches one regex, so each rule is its own check. On refusal the
+# reason is left in _PIN_GO_MOD_REASON. The major is compared as a string,
+# so a huge one cannot overflow into a pass. The path-independent half is
+# _pin_go_mod_canonical_ok.
+_pin_go_mod_version_ok() {
+  local _path="${1}" _v="${2}" _core _major _last
+  local LC_ALL=C
+  _pin_go_mod_canonical_ok "${_v}" || return 1
+  _core="${_v#v}"
+  _core="${_core%%-*}"
+  if [[ "${_path}" == gopkg.in/* ]]; then _PIN_GO_MOD_REASON=gopkg_in_path; return 1; fi
+  _major="${_core%%.*}"
+  _last=""
+  [[ "${_path}" == */* ]] && _last="${_path##*/}"
+  # module.SplitPathVersion: a final `/v<digits and dots>` is a major
+  # suffix; with a dot, a leading 0 or as /v1 it makes the path invalid.
+  if [[ "${_last}" =~ ^v[0-9.]+$ ]]; then
+    if [[ "${_last}" == *.* || "${_last}" == v0* || "${_last}" == v1 ]]; then _PIN_GO_MOD_REASON=path_major_invalid; return 1; fi
+    if [[ "${_last#v}" != "${_major}" ]]; then _PIN_GO_MOD_REASON=path_major_mismatch; return 1; fi
+  elif [[ "${_major}" != 0 && "${_major}" != 1 ]]; then
+    _PIN_GO_MOD_REASON=path_major_mismatch
+    return 1
+  fi
+  return 0
+}
+
+# _pin_go_mod_canonical_ok <version> -- 0 only for a version that is
+# canonical semver on its own, with no module path to check it against:
+# the path-independent half of _pin_go_mod_version_ok (base#1488), its
+# only caller. On refusal the reason is left in _PIN_GO_MOD_REASON.
+_pin_go_mod_canonical_ok() {
+  local _v="${1}" _core _pre="" _has_pre=0 _f _rest _id _dots
+  local LC_ALL=C
+  _PIN_GO_MOD_REASON=""
+  if [[ "${_v}" != v* ]]; then _PIN_GO_MOD_REASON=version_no_v; return 1; fi
+  if [[ "${_v}" == *+* ]]; then _PIN_GO_MOD_REASON=version_build; return 1; fi
+  _core="${_v#v}"
+  if [[ "${_core}" == *-* ]]; then
+    _has_pre=1
+    _pre="${_core#*-}"
+    _core="${_core%%-*}"
+  fi
+  _dots="${_core//[!.]/}"
+  if [[ "${#_dots}" -ne 2 ]]; then _PIN_GO_MOD_REASON=version_noncanonical; return 1; fi
+  _rest="${_core}."
+  while [[ -n "${_rest}" ]]; do
+    _f="${_rest%%.*}"
+    _rest="${_rest#*.}"
+    if [[ "${_f}" =~ ^0[0-9]+$ ]]; then _PIN_GO_MOD_REASON=version_leading_zero; return 1; fi
+    if [[ ! "${_f}" =~ ^(0|[1-9][0-9]*)$ ]]; then _PIN_GO_MOD_REASON=version_noncanonical; return 1; fi
+  done
+  if (( _has_pre )); then
+    _rest="${_pre}."
+    while [[ -n "${_rest}" ]]; do
+      _id="${_rest%%.*}"
+      _rest="${_rest#*.}"
+      if [[ -z "${_id}" ]]; then _PIN_GO_MOD_REASON=version_prerelease_empty; return 1; fi
+      if [[ "${_id}" =~ [^0-9A-Za-z-] ]]; then _PIN_GO_MOD_REASON=version_prerelease_charset; return 1; fi
+      if [[ "${_id}" =~ ^0[0-9]+$ ]]; then _PIN_GO_MOD_REASON=version_prerelease_zero; return 1; fi
+    done
+  fi
+  return 0
+}
+
+# _pin_go_mod_exclude_ok <path> <version> -- 0 when Go's modfile parser
+# reads `exclude <path> <version>` (base#1488, review round 2): the version
+# through module.CanonicalVersion (semver: `v`, then MAJOR[.MINOR[.PATCH
+# [-pre][+build]]], numbers and numeric prerelease identifiers without a
+# leading zero), then module.CheckPathMajor against the major
+# module.SplitPathVersion reads off the path. An exclude emits no record,
+# so none of the require entry's record-fidelity refusals apply: Go keeps
+# +incompatible, reads a gopkg.in path, drops +build, completes a short
+# version and accepts an empty path. On refusal the reason is left in
+# _PIN_GO_MOD_REASON: version_invalid, path_major_invalid or
+# path_major_mismatch.
+_pin_go_mod_exclude_ok() {
+  local _path="${1}" _v="${2}" _n='(0|[1-9][0-9]*)' _id='[0-9A-Za-z-]+' _re
+  local _major _pre _build _run _i _suffix="" _pm=""
+  local LC_ALL=C
+  _PIN_GO_MOD_REASON=""
+  _re="^v${_n}(\.${_n}(\.${_n}(-${_id}(\.${_id})*)?(\+${_id}(\.${_id})*)?)?)?$"
+  if [[ ! "${_v}" =~ ${_re} ]]; then _PIN_GO_MOD_REASON=version_invalid; return 1; fi
+  _major="${BASH_REMATCH[1]}"
+  _pre="${BASH_REMATCH[6]}"
+  _build="${BASH_REMATCH[8]}"
+  if [[ ".${_pre#-}." =~ \.0[0-9]+\. ]]; then _PIN_GO_MOD_REASON=version_invalid; return 1; fi
+  # module.SplitPathVersion: gopkg.in/<x>.v<N>[-unstable], or a final
+  # /v<N>; a path with neither carries no major.
+  if [[ "${_path}" == gopkg.in/* ]]; then
+    _run="${_path%-unstable}"
+    [[ "${_run}" != "${_path}" ]] && _suffix=-unstable
+    _pm="${_run##*.v}"
+    if [[ "${_run}" != *.v* || ! "${_pm}" =~ ^[0-9]+$ ]] \
+      || [[ "${_pm}" == 0* && ".v${_pm}${_suffix}" != .v0 ]]; then
+      _PIN_GO_MOD_REASON=path_major_invalid
+      return 1
+    fi
+  else
+    _run="${_path##*[!0-9.]}"
+    _i=$(( ${#_path} - ${#_run} ))
+    if (( _i > 1 )) && [[ -n "${_run}" && "${_path:_i-2:2}" == /v ]]; then
+      if [[ "${_run}" == *.* || "${_run}" == 0* || "${_run}" == 1 ]]; then _PIN_GO_MOD_REASON=path_major_invalid; return 1; fi
+      _pm="${_run}"
+    fi
+  fi
+  # module.CheckPathMajor: gopkg.in's .v1 also takes a v0.0.0- pseudo-version.
+  [[ "${_v}" == v0.0.0-* && "${_pm}" == 1 && "${_path}" == gopkg.in/* ]] && return 0
+  if [[ -z "${_pm}" ]]; then
+    [[ "${_major}" == 0 || "${_major}" == 1 || "${_build}" == +incompatible ]] && return 0
+  elif [[ "${_major}" == "${_pm}" ]]; then
+    return 0
+  fi
+  _PIN_GO_MOD_REASON=path_major_mismatch
+  return 1
+}
+
+# _pin_go_mod_unquote <kind> <text> -- a path or version token as Go reads
+# it: a string loses its quotes and is decoded left to right, `\"` to `"`
+# and `\\` to `\` (base#1488; every other escape never reaches here: the
+# lexer refuses it). Non-zero when a word holds a quote character, which Go
+# reserves ("unquoted string cannot contain quote").
+_pin_go_mod_unquote() {
+  local _in _out="" _k=0
+  if [[ "${1}" == s ]]; then
+    _in="${2:1:${#2}-2}"
+    while (( _k < ${#_in} )); do
+      if [[ "${_in:_k:1}" == "\\" ]]; then _k=$(( _k + 1 )); fi
+      _out+="${_in:_k:1}"
+      _k=$(( _k + 1 ))
+    done
+    printf '%s' "${_out}"
+    return 0
+  fi
+  [[ "${2}" != *[\"\']* ]] || return 1
+  printf '%s' "${2}"
+}
+
+# _pin_go_mod_entry <lineno> <first> [emit] -- one require entry: the tokens
+# of the caller's `_gm_kind`/`_gm_text` from index <first>. Appends its
+# record to the caller's `_gm_out`; non-zero, refusal logged, otherwise.
+# With emit=0 (an exclude entry, base#1488) the path and version checks run
+# and nothing is recorded; Go ignores an exclude's comments, so neither the
+# record nor the indirect rule applies.
+_pin_go_mod_entry() {
+  local _ln="${1}" _first="${2}" _emit="${3:-1}" _k _path _ver _cm _rec _tabs
+  local -a _f=()
+  for (( _k = _first; _k < ${#_gm_kind[@]}; _k++ )); do
+    if [[ "${_gm_kind[_k]}" == p ]]; then _pin_go_mod_refuse "${_ln}" punctuation; return 1; fi
+  done
+  if (( ${#_gm_kind[@]} - _first != 2 )); then _pin_go_mod_refuse "${_ln}" arity; return 1; fi
+  if ! _path="$(_pin_go_mod_unquote "${_gm_kind[_first]}" "${_gm_text[_first]}")"; then _pin_go_mod_refuse "${_ln}" word_quote; return 1; fi
+  if ! _ver="$(_pin_go_mod_unquote "${_gm_kind[_first+1]}" "${_gm_text[_first+1]}")"; then _pin_go_mod_refuse "${_ln}" word_quote; return 1; fi
+  # An exclude is held to Go's own checks only: it emits no record, so the
+  # record-fidelity refusals below (path_empty, version_ok) would refuse a
+  # file Go reads (review round 2, base#1488).
+  if (( ! _emit )); then
+    _pin_go_mod_exclude_ok "${_path}" "${_ver}" && return 0
+    _pin_go_mod_refuse "${_ln}" "${_PIN_GO_MOD_REASON}"
+    return 1
+  fi
+  # Go drops a requirement whose path is empty (`require "" v1.0.0` reads
+  # as no requirement at all), so no record of it agrees with Go (review
+  # round 2, base#1463).
+  if [[ -z "${_path}" ]]; then _pin_go_mod_refuse "${_ln}" path_empty; return 1; fi
+  # The record's own separator: a tab inside a quoted path or a comment
+  # would split one field into two for every reader of the record
+  # (`require "a<TAB>b" v1.0.0` read as path=a, version=b; review round 1,
+  # base#1463). So the record is built first and kept only when it has
+  # exactly its three separators, whichever field the tab rode in.
+  _rec="${_ln}"$'\t'"${_path}"$'\t'"${_ver}"$'\t'"${_gm_comment}"
+  _tabs="${_rec//[!$'\t']/}"
+  if (( ${#_tabs} != 3 )); then _pin_go_mod_refuse "${_ln}" record_tab; return 1; fi
+  if ! _pin_go_mod_version_ok "${_path}" "${_ver}"; then _pin_go_mod_refuse "${_ln}" "${_PIN_GO_MOD_REASON}"; return 1; fi
+  # modfile's isIndirect: the suffix comment's fields are exactly
+  # `indirect`, or open with `indirect;`.
+  _cm="${_gm_comment#//}"
+  IFS=$' \t\r' read -r -a _f <<< "${_cm}" || true
+  if [[ ( "${#_f[@]}" -eq 1 && "${_f[0]}" == indirect ) || ( "${#_f[@]}" -gt 1 && "${_f[0]}" == 'indirect;' ) ]]; then
+    _log_err pin go_mod_indirect_requirement "file=${_gm_file}" "line=${_ln}" reason=indirect \
+      "display=go_mod_indirect_requirement: ${_gm_file}:${_ln}: an indirect requirement is not a declaration this repo makes; drop it or make it direct"
+    return 1
+  fi
+  _gm_out+="${_rec}"$'\n'
+}
+
+# _pin_go_mod_godebug <lineno> <first> -- check one godebug line, the line
+# form (first=1: its argument is token 1) or a block line (first=0), as
+# Go's f.add does: exactly one argument, whose raw text holds no quote,
+# backquote or comma and has a `=`; otherwise godebug_usage. Checked,
+# never emitted (base#1488).
+_pin_go_mod_godebug() {
+  local _ln="${1}" _first="${2}"
+  if (( ${#_gm_kind[@]} != _first + 1 )) || [[ "${_gm_text[_first]}" == *[\"\'\`,]* || "${_gm_text[_first]}" != *=* ]]; then
+    _pin_go_mod_refuse "${_ln}" godebug_usage
+    return 1
+  fi
+}
+
+# _pin_go_mod_retract <lineno> <first> -- check one retract line, the
+# line form (first=1: its arguments start at token 1) or a block line
+# (first=0), as Go's parseVersionInterval reads it: `<version>` or
+# `[ <low> , <high> ]`, walked token by token (base#1488). Go holds a
+# retract version to no version grammar: the oracle records Go rc 0 for
+# `retract v1.2`, `v1.0.0+incompatible`, `foo` and `]` (review round 1,
+# base#1488), so any token is a version here too, except a word holding a
+# quote, which Go's parseString rejects (word_quote). A
+# piece that is missing -- no argument, a leading `(`, no version after
+# `[` or `,`, no `,` or `]` where one belongs -- is retract_interval; a
+# token after the version or the interval is retract_trailer. Checked,
+# never emitted; the rationale comment is not read (Go does not check it).
+_pin_go_mod_retract() {
+  local _ln="${1}" _k="${2}" _n="${#_gm_kind[@]}" _step
+  local -a _want=(v)
+  if [[ "${_gm_kind[_k]:-}" == p && "${_gm_text[_k]:-}" == '(' ]]; then _pin_go_mod_refuse "${_ln}" retract_interval; return 1; fi
+  if [[ "${_gm_kind[_k]:-}" == p && "${_gm_text[_k]:-}" == '[' ]]; then _want=('[' v ',' v ']'); fi
+  for _step in "${_want[@]}"; do
+    if (( _k >= _n )); then _pin_go_mod_refuse "${_ln}" retract_interval; return 1; fi
+    if [[ "${_step}" == v ]]; then
+      if ! _pin_go_mod_unquote "${_gm_kind[_k]}" "${_gm_text[_k]}" > /dev/null; then _pin_go_mod_refuse "${_ln}" word_quote; return 1; fi
+    elif [[ "${_gm_kind[_k]}" != p || "${_gm_text[_k]}" != "${_step}" ]]; then
+      _pin_go_mod_refuse "${_ln}" retract_interval
+      return 1
+    fi
+    _k=$(( _k + 1 ))
+  done
+  if (( _k < _n )); then _pin_go_mod_refuse "${_ln}" retract_trailer; return 1; fi
+}
+
+# _pin_go_mod_directive <verb> <lineno> <first> -- one require, godebug,
+# exclude or retract line: the line form (first=1: its arguments start at
+# token 1) or a line of a `<verb> (` block (first=0), read as the
+# arguments of <verb>, as Go's f.add reads it (base#1488). Only a require
+# appends a record; non-zero, refusal logged, otherwise.
+_pin_go_mod_directive() {
+  case "${1}" in
+    godebug) _pin_go_mod_godebug "${2}" "${3}" ;;
+    exclude) _pin_go_mod_entry "${2}" "${3}" 0 ;;
+    retract) _pin_go_mod_retract "${2}" "${3}" ;;
+    *) _pin_go_mod_entry "${2}" "${3}" ;;
+  esac
+}
+
+# _pin_go_mod_scan <file>
+#
+# One `lineno<TAB>path<TAB>version<TAB>comment` record per require entry,
+# line form or block form, numbered by the entry's own line. The comment
+# column is the entry's `//` suffix comment, or empty.
+#
+# A file it does not read is refused: rc 1, NOTHING on stdout, and one
+# go_mod_unsupported_syntax (file= line= reason=), go_mod_indirect_requirement
+# or pin_file_unreadable. The whole file is scanned before any record is
+# printed, so a bad directive AFTER a require still refuses the file --
+# Go rejects such a file too.
+_pin_go_mod_scan() {
+  local _gm_file="${1}" _gm_out="" _gm_comment="" _ln=0 _line _block_verb="" _block_ln=0
+  local _seen_module=0 _seen_go=0 _seen_toolchain=0 _verb _k _bad_ln
+  local -a _gm_kind=() _gm_text=() _gm_start=() _lines=()
+  local LC_ALL=C
+  # The byte check is the first read of the file, so a file it cannot
+  # read -- unreadable, or an od that fails -- is refused here (base#1463).
+  if ! _bad_ln="$(_pin_go_mod_bad_byte_line "${_gm_file}")"; then
+    _pin_refuse_unreadable "${_gm_file}"
+    return 1
+  fi
+  if [[ -n "${_bad_ln}" ]]; then _pin_go_mod_refuse "${_bad_ln}" unsupported_byte; return 1; fi
+  mapfile -t _lines < "${_gm_file}"
+  for _line in "${_lines[@]}"; do
+    _ln=$(( _ln + 1 ))
+    _pin_go_mod_lex "${_line}" "${_ln}" || return 1
+    (( ${#_gm_kind[@]} > 0 )) || continue
+    if [[ -n "${_block_verb}" ]]; then
+      if [[ "${_gm_text[0]}" == ')' && "${_gm_kind[0]}" == p ]]; then
+        if (( ${#_gm_kind[@]} > 1 )); then _pin_go_mod_refuse "${_ln}" paren_not_alone; return 1; fi
+        _block_verb=""
+        continue
+      fi
+      for (( _k = 1; _k < ${#_gm_kind[@]}; _k++ )); do
+        if [[ "${_gm_kind[_k]}" == p && "${_gm_text[_k]}" == ')' ]]; then _pin_go_mod_refuse "${_ln}" paren_not_alone; return 1; fi
+      done
+      _pin_go_mod_directive "${_block_verb}" "${_ln}" 0 || return 1
+      continue
+    fi
+    # The verb is the first token's TEXT: a string keeps its quotes, so
+    # `"require"`, like a `(`, is no verb Go knows and is unknown_verb.
+    _verb="${_gm_text[0]}"
+    if [[ "${_verb}" == replace ]]; then _pin_go_mod_refuse "${_ln}" replace; return 1; fi
+    if [[ "${_verb}" == tool ]]; then _pin_go_mod_refuse "${_ln}" tool; return 1; fi
+    if [[ "${_verb}" == ignore ]]; then _pin_go_mod_refuse "${_ln}" ignore; return 1; fi
+    case "${_verb}" in
+      module | go | toolchain)
+        if _pin_go_mod_opens_block; then _pin_go_mod_refuse "${_ln}" block_form_verb; return 1; fi
+        ;;
+    esac
+    case "${_verb}" in
+      module)
+        if (( _seen_module )); then _pin_go_mod_refuse "${_ln}" module_repeated; return 1; fi
+        if (( ${#_gm_kind[@]} != 2 )); then _pin_go_mod_refuse "${_ln}" module_arity; return 1; fi
+        if [[ "${_gm_kind[1]}" == w && "${_gm_text[1]}" == *[\"\']* ]]; then _pin_go_mod_refuse "${_ln}" module_quote; return 1; fi
+        _seen_module=1
+        ;;
+      go)
+        if (( _seen_go )); then _pin_go_mod_refuse "${_ln}" go_repeated; return 1; fi
+        if (( ${#_gm_kind[@]} != 2 )); then _pin_go_mod_refuse "${_ln}" go_arity; return 1; fi
+        # modfile.GoVersionRE, matched on the raw token in the C locale.
+        if [[ ! "${_gm_text[1]}" =~ ^([1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?([a-z]+[0-9]+)?$ ]]; then _pin_go_mod_refuse "${_ln}" go_version; return 1; fi
+        _seen_go=1
+        ;;
+      toolchain)
+        if (( _seen_toolchain )); then _pin_go_mod_refuse "${_ln}" toolchain_repeated; return 1; fi
+        if (( ${#_gm_kind[@]} != 2 )); then _pin_go_mod_refuse "${_ln}" toolchain_arity; return 1; fi
+        # modfile.ToolchainRE, `^default$|^go1($|\.)`, on the raw token.
+        if [[ ! "${_gm_text[1]}" =~ ^(default|go1(\..*)?)$ ]]; then _pin_go_mod_refuse "${_ln}" toolchain_version; return 1; fi
+        _seen_toolchain=1
+        ;;
+      require | godebug | exclude | retract)
+        if _pin_go_mod_opens_block; then
+          if (( ${#_gm_kind[@]} > 2 )); then _pin_go_mod_refuse "${_ln}" paren_trailer; return 1; fi
+          _block_verb="${_verb}"
+          _block_ln="${_ln}"
+          continue
+        fi
+        _pin_go_mod_directive "${_verb}" "${_ln}" 1 || return 1
+        ;;
+      *)
+        _pin_go_mod_refuse "${_ln}" unknown_verb
+        return 1
+        ;;
+    esac
+  done
+  if [[ -n "${_block_verb}" ]]; then _pin_go_mod_refuse "${_block_ln}" unterminated_block; return 1; fi
+  printf '%s' "${_gm_out}"
+}
+
+# _pin_go_mod_record_fields <record> -- split one _pin_go_mod_scan record
+# into the caller's `_gm_r_ln`, `_gm_r_path`, `_gm_r_ver` and `_gm_r_cm`.
+# It cuts at each tab rather than `IFS=$'\t' read`: tab is IFS whitespace,
+# so `read` folds two adjacent tabs into one and an empty field hands its
+# column to the next one -- `3<TAB><TAB>v1.0.0<TAB>// note` read as
+# version=`// note` (review round 2, base#1463).
+_pin_go_mod_record_fields() {
+  local _r="${1}"
+  _gm_r_ln="${_r%%$'\t'*}"
+  _r="${_r#*$'\t'}"
+  _gm_r_path="${_r%%$'\t'*}"
+  _r="${_r#*$'\t'}"
+  _gm_r_ver="${_r%%$'\t'*}"
+  _gm_r_cm="${_r#*$'\t'}"
+}
+
+# _pin_go_mod_set_line <file> <lineno> <version>
+#
+# Print line <lineno> of the go.mod <file> with the version of its require
+# entry replaced by <version>, everything else on the line byte for byte:
+# indentation, the path, a `//` comment (even one that repeats the old
+# version), and the quotes of a quoted version. The bump half of the
+# go.mod reader (base#1463).
+#
+# The line must be a require entry the scanner emits, and the token
+# replaced is the one the scanner read the version from, located by the
+# lexer's own offsets -- not a text substitution, which cannot tell the
+# version from the same string in the comment. <version> must be one
+# _pin_go_mod_version_ok keeps for the entry's path, so a bump never
+# writes a go.mod the reader would then refuse. Otherwise rc 1, nothing on
+# stdout, and pin_set_refused (file= line= reason=).
+_pin_go_mod_set_line() {
+  local _gm_file="${1}" _want_ln="${2}" _new="${3}" _records _rec _line _last _tok
+  local _gm_r_ln="" _gm_r_path="" _gm_r_ver="" _gm_r_cm="" _gm_hit=0 _gm_comment=""
+  local -a _gm_kind=() _gm_text=() _gm_start=()
+  local LC_ALL=C
+  _records="$(_pin_go_mod_scan "${_gm_file}")" || return 1
+  while IFS= read -r _rec; do
+    [[ -n "${_rec}" ]] || continue
+    _pin_go_mod_record_fields "${_rec}"
+    if [[ "${_gm_r_ln}" == "${_want_ln}" ]]; then
+      _gm_hit=1
+      break
+    fi
+  done <<< "${_records}"
+  if (( ! _gm_hit )); then
+    _log_err pin pin_set_refused "file=${_gm_file}" "line=${_want_ln}" reason=not_require_entry \
+      "display=pin_set_refused: ${_gm_file}:${_want_ln}: not a require entry the go.mod scanner reads; the file is left as it was"
+    return 1
+  fi
+  if ! _pin_go_mod_version_ok "${_gm_r_path}" "${_new}"; then
+    _log_err pin pin_set_refused "file=${_gm_file}" "line=${_want_ln}" "reason=${_PIN_GO_MOD_REASON}" \
+      "display=pin_set_refused: ${_gm_file}:${_want_ln}: ${_new} is not a version Go keeps as written for ${_gm_r_path} (${_PIN_GO_MOD_REASON}); the file is left as it was"
+    return 1
+  fi
+  _line="$(awk -v n="${_want_ln}" 'NR == n' "${_gm_file}")"
+  _pin_go_mod_lex "${_line}" "${_want_ln}" || return 1
+  # The scanner held the entry to `[require] <path> <version>`, so the
+  # version is the line's last token.
+  _last=$(( ${#_gm_kind[@]} - 1 ))
+  _tok="${_new}"
+  [[ "${_gm_kind[_last]}" == s ]] && _tok="\"${_new}\""
+  printf '%s\n' "${_line:0:${_gm_start[_last]}}${_tok}${_line:$(( _gm_start[_last] + ${#_gm_text[_last]} ))}"
+}
+
+# _pin_read <repo-root>
+#
+# THE table. One TSV record per marker:
+#
+#   <state> <name> <resolver> <coordinate> <pattern> <skip> <current> <file> <line>
+#
+# Empty fields are written as `-` so the record always has nine columns and
+# `read` never collapses two of them. <line> is the TARGET line's number,
+# because that is the line a bump rewrites.
+#
+# A file it cannot read is pin_file_unreadable, rc 1: an unreadable file is
+# not one that declares nothing (base#1463). A go.mod is read through
+# _pin_go_mod_scan first, so a go.mod it refuses fails here; its markers are
+# `//` comment lines, a marker's target must be a require entry the scanner
+# emitted, and <current> is the version the scanner read.
+#
+# The table is held until every file has been read and printed only then,
+# so a refusal partway through leaves stdout empty rather than a partial
+# table beside the error (base#1463).
+_pin_read() {
+  local _root="${1}"
+  local _file _abs _lineno _line _target _target_no _rest _list
+  local _table="" _record
+  local _state _name _resolver _coord _pattern _skip _current _cksum
+  local _marker_re _comment_re _gm_records _gm_rec
+  local _gm_r_ln _gm_r_path _gm_r_ver _gm_r_cm
+  local -a _fields=()
+  local -A _gm_version=()
+
+  # Command substitution, not a process substitution feeding the loop: a
+  # `< <(...)` redirection discards the producer's exit status, so a
+  # missing scan root would end the loop quietly and this would return a
+  # table of nothing with status 0 -- which every caller would read as
+  # "the repo declares no pins" rather than "the reader could not look".
+  _list="$(_pin_files "${_root}")" || return 1
+
+  while IFS= read -r _file; do
+    _abs="${_root}/${_file}"
+    if [[ ! -r "${_abs}" ]]; then
+      _pin_refuse_unreadable "${_abs}"
+      return 1
+    fi
+    _marker_re="${_PIN_MARKER_RE}"
+    _comment_re='^[[:space:]]*#'
+    _gm_version=()
+    if [[ "${_file##*/}" == go.mod ]]; then
+      _gm_records="$(_pin_go_mod_scan "${_abs}")" || return 1
+      while IFS= read -r _gm_rec; do
+        [[ -n "${_gm_rec}" ]] || continue
+        _pin_go_mod_record_fields "${_gm_rec}"
+        _gm_version["${_gm_r_ln}"]="${_gm_r_ver}"
+      done <<< "${_gm_records}"
+      _marker_re="${_PIN_GO_MOD_MARKER_RE}"
+      _comment_re='^[[:space:]]*//'
+    fi
+    _lineno=0
+    _state=""
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+      _lineno=$(( _lineno + 1 ))
+      if [[ -z "${_state}" ]]; then
+        [[ "${_line}" =~ ${_marker_re} ]] || continue
+        _rest="${_line#*"${_PIN_MARKER}"}"
+        # shellcheck disable=SC2206 # deliberate word-split of the marker body.
+        _fields=(${_rest%%--*})
+        if [[ "${#_fields[@]}" -eq 0 ]]; then
+          printf '%s:%d: %s marker carries no body\n' \
+            "${_file}" "${_lineno}" "${_PIN_MARKER}" >&2
+          return 1
+        fi
+        _pattern=""
+        _skip=""
+        _cksum=""
+        case "${_fields[0]}" in
+          "${_PIN_STATE_IGNORE}")
+            _state="${_PIN_STATE_IGNORE}"
+            _name="${_file}:${_lineno}"
+            _resolver=""
+            _coord=""
+            ;;
+          "${_PIN_STATE_UNPINNED}")
+            _state="${_PIN_STATE_UNPINNED}"
+            _name="${_fields[1]:-}"
+            _resolver=""
+            _coord=""
+            if [[ -z "${_name}" ]]; then
+              printf '%s:%d: unpinned marker names no dependency\n' \
+                "${_file}" "${_lineno}" >&2
+              return 1
+            fi
+            ;;
+          *)
+            _state="${_PIN_STATE_PINNED}"
+            _name="${_fields[0]}"
+            _resolver="${_fields[1]:-}"
+            _coord="${_fields[2]:-}"
+            if [[ -z "${_resolver}" || -z "${_coord}" ]]; then
+              printf '%s:%d: pin %s names no resolver and coordinate\n' \
+                "${_file}" "${_lineno}" "${_name}" >&2
+              return 1
+            fi
+            local _kv
+            for _kv in "${_fields[@]:3}"; do
+              case "${_kv}" in
+                pattern=*) _pattern="${_kv#pattern=}" ;;
+                skip=*)    _skip="${_kv#skip=}" ;;
+                sha256=*)
+                  if [[ "${_kv}" != sha256=*@?* ]]; then
+                    printf '%s:%d: pin %s sha256 option %s names no source (expected sha256=<ARG>@<source>)\n' \
+                      "${_file}" "${_lineno}" "${_name}" "${_kv}" >&2
+                    return 1
+                  fi
+                  _cksum+="${_cksum:+ }${_kv#sha256=}" ;;
+                *)
+                  printf '%s:%d: pin %s carries unknown option %s\n' \
+                    "${_file}" "${_lineno}" "${_name}" "${_kv}" >&2
+                  return 1
+                  ;;
+              esac
+            done
+            ;;
+        esac
+        _target=""
+        _target_no=0
+        continue
+      fi
+      # Looking for the marker's target: the next line that is neither
+      # blank nor another comment. A SECOND marker before that line is an
+      # error, not a silent loss: both would otherwise claim one target
+      # and only the first would ever be read.
+      if [[ "${_line}" =~ ${_marker_re} ]]; then
+        printf '%s:%d: %s marker follows another with no target between them\n' \
+          "${_file}" "${_lineno}" "${_PIN_MARKER}" >&2
+        return 1
+      fi
+      [[ -z "${_line//[[:space:]]/}" ]] && continue
+      [[ "${_line}" =~ ${_comment_re} ]] && continue
+      _target="${_line}"
+      _target_no="${_lineno}"
+      _current=""
+      if [[ "${_file##*/}" == go.mod ]]; then
+        if [[ -z "${_gm_version["${_target_no}"]+x}" ]]; then
+          _log_err pin go_mod_pin_target_not_require "file=${_file}" "line=${_target_no}" "pin=${_name}" \
+            "display=go_mod_pin_target_not_require: ${_file}:${_target_no}: the ${_PIN_MARKER} marker for ${_name} targets a line that is not a require entry"
+          return 1
+        fi
+        [[ "${_state}" == "${_PIN_STATE_IGNORE}" ]] || _current="${_gm_version["${_target_no}"]}"
+      elif [[ "${_state}" == "${_PIN_STATE_PINNED}" ]]; then
+        if ! _current="$(_pin_extract_value "${_target}" "${_coord}")"; then
+          printf '%s:%d: pin %s: no version for %s on its target line\n' \
+            "${_file}" "${_target_no}" "${_name}" "${_coord}" >&2
+          return 1
+        fi
+      elif [[ "${_state}" == "${_PIN_STATE_UNPINNED}" ]]; then
+        # `unpinned` says the dependency FLOATS, not that the line holds
+        # nothing: where the target is an assignment the record can carry
+        # the value it declares, and a caller that would otherwise re-derive
+        # it by reading the file reads the table instead.
+        #
+        # The assignment form only. An unpinned marker carries no
+        # coordinate, so the token-after-coordinate branch has nothing to
+        # anchor on and would put a fabricated version in the table -- `-`
+        # is the honest column for `RUN apk add ...`.
+        _current="$(_pin_assign_value "${_target}")" || _current=""
+      fi
+      printf -v _record '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n' \
+        "${_state}" "${_name}" "${_resolver:--}" "${_coord:--}" \
+        "${_pattern:--}" "${_skip:--}" "${_current:--}" "${_file}" "${_target_no}" \
+        "${_cksum:--}"
+      _table+="${_record}"
+      _state=""
+    done < "${_abs}"
+    if [[ -n "${_state}" ]]; then
+      printf '%s: %s marker for %s has no target line after it\n' \
+        "${_file}" "${_PIN_MARKER}" "${_name}" >&2
+      return 1
+    fi
+  done <<< "${_list}"
+  printf '%s' "${_table}"
+}
+
+# ── Detector ────────────────────────────────────────────────────────────────
+
+# _pin_has_image_ref <line>
+#
+# True when the line names an image at a version-shaped tag that is NOT
+# one of the three things that shape also matches (a numeric name, a
+# digest, a `-t`-assigned output). Every token on the line is considered,
+# so `docker build -t base:0.1 -f - alpine:3.21` still answers TRUE for
+# the one that is somebody else's release.
+_pin_has_image_ref() {
+  local _line="${1}" _rest="${1}" _name _tag
+  while [[ "${_rest}" =~ ${_PIN_IMAGE_REF_RE} ]]; do
+    _name="${BASH_REMATCH[2]}"
+    _tag="${BASH_REMATCH[3]}"
+    # Consume through the match so the next iteration cannot rematch it.
+    # BASH_REMATCH[0] is never empty here, so the loop always advances.
+    _rest="${_rest#*"${BASH_REMATCH[0]}"}"
+    [[ "${_name}" =~ ${_PIN_IMAGE_NUMERIC_NAME_RE} ]] && continue
+    [[ "${_tag}" =~ ${_PIN_IMAGE_DIGEST_RE} ]] && continue
+    _pin_image_is_built "${_line}" "${_name}:${_tag}" && continue
+    return 0
+  done
+  return 1
+}
+
+# _pin_image_is_built <line> <name:tag> -- is that token the argument of a
+# `-t` / `--tag`, i.e. an image this repo produces rather than consumes?
+# The token is matched LITERALLY (quoted on the right-hand side of `=~`),
+# so a `.` or `-` in an image name cannot act as a metacharacter.
+_pin_image_is_built() {
+  local _line="${1}" _tok="${2}"
+  [[ "${_line}" =~ ${_PIN_IMAGE_BUILT_RE}"${_tok}" ]]
+}
+
+# _pin_is_declaration <file> <line> [<lineno>]
+#
+# True when the line declares a third-party version this repo names and
+# dependabot cannot bump. See the shape table above for the forms and why
+# the boundary sits where it does.
+#
+# Every test but the last is on the LINE. The last consults <file> for one
+# question only -- is this a workflow file, i.e. inside dependabot's own
+# scope -- because that is where the division of labour is real. Nothing
+# here asks what KIND of file it is otherwise: that question is what
+# quietly exempted the shapes and the contexts this detector kept missing.
+#
+# The one exception is go.mod (base#1463), where no line shape decides:
+# the line is a declaration exactly when <lineno> is one the go.mod scanner
+# emitted, or the `go` directive _pin_go_mod_go_line names (base#1440).
+# _pin_uncovered hands over the records it already scanned
+# (`_pin_gomod_file` / `_pin_gomod_lines` / `_pin_gomod_go`, its locals);
+# any other caller is scanned here. A go.mod line with no <lineno>, or a
+# go.mod the scanner refuses, cannot be answered: 2.
+_pin_is_declaration() {
+  local _file="${1}" _line="${2}" _lineno="${3:-}"
+  local _value _ref _emitted _go_rec
+
+  if [[ "${_file##*/}" == go.mod ]]; then
+    [[ -n "${_lineno}" ]] || return 2
+    if [[ "${_pin_gomod_file:-}" == "${_file}" ]]; then
+      _emitted="${_pin_gomod_lines:-}"
+      _go_rec="${_pin_gomod_go:-}"
+    else
+      _emitted="$(_pin_go_mod_scan "${_file}")" || return 2
+      _go_rec="$(_pin_go_mod_go_line "${_file}")" || return 2
+    fi
+    [[ $'\n'"${_emitted}" == *$'\n'"${_lineno}"$'\t'* ]] && return 0
+    [[ -n "${_go_rec}" && "${_go_rec%%$'\t'*}" == "${_lineno}" ]] && return 0
+    return 1
+  fi
+
+  [[ "${_line}" =~ ${_PIN_RELEASE_URL_RE} ]] && return 0
+  if [[ "${_line}" == *clone* && "${_line}" =~ ${_PIN_CLONE_REF_RE} ]]; then
+    return 0
+  fi
+  _pin_has_image_ref "${_line}" && return 0
+
+  # An assignment whose whole right-hand side is a version: a Dockerfile
+  # `ARG`, a `local` / `readonly` / `declare` / `export`, or a bare
+  # `NAME=<version>`. `ARG` is Dockerfile syntax wherever it is written --
+  # a heredoc in a generator included -- and a shell assignment is a
+  # declaration site wherever it is written for the same reason: the VALUE
+  # decides, not the keyword and not the file.
+  #
+  # `${_PIN_ASSIGN_RE}` is the reader's own regex, so a shape the reader
+  # can extract a version from is a shape this can require a marker on.
+  # A non-version value falls THROUGH rather than returning: narrowing the
+  # answer to "not a declaration" on the strength of one shape not
+  # matching is how a guard stops seeing the next one.
+  if [[ "${_line}" =~ ${_PIN_ASSIGN_RE} ]]; then
+    _value="$(_pin_unquote "$(_pin_rhs_value "${BASH_REMATCH[3]}")")"
+    [[ "${_value}" =~ ${_PIN_VERSION_RE} ]] && return 0
+    # An action REF assigned whole -- `readonly REF='actions/checkout@v7'`.
+    # This file's advice for a version no marker can address is to hoist it
+    # onto a line of its own, and for a `uses:` ref inside a heredoc that
+    # advice produces exactly this line. Recognising the version shape but
+    # not this one made the marker on every hoisted ref VOLUNTARY: deleting
+    # it left both this lint and the generated-workflow lint green over a
+    # ref nothing watches, which is the state the hoist was performed to
+    # end. Same correction as the four before it -- the guard could not see
+    # the shape of its own recommended fix.
+    [[ "${_value}" =~ ${_PIN_ACTION_REF_RE} ]] && return 0
+  fi
+
+  if [[ "${_line}" =~ ${_PIN_USES_RE} ]]; then
+    _ref="${BASH_REMATCH[1]}"
+    # shellcheck disable=SC2016 # the literal expression opener, not an expansion.
+    [[ "${_ref}" == *'${'* ]] && return 1
+    [[ "${_ref}" == './'* ]] && return 1
+    # `@<tag>` in a help string is a placeholder telling a reader what to
+    # write, not a ref anything resolves.
+    [[ "${_ref}" == *'<'* ]] && return 1
+    if [[ "${_file}" =~ ${_PIN_DEPENDABOT_SCOPE_RE} ]]; then
+      # Dependabot's file, so a VERSION ref is its job and a BRANCH ref --
+      # which it bumps to nothing, ever -- is still ours.
+      [[ "${_ref}" =~ ${_PIN_USES_VERSION_RE} ]] && return 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
+# _pin_uncovered <repo-root>
+#
+# Print `<file>:<line>: <text>` for every declaration that is not some
+# marker's target. Prints nothing when the trees are fully declared.
+#
+# It re-walks the files rather than reusing _pin_read's records because
+# the question is different: the reader asks "what did the markers say",
+# and this asks "what did they NOT say". A shared walk would answer the
+# second question with the first one's blind spots.
+_pin_uncovered() {
+  local _root="${1}"
+  local _file _abs _lineno _line _key _covered_list _list _table _golang_pinned
+  local _pin_gomod_file="" _pin_gomod_lines="" _pin_gomod_go=""
+  local -A _covered=()
+
+  # Both producers run in a command substitution for the reason spelled
+  # out in _pin_read: a redirection would swallow their exit status. The
+  # reader's table is captured BEFORE awk reads it: pipefail is off here,
+  # so `_pin_read | awk` would answer with awk's 0 over a reader that
+  # failed (base#1463).
+  _table="$(_pin_read "${_root}")" || return 1
+  _covered_list="$(awk -F'\t' '{print $8 ":" $9}' <<< "${_table}")"
+  # A go.mod `go` directive is covered by the pinned golang image, not by a
+  # marker of its own: that pin is the one _pin_go_directive_check compares
+  # it with (base#1440).
+  _golang_pinned="$(awk -F'\t' -v s="${_PIN_STATE_PINNED}" -v n="${_PIN_GO_DIRECTIVE_PIN}" \
+    '$1 == s && $2 == n { print 1; exit }' <<< "${_table}")"
+  _list="$(_pin_files "${_root}")" || return 1
+
+  while IFS= read -r _key; do
+    [[ -n "${_key}" ]] && _covered["${_key}"]=1
+  done <<< "${_covered_list}"
+
+  while IFS= read -r _file; do
+    _abs="${_root}/${_file}"
+    _pin_gomod_file=""
+    if [[ "${_file##*/}" == go.mod ]]; then
+      _pin_gomod_lines="$(_pin_go_mod_scan "${_abs}")" || return 1
+      _pin_gomod_go="$(_pin_go_mod_go_line "${_abs}")" || return 1
+      _pin_gomod_file="${_file}"
+      if [[ -n "${_golang_pinned}" && -n "${_pin_gomod_go}" ]]; then
+        _covered["${_file}:${_pin_gomod_go%%$'\t'*}"]=1
+      fi
+    fi
+    _lineno=0
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+      _lineno=$(( _lineno + 1 ))
+      [[ "${_line}" =~ ^[[:space:]]*# ]] && continue
+      if _pin_is_declaration "${_file}" "${_line}" "${_lineno}" \
+         && [[ -z "${_covered["${_file}:${_lineno}"]:-}" ]]; then
+        printf '%s:%d: %s\n' "${_file}" "${_lineno}" \
+          "${_line#"${_line%%[![:space:]]*}"}"
+      fi
+    done < "${_abs}"
+  done <<< "${_list}"
+}
+
+# _pin_go_mod_go_line <file> -- print `<lineno><TAB><version>` for the go.mod
+# <file>'s `go` directive, nothing when it has none. The file is scanned
+# first, so a directive the scanner refuses is never half-read: rc 1 with
+# the scanner's refusal logged. The directive is the line whose first lexed
+# token is the word `go` and that is not a require entry the scanner
+# emitted (a block entry for a module path `go`) (base#1440), nor any line
+# inside a `<verb> (` ... `)` block: a block line belongs to its block's
+# verb, so `go v1.0.0` in an exclude block is no go directive (base#1488).
+_pin_go_mod_go_line() {
+  local _gm_file="${1}" _emitted _line _ln=0 _gm_comment="" _in_block=0
+  local -a _gm_kind=() _gm_text=() _gm_start=() _lines=()
+  local LC_ALL=C
+  _emitted="$(_pin_go_mod_scan "${_gm_file}")" || return 1
+  mapfile -t _lines < "${_gm_file}"
+  for _line in "${_lines[@]}"; do
+    _ln=$(( _ln + 1 ))
+    _pin_go_mod_lex "${_line}" "${_ln}" || return 1
+    if (( _in_block )); then
+      [[ "${_gm_text[0]:-}" == ')' && "${_gm_kind[0]:-}" == p ]] && _in_block=0
+      continue
+    fi
+    if _pin_go_mod_opens_block; then _in_block=1; continue; fi
+    [[ "${_gm_text[0]:-}" == go && "${_gm_kind[0]:-}" == w ]] || continue
+    [[ $'\n'"${_emitted}" == *$'\n'"${_ln}"$'\t'* ]] && continue
+    printf '%s\t%s\n' "${_ln}" "${_gm_text[1]}"
+    return 0
+  done
+}
+
+# _pin_go_mod_set_go_line <file> <lineno> <old-version> <new-version> --
+# print line <lineno> of the go.mod <file>, a `go` directive naming
+# <old-version>, with that version replaced by <new-version>; the spacing
+# and any comment are kept (base#1440).
+_pin_go_mod_set_go_line() {
+  local _line
+  _line="$(awk -v n="${2}" 'NR == n' "${1}")"
+  printf '%s\n' "${_line/"${3}"/"${4}"}"
+}
+
+# The pin whose image builds every go.mod module; its Go minor is the one
+# a module's `go` directive must name, and its image is the one pins.sh
+# regenerates go.sum in (base#1440).
+readonly _PIN_GO_DIRECTIVE_PIN=golang
+
+# _pin_go_minor <image-or-version> -- print the major.minor a golang image's
+# tag (`golang:1.27.2-trixie@sha256:...`) or a go directive's version
+# (`1.27rc1`) starts with, nothing when it starts with none (base#1440).
+_pin_go_minor() {
+  local _tag="${1%%@*}"
+  _tag="${_tag##*:}"
+  [[ "${_tag}" =~ ^([0-9]+)\.([0-9]+) ]] || return 0
+  printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+# _pin_go_directive_check <repo-root>
+#
+# Compare every tracked go.mod's `go` directive with the golang pin by
+# major.minor: the directive names the Go the module needs, the pin the Go
+# that builds it. A mismatch is go_mod_go_directive_mismatch (file= line=
+# go= golang=), rc 1, nothing on stdout. A go.mod with no `go` line is a
+# mismatch named go=- line=0. A tracked go.mod with no pinned golang image
+# is go_mod_golang_pin_missing (file=) (base#1440).
+_pin_go_directive_check() {
+  local _root="${1}" _table _list _file _go_rec _go_ln _go_ver
+  local _image="" _pin_mm _go_mm
+  local _state _name _resolver _coord _pattern _skip _current _pfile _pline _pcksum
+  _table="$(_pin_read "${_root}")" || return 1
+  while IFS=$'\t' read -r _state _name _resolver _coord _pattern _skip _current _pfile _pline _pcksum; do
+    if [[ "${_name}" == "${_PIN_GO_DIRECTIVE_PIN}" && "${_state}" == "${_PIN_STATE_PINNED}" ]]; then
+      _image="${_current}"
+    fi
+  done <<< "${_table}"
+  _list="$(_pin_files "${_root}")" || return 1
+  if [[ -z "${_image}" ]]; then
+    while IFS= read -r _file; do
+      [[ "${_file##*/}" == go.mod ]] || continue
+      _log_err pin go_mod_golang_pin_missing "file=${_file}" \
+        "display=go_mod_golang_pin_missing: ${_file}: no pinned ${_PIN_GO_DIRECTIVE_PIN} image to compare its go directive with"
+      return 1
+    done <<< "${_list}"
+    return 0
+  fi
+  _pin_mm="$(_pin_go_minor "${_image}")"
+  [[ -n "${_pin_mm}" ]] || return 0
+  while IFS= read -r _file; do
+    [[ "${_file##*/}" == go.mod ]] || continue
+    _go_rec="$(_pin_go_mod_go_line "${_root}/${_file}")" || return 1
+    if [[ -n "${_go_rec}" ]]; then
+      _go_ln="${_go_rec%%$'\t'*}"
+      _go_ver="${_go_rec#*$'\t'}"
+      _go_mm="$(_pin_go_minor "${_go_ver}")"
+    else
+      _go_ln=0 _go_ver=- _go_mm=-
+    fi
+    if [[ "${_go_mm}" != "${_pin_mm}" ]]; then
+      _log_err pin go_mod_go_directive_mismatch "file=${_file}" "line=${_go_ln}" \
+        "go=${_go_mm}" "golang=${_pin_mm}" \
+        "display=go_mod_go_directive_mismatch: ${_file}:${_go_ln}: go ${_go_ver} names Go ${_go_mm}; the ${_PIN_GO_DIRECTIVE_PIN} pin builds it with ${_pin_mm}"
+      return 1
+    fi
+  done <<< "${_list}"
+}

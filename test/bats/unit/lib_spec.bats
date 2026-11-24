@@ -1,0 +1,1476 @@
+#!/usr/bin/env bats
+#
+# lib_spec.bats - Execution tests for dist/script/docker/lib/_lib.sh helpers.
+#
+# These tests source _lib.sh in a fresh subshell and call each helper so
+# the bash branches actually run (kcov can then attribute coverage).
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  LIB="/source/dist/script/docker/lib/_lib.sh"
+}
+
+# ── _detect_lang / _LANG ────────────────────────────────────────────────────
+
+# Part B: i18n.sh no longer sets _LANG as a module-load side-effect;
+# callers resolve it explicitly via _resolve_lang. These assert the new
+# contract -- the function maps LANG / SETUP_LANG to the canonical code.
+
+# why: Default language
+@test "_resolve_lang sets 'en' when LANG is unset (#568)" {
+  run bash -c "unset LANG SETUP_LANG; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "en"
+}
+
+# why: Traditional Chinese
+@test "_resolve_lang sets 'zh-TW' for zh_TW.UTF-8 (#568)" {
+  run bash -c "unset SETUP_LANG; LANG=zh_TW.UTF-8; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "zh-TW"
+}
+
+# why: Simplified Chinese
+@test "_resolve_lang sets 'zh-CN' for zh_CN.UTF-8 (#568)" {
+  run bash -c "unset SETUP_LANG; LANG=zh_CN.UTF-8; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "zh-CN"
+}
+
+# why: Singapore variant
+@test "_resolve_lang sets 'zh-CN' for zh_SG (Singapore) (#568)" {
+  run bash -c "unset SETUP_LANG; LANG=zh_SG.UTF-8; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "zh-CN"
+}
+
+# why: Japanese
+@test "_resolve_lang sets 'ja' for ja_JP.UTF-8 (#568)" {
+  run bash -c "unset SETUP_LANG; LANG=ja_JP.UTF-8; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "ja"
+}
+
+# why: Env override
+@test "_resolve_lang honors SETUP_LANG override (#568)" {
+  run bash -c "SETUP_LANG=ja LANG=en_US.UTF-8; source ${LIB}; _resolve_lang _LANG; echo \"\${_LANG}\""
+  assert_success
+  assert_output "ja"
+}
+
+# why: Load-time side-effect removed
+@test "_lib.sh does NOT set _LANG at source time (#568 Part B)" {
+  # The load-time side-effect is removed -- sourcing the lib chain leaves
+  # _LANG unset until a caller invokes _resolve_lang explicitly.
+  run bash -c "unset SETUP_LANG; LANG=zh_TW.UTF-8; source ${LIB}; echo \"\${_LANG:-UNSET}\""
+  assert_success
+  assert_output "UNSET"
+}
+
+# ── lib self-sourcing (load order not load-bearing, Part A) ─────────────
+
+# why: Self-sourcing (load order not load-bearing)
+@test "conf_logging.sh self-sources its conf.sh dependency in isolation (#568)" {
+  # Sourcing conf_logging.sh alone (no _lib.sh / conf.sh first) must still
+  # make its _parse_ini_section dependency available -- the module
+  # idempotently self-sources its deps so _lib.sh load order is not
+  # load-bearing.
+  run bash -c "source /source/dist/script/docker/lib/conf_logging.sh; declare -F _parse_ini_section"
+  assert_success
+}
+
+# ── double-source guard ─────────────────────────────────────────────────────
+
+# why: Double-source guard
+@test "_lib.sh is idempotent when sourced twice" {
+  run bash -c "source ${LIB}; source ${LIB}; echo \"\${_DOCKER_LIB_SOURCED}\""
+  assert_success
+  assert_output "1"
+}
+
+# ── _load_env ───────────────────────────────────────────────────────────────
+
+# why: Env loader works
+@test "_load_env exports variables from a .env file" {
+  local _tmp
+  _tmp="$(mktemp)"
+  cat > "${_tmp}" <<EOF
+FOO=bar
+BAZ=qux
+EOF
+  run bash -c "source ${LIB}; _load_env '${_tmp}'; echo \"\${FOO}-\${BAZ}\""
+  assert_success
+  assert_output "bar-qux"
+  rm -f "${_tmp}"
+}
+
+# why: Required arg check
+@test "_load_env errors when no path is given" {
+  run -127 bash -c "source ${LIB}; _load_env"
+}
+
+# why: %q-quoted hostile value loads literally (no command-sub / word-split)
+@test "_load_env round-trips shell-hostile values verbatim (no exec, no split) (#689)" {
+  # _load_env does `set -o allexport; source "${env_file}"`, executing the
+  # .env as shell. write_env is responsible for producing safe quoting (it
+  # emits hostile build-arg values via `printf '%s=%q'`). This pins the
+  # loader half of that contract: a value carrying a command-substitution
+  # string, a backtick string, spaces, and a single quote -- written with
+  # the SAME %q quoting write_env uses -- must round-trip to the literal
+  # bytes (no command substitution executed, no word-splitting).
+  local _tmp
+  _tmp="$(mktemp)"
+  local _spaces='a b c'
+  local _dollar='X=$(id)'
+  local _backtick='Y=`whoami`'
+  local _squote="it's"
+  {
+    printf '%s=%q\n' FOO "${_spaces}"
+    printf '%s=%q\n' BAR "${_dollar}"
+    printf '%s=%q\n' BAZ "${_backtick}"
+    printf '%s=%q\n' QUX "${_squote}"
+  } > "${_tmp}"
+  run bash -c "source ${LIB}; _load_env '${_tmp}'; printf '%s\n' \"\${FOO}\" \"\${BAR}\" \"\${BAZ}\" \"\${QUX}\""
+  assert_success
+  assert_line --index 0 "a b c"
+  assert_line --index 1 'X=$(id)'
+  assert_line --index 2 'Y=`whoami`'
+  assert_line --index 3 "it's"
+  # The substitutions must NOT have executed: no uid= leakage anywhere.
+  refute_output --partial "uid="
+  rm -f "${_tmp}"
+}
+
+# bats test_tags=kcov-fragile
+# why: Missing-file error path (no `[[ -f ]]` guard)
+@test "_load_env aborts under set -euo pipefail when the file does not exist (#689)" {
+  # kcov instrumentation perturbs the inner set -u shell (BASH_SOURCE comes
+  # back unbound), masking the real "No such file" diagnostic; the abort
+  # behaviour is covered by the plain bats-unit run. Skip only under coverage.
+  [ "${COVERAGE:-0}" = 1 ] && skip "kcov perturbs the inner set -u shell (#613)"
+  # The path is provided but the file is gone -- the race the wrapper's
+  # no_env guard is meant to prevent, and which run.sh would hit at
+  # `_load_env "${FILE_PATH}/.env.generated"`. _load_env sources $1 with
+  # no `[[ -f ]]` guard, so under the wrappers' `set -euo pipefail` the
+  # failed `source` aborts the script. Pin that failure mode: non-zero
+  # exit, a "No such file" diagnostic, and that the line past _load_env
+  # never runs.
+  run bash -c "set -euo pipefail; source ${LIB}; _load_env /no/such/.env.generated; echo REACHED"
+  assert_failure
+  refute_output --partial "REACHED"
+  assert_output --partial "No such file"
+}
+
+# ── _compute_project_name ───────────────────────────────────────────────────
+
+# why: Project name (single-instance)
+@test "_compute_project_name produces clean PROJECT_NAME (single-instance #600)" {
+  run bash -c "
+    source ${LIB}
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _compute_project_name
+    echo \"\${PROJECT_NAME}\"
+  "
+  assert_success
+  assert_output "alice-myrepo"
+}
+
+# why: The only path that reaches the `local` last resort
+@test "_compute_project_name derives local-<basename> with nothing loaded (#920)" {
+  # The wrapper's pre-bootstrap path, and the ONLY path that reaches the
+  # `local` last resort. Nothing has been loaded, so there is no hub user
+  # AND no USER_NAME -- both keys come from the same `.env.generated`, so
+  # an OS-user rung in the resolver could never fire here. The checkout's
+  # basename is what distinguishes this project, which is why `local` is
+  # honest rather than a shared-prefix collision.
+  run bash -c "
+    source ${LIB}
+    unset DOCKER_HUB_USER IMAGE_NAME USER_NAME PROJECT_NAME
+    FILE_PATH=/tmp/some-checkout
+    _compute_project_name
+    echo \"\${PROJECT_NAME}\"
+  "
+  assert_success
+  assert_output "local-some-checkout"
+}
+
+@test "_compute_project_name honours the PROJECT_NAME resolved into .env.generated (#893)" {
+  # The wrapper's -p and compose.yaml's `name:` must be ONE value. That
+  # value is resolved once at setup time and recorded in .env.generated;
+  # _load_env puts it in scope, and the wrapper must not recompute over it.
+  # Today the assignment is unconditional, so a resolved project name is
+  # silently discarded and two worktrees collide with no way to differ.
+  run bash -c "
+    source ${LIB}
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo PROJECT_NAME=alice-myrepo-wt2
+    _compute_project_name
+    echo \"\${PROJECT_NAME}\"
+  "
+  assert_success
+  assert_output "alice-myrepo-wt2"
+}
+
+@test "_compose_project passes the resolved PROJECT_NAME to -p (#893)" {
+  local _repo
+  _repo="$(mktemp -d)"
+  printf 'PROJECT_NAME=alice-myrepo-wt2\n' > "${_repo}/.env.generated"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_repo}'
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _load_env '${_repo}/.env.generated'
+    _compute_project_name
+    DRY_RUN=true _compose_project ps
+  "
+  assert_success
+  assert_output --partial "-p alice-myrepo-wt2"
+  rm -rf "${_repo}"
+}
+
+# ── _resolve_project_name (the single producer of a project name) ───────────
+
+@test "_resolve_project_name: a configured name is used verbatim (#893)" {
+  run bash -c "
+    source ${LIB}
+    _resolve_project_name 'myrepo-wt2' alice myrepo /tmp/whatever _out
+    echo \"\${_out}\"
+  "
+  assert_success
+  assert_output "myrepo-wt2"
+}
+
+@test "_resolve_project_name: empty configured name derives the historical default (#893)" {
+  run bash -c "
+    source ${LIB}
+    _resolve_project_name '' alice myrepo /tmp/whatever _out
+    echo \"\${_out}\"
+  "
+  assert_success
+  assert_output "alice-myrepo"
+}
+
+# why: `[project] name` answers a shared Docker Hub login
+@test "_resolve_project_name: a configured name wins where the derivation cannot separate two users (#920)" {
+  # The project name is now the ONLY per-host isolation the emitted stack
+  # has, and the one case the derivation cannot separate is two OS users
+  # behind ONE Docker Hub login -- detection hands both the same prefix.
+  # `[project] name` is the documented answer there, so it has to keep
+  # winning over a NON-empty derived prefix.
+  run bash -c "
+    source ${LIB}
+    _resolve_project_name 'myrepo-wt2' shared-hub myrepo /tmp/whatever _out
+    echo \"\${_out}\"
+  "
+  assert_success
+  assert_output "myrepo-wt2"
+}
+
+# ── _env_file_value / _carry_project_name (project-name continuity) ────────
+
+# why: Reads the file, not the environment
+@test "_env_file_value reads the last assignment, and empty when absent (#920)" {
+  # Deliberately not `source`: the question is what the FILE records, so an
+  # absent key must answer empty rather than answering with whatever the
+  # environment happens to export.
+  local _f="${BATS_TEST_TMPDIR}/env"
+  printf 'A=1\nPROJECT_NAME=first\nB=2\nPROJECT_NAME=second\n' > "${_f}"
+  run bash -c "
+    export PROJECT_NAME=from-the-environment
+    source ${LIB}
+    _env_file_value '${_f}' PROJECT_NAME _p
+    _env_file_value '${_f}' NOT_THERE _n
+    _env_file_value '${_f}.missing' PROJECT_NAME _m
+    echo \"[\${_p}][\${_n}][\${_m}]\"
+  "
+  assert_success
+  assert_output "[second][][]"
+}
+
+# why: Fresh checkout, nothing pending
+@test "_carry_project_name: a checkout with no recorded name takes the resolved one (#920)" {
+  run bash -c "
+    source ${LIB}
+    _carry_project_name '' 'tester-myrepo' '' _name _pending
+    echo \"[\${_name}][\${_pending}]\"
+  "
+  assert_success
+  assert_output "[tester-myrepo][]"
+}
+
+# why: The ordinary apply
+@test "_carry_project_name: an unchanged resolution records nothing pending (#920)" {
+  run bash -c "
+    source ${LIB}
+    _carry_project_name 'tester-myrepo' 'tester-myrepo' '' _name _pending
+    echo \"[\${_name}][\${_pending}]\"
+  "
+  assert_success
+  assert_output "[tester-myrepo][]"
+}
+
+# why: A rename nobody asked for waits
+@test "_carry_project_name: a changed DERIVATION keeps the recorded name (#920)" {
+  # The rename nobody asked for: an upgrade changes what the default
+  # derives, and the project name is the key compose finds the RUNNING
+  # containers by. Compose cannot relabel a running container, so the new
+  # name waits rather than orphaning the stack.
+  run bash -c "
+    source ${LIB}
+    _carry_project_name 'local-myrepo' 'tester-myrepo' '' _name _pending
+    echo \"[\${_name}][\${_pending}]\"
+  "
+  assert_success
+  assert_output "[local-myrepo][tester-myrepo]"
+}
+
+# why: The setting is not deferred
+@test "_carry_project_name: a CONFIGURED name is taken at once (#920, #893)" {
+  # The exception, and the reason for it: `[project] name` exists so a
+  # second worktree does not share the first's derived name. Deferring it
+  # while that shared name has containers -- the other checkout's -- would
+  # defeat the setting exactly when it is needed.
+  run bash -c "
+    source ${LIB}
+    _carry_project_name 'local-myrepo' 'myrepo-wt2' 'myrepo-wt2' _name _pending
+    echo \"[\${_name}][\${_pending}]\"
+  "
+  assert_success
+  assert_output "[myrepo-wt2][]"
+}
+
+# why: The recorded key wins outright
+@test "_recorded_project_name reads the PROJECT_NAME a repo already records (#920)" {
+  local _f="${BATS_TEST_TMPDIR}/env-new"
+  printf 'DOCKER_HUB_USER=bobhub\nIMAGE_NAME=myrepo\nPROJECT_NAME=isaac-ci\n' \
+    > "${_f}"
+  # The recorded key wins outright: it is the resolved value, and the two
+  # legacy keys beside it are no longer what compose reads.
+  run bash -c "
+    source ${LIB}
+    _recorded_project_name '${_f}' _out
+    echo \"[\${_out}]\"
+  "
+  assert_success
+  assert_output "[isaac-ci]"
+}
+
+# why: The previous release's file shape is not a fresh checkout
+@test "_recorded_project_name reconstructs the name a PRE-record env file runs under (#920)" {
+  # The shape every consumer on the previous release carries: no
+  # PROJECT_NAME key at all, because the emitter interpolated
+  # `name: \${DOCKER_HUB_USER}-\${IMAGE_NAME}` and the wrapper assembled
+  # the same string for its -p. Byte-for-byte the key set that release
+  # wrote, comment banners and quoted values included, so the reader is
+  # exercised on the real file rather than on a two-line idealisation.
+  local _f="${BATS_TEST_TMPDIR}/env-legacy"
+  cat > "${_f}" <<'EOF'
+# Auto-generated by setup.sh on 2026-08-27 11:52:00
+# Auto-detected fields, do not edit manually. Edit WS_PATH if needed
+
+# ── User / hardware (auto-detected) ──────────
+USER_NAME=alice
+USER_GROUP=alice
+USER_UID=1000
+USER_GID=1000
+HARDWARE=x86_64
+DOCKER_HUB_USER=bobhub
+GPU_ENABLED=true
+IMAGE_NAME=myrepo
+
+# ── Runtime config (from setup.conf) ─────────
+NETWORK_MODE=host
+GPU_CAPABILITIES="gpu compute utility graphics"
+EOF
+  # Not `alice-myrepo`: the live containers are labelled with the HUB user
+  # recorded here, which is the whole point of reading the file instead of
+  # re-deriving. Reading this as "fresh checkout" is what would let the
+  # rename land silently on the one population that is mid-migration.
+  run bash -c "
+    source ${LIB}
+    _recorded_project_name '${_f}' _out
+    echo \"[\${_out}]\"
+  "
+  assert_success
+  assert_output "[bobhub-myrepo]"
+}
+
+# why: A genuinely fresh checkout, and both half-shapes
+@test "_recorded_project_name answers empty when there is no name to reconstruct (#920)" {
+  # A genuinely fresh checkout, and the two half-shapes: either key
+  # missing leaves a string compose would have refused as a project name,
+  # so there is no stack under it to keep continuity with.
+  local _d="${BATS_TEST_TMPDIR}/rec"
+  mkdir -p "${_d}"
+  printf 'USER_NAME=alice\n' > "${_d}/none"
+  printf 'DOCKER_HUB_USER=bobhub\n' > "${_d}/no-image"
+  printf 'IMAGE_NAME=myrepo\n' > "${_d}/no-hub"
+  run bash -c "
+    export DOCKER_HUB_USER=from-the-environment IMAGE_NAME=also-from-there
+    source ${LIB}
+    _recorded_project_name '${_d}/none'     _a
+    _recorded_project_name '${_d}/no-image' _b
+    _recorded_project_name '${_d}/no-hub'   _c
+    _recorded_project_name '${_d}/missing'  _d
+    echo \"[\${_a}][\${_b}][\${_c}][\${_d}]\"
+  "
+  assert_success
+  assert_output "[][][][]"
+}
+
+# why: Multi-user isolation with no config, pinned through the detection
+# that delivers it
+@test "_resolve_project_name: two OS users with no Docker Hub login derive distinct project names (#920)" {
+  # The property that dropping the container name made load-bearing, pinned
+  # through the chain that actually delivers it. The resolver has no OS-user
+  # rung of its own -- one would be unreachable, since the two detectors end
+  # in the same fallback -- so the prefix differs per OS user because
+  # DETECTION resolves the hub user to the OS user when there is no login.
+  run bash -c "
+    source ${LIB}
+    docker() { return 1; }
+    USER=alice detect_docker_hub_user _ha
+    USER=bob   detect_docker_hub_user _hb
+    _resolve_project_name '' \"\${_ha}\" myrepo /tmp/whatever _a
+    _resolve_project_name '' \"\${_hb}\" myrepo /tmp/whatever _b
+    echo \"\${_a} \${_b}\"
+  "
+  assert_success
+  assert_output "alice-myrepo bob-myrepo"
+}
+
+@test "_resolve_project_name: falls back to local + directory basename with nothing to go on (#893)" {
+  run bash -c "
+    source ${LIB}
+    _resolve_project_name '' '' '' /tmp/some-checkout _out
+    echo \"\${_out}\"
+  "
+  assert_success
+  assert_output "local-some-checkout"
+}
+
+@test "_compute_project_name warns when .env.generated carries no PROJECT_NAME (#893)" {
+  # A cache generated before the project-name key existed. Falling back
+  # silently would leave the user with a name they cannot find the source
+  # of; the resolved cache is stale and must say so.
+  local _repo
+  _repo="$(mktemp -d)"
+  printf 'IMAGE_NAME=myrepo\n' > "${_repo}/.env.generated"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_repo}'
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _compute_project_name
+    echo \"\${PROJECT_NAME}\"
+  "
+  assert_success
+  assert_output --partial "alice-myrepo"
+  assert_output --partial "PROJECT_NAME"
+  rm -rf "${_repo}"
+}
+
+# why: the missing-cache case the warning above does not cover. A configured
+# checkout RECORDS its project name; deriving one over the gap invents a
+# name this checkout never ran under, and acting on it can reach a
+# different live checkout on a shared host. Only a self-managed checkout
+# may derive.
+@test "_compute_project_name refuses to derive for a configured checkout with no cache (#1015)" {
+  local _repo
+  _repo="$(mktemp -d)"
+  printf '[image]\nname = "myrepo"\n' > "${_repo}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    unset PROJECT_NAME
+    FILE_PATH='${_repo}'
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _compute_project_name
+    echo \"REACHED \${PROJECT_NAME}\"
+  "
+  rm -rf "${_repo}"
+  assert_failure
+  refute_output --partial "REACHED"
+  assert_output --partial ".env.generated"
+}
+
+# why: the same gap in a self-managed checkout is that checkout's normal state --
+# nothing writes the cache there and nothing ever will -- so the derivation
+# is the answer rather than a guess over a missing one.
+@test "_compute_project_name still derives for a self-managed checkout (#1015)" {
+  local _repo
+  _repo="$(mktemp -d)"
+  run bash -c "
+    source ${LIB}
+    unset DOCKER_HUB_USER IMAGE_NAME USER_NAME PROJECT_NAME
+    FILE_PATH='${_repo}'
+    _compute_project_name
+    echo \"\${PROJECT_NAME}\"
+  "
+  rm -rf "${_repo}"
+  assert_success
+  assert_output --partial "local-"
+}
+
+# ── _compose / _compose_project (DRY_RUN path) ──────────────────────────────
+
+# why: DRY_RUN path
+@test "_compose with DRY_RUN=true prints command instead of running" {
+  run bash -c "source ${LIB}; DRY_RUN=true _compose ps --all"
+  assert_success
+  assert_output --partial "[dry-run] docker compose"
+  assert_output --partial "ps"
+  assert_output --partial "--all"
+}
+
+# why: Real-call branch
+@test "_compose without DRY_RUN tries to invoke docker compose (sanity)" {
+  # When DRY_RUN is unset/false, _compose calls real docker compose; on a
+  # CI runner without docker the command exits non-zero, but we just want
+  # to confirm the false branch executes (kcov coverage).
+  run -127 bash -c "source ${LIB}; PATH=/nonexistent _compose version"
+  # PATH=/nonexistent forces `docker compose` lookup to fail with rc 127,
+  # confirming the non-dry-run branch was taken (reached the real invocation).
+  refute_output --partial "[dry-run]"
+}
+
+# why: Project wrapper
+@test "_compose_project pre-fills -p / -f / --env-file from PROJECT_NAME and FILE_PATH" {
+  local _repo
+  _repo="$(mktemp -d)"
+  : > "${_repo}/.env.generated"   # present -> --env-file is included
+  run bash -c "
+    source ${LIB}
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _compute_project_name ''
+    FILE_PATH='${_repo}'
+    DRY_RUN=true _compose_project ps
+  "
+  assert_success
+  assert_output --partial "-p alice-myrepo"
+  assert_output --partial "-f ${_repo}/compose.yaml"
+  assert_output --partial "--env-file ${_repo}/.env.generated"
+  assert_output --partial " ps"
+  rm -rf "${_repo}"
+}
+
+@test "_compose_project omits --env-file when .env.generated is absent (self-managed repo)" {
+  # base self-use (ADR-00000011 sec.4): a hand-authored compose.yaml with no
+  # generated .env.generated -- _compose_project must still pass -p / -f but
+  # drop --env-file so docker compose does not error on a missing file.
+  local _repo
+  _repo="$(mktemp -d)"   # no .env.generated created
+  run bash -c "
+    source ${LIB}
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    _compute_project_name ''
+    FILE_PATH='${_repo}'
+    DRY_RUN=true _compose_project ps
+  "
+  assert_success
+  assert_output --partial "-p alice-myrepo"
+  assert_output --partial "-f ${_repo}/compose.yaml"
+  refute_output --partial "--env-file"
+  assert_output --partial " ps"
+  rm -rf "${_repo}"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _sanitize_lang (i18n.sh)
+# ════════════════════════════════════════════════════════════════════
+
+# why: Lang validator pass-through
+@test "_sanitize_lang accepts en / zh-TW / zh-CN / ja unchanged" {
+  run bash -c "source ${LIB}; v=en;    _sanitize_lang v; echo \"\${v}\""
+  assert_success
+  assert_output "en"
+  run bash -c "source ${LIB}; v=zh-TW; _sanitize_lang v; echo \"\${v}\""
+  assert_success
+  assert_output "zh-TW"
+  run bash -c "source ${LIB}; v=zh-CN; _sanitize_lang v; echo \"\${v}\""
+  assert_success
+  assert_output "zh-CN"
+  run bash -c "source ${LIB}; v=ja;    _sanitize_lang v; echo \"\${v}\""
+  assert_success
+  assert_output "ja"
+}
+
+# why: Unknown lang fallback
+@test "_sanitize_lang warns and falls back to 'en' for unsupported values (English default)" {
+  # Locale-agnostic / English system: English WARNING is emitted.
+  run bash -c "unset LANG; source ${LIB}; v=foo; _sanitize_lang v test 2>&1; echo \"--VALUE=\${v}\""
+  assert_success
+  assert_output --partial "WARNING"
+  assert_output --partial "foo"
+  assert_output --partial "--VALUE=en"
+}
+
+# why: Legacy lang rejection
+@test "_sanitize_lang warns for the old bare 'zh' code (post zh→zh-TW rename)" {
+  run bash -c "unset LANG; source ${LIB}; v=zh; _sanitize_lang v tui 2>&1; echo \"--VALUE=\${v}\""
+  assert_success
+  assert_output --partial "WARNING"
+  assert_output --partial "--VALUE=en"
+}
+
+@test "_sanitize_lang warning is localized to system LANG (zh-TW)" {
+  # Regression: v0.9.7 Agent A scoped this helper out of i18n coverage.
+  # v0.9.11 localizes the warning using the SYSTEM LANG (not _LANG,
+  # which holds the invalid input), so a user whose shell is zh-TW sees
+  # the warning in Traditional Chinese rather than English.
+  run env LANG=zh_TW.UTF-8 bash -c "source ${LIB}; v=foo; _sanitize_lang v test 2>&1"
+  assert_success
+  assert_output --partial "警告"
+  assert_output --partial "foo"
+  refute_output --partial "WARNING"
+}
+
+@test "_sanitize_lang warning is localized to system LANG (zh-CN)" {
+  run env LANG=zh_CN.UTF-8 bash -c "source ${LIB}; v=foo; _sanitize_lang v test 2>&1"
+  assert_success
+  assert_output --partial "警告"
+  refute_output --partial "WARNING"
+}
+
+@test "_sanitize_lang warning is localized to system LANG (ja)" {
+  run env LANG=ja_JP.UTF-8 bash -c "source ${LIB}; v=foo; _sanitize_lang v test 2>&1"
+  assert_success
+  assert_output --partial "警告: サポート外"
+  refute_output --partial "WARNING"
+}
+
+# ── _dump_conf_section / _print_config_summary ─────────────────────────────
+
+_write_sample_conf() {
+  # Minimal INI .setup.conf with comments, blanks, and three sections --
+  # used by the _dump_conf_section tests, which are about the INI reader,
+  # to verify comment/blank skipping and section boundaries.
+  mkdir -p "$(dirname "${1}")"
+  cat > "${1}" <<'EOF'
+[image]
+# rule comment — should be skipped
+rule_1 = @basename
+
+rule_2 = @default:unknown
+
+[build]
+arg_1 = TZ=Asia/Taipei
+arg_2 = APT_MIRROR_UBUNTU=tw.archive.ubuntu.com
+
+[volumes]
+# populated at first init
+mount_1 = /home/alice/work:/home/alice/work
+EOF
+}
+
+# The same configuration as a real setup.toml -- the shape the WRITERS
+# produce, which is what the summary has to read.
+#
+# It used to be `_write_sample_conf` for these tests too: INI written to a
+# `setup.toml` path. Every numbered family was a table scalar there, which
+# an INI reader finds and the bridge never sees, so the summary tests and
+# the summary agreed with each other while both disagreed with every file
+# `setup.sh set` writes. toml_fixture_lint could not catch it because the
+# heredoc's destination is a PARAMETER here, not a literal `.toml` path.
+_write_sample_setup_toml() {
+  mkdir -p "$(dirname "${1}")"
+  cat > "${1}" <<'EOF'
+[[image.rules]]
+# rule comment — should be skipped
+rule = "@basename"
+
+[[image.rules]]
+rule = "@default:unknown"
+
+[build]
+
+[[build.args]]
+key = "TZ"
+value = "Asia/Taipei"
+
+[[build.args]]
+key = "APT_MIRROR_UBUNTU"
+value = "tw.archive.ubuntu.com"
+
+# populated at first init
+[[volumes]]
+source = "/home/alice/work"
+target = "/home/alice/work"
+
+[security]
+privileged = false
+
+[[security.cap_add]]
+cap = "NET_ADMIN"
+EOF
+}
+
+# why: INI section dump
+@test "_dump_conf_section extracts keys from the named section" {
+  local _f="${BATS_TEST_TMPDIR}/setup.conf"
+  _write_sample_conf "${_f}"
+  run bash -c "source ${LIB}; _dump_conf_section '${_f}' image"
+  assert_success
+  assert_output --partial "rule_1 = @basename"
+  assert_output --partial "rule_2 = @default:unknown"
+  refute_output --partial "arg_1"
+  refute_output --partial "mount_1"
+  refute_output --partial "rule comment"
+}
+
+# why: Section boundary
+@test "_dump_conf_section stops at the next section header" {
+  local _f="${BATS_TEST_TMPDIR}/setup.conf"
+  _write_sample_conf "${_f}"
+  run bash -c "source ${LIB}; _dump_conf_section '${_f}' build"
+  assert_success
+  assert_output --partial "arg_1 = TZ=Asia/Taipei"
+  assert_output --partial "arg_2 = APT_MIRROR_UBUNTU=tw.archive.ubuntu.com"
+  refute_output --partial "rule_"
+  refute_output --partial "mount_"
+}
+
+# why: Missing file
+@test "_dump_conf_section returns silent empty for missing file" {
+  run bash -c "source ${LIB}; _dump_conf_section /no/such/file.conf image"
+  assert_success
+  assert_output ""
+}
+
+# why: Missing section
+@test "_dump_conf_section returns silent empty for unknown section" {
+  local _f="${BATS_TEST_TMPDIR}/setup.conf"
+  _write_sample_conf "${_f}"
+  run bash -c "source ${LIB}; _dump_conf_section '${_f}' no_such_section"
+  assert_success
+  assert_output ""
+}
+
+@test "_dump_conf_section hides keys with empty values (using default)" {
+  # Empty `key =` means "use the Docker / template default"; surfacing
+  # it in the summary is noise. Populated keys in the same section
+  # still print.
+  local _f="${BATS_TEST_TMPDIR}/setup.conf"
+  cat > "${_f}" <<'EOF'
+[build]
+target_arch =
+network =
+arg_1 = TZ=Asia/Taipei
+[resources]
+shm_size =
+EOF
+  run bash -c "source ${LIB}; _dump_conf_section '${_f}' build"
+  assert_success
+  assert_output --partial "arg_1 = TZ=Asia/Taipei"
+  refute_output --partial "target_arch ="
+  refute_output --partial "network ="
+
+  # Section with only empty keys → empty output → caller skips the
+  # whole section header via the [[ -z ${_content} ]] check.
+  run bash -c "source ${LIB}; _dump_conf_section '${_f}' resources"
+  assert_success
+  assert_output ""
+}
+
+# why: Full config dump, over the shape the WRITERS produce. The summary
+# read the file's lines through `_dump_conf_section`, an INI reader that
+# matches an exact `[section]` header and stops at the next one, so
+# against a real setup.toml every numbered family vanished from it: an
+# `[[volumes]]` block is not inside `[volumes]`, and `[build]` ended at
+# the first `[[build.args]]`. The mounts, the build args and the
+# capability lists -- settings the run consumes -- were missing from the
+# one screen a first-time user reads before a build. This passed anyway
+# because the fixture was INI written to a `setup.toml` path, so the test
+# and the code agreed with each other and both disagreed with every file
+# `setup.sh set` writes.
+@test "_print_config_summary prints files, identity, all populated sections, resolved" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    HARDWARE=x86_64 DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    WS_PATH=/home/alice/work
+    GPU_ENABLED=true GPU_COUNT=all GPU_CAPABILITIES='gpu compute'
+    SETUP_GUI_DETECTED=true NETWORK_MODE=host IPC_MODE=host PRIVILEGED=false
+    TZ=Asia/Taipei APT_MIRROR_UBUNTU=tw.archive.ubuntu.com
+    APT_MIRROR_DEBIAN=mirror.twds.com.tw
+    PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+  assert_success
+  # File paths
+  assert_output --partial "setup.toml   : ${_fp}/setup.toml"
+  assert_output --partial ".env         : ${_fp}/.env"
+  assert_output --partial "compose.yaml : ${_fp}/compose.yaml"
+  # Identity
+  assert_output --partial "alice (uid=1000)"
+  assert_output --partial "hardware     : x86_64"
+  assert_output --partial "image / tag  : alice/myrepo"
+  assert_output --partial "project      : alice-myrepo"
+  assert_output --partial "workspace    : /home/alice/work"
+  # setup.conf dump — each populated section
+  # Array-of-tables entries print in setup.toml's own vocabulary: the
+  # `[[...]]` table name and the entry's field names, never the internal
+  # `<prefix>_N` view (base#1339).
+  assert_output --partial "[[image.rules]]"
+  assert_output --partial "rule = @basename"
+  assert_output --partial "[[build.args]]"
+  assert_output --partial "key = TZ"
+  assert_output --partial "value = Asia/Taipei"
+  assert_output --partial "[[volumes]]"
+  assert_output --partial "source = /home/alice/work"
+  assert_output --partial "target = /home/alice/work"
+  # The capability list, and a scalar beside it in the same section --
+  # the array families are the half the INI reader lost, and the scalar
+  # is what says the section is not simply being dumped raw (an INI
+  # reader printed `privileged = false` with its TOML quotes on).
+  assert_output --partial "[security]"
+  assert_output --partial "[[security.cap_add]]"
+  assert_output --partial "cap = NET_ADMIN"
+  assert_output --partial "privileged = false"
+  refute_output --regexp "(rule|arg|mount|cap_add)_[0-9]+ ="
+  # Resolved
+  assert_output --partial "GPU enabled : true"
+  assert_output --partial "GUI enabled : true"
+  assert_output --partial "network     : host"
+  assert_output --partial "TZ=Asia/Taipei"
+  # Customize hint
+  assert_output --partial "just docker setup-tui"
+}
+
+# _summary_entries <output>
+#
+# The setup.toml dump of a `_print_config_summary build` run, as its
+# entry lines alone: every `[build]   <header>` line and every
+# `[build]     <field> = <value>` line under one, in printed order.
+# A header is a `[...]` table name, which is what tells these apart from
+# the identity and resolved lines that share the tag.
+_summary_entries() {
+  grep -E '^\[build\]   (\[|  [^ ].* = )' <<< "${1}"
+}
+
+# _summary_toml <dir>
+#
+# Run the summary over <dir>/setup.toml with a fixed identity.
+_summary_toml() {
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${1}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+}
+
+# why: the shipped template is what a first-time user's summary reads.
+# The whole ordered dump is pinned, not substrings of it: one header per
+# ENTRY (an implementation printing one per array still contains every
+# substring), each entry's fields together and in file order (pairing a
+# key with another entry's value still contains both), and every entry
+# of the template (dropping a middle one still has a first and a last).
+@test "_print_config_summary shows the template's [[...]] entries in setup.toml vocabulary (base#1339)" {
+  local _fp="${BATS_TEST_TMPDIR}/template"
+  mkdir -p "${_fp}"
+  cp /source/dist/setup.toml "${_fp}/setup.toml"
+  _summary_toml "${_fp}"
+  assert_success
+  # No INI-era numbered key may surface under the setup.toml heading.
+  refute_output --regexp "[a-z]_[0-9]+ ="
+  run _summary_entries "${output}"
+  assert_output - <<'EOF'
+[build]   [[image.rules]]
+[build]     rule = prefix:docker_
+[build]   [[image.rules]]
+[build]     rule = suffix:_ws
+[build]   [[image.rules]]
+[build]     rule = @basename
+[build]   [build]
+[build]     network = auto
+[build]   [[build.args]]
+[build]     key = APT_MIRROR_UBUNTU
+[build]     value = tw.archive.ubuntu.com
+[build]   [[build.args]]
+[build]     key = APT_MIRROR_DEBIAN
+[build]     value = mirror.twds.com.tw
+[build]   [[build.args]]
+[build]     key = TZ
+[build]     value = Asia/Taipei
+[build]   [deploy]
+[build]     gpu_mode = auto
+[build]     gpu_count = all
+[build]     gpu_capabilities = gpu compute utility graphics
+[build]     gpu_runtime = auto
+[build]     dri_groups = auto
+[build]   [gui]
+[build]     mode = auto
+[build]   [network]
+[build]     mode = host
+[build]     ipc = host
+[build]     pid = private
+[build]   [security]
+[build]     privileged = false
+EOF
+}
+
+# why: TOML lets two arrays of one table interleave, and lets the
+# table's own `[security]` header come after its arrays; tomllib groups
+# an array's entries under one key, so a dump walked from the parsed
+# dict printed A, C, B and the scalars first. And an entry's empty field
+# is part of the entry -- the KV view keeps `EMPTY=` -- so dropping it
+# showed a different build argument from the one the run gets.
+@test "_print_config_summary keeps setup.toml's entry order and an entry's empty field (base#1339)" {
+  local _fp="${BATS_TEST_TMPDIR}/order"
+  mkdir -p "${_fp}"
+  cat > "${_fp}/setup.toml" <<'EOF'
+[[build.args]]
+key = "EMPTY"
+value = ""
+
+[[build.args]]
+key = "TZ"
+value = "Asia/Taipei"
+
+[[security.cap_add]]
+cap = "A"
+
+[[security.cap_drop]]
+cap = "B"
+
+[[security.cap_add]]
+cap = "C"
+
+[security]
+privileged = false
+
+[build]
+network = "auto"
+target_arch = ""
+EOF
+  _summary_toml "${_fp}"
+  assert_success
+  run _summary_entries "${output}"
+  assert_output - <<'EOF'
+[build]   [[build.args]]
+[build]     key = EMPTY
+[build]     value = ""
+[build]   [[build.args]]
+[build]     key = TZ
+[build]     value = Asia/Taipei
+[build]   [[security.cap_add]]
+[build]     cap = A
+[build]   [[security.cap_drop]]
+[build]     cap = B
+[build]   [[security.cap_add]]
+[build]     cap = C
+[build]   [security]
+[build]     privileged = false
+[build]   [build]
+[build]     network = auto
+EOF
+}
+
+# why: file order is the file's, across sections too. The bridge emits
+# blocks in source order, but a summary that walks a fixed list of
+# sections and prints each one's rows regroups them: `[[security.cap_add]]`
+# A, `[[build.args]]` TZ, `[[security.cap_drop]]` B printed TZ, A, B.
+# And a header is a TOML key, so `[[security."cap\u005Fadd"]]` IS
+# `security.cap_add`: placing blocks by the header's undecoded spelling
+# lost that entry's position and printed A, C, B.
+@test "_print_config_summary keeps file order across sections and through a quoted header (base#1339)" {
+  local _fp="${BATS_TEST_TMPDIR}/cross"
+  mkdir -p "${_fp}"
+  cat > "${_fp}/setup.toml" <<'EOF'
+[[security.cap_add]]
+cap = "A"
+
+[[build.args]]
+key = "TZ"
+value = "Asia/Taipei"
+
+[[security.cap_drop]]
+cap = "B"
+
+[[ security . "cap\u005Fadd" ]] # escaped key
+cap = "C"
+EOF
+  _summary_toml "${_fp}"
+  assert_success
+  run _summary_entries "${output}"
+  assert_output - <<'EOF'
+[build]   [[security.cap_add]]
+[build]     cap = A
+[build]   [[build.args]]
+[build]     key = TZ
+[build]     value = Asia/Taipei
+[build]   [[security.cap_drop]]
+[build]     cap = B
+[build]   [[security.cap_add]]
+[build]     cap = C
+EOF
+}
+
+# why: an array entry is a block whether or not it has fields. Three
+# `[[image.rules]]` entries with an empty middle one are three entries,
+# but rows were emitted per FIELD, so the fieldless one produced none
+# and the summary printed two headers -- the user's three rules read as
+# two.
+@test "_print_config_summary prints a fieldless array entry as its own header (base#1339)" {
+  local _fp="${BATS_TEST_TMPDIR}/fieldless"
+  mkdir -p "${_fp}"
+  cat > "${_fp}/setup.toml" <<'EOF2'
+[[image.rules]]
+rule = "A"
+
+[[image.rules]]
+
+[[image.rules]]
+rule = "C"
+EOF2
+  _summary_toml "${_fp}"
+  assert_success
+  run _summary_entries "${output}"
+  assert_output - <<'EOF2'
+[build]   [[image.rules]]
+[build]     rule = A
+[build]   [[image.rules]]
+[build]   [[image.rules]]
+[build]     rule = C
+EOF2
+}
+
+# why: the loader still accepts a family spelled as numbered table
+# scalars (`[image] rule_1 = ...`), and printing those verbatim put the
+# `<prefix>_N` vocabulary back under the setup.toml heading. They print
+# as the [[...]] entries `setup.sh set` would write for them, in their
+# numbered order, split into fields the way the writer splits them.
+@test "_print_config_summary prints numbered table scalars as [[...]] entries (base#1339)" {
+  local _fp="${BATS_TEST_TMPDIR}/numbered"
+  mkdir -p "${_fp}"
+  cat > "${_fp}/setup.toml" <<'EOF'
+[image]
+rule_2 = "suffix:_ws"
+rule_1 = "@basename"
+
+[build]
+network = "auto"
+arg_1 = "EMPTY="
+arg_2 = "HTTP_PROXY"
+
+[network]
+mode = "bridge"
+port_1 = "8080:80"
+EOF
+  _summary_toml "${_fp}"
+  assert_success
+  refute_output --regexp "[a-z]_[0-9]+ ="
+  run _summary_entries "${output}"
+  assert_output - <<'EOF'
+[build]   [[image.rules]]
+[build]     rule = @basename
+[build]   [[image.rules]]
+[build]     rule = suffix:_ws
+[build]   [build]
+[build]     network = auto
+[build]   [[build.args]]
+[build]     key = EMPTY
+[build]     value = ""
+[build]   [[build.args]]
+[build]     key = HTTP_PROXY
+[build]   [network]
+[build]     mode = bridge
+[build]   [[network.ports]]
+[build]     host = 8080
+[build]     container = 80
+EOF
+}
+
+# why: the summary reads `--entries`, which printed a file the loader
+# refuses as if it were valid: `[[build.install]]` beside `[build]` came
+# out as a `[build]` block and a `[[build.install]]` block. A refused
+# file shows no setup.toml rows at all -- not the half the bridge got
+# through before the array -- because the bridge refuses before it
+# prints anything (base#1396).
+@test "_print_config_summary prints no setup.toml rows for a file with an unknown array (base#1396)" {
+  local _fp="${BATS_TEST_TMPDIR}/unknown_array"
+  mkdir -p "${_fp}"
+  printf '[build]\nnetwork = "auto"\n\n[[build.install]]\nsource = "a"\n' \
+    > "${_fp}/setup.toml"
+  _summary_toml "${_fp}"
+  run _summary_entries "${output}"
+  assert_output ""
+}
+
+@test "_print_config_summary names an active setup.local.toml and its sections (#893)" {
+  # A config layer nobody else can see must never be invisible in the run
+  # that uses it: the summary is the one place the user is told which files
+  # this invocation resolved from.
+  local _fp="${BATS_TEST_TMPDIR}/withlocal"
+  mkdir -p "${_fp}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  printf '[gui]\nmode = "off"\n[network]\nmode = "bridge"\n' > "${_fp}/setup.local.toml"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+  assert_success
+  assert_output --partial "${_fp}/setup.local.toml"
+  assert_output --partial "gui, network"
+}
+
+@test "_print_config_summary says nothing about a setup.local.toml that is absent (#893)" {
+  local _fp="${BATS_TEST_TMPDIR}/nolocal"
+  mkdir -p "${_fp}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    DOCKER_HUB_USER=alice IMAGE_NAME=myrepo PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+  assert_success
+  refute_output --partial "setup.local.toml"
+}
+
+# why: Variables block populated
+@test "_print_config_summary prints Variables block mapping setup.conf placeholders to detected values" {
+  # The Identity block already shows resolved user/workspace, but the
+  # setup.toml [volumes] dump prints raw `${WS_PATH}` / `${USER_NAME}`
+  # placeholders. Variables block bridges the gap so users can map the
+  # placeholder to the value at a glance without re-deriving from
+  # Identity field labels.
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    HARDWARE=x86_64 DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    WS_PATH=/home/alice/work
+    GPU_ENABLED=true GPU_COUNT=all GPU_CAPABILITIES='gpu compute'
+    SETUP_GUI_DETECTED=true NETWORK_MODE=host IPC_MODE=host PRIVILEGED=false
+    TZ=Asia/Taipei APT_MIRROR_UBUNTU=tw.archive.ubuntu.com
+    APT_MIRROR_DEBIAN=mirror.twds.com.tw
+    PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+  assert_success
+  assert_output --partial "Variables"
+  assert_output --partial "\${USER_NAME} = alice"
+  assert_output --partial "\${USER_UID}  = 1000"
+  assert_output --partial "\${USER_GROUP} = alice"
+  assert_output --partial "\${USER_GID}  = 1000"
+  assert_output --partial "\${WS_PATH}   = /home/alice/work"
+}
+
+# why: Variables fallback
+@test "_print_config_summary Variables block falls back to '-' for unset values" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    FILE_PATH='${_fp}'
+    unset USER_NAME USER_UID USER_GROUP USER_GID WS_PATH
+    _print_config_summary build
+  "
+  assert_success
+  assert_output --partial "\${USER_NAME} = -"
+  assert_output --partial "\${WS_PATH}   = -"
+}
+
+# why: Empty-section skip
+@test "_print_config_summary hides sections that are empty in setup.conf" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  # Minimal conf with only [image]; expect no [build]/[volumes] headers
+  mkdir -p "${_fp}" && cat > "${_fp}/setup.toml" <<'EOF'
+[image]
+rule_1 = "@basename"
+EOF
+  run bash -c "source ${LIB}; FILE_PATH='${_fp}'; _print_config_summary build"
+  assert_success
+  assert_output --partial "[[image.rules]]"
+  assert_output --partial "rule = @basename"
+  refute_output --partial "  [build]"
+  refute_output --partial "  [volumes]"
+}
+
+# why: Missing-conf hint
+@test "_print_config_summary warns when setup.conf is missing" {
+  local _fp="${BATS_TEST_TMPDIR}/no_conf"
+  mkdir -p "${_fp}"
+  run bash -c "source ${LIB}; FILE_PATH='${_fp}'; _print_config_summary build"
+  assert_success
+  assert_output --partial "setup.toml not found"
+  assert_output --partial "just docker setup-tui"
+}
+
+# why: Color migration via _log_plain
+@test "_print_config_summary wraps dividers + section headers in ANSI when FORCE_COLOR=1 (#309)" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    FORCE_COLOR=1 source ${LIB}
+    FORCE_COLOR=1
+    FILE_PATH='${_fp}'
+    _print_config_summary build
+  "
+  assert_success
+  # Dividers wrapped in dim ANSI (\033[2m...\033[0m)
+  assert_output --partial $'\033[2m──'
+  # Section headers wrapped in bold ANSI (\033[1m...\033[0m)
+  assert_output --partial $'\033[1mFiles\033[0m'
+  assert_output --partial $'\033[1mIdentity\033[0m'
+  assert_output --partial $'\033[1mVariables\033[0m'
+  assert_output --partial $'\033[1msetup.toml\033[0m'
+  assert_output --partial $'\033[1mResolved\033[0m'
+  # Indented value lines stay un-styled
+  refute_output --partial $'\033[1m  setup.toml'
+  refute_output --partial $'\033[2m  setup.toml'
+}
+
+# why: NO_COLOR precedence on summary
+@test "_print_config_summary omits ANSI when NO_COLOR=1 overrides FORCE_COLOR=1 (#309)" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    NO_COLOR=1 FORCE_COLOR=1 source ${LIB}
+    NO_COLOR=1 FORCE_COLOR=1
+    FILE_PATH='${_fp}'
+    _print_config_summary build
+  "
+  assert_success
+  # No ANSI escape sequences anywhere in output
+  refute_output --partial $'\033['
+  # Headers still present as plain text
+  assert_output --partial "Files"
+  assert_output --partial "Resolved"
+}
+
+# why: #157 empty-conf hint on build/run summary
+@test "_print_config_summary warns when setup.conf exists but has no [section] headers" {
+  # Empty / comments-only setup.conf is the same situation as missing
+  # from a behavior standpoint (every section falls back to template
+  # defaults), but the existing missing-conf branch never fires because
+  # the file does exist. Surface a parallel hint inside the file-exists
+  # branch so downstream `build.sh` users see the warning.
+  local _fp="${BATS_TEST_TMPDIR}/empty_conf"
+  mkdir -p "${_fp}"
+  mkdir -p "${_fp}" && cat > "${_fp}/setup.toml" <<'EOF'
+# only comments, no [section] headers
+EOF
+  run bash -c "source ${LIB}; FILE_PATH='${_fp}'; _print_config_summary build"
+  assert_success
+  assert_output --partial "no section overrides"
+}
+
+# ── _lib_msg / _print_config_summary i18n ──────────────────────────────────
+
+@test "_lib_msg returns English by default" {
+  run bash -c "source ${LIB}; unset _LANG; echo \"\$(_lib_msg files)|\$(_lib_msg identity)|\$(_lib_msg resolved)|\$(_lib_msg customize)\""
+  assert_success
+  assert_output "Files|Identity|Resolved|Customize"
+}
+
+@test "_lib_msg returns zh-TW translations" {
+  run bash -c "source ${LIB}; _LANG=zh-TW; echo \"\$(_lib_msg files)|\$(_lib_msg identity)|\$(_lib_msg user)|\$(_lib_msg hardware)|\$(_lib_msg gpu_enabled)|\$(_lib_msg network)\""
+  assert_success
+  assert_output "檔案|身分|使用者|硬體|GPU 已啟用|網路"
+}
+
+@test "_lib_msg returns zh-CN translations" {
+  run bash -c "source ${LIB}; _LANG=zh-CN; echo \"\$(_lib_msg files)|\$(_lib_msg user)|\$(_lib_msg hardware)|\$(_lib_msg workspace)\""
+  assert_success
+  assert_output "文件|用户|硬件|工作区"
+}
+
+@test "_lib_msg returns ja translations" {
+  run bash -c "source ${LIB}; _LANG=ja; echo \"\$(_lib_msg files)|\$(_lib_msg identity)|\$(_lib_msg user)|\$(_lib_msg hardware)\""
+  assert_success
+  assert_output "ファイル|ID|ユーザー|ハードウェア"
+}
+
+@test "_lib_msg returns count / caps across all languages" {
+  # Regression: these two keys are only invoked inline in the
+  # "Resolved" block of _print_config_summary and were missed by
+  # spot-check assertions; kcov flagged both branches as uncovered.
+  run bash -c "source ${LIB}; _LANG=en; echo \"\$(_lib_msg count)|\$(_lib_msg caps)\""
+  assert_success
+  assert_output "count|caps"
+
+  run bash -c "source ${LIB}; _LANG=zh-TW; echo \"\$(_lib_msg count)|\$(_lib_msg caps)\""
+  assert_success
+  assert_output "數量|能力"
+
+  run bash -c "source ${LIB}; _LANG=zh-CN; echo \"\$(_lib_msg count)|\$(_lib_msg caps)\""
+  assert_success
+  assert_output "数量|能力"
+
+  run bash -c "source ${LIB}; _LANG=ja; echo \"\$(_lib_msg count)|\$(_lib_msg caps)\""
+  assert_success
+  assert_output "数量|ケーパビリティ"
+}
+
+@test "_lib_msg falls back to English for unknown _LANG value" {
+  # unknown locale should not silently output empty — falls through to *:.
+  run bash -c "source ${LIB}; _LANG=de; echo \"\$(_lib_msg files)|\$(_lib_msg identity)\""
+  assert_success
+  assert_output "Files|Identity"
+}
+
+@test "_print_config_summary uses zh-TW labels when _LANG=zh-TW" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    _LANG=zh-TW
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    HARDWARE=aarch64 DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    WS_PATH=/home/alice/work
+    GPU_ENABLED=true GPU_COUNT=all GPU_CAPABILITIES='gpu compute'
+    SETUP_GUI_DETECTED=false NETWORK_MODE=host IPC_MODE=host PRIVILEGED=true
+    TZ=Asia/Taipei APT_MIRROR_UBUNTU=tw.archive.ubuntu.com
+    APT_MIRROR_DEBIAN=mirror.twds.com.tw
+    PROJECT_NAME=alice-myrepo
+    _print_config_summary run
+  "
+  assert_success
+  # Translated section headings
+  assert_output --partial "[run] 檔案"
+  assert_output --partial "[run] 身分"
+  assert_output --partial "[run] 解析結果"
+  # Translated field labels
+  assert_output --partial "使用者"
+  assert_output --partial "硬體"
+  assert_output --partial "工作區"
+  assert_output --partial "GPU 已啟用"
+  assert_output --partial "GUI 已啟用"
+  assert_output --partial "網路"
+  assert_output --partial "特權"
+  # Customize hint translated
+  assert_output --partial "自訂:"
+  # English key labels preserved (technical terms / .env var names)
+  assert_output --partial "TZ=Asia/Taipei"
+  assert_output --partial "ipc=host"
+}
+
+@test "_print_config_summary uses ja labels when _LANG=ja" {
+  local _fp="${BATS_TEST_TMPDIR}"
+  _write_sample_setup_toml "${_fp}/setup.toml"
+  run bash -c "
+    source ${LIB}
+    _LANG=ja
+    FILE_PATH='${_fp}'
+    USER_NAME=alice USER_UID=1000 USER_GROUP=alice USER_GID=1000
+    HARDWARE=x86_64 DOCKER_HUB_USER=alice IMAGE_NAME=myrepo
+    WS_PATH=/home/alice/work
+    GPU_ENABLED=true GPU_COUNT=all GPU_CAPABILITIES='gpu'
+    SETUP_GUI_DETECTED=true NETWORK_MODE=host IPC_MODE=host PRIVILEGED=false
+    PROJECT_NAME=alice-myrepo
+    _print_config_summary build
+  "
+  assert_success
+  assert_output --partial "[build] ファイル"
+  assert_output --partial "[build] ID"
+  assert_output --partial "[build] 解決済み"
+  assert_output --partial "ユーザー"
+  assert_output --partial "ハードウェア"
+  assert_output --partial "ワークスペース"
+}
+
+@test "_print_config_summary conf_missing hint is translated (zh-TW)" {
+  local _fp="${BATS_TEST_TMPDIR}/no_conf_zh"
+  mkdir -p "${_fp}"
+  run bash -c "source ${LIB}; _LANG=zh-TW; FILE_PATH='${_fp}'; _print_config_summary build"
+  assert_success
+  assert_output --partial "找不到 setup.toml"
+  assert_output --partial "just docker build --setup"
+}
+
+# why: base#1177 put a `GPU_CAPABILITIES` array in the lib tree and
+# measured what that costs: `_lib.sh` loads env_emit.sh and
+# config_summary.sh into ONE process alongside every other module, and
+# `.env` carries a variable of that exact name, so the array shadowed the
+# operator's value and `${GPU_CAPABILITIES:--}` read back `gpu` -- the
+# array's first element -- whatever the configuration said. Nothing
+# failed; the summary just printed a different list. The population is
+# DERIVED from the names env_emit.sh actually writes rather than listed
+# here, because a guard naming today's twenty-four passes forever while
+# the next emitted name is taken by a module variable (base#1089 /
+# base#1090 / base#1214). The probe runs with those names cleared from
+# the environment, so what it finds is what the TREE declares.
+@test "no lib module declares a variable the generated .env already names (base#1177)" {
+  local -a _names=()
+  mapfile -t _names < <(grep -oE '^[A-Z][A-Z0-9_]*=' \
+    /source/dist/script/docker/lib/env_emit.sh | sed 's/=$//' | sort -u)
+  # Non-vacuity: a derivation that stopped matching would compare the lib
+  # tree against an empty population and report nothing. A floor, well
+  # under the live count.
+  [ "${#_names[@]}" -ge 10 ] || fail "derived ${#_names[@]} emitted env name(s) from env_emit.sh; the harvest is broken, so the check below is vacuous"
+  local _probe="${BATS_TEST_TMPDIR}/env_shadow_probe.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'source %s\n' "${LIB}"
+    printf '%s\n' 'for _n in "$@"; do'
+    printf '%s\n' '  [[ -v "${_n}" ]] && printf "%s declared as: %s\n" "${_n}" "$(declare -p "${_n}" 2>/dev/null)"'
+    printf '%s\n' 'done'
+    printf '%s\n' 'exit 0'
+  } > "${_probe}"
+  local -a _clear=()
+  local _n
+  for _n in "${_names[@]}"; do _clear+=(-u "${_n}"); done
+  run env "${_clear[@]}" bash "${_probe}" "${_names[@]}"
+  assert_success
+  assert_output ""
+}
+
+# why: base#1185 -- the splitter call the original blast-radius analysis
+#      missed; a wrong split here is a wrong SUMMARY, which no exit
+#      status reports
+@test "_summary_dump_section groups by the registry, not by the first dot (base#1185)" {
+  # `_summary_dump_section` asks `_conf_split_nskey` which section each
+  # resolved key belongs to and prints the ones that match. It was absent
+  # from base#1185's original call list, and it is the one site whose
+  # symptom is silent: a mis-grouped key still prints, under the wrong
+  # heading, and the command still succeeds.
+  #
+  # Two runs over the same input, differing only in whether `base` is
+  # registered as sub-sectioned. Nothing under dist/ differs between
+  # them, which is the property this slice bought.
+  run bash -c "
+    source ${LIB}
+    _k=( base.watchdog.check logging.web.driver )
+    _v=( 30s json-file )
+    _summary_dump_section t base _k _v
+    echo ---
+    _summary_dump_section t base.watchdog _k _v
+  "
+  assert_success
+  # Unregistered: the key lands under [base] with a dotted key name, and
+  # [base.watchdog] is empty.
+  assert_line --index 0 "[t]   [base]"
+  assert_line --index 1 "[t]     watchdog.check = 30s"
+  assert_line --index 2 "---"
+  assert_equal "${#lines[@]}" 3
+
+  run bash -c "
+    source ${LIB}
+    SCHEMA_SUBSECTIONED+=( base )
+    _k=( base.watchdog.check logging.web.driver )
+    _v=( 30s json-file )
+    _summary_dump_section t base _k _v
+    echo ---
+    _summary_dump_section t base.watchdog _k _v
+  "
+  assert_success
+  # Registered: [base] has nothing of its own, and the key is grouped
+  # under the table it names.
+  assert_line --index 0 "---"
+  assert_line --index 1 "[t]   [base.watchdog]"
+  assert_line --index 2 "[t]     check = 30s"
+  assert_equal "${#lines[@]}" 3
+}

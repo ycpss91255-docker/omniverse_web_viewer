@@ -1,0 +1,283 @@
+#!/usr/bin/env bats
+#
+# multi_distro_build_worker_yaml_spec.bats — structural assertions for
+# `.github/workflows/multi-distro-build-worker.yaml` (B-1 dispatcher
+# extended to N-D matrix-mode via).
+#
+# The dispatcher is a two-job reusable workflow on top of
+# build-worker.yaml:
+#
+# 1. `resolve-matrix` — pure-shell selector that emits a `matrix`
+#    `include`-shape JSON array output based on `github.event_name`.
+#    `pull_request` -> `pr_matrix` (subset); everything else (tag push,
+#    main push, workflow_dispatch) -> `tag_matrix` (full release matrix).
+#
+# 2. `call-build` — strategy.matrix job invoking
+#    `./.github/workflows/build-worker.yaml` per matrix cell. Each cell
+#    MUST have `name` (used for image_name suffix + cache scope) and
+#    `build_args` (forwarded verbatim to build-worker.yaml). Derives
+#    per-shard `image_name` as `<image_name>-<matrix.name>` so GHCR tags
+#    disambiguate across cells. Per-cell
+#    `cache_variant: ${{ matrix.name }}` so buildx GHA cache shards by
+#    cell name (matches's per-variant scope pattern).
+#
+# 3. `ci-passed` — rollup aggregating the matrix result for branch
+#    protection. Matches the existing rollup naming used by
+#    env/ros_distro / env/ros2_distro per CLAUDE.md's status-check
+#    table, so downstream branch-protection contexts don't change when
+#    adopting this dispatcher.
+#
+# BREAKING since v0.32.0: the 1D inputs `pr_distros` /
+# `tag_distros` / `distro_input_name` / `extra_build_args` are removed;
+# callers must use `pr_matrix` / `tag_matrix` (full JSON include-shape)
+# instead.
+#
+# why: Structural assertions for
+# `.github/workflows/multi-distro-build-worker.yaml` (#325 B-1 dispatcher,
+# extended to N-D matrix-mode via #344 in v0.32.0). The dispatcher fans a
+# per-event `include`-shape matrix across `build-worker.yaml` matrix shards
+# so multi-distro / multi-variant caller `main.yaml`s (`env/ros_distro`,
+# `env/ros2_distro`, `app/ros1_bridge`) stop copy-pasting a `${{
+# github.event_name == 'pull_request' && ... || ... }}` expression. Three
+# jobs:
+#
+# 1. **`resolve-matrix`** — pure-shell selector emitting a `matrix`
+# JSON-array output (`include`-shape, each entry has `name` + `build_args`
+# plus arbitrary additional fields). `pull_request` -> `pr_matrix` (subset);
+# anything else (tag push, main push, `workflow_dispatch`) -> `tag_matrix`
+# (release validation matrix).
+#
+# 2. **`call-build`** — strategy.matrix job invoking the local
+# `build-worker.yaml` per matrix cell. Derives per-shard `image_name` as
+# `<image_name>-<matrix.name>`, forwards `matrix.build_args` verbatim as
+# `build_args`, and shards buildx GHA cache by name via `cache_variant: ${{
+# matrix.name }}` (reuses #272's per-variant scope contract). `fail-fast:
+# false` so one shard's failure doesn't cancel siblings.
+#
+# 3. **`ci-passed`** — rollup gate for branch protection. Matches the
+# existing `ci-passed` rollup naming used by env/ros_distro /
+# env/ros2_distro per CLAUDE.md's status-check table, so downstream
+# branch-protection contexts don't change on adoption.
+#
+# **BREAKING since v0.32.0 (#344)**: legacy 1D inputs `pr_distros` /
+# `tag_distros` / `distro_input_name` / `extra_build_args` were removed; the
+# 14 v0.29-era tests covering those inputs are replaced by 16 tests covering
+# the new matrix-mode shape (incl. a negative assertion that the 1D inputs
+# are gone).
+#
+# Grouped by concern:
+#
+# - Declares `workflow_call`
+#
+# - Required inputs: `pr_matrix`, `tag_matrix`, `image_name`
+#
+# - Legacy 1D inputs gone (no `pr_distros` / `tag_distros` /
+# `distro_input_name` / `extra_build_args`)
+#
+# - `pr_matrix` description documents required `name` + `build_args` fields
+#
+# - `tag_matrix` description documents required `name` + `build_args` fields
+#
+# - Passthrough inputs mirror build-worker (build_runtime / platforms /
+# context_path / dockerfile_path / build_contexts). The tooling image is
+# NOT among them: build-worker derives it from its own version-matched
+# checkout, so there is nothing for a dispatcher to forward (closes #1122)
+#
+# - `resolve-matrix` emits `matrix` output (include-shape)
+#
+# - `resolve-matrix` branches on `github.event_name == 'pull_request'`
+#
+# - `call-build` `uses: ./.github/workflows/build-worker.yaml`
+#
+# - `call-build` matrix `include:
+# fromJSON(needs.resolve-matrix.outputs.matrix)`
+#
+# - `call-build` per-shard `image_name: <image_name>-<matrix.name>` (hyphen)
+#
+# - `call-build` forwards `build_args: ${{ matrix.build_args }}` verbatim
+#
+# - `call-build` `cache_variant: ${{ matrix.name }}` (per-cell cache scope)
+#
+# - `call-build` `fail-fast: false`
+#
+# - `ci-passed` rollup depends on `call-build`, runs with `if: always()`
+#
+# - `ci-passed` declares `name: ci-passed` to satisfy branch protection
+# contract
+#
+# - Every job's grant pinned as an exact per-job entry set, over the job
+# list derived from the file (all three jobs `contents: read` -- the
+# dispatcher builds nothing and pushes nothing)
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  WF="/source/.github/workflows/multi-distro-build-worker.yaml"
+  assert_spec_subject "${WF}" \
+      "the multi-distro build worker this spec pins"
+}
+
+# _on_block -- the code lines of the trigger + workflow_call interface, from
+# `on:` to `jobs:`. Comment-stripped, so the paragraphs that discuss the
+# removed 1D inputs by name cannot satisfy the assertion that they are gone.
+_on_block() {
+  awk '/^on:/{flag=1} /^jobs:/{flag=0} flag' "${WF}" | strip_comments
+}
+
+# _input_block <input> -- the code lines of one workflow_call input's mapping.
+_input_block() {
+  awk -v _key="^      ${1}:" \
+      '$0 ~ _key {flag=1; next} /^      [a-z]/{flag=0} flag' "${WF}" \
+    | strip_comments
+}
+
+# ── workflow_call interface ─────────────────────────────────────────
+
+@test "multi-distro-build-worker.yaml: declares workflow_call (#325 B-1)" {
+  run code_grep -E '^\s+workflow_call:' "${WF}"
+  assert_success
+}
+
+@test "multi-distro-build-worker.yaml: required inputs include pr_matrix + tag_matrix + image_name (#344 matrix-mode)" {
+  run _on_block
+  assert_success
+  assert_output --partial 'pr_matrix:'
+  assert_output --partial 'tag_matrix:'
+  assert_output --partial 'image_name:'
+}
+
+@test "multi-distro-build-worker.yaml: legacy 1D inputs are gone (no pr_distros / tag_distros / distro_input_name / extra_build_args) (#344 BREAKING)" {
+  run _on_block
+  assert_success
+  refute_output --partial 'pr_distros:'
+  refute_output --partial 'tag_distros:'
+  refute_output --partial 'distro_input_name:'
+  refute_output --partial 'extra_build_args:'
+}
+
+@test "multi-distro-build-worker.yaml: pr_matrix description mentions required name + build_args fields per entry (#344)" {
+  run _input_block pr_matrix
+  assert_success
+  assert_output --partial 'name'
+  assert_output --partial 'build_args'
+}
+
+@test "multi-distro-build-worker.yaml: tag_matrix description mentions required name + build_args fields per entry (#344)" {
+  run _input_block tag_matrix
+  assert_success
+  assert_output --partial 'name'
+  assert_output --partial 'build_args'
+}
+
+@test "multi-distro-build-worker.yaml: passthrough inputs mirror build-worker (build_runtime / platforms / context_path / dockerfile_path / build_contexts) (closes #1122)" {
+  run _on_block
+  assert_success
+  assert_output --partial 'build_runtime:'
+  # test_tools_version is deliberately absent: build-worker derives the
+  # tooling image from its own version-matched checkout, so a dispatcher
+  # forwarding a version would be reintroducing the second source.
+  refute_output --partial 'test_tools_version:'
+  assert_output --partial 'platforms:'
+  assert_output --partial 'context_path:'
+  assert_output --partial 'dockerfile_path:'
+  assert_output --partial 'build_contexts:'
+}
+
+# ── resolve-matrix job ───────────────────────────────────────────────
+
+@test "multi-distro-build-worker.yaml: resolve-matrix job emits matrix output (#344 include-shape)" {
+  run yaml_job_lines "${WF}" resolve-matrix
+  assert_success
+  assert_output --partial 'matrix: ${{ steps.r.outputs.matrix }}'
+}
+
+@test "multi-distro-build-worker.yaml: resolve-matrix branches on github.event_name == pull_request (#344)" {
+  run yaml_job_lines "${WF}" resolve-matrix
+  assert_success
+  assert_output --partial 'EVENT_NAME: ${{ github.event_name }}'
+  assert_output --partial '"${EVENT_NAME}" == "pull_request"'
+  assert_output --partial 'matrix=${PR_MATRIX}'
+  assert_output --partial 'matrix=${TAG_MATRIX}'
+}
+
+# ── call-build matrix job ────────────────────────────────────────────
+
+@test "multi-distro-build-worker.yaml: call-build uses local build-worker via ./.github/workflows/build-worker.yaml (#325 B-1)" {
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'uses: ./.github/workflows/build-worker.yaml'
+}
+
+@test "multi-distro-build-worker.yaml: call-build matrix is include: fromJSON(needs.resolve-matrix.outputs.matrix) (#344 N-D)" {
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'include: ${{ fromJSON(needs.resolve-matrix.outputs.matrix) }}'
+}
+
+@test "multi-distro-build-worker.yaml: call-build derives per-shard image_name as <image_name>-<matrix.name> (hyphen, #344)" {
+  # Hyphen separator chosen to match the existing org pattern (e.g.
+  # app/ros1_bridge's pre-dispatcher main.yaml shipped
+  # `ros1_bridge-${distro}`). v0.29.1 fix carried over.
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'image_name: ${{ inputs.image_name }}-${{ matrix.name }}'
+  refute_output --partial 'image_name: ${{ inputs.image_name }}_${{ matrix.name }}'
+}
+
+@test "multi-distro-build-worker.yaml: call-build passes matrix.build_args verbatim as build_args (#344)" {
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'build_args: ${{ matrix.build_args }}'
+}
+
+@test "multi-distro-build-worker.yaml: call-build splits buildx cache by name via cache_variant: matrix.name (#272 reuse, #344)" {
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'cache_variant: ${{ matrix.name }}'
+}
+
+@test "multi-distro-build-worker.yaml: call-build has fail-fast: false so one shard's failure doesn't cancel siblings (#325 B-1)" {
+  run yaml_job_lines "${WF}" call-build
+  assert_success
+  assert_output --partial 'fail-fast: false'
+}
+
+# ── ci-passed rollup ─────────────────────────────────────────────────
+
+@test "multi-distro-build-worker.yaml: ci-passed rollup job exists, depends on call-build, runs even if matrix failed (#325 B-1)" {
+  run yaml_job_lines "${WF}" ci-passed
+  assert_success
+  assert_output --partial 'needs: call-build'
+  assert_output --partial 'if: ${{ always() }}'
+  assert_output --partial 'NEEDS_RESULT'
+  assert_output --partial 'needs.call-build.result'
+}
+
+@test "multi-distro-build-worker.yaml: ci-passed job has explicit name: ci-passed (matches existing multi-distro rollup contract) (#325 B-1)" {
+  run yaml_job_lines "${WF}" ci-passed
+  assert_success
+  assert_output --partial 'name: ci-passed'
+}
+
+# ── Per-job least privilege ──────────────────────────────────────────────────
+
+@test "multi-distro-build-worker.yaml: every job's grant is pinned as an exact set (#957)" {
+  # The dispatcher itself builds nothing and pushes nothing: resolve-matrix
+  # emits JSON, call-build delegates to build-worker.yaml, ci-passed rolls
+  # the matrix result up for branch protection. None of the three needs
+  # more than a checkout, so all three are pinned to `contents: read`.
+  #
+  # This file is the reason the least-privilege guard was widened past
+  # build-worker: it had three jobs and no `permissions:` line anywhere, so
+  # every job ran on the CALLING repo's whole token while the guard next
+  # door was green.
+  # The exact set is what keeps that from coming back one scope at a time.
+  # The job list is DERIVED, so a fourth job is named here on the day it
+  # lands.
+  run yaml_permission_surface "${WF}"
+  assert_success
+  assert_output 'resolve-matrix: contents: read
+call-build: contents: read
+ci-passed: contents: read'
+}

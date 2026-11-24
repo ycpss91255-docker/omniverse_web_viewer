@@ -1,0 +1,412 @@
+# Unify human-edited config to TOML with typed merge semantics
+
+> Serves: PRD invariant 3 (composable by construction) via a
+> machine-parsable, type-safe config format; also the
+> one-source-many-render goal and ADR-00000036 (parameterised generate
+> API).
+
+- **Date:** 2026-09-06
+- **Status:** Accepted
+- **Relates to:** ADR-00000001 (setup.conf is the main path),
+  ADR-00000003 (env vs workload param boundary),
+  ADR-00000025 (per-worktree `.setup.conf.local` override),
+  ADR-00000036 (parameterised generate API)
+
+## Context
+
+The current configuration pipeline uses two human-edited formats that
+serve Docker container infrastructure:
+
+1. **`.setup.conf`** -- a custom INI dialect parsed by a hand-written
+   bash tokenizer (`_ini_tokenize`). 15 sections, 8 of which encode
+   ordered lists via numbered keys (`mount_1`, `arg_1`, `device_1`,
+   ...). Three-layer override: template `.setup.conf` -> repo
+   `.setup.conf` -> `.setup.conf.local`.
+
+2. **`.env.local`** -- a flat `KEY=VALUE` file for container service
+   runtime env vars (ADR-00000003). Two-layer: generated `.env`
+   (defaults) + `.env.local` (user overrides).
+
+Three problems drove this decision:
+
+- **Format weakness.** INI has no type system -- `true`, `1`, `yes`
+  are all valid booleans to different parsers; no arrays, no nested
+  structure. The numbered-key workaround (`mount_1`, `mount_2`, ...)
+  is fragile: no validation, ordering is implicit, adding/removing
+  requires manual renumbering.
+
+- **Merge granularity mismatch.** ADR-00000025 sec. 3 adopted
+  section-replace (the entire section is replaced by the upper
+  layer) because numbered-key lists cannot be key-level merged
+  without producing incoherent combinations neither layer wrote.
+  This forced scalar sections (`[gui]`, `[network]`, ...) to also
+  be section-replaced even though key-level merge is safe for them
+  -- a user who wants to override only `[gui] mode` must copy the
+  entire section.
+
+- **Two formats for one concern.** `.setup.conf` and `.env.local`
+  both serve Docker but use different formats, different parsers,
+  and different merge rules. The split criterion (ADR-00000003 axis
+  A: machine-bound vs task-volatile) is correct but could be
+  expressed within one format with separate files.
+
+The org has precedent: multi_run#26 chose TOML + Python `tomllib` for
+its own config. The config-manager design document (v0.16, 2026-09-02)
+independently chose TOML for its config manifest (`config-list.toml`)
+with the reasoning: strictness ranking TOML > JSON > YAML (no `no`/`08`
+ambiguity, mandatory type distinction, no indentation semantics).
+
+Industry survey of merge strategies across 8 systems (Podman, Docker
+Compose, Helm, Kustomize, NixOS, Ansible, Git config, toml-merge)
+found a clear consensus: **scalar fields -> key-level merge; array
+fields -> replace.** 6/8 systems use this pattern. The two that append
+arrays (Docker Compose, NixOS) both needed escape mechanisms (`!reset`,
+`mkForce`) to handle the cases where append is wrong.
+
+## Decision
+
+**Unify all human-edited Docker config files to TOML.** Four files,
+split by service boundary (ADR-00000003 axis A):
+
+| File | Whose | Concern | Layering |
+|---|---|---|---|
+| `setup.toml` | the repo's (committed) | Docker infrastructure: how the container is assembled | template -> repo -> (caller-supplied per ADR-36) |
+| `setup.local.toml` | the operator's (gitignored) | Per-instance Docker infrastructure override | overrides `setup.toml` |
+| `env.toml` | the repo's (committed) | Container service runtime env defaults | template -> repo |
+| `env.local.toml` | the operator's (gitignored) | Per-instance service env override | overrides `env.toml` |
+
+**Amendment (base#1167, 2026-10-12): the TOML config SOURCES carry no
+leading dot.** The table above originally spelled the service-env pair
+`.env.toml` / `.env.local.toml`. The dot was inherited from `.env`'s
+dotenv convention and did not belong on a TOML config source: `setup.toml`
+never carried one, and the two pairs are the same kind of file. The
+sources are now `env.toml` / `env.local.toml`, and the variant marker is
+an INFIX, not a suffix -- `env.local.toml` keeps `.toml` as the real
+extension, so editors highlight it, `*.toml` globs match it and TOML
+linters read it, which `env.toml.local` would not.
+
+The GENERATED outputs are unchanged and keep their dots. `.env` and
+`.env.local` are compose dotenv files loaded through `env_file:`, so the
+rename stops at the source side of the arrow in the generated-outputs
+block below. The root `.gitignore` entries `.env` and `.env.local` are
+likewise untouched.
+
+Nothing read either source under either spelling when this landed (the
+readers are base#1168), and no release ever wrote one to a consumer's
+disk: `_migrate_env_local_to_toml` had no caller in v0.42.0, v0.43.0-rc1
+or v0.43.0-rc2, and `_scaffold_env_local` is called with `.env.local` at
+both of its call sites in all three. So this rename owes no migration and
+carries no forwarder under ADR-00000006 -- nothing a released caller names
+moved. The one artifact that does reach a consumer is the canonical
+`.gitignore` entry, and the dotted spelling STAYS in
+`_canonical_gitignore_entries` beside the dotless one rather than moving
+to `_retired_gitignore_entries`: v0.43.0-rc1 and -rc2 shipped a template
+documenting `<repo>/.env.local.toml` as the gitignored per-instance
+override, so an operator who followed those instructions has that file,
+and retracting the line would leave their service env reachable by
+`git add .` and shipped in the build context.
+
+**Split criterion.** The boundary is the **service boundary**, not
+lifecycle (build vs run):
+
+- `setup.toml` = Docker infrastructure (how the container is built and
+  run): image rules, build args, GPU, GUI, network, volumes, devices,
+  security, lifecycle, logging, deploy, additional contexts.
+- `env.toml` = service runtime env (how the application inside the
+  container behaves): `ROS_MASTER_URI`, `ROS_DOMAIN_ID`, `LOG_LEVEL`,
+  `WATCHDOG_ENABLED`, application-level parameters.
+
+The two have **zero intersection** at the service level. If overlap
+is discovered, `env.toml` takes precedence because its purpose is
+the container-internal service. The current `[environment]` section
+splits along the service boundary: infrastructure env vars
+(`DISPLAY`, `NVIDIA_VISIBLE_DEVICES`, `PULSE_SERVER` -- host
+interfaces the container needs to function) stay in `setup.toml`;
+service runtime env vars (`ROS_MASTER_URI`, `LOG_LEVEL`,
+`WATCHDOG_ENABLED`) move to `env.toml`.
+
+**TOML structure.** Scalar sections use standard `[table]` syntax;
+list-shaped sections use `[[array of tables]]`:
+
+```toml
+# scalar section -- key-level merge in overlay
+[gui]
+mode = "auto"
+
+[network]
+mode = "host"
+ipc = "host"
+
+# array section -- array replace in overlay
+[[volumes]]
+source = "./src"
+target = "/opt/workspace"
+mode = "rw"
+
+[[volumes]]
+source = "/dev/shm"
+target = "/dev/shm"
+
+[[build.args]]
+key = "APT_MIRROR_UBUNTU"
+value = "tw.archive.ubuntu.com"
+
+[[devices]]
+path = "/dev/video0"
+
+[[image.rules]]
+pattern = "jetson*"
+tag = "l4t"
+```
+
+**Merge semantics.** Type-aware, matching the industry consensus:
+
+- **Scalar keys within a `[table]`**: key-level merge. The upper layer
+  overrides only the keys it defines; unmentioned keys inherit from
+  the lower layer.
+- **`[[array of tables]]`**: array replace. If the upper layer defines
+  any `[[volumes]]` entry, the entire volumes array replaces the lower
+  layer's. No append, no index-based merge.
+
+**Amendment (#1137, 2026-10-10): zero entries is defining the array.**
+"Defines any `[[volumes]]` entry" leaves out the case that turned out to
+matter most: a layer that defines the array with NO entries. It replaces,
+like any other definition -- an upper layer carrying `volumes = []`
+leaves the lower layer's list empty, because that is what an operator who
+removed the last `[[volumes]]` block decided. The state that inherits is
+the ABSENT key, not the empty array, and the two are not
+interchangeable. Both halves of that distinction were defects before the
+rule was written down: `setup remove build.arg_1` dropped the declaration
+and the merge handed back every argument the template defines (#1127),
+and the INI-to-TOML converter emitted no blocks at all for a family whose
+only slot was empty and did the same (#1137) -- where the INI chain's
+section-replace had resolved that same config to zero build arguments.
+
+**Amendment (#1235, 2026-10-11): a masked scalar may resolve differently
+after the migration, and that is ACCEPTED.** Key-level merge resolves a
+`[table]` scalar from the highest layer that DEFINES it. Section-replace
+resolved it from the single layer that OWNED the section, so every lower
+layer's value for every other key of that section was masked -- a
+`.setup.conf.local` carrying only `[security] cap_add_1 = NET_ADMIN`
+masked the repo's `[security] privileged = true` and the template's
+`false` with it, leaving the key ABSENT from the resolved chain and
+`_resolve_docker_conf`'s own `false` default to answer it. The converted
+chain answers the repo's `true`. So the migration can move a scalar's
+resolved value wherever a lower layer's value was previously masked, in
+BOTH directions, and it moves it without either file being edited. This
+is not a defect: it is this Decision applied to the scalar sections the
+Context above calls collateral damage of the blanket rule. It is recorded
+here because the cost was stated nowhere, and `privileged` is the case
+that matters -- its direction LOOSENS the container, false before the
+upgrade and true after.
+
+How an upgrader checks their own repo, before and after. `setup.sh list`
+prints the RESOLVED chain as `key = value` lines per section, and it is
+shipped on both sides of this migration: on the version being left it
+reads the INI chain, on this one the TOML chain, so one command answers
+the same question about two different merge rules.
+
+```
+./setup.sh list > /tmp/setup-before.txt   # BEFORE the upgrade
+# upgrade, letting init.sh run the converter
+./setup.sh list > /tmp/setup-after.txt    # after, before the first apply
+diff -u /tmp/setup-before.txt /tmp/setup-after.txt
+```
+
+Every `key = value` line the diff moves is a scalar whose resolved value
+the new merge rule changed; a line that APPEARS is a key the old chain
+had masked out of the resolved view altogether, which is the shape the
+`privileged` case takes. Section headers alone come and go between the
+two versions for unrelated reasons and are not findings. Run it before
+the first `setup.sh apply` on the new version, because `apply` is what
+writes the resolved value into `compose.yaml` and `.env`. The accepted
+answer is pinned by `ini_to_toml_migrate_spec`, which measures both
+chains over this same `[security]` fixture.
+
+The `env_N` half of #1235 is NOT settled by this and stays open:
+`[environment]`'s numbered entries are read as a list, have no
+array-of-tables home, and the Decision above splits that section along
+the service boundary without classifying an arbitrary `KEY=VALUE`.
+
+This resolves ADR-00000025 sec. 3's concern: the numbered-key ordered
+lists that forced section-replace are gone. Scalar sections that were
+collateral damage of the blanket section-replace rule can now be
+key-level merged safely.
+
+**Generated outputs remain Docker-native format:**
+
+```
+compose.yaml     <- from setup.toml (infrastructure)
+.env             <- from setup.toml (infra env) + env.toml (service env)
+.env.local       <- from env.local.toml
+.env.generated   <- interpolation cache (unchanged)
+```
+
+*Amended by ADR-00000039 (#1395, 2026-10-29): the parser and generator
+for base are the Go `config-gen`; toml-bridge remains for Python
+consumers.*
+
+**Containerised parsing.** TOML is parsed before `docker compose up`
+-- the parse results ARE its inputs. The parser runs in a dedicated
+container image (`toml-bridge`), not on the host: the host contract
+is Docker + Git + `just` and nothing else, and a host-side Python or
+binary would add a fourth dependency whose version the project cannot
+control across Ubuntu 16.04--24.04 machines. Docker is already
+required, so invoking the parser via `docker run` adds no new
+prerequisite. Inside the container the parser is Python with vendored
+`tomli` (the backport accepted into the stdlib as `tomllib` via
+PEP 680), which is zero-dependency, ~1000 lines, MIT-licensed, and
+supports Python 3.6+. The merge logic (type-aware: scalar key-level,
+array replace) also runs in Python where the type information is
+native (`dict` vs `list`). The `toml-bridge` image is a standalone
+Dockerfile (`dockerfile/Dockerfile.toml-bridge`).
+
+`test-tools` carries the same parser, so downstream repos inherit the
+capability through the existing `test-tools-stage` pattern without
+building that image. It does NOT pull it from there: it COPYs
+`dockerfile/toml_bridge.py` out of the build context and installs
+`python3` from the alpine series it is already pinned to, which is the
+interpreter the script then runs under. The wording this replaces said
+`test-tools` pulled the parser via `COPY --from`, and for four published
+tags that described the file and not the capability -- the COPY was
+real, the final stage installed no interpreter, and the bundled bridge
+answered `env: 'python3': No such file or directory` while a grep for
+that COPY line stood in for a test. The claim is now held by a probe
+that runs it: `test/bats/integration/test_tools_toml_bridge_spec.bats`
+inside the suite, and the smoke step of `release-test-tools.yaml` before
+any tag names the published content.
+
+Alpine's `python3` is 3.12, whose stdlib carries `tomllib`, so the
+`tomli` fallback is not installed there; it stays in the standalone
+image, which is the one that has to work on a 3.6--3.10 runtime.
+
+## Alternatives
+
+- **A1 -- Stay with INI + flat `.env`.** Zero migration cost, but
+  preserves the numbered-key fragility, the section-replace
+  collateral damage on scalar sections, and the two-format
+  maintenance burden. The hand-written `_ini_tokenize` parser has
+  known edge cases. Rejected because the problems compound as
+  sections grow.
+
+- **A2 -- YAML for everything.** Rich type system, native in Docker
+  Compose. Rejected because: YAML has well-documented parsing
+  ambiguities (`no` as boolean, `08` as string vs int depending on
+  YAML version), indentation-significant syntax is error-prone for
+  hand-editing, and the config-manager project already chose TOML
+  over YAML with the same reasoning.
+
+- **A3 -- JSON for everything.** Strict and unambiguous. Rejected
+  because: no comments (unacceptable for human-edited config files),
+  trailing-comma errors, verbose syntax for the kind of config
+  humans write by hand.
+
+- **A4 -- Single file (setup.toml only) with `[environment]` section
+  for service env.** Simpler, but violates the service boundary:
+  `setup.toml` is Docker infrastructure, and forcing users to edit
+  Docker config to change application-level env vars conflates two
+  concerns. The realsense_ros1 repo demonstrates the split is real
+  and practiced: its `setup.conf [environment]` is empty; all
+  service runtime env vars (`ROS_MASTER_URI`, `ROS_IP`,
+  `WATCHDOG_ENABLED`) come via `.env.local`.
+
+- **A5 -- Terraform-style `.tf` + `.tfvars` split.** Rejected
+  because `setup.conf` drives both build and run; the lifecycle
+  boundary that Terraform splits on (declaration vs values) does not
+  map to our structure.
+
+- **A6 -- Array append instead of replace.** Rejected by industry
+  evidence: 6/8 surveyed systems use array replace; the two that
+  append (Docker Compose, NixOS) both needed escape mechanisms.
+  Append also reintroduces the inability to remove items that
+  ADR-00000025 sec. 3 identified as broken for ordered lists.
+
+## Consequences
+
+- The `[environment]` section splits along the service boundary:
+  infrastructure env vars (host interfaces like `DISPLAY`, GPU
+  visibility) stay in `setup.toml`; service runtime env vars
+  (application parameters) move to `env.toml`. `setup.toml` has
+  zero application-level env vars.
+
+- Scalar-section overrides become lighter: an operator who wants only
+  `[gui] mode = "wayland"` writes one key, not the entire section.
+
+- Array-section overrides remain explicit: writing any `[[volumes]]`
+  replaces the full list, preserving the "what you see is what you
+  get" property.
+
+- The `_ini_tokenize` bash parser is replaced by a containerised
+  TOML bridge (`toml-bridge` image). The bash shim calls
+  `docker run` and receives the merged result. The host contract
+  (Docker + Git + `just`) does not grow.
+
+- `setup_tui.sh` (2975 lines + 691-line backend) is frozen until the
+  TOML migration completes. The TUI's INI-aware editor functions
+  (`_edit_section_*`) cannot operate on TOML structure. A rebuild or
+  replacement (possibly by the config-manager Web UI) follows the
+  migration.
+
+  **The freeze is LIFTED (#1232, 2026-10-12).** Its own condition is
+  met: the migration landed with #1148 (D1-D8, D10) and #1248, so the
+  readers, the writers and the shipped template are all on
+  `setup.toml`. The editor is rebuilt on the layer chain rather than
+  replaced: `_load_current` reads the effective configuration through
+  `_setup_effective_full`, the save goes to `<repo>/setup.toml`, Reset
+  delegates to `setup.sh reset`, and `_tui_refuse_frozen` -- the
+  interim refusal that kept the frozen editor from printing a save
+  confirmation over a setting with no effect -- is deleted along with
+  `_wrapper_tui_usable`'s FALSE branch.
+
+  **The `_edit_section_*` warning above measured the wrong layer.**
+  The editors never touch file format: they address configuration as
+  `<section>.<key>` strings through `_override_get` / `_override_set`,
+  and the ONE place that meets a file is the read/write pair
+  (`_load_setup_conf_full` / `_write_setup_conf`), which this
+  Decision's own containerised bridge already dispatches on extension
+  -- numbering `[[array of tables]]` blocks back into the `<prefix>_N`
+  names those editors speak. What was genuinely INI-shaped was the
+  editor's model of the config as ONE FILE: `_load_current` read
+  whichever of two paths existed first, so the menus opened on one
+  layer's contents rather than on the merge, and that is what the
+  rebuild replaced. The structural claim stands only for a reader or
+  writer that bypasses the bridge, and nothing in the TUI does.
+
+- Migration path for downstream repos: a one-time converter
+  (`setup.conf` -> `setup.toml`, `.env.local` -> `env.local.toml`)
+  runs during the first `init.sh` resync after upgrade, gated on
+  file existence (same pattern as the `.env` -> `.env.local` migration
+  in ADR-00000003's 2026-08-26 amendment).
+
+- Amends ADR-00000025 sec. 3: section-replace is no longer blanket.
+  The merge rule is now type-aware (scalar key-level, array replace).
+  The reasoning in sec. 3 (ordered lists cannot be key-merged) remains
+  correct and is the basis for the array-replace half of the new rule.
+
+- Amends ADR-00000001: "setup.conf keeps section-replace semantics"
+  is refined to type-aware merge semantics for `setup.toml`.
+
+- Amends ADR-00000036 sec. 1 and its ADR-00000025 amendment (added
+  #1258, 2026-10-12): that record spells the chain
+  `<template>/.setup.conf` -> repo `.setup.conf` -> `.setup.conf.local`
+  and calls it "section-replace at each step", which is this list's own
+  subject twice over. It was missing from this list, so no amendment was
+  written back into ADR-36 while ADR-1 and ADR-25 each received three.
+  ADR-36's mechanism -- the top layer takes a caller-supplied path --
+  is untouched; only the filenames and the merge rule are.
+
+- Timing: this migration is internal to the generate API (ADR-36).
+  The TOML files are inputs to the same pipeline that currently reads
+  `.setup.conf`; generated outputs (`compose.yaml`, `.env`) are
+  unchanged. ADR-36's parameterised API accepts `setup.local.toml` as
+  the caller-supplied layer.
+
+- The 15 sections (`[project]`, `[gui]`, `[gpu]`, ...) keep their
+  current TUI-oriented structure in phase 1 (format migration). A
+  future phase restructures sections to align with the Docker Compose
+  spec, at which point the TUI owns its own grouping/view layer
+  instead of the config structure mirroring TUI screens.
+
+- JSON Schema validation of the parsed TOML structure (as practiced by
+  the config-manager project, sec. 6.2) is a natural follow-up but not
+  part of this decision.

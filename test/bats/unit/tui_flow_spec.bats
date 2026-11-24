@@ -1,0 +1,1168 @@
+#!/usr/bin/env bats
+#
+# tui_flow.bats — interactive-flow tests for setup_tui.sh.
+#
+# Covers menu navigation (Save & Exit), image rule editor with
+# compaction, generic list-section CRUD, and Cancel / Esc abort
+# paths.lifts setup_tui.sh per-file coverage from 18% to
+# >=70% by exercising the function set the comment in tui_spec.bats
+# already promised would live in this file.
+#
+# Mocking strategy: source setup_tui.sh directly (so _TUI_OVR_KEYS /
+# _TUI_OVR_VALUES / _TUI_REMOVED / _TUI_CURRENT live in this shell), then
+# override the _tui_* dialog wrappers with bash function definitions
+# that pop scripted (exit, response) pairs from a queue. Each test
+# pre-loads the queue with the user's intended click path, calls the
+# target function, and asserts on the resulting in-memory override
+# state — no real dialog / whiptail process ever launches.
+#
+# why: Interactive-flow tests for `setup_tui.sh` (#189). Sources
+# `setup_tui.sh` directly and overrides `_tui_menu` / `_tui_select` /
+# `_tui_inputbox` / `_tui_yesno` / `_tui_msgbox` /
+# `_tui_checklist` with file-backed stubs (queue lines popped via `head -n
+# 1` + `sed -i 1d` so state survives the `$(...)` subshell calls). Each case
+# scripts the user's click path, calls one section editor, and asserts on
+# the resulting `_TUI_OVR_*` / `_TUI_REMOVED` / `_TUI_CURRENT` arrays — no
+# real `dialog` / `whiptail` ever launches. Lifts `setup_tui.sh` per-file
+# coverage from 18% to 83% by exercising the 5 high-value target areas the
+# issue body called out.
+#
+# Grouped by concern:
+#
+# - `_load_current` (the repo layer wins on the keys it names and the
+# template's other keys come with it; a repo with no committed layer opens
+# on the template; both missing -> silent return 0)
+#
+# - `_render_main_menu` / `_render_advanced_menu` (#178 Save & Exit
+# unification, Cancel/Esc returns 1, navigation into section editor)
+#
+# - `_edit_image_rule` (#177 site: add
+# string/prefix/suffix/basename/default, Cancel from radiolist or inputbox,
+# `__remove`/`__move_up`/`__move_down`, dedupe drops duplicate slot)
+#
+# - `_compact_image_rules_after_remove` (mid-list shift down, last drop,
+# empty no-op, sparse-slot collapse)
+#
+# - `_swap_image_rule` (both occupied / target empty / source empty / both
+# empty / m<1)
+#
+# - `_edit_list_section` via `_edit_section_environment` (env_
+# add/edit/remove, invalid → msgbox+retry, max+1 indexing, Cancel/Esc)
+#
+# - `_edit_section_image` top-level dispatch (add max+1, click rule_N, Back)
+#
+# - `_edit_section_network` (host+host+pid no shm prompt, bridge prompts
+# name+ports, ipc=private prompts shm, empty network_name allowed)
+#
+# - `_edit_section_deploy` (off short-circuits — only writes gpu_mode)
+#
+# - Multi-section dispatch from main menu (network → host → save)
+#
+# - Per-stage UI #220 (`_list_dockerfile_stages_available` from-Dockerfile +
+# baseline filter, `_count_stage_overrides` OVR+CURRENT dedup + empty skip,
+# `_edit_stage_gui` mode + __inherit, `_edit_stage_scalar` write +
+# empty-clears, `_edit_stage_list` inherit toggle + add)
+#
+# - Menu restructure #221 (i18n keys for main.runtime/mounts/features × 4
+# langs; `_render_runtime_menu` / `_render_mounts_menu` /
+# `_render_features_menu` function existence; main-menu dispatch for
+# image/build/runtime/mounts/features + bare
+# network/deploy/gui/volumes/environment no longer dispatch from main;
+# Runtime sub-menu dispatch for network/deploy/gui/environment +
+# __back/Cancel; Mounts sub-menu dispatch for volumes/devices/tmpfs +
+# __back/Cancel; Features sub-menu __back, per_stage enabled enters editor,
+# per_stage hidden shows msgbox without entering editor; Advanced sub-menu
+# image/build/devices/tmpfs entries removed, security still dispatches)
+#
+# - #328 logging menu dispatch (Runtime menu's `logging` entry calls
+# `_edit_section_logging`; `_edit_section_logging`'s top-level menu routes
+# `global` to `_edit_logging_keys logging` and `devel` / `test` / `runtime`
+# to `_edit_logging_keys logging.<svc>`)
+#
+# - #561 `_tui_known_subcommand` derives CLI direct-jump subcommands from
+# `SCHEMA_SECTIONS` (accepts every section + `ports` pseudo-section, rejects
+# unknown args, tracks `SCHEMA_SECTIONS` additions)
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+
+  # shellcheck disable=SC1091
+  source /source/dist/script/docker/wrapper/setup_tui.sh
+
+  # Reset per-test global state. The arrays are declared at module load
+  # time (setup_tui.sh declare -gA / declare -ga); zero them out so
+  # earlier test cases do not leak overrides into the next case.
+  _TUI_OVR_KEYS=()
+  _TUI_OVR_VALUES=()
+  _TUI_REMOVED=()
+  _TUI_CURRENT=()
+
+  # File-backed queue for the _tui_* stubs. _tui_* are called via
+  # `$(...)` command substitution, so any pop counter held in a shell
+  # variable would die in the subshell — using a file lets the pop
+  # mutate state visibly to the parent. Each line: "<exit>|<response>".
+  _QFILE="${BATS_TEST_TMPDIR}/tui_queue"
+  : > "${_QFILE}"
+  # path: setup.conf lives at setup.toml
+  mkdir -p "${BATS_TEST_TMPDIR}"
+
+  # Override the dialog primitives from _tui_backend.sh AFTER sourcing
+  # setup_tui.sh, so our definitions win. (Top-level definitions in the
+  # bats file would lose to the source line below.) eval is intentional
+  # so the stubs are visible to subshells via export -f.
+  _tui_pop() {
+    local _line
+    _line="$(head -n 1 "${_QFILE}" 2>/dev/null || true)"
+    [[ -z "${_line}" ]] && _line="1|"
+    sed -i '1d' "${_QFILE}" 2>/dev/null || true
+    printf '%s' "${_line#*|}"
+    return "${_line%%|*}"
+  }
+  _tui_menu()      { _tui_pop; }
+  _tui_select()    { _tui_pop; }
+  _tui_inputbox()  { _tui_pop; }
+  _tui_checklist() { _tui_pop; }
+  _tui_yesno()     {
+    local _line
+    _line="$(head -n 1 "${_QFILE}" 2>/dev/null || true)"
+    [[ -z "${_line}" ]] && _line="1|"
+    sed -i '1d' "${_QFILE}" 2>/dev/null || true
+    return "${_line%%|*}"
+  }
+  _tui_msgbox()    { return 0; }
+  export -f _tui_pop _tui_menu _tui_select _tui_inputbox \
+            _tui_checklist _tui_yesno _tui_msgbox
+  export _QFILE
+}
+
+teardown() {
+  return 0
+}
+
+# ── Stub helpers ─────────────────────────────────────────────────────────
+
+# Convenience: queue a chain of (exit, response) lines into _QFILE.
+queue() {
+  : > "${_QFILE}"
+  local _e
+  for _e in "$@"; do
+    printf '%s\n' "${_e}" >> "${_QFILE}"
+  done
+}
+
+# Look up override key by name, echo value or empty when absent.
+ovr_get() {
+  local _k="${1}" i
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    [[ "${_TUI_OVR_KEYS[i]}" == "${_k}" ]] && {
+      printf '%s' "${_TUI_OVR_VALUES[i]}"
+      return 0
+    }
+  done
+  return 1
+}
+
+# Did the test mark <key> for removal?
+is_removed() {
+  local _k="${1}" _r
+  for _r in "${_TUI_REMOVED[@]}"; do
+    [[ "${_r}" == "${_k}" ]] && return 0
+  done
+  return 1
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _load_current
+# ════════════════════════════════════════════════════════════════════
+
+# why: these two tests used to pin the OPPOSITE rule -- "read the repo
+# file, else fall back to the template" -- and that one-file read is the
+# defect base#1232 records: the config is an overlay chain, so an editor
+# whose baseline is whichever file exists first shows one layer's contents
+# instead of the values in force. The repo layer must still WIN on the
+# keys it names (that half was always right), and the template's other
+# keys must now come with it rather than disappearing. `bridge` is not the
+# schema default (`host`), so the first assertion can only hold if the
+# repo layer was read; `auto` for gui.mode could not tell "the template
+# was read" from "nothing was read and a default stood in", so the
+# template key carries a non-default value too.
+@test "_load_current: the repo layer wins and the template's other keys come with it" {
+  local _base="${BATS_TEST_TMPDIR}/repo" _dist="${BATS_TEST_TMPDIR}/dist"
+  mkdir -p "${_base}" "${_dist}"
+  cat > "${_dist}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+
+[deploy]
+gpu_mode = "force"
+EOF
+  cat > "${_base}/setup.toml" <<'EOF'
+[network]
+mode = "bridge"
+EOF
+  _load_current "${_base}" "${_dist}"
+  [[ "${_TUI_CURRENT[network.mode]}" == "bridge" ]]
+  [[ "${_TUI_CURRENT[deploy.gpu_mode]}" == "force" ]]
+}
+
+# why: a repo that has never been set up has no committed layer, and the
+# template's values are what `setup.sh apply` is about to seed it with --
+# so they are what the menus have to open on. `force` rather than `auto`:
+# `auto` IS the schema default for deploy.gpu_mode, so an assertion on it
+# could not tell "the template was read" from "nothing was read and the
+# default stood in", which is the whole claim here.
+@test "_load_current: a repo with no committed layer opens on the template" {
+  local _base="${BATS_TEST_TMPDIR}/repo" _dist="${BATS_TEST_TMPDIR}/dist"
+  mkdir -p "${_base}" "${_dist}"
+  cat > "${_dist}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "force"
+EOF
+  _load_current "${_base}" "${_dist}"
+  [[ "${_TUI_CURRENT[deploy.gpu_mode]}" == "force" ]]
+}
+
+@test "_load_current: returns 0 silently when both files missing" {
+  run _load_current "${BATS_TEST_TMPDIR}/x" "${BATS_TEST_TMPDIR}/y"
+  assert_success
+  [[ "${#_TUI_CURRENT[@]}" -eq 0 ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _render_main_menu / _render_advanced_menu (Save & Exit unification)
+# ════════════════════════════════════════════════════════════════════
+
+@test "_render_main_menu: __save returns 0 (Save & Exit path)" {
+  queue "0|__save"
+  run _render_main_menu
+  assert_success
+}
+
+@test "_render_main_menu: empty choice (Cancel) returns 1" {
+  queue "0|"
+  run _render_main_menu
+  [ "${status}" -eq 1 ]
+}
+
+@test "_render_main_menu: non-zero rc (Esc) returns 1" {
+  queue "1|"
+  run _render_main_menu
+  [ "${status}" -eq 1 ]
+}
+
+@test "_render_main_menu: navigates into _edit_section_<choice> then Save" {
+  # image is now a top-level main entry. Click image →
+  # _edit_section_image opens its rule-list menu (back immediately) →
+  # main loop pops __save → exit.
+  queue "0|image" "0|back" "0|__save"
+  run _render_main_menu
+  assert_success
+}
+
+@test "_render_advanced_menu: __back exits the loop" {
+  queue "0|__back"
+  run _render_advanced_menu
+  assert_success
+}
+
+@test "_render_advanced_menu: Cancel (rc!=0) exits via break" {
+  queue "1|"
+  run _render_advanced_menu
+  assert_success
+}
+
+@test "_tui_known_subcommand accepts a SCHEMA_SECTIONS member iff it has an editor (#561)" {
+  local _s
+  for _s in "${SCHEMA_SECTIONS[@]}"; do
+    run _tui_known_subcommand "${_s}"
+    if declare -F "_edit_section_${_s}" >/dev/null; then
+      [ "${status}" -eq 0 ]
+    else
+      # Being on the registry is not enough to be dispatchable: main
+      # jumps straight to `"_edit_section_${_subcmd}"`, so accepting a
+      # section with no editor (today `project`, a deliberate opt-out)
+      # sent it into a command-not-found. This used to assert acceptance
+      # for every member, which is the assumption that hid it.
+      [ "${status}" -ne 0 ]
+    fi
+  done
+}
+
+@test "_tui_known_subcommand accepts the ports pseudo-section (#561)" {
+  run _tui_known_subcommand ports
+  [ "${status}" -eq 0 ]
+}
+
+@test "_tui_known_subcommand rejects an unknown argument (#561)" {
+  run _tui_known_subcommand bogus
+  [ "${status}" -ne 0 ]
+}
+
+@test "_tui_known_subcommand derives from SCHEMA_SECTIONS (single source) (#561)" {
+  SCHEMA_SECTIONS+=(brandnew)
+  # A section reaches the CLI by being registered AND having an editor;
+  # neither half is a list kept here. Registered with no editor is the
+  # `project` shape, and it must be refused rather than dispatched.
+  run _tui_known_subcommand brandnew
+  [ "${status}" -ne 0 ]
+  _edit_section_brandnew() { return 0; }
+  run _tui_known_subcommand brandnew
+  [ "${status}" -eq 0 ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_image_rule (regression site)
+#
+# Two-step editor: rule type radiolist → value inputbox (skipped for
+# basename / __remove / __move_*).
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_image_rule: add string rule writes prefix-free value" {
+  queue "0|string" "0|myimg"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "string:myimg" ]]
+}
+
+@test "_edit_image_rule: add prefix rule prefixes the value" {
+  queue "0|prefix" "0|abc"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "prefix:abc" ]]
+}
+
+@test "_edit_image_rule: add suffix rule prefixes the value" {
+  queue "0|suffix" "0|_dev"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "suffix:_dev" ]]
+}
+
+@test "_edit_image_rule: add basename rule writes @basename and skips inputbox" {
+  queue "0|basename"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "@basename" ]]
+}
+
+@test "_edit_image_rule: add default rule rewrites @default:<value>" {
+  queue "0|default" "0|fallback"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "@default:fallback" ]]
+}
+
+@test "_edit_image_rule: Cancel from radiolist returns without writing" {
+  queue "1|"
+  _edit_image_rule 1
+  ! ovr_get image.rule_1
+}
+
+@test "_edit_image_rule: Cancel from inputbox returns without writing" {
+  queue "0|prefix" "1|"
+  _edit_image_rule 1
+  ! ovr_get image.rule_1
+}
+
+@test "_edit_image_rule: __remove triggers compaction (single rule → empty)" {
+  _override_set image.rule_1 "string:foo"
+  queue "0|__remove"
+  _edit_image_rule 1
+  is_removed image.rule_1
+}
+
+@test "_edit_image_rule: __move_up at n=2 swaps with n=1" {
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_2 "string:b"
+  queue "0|__move_up"
+  _edit_image_rule 2
+  [[ "$(ovr_get image.rule_1)" == "string:b" ]]
+  [[ "$(ovr_get image.rule_2)" == "string:a" ]]
+}
+
+@test "_edit_image_rule: __move_down at n=1 swaps with n=2" {
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_2 "string:b"
+  queue "0|__move_down"
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "string:b" ]]
+  [[ "$(ovr_get image.rule_2)" == "string:a" ]]
+}
+
+@test "_edit_image_rule: dedupe — adding existing value drops the duplicate slot" {
+  _override_set image.rule_1 "string:foo"
+  _override_set image.rule_2 "string:other"
+  queue "0|string" "0|other"   # rewrite slot 1 to match slot 2's value
+  _edit_image_rule 1
+  [[ "$(ovr_get image.rule_1)" == "string:other" ]]
+  is_removed image.rule_2
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _compact_image_rules_after_remove
+# ════════════════════════════════════════════════════════════════════
+
+@test "_compact_image_rules_after_remove: shifts higher rules down by one slot" {
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_2 "string:b"
+  _override_set image.rule_3 "string:c"
+  _compact_image_rules_after_remove 2
+  [[ "$(ovr_get image.rule_1)" == "string:a" ]]
+  [[ "$(ovr_get image.rule_2)" == "string:c" ]]
+  is_removed image.rule_3
+}
+
+@test "_compact_image_rules_after_remove: removing last rule just drops it" {
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_2 "string:b"
+  _compact_image_rules_after_remove 2
+  [[ "$(ovr_get image.rule_1)" == "string:a" ]]
+  is_removed image.rule_2
+}
+
+@test "_compact_image_rules_after_remove: empty list is a no-op" {
+  _compact_image_rules_after_remove 1
+  [[ "${#_TUI_OVR_KEYS[@]}" -eq 0 ]]
+}
+
+@test "_compact_image_rules_after_remove: collapses sparse slots above target" {
+  # Pre-existing gap (rule_1, rule_3 — no rule_2) plus a remove at 1
+  # should produce a single contiguous rule_1 holding the old rule_3.
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_3 "string:c"
+  _compact_image_rules_after_remove 1
+  [[ "$(ovr_get image.rule_1)" == "string:c" ]]
+  is_removed image.rule_3
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _swap_image_rule
+# ════════════════════════════════════════════════════════════════════
+
+@test "_swap_image_rule: both occupied — swaps values" {
+  _override_set image.rule_1 "string:a"
+  _override_set image.rule_2 "string:b"
+  _swap_image_rule 1 2
+  [[ "$(ovr_get image.rule_1)" == "string:b" ]]
+  [[ "$(ovr_get image.rule_2)" == "string:a" ]]
+}
+
+@test "_swap_image_rule: m < 1 is a silent no-op" {
+  _override_set image.rule_1 "string:a"
+  _swap_image_rule 1 0
+  [[ "$(ovr_get image.rule_1)" == "string:a" ]]
+}
+
+@test "_swap_image_rule: target empty — moves source into empty slot" {
+  _override_set image.rule_1 "string:a"
+  _swap_image_rule 1 2
+  [[ "$(ovr_get image.rule_2)" == "string:a" ]]
+  is_removed image.rule_1
+}
+
+@test "_swap_image_rule: source empty — moves target into source slot" {
+  _override_set image.rule_2 "string:b"
+  _swap_image_rule 1 2
+  [[ "$(ovr_get image.rule_1)" == "string:b" ]]
+  is_removed image.rule_2
+}
+
+@test "_swap_image_rule: both empty is a no-op" {
+  _swap_image_rule 1 2
+  [[ "${#_TUI_OVR_KEYS[@]}" -eq 0 ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_list_section / _edit_list_entry (mount_*, env_*, port_*, ...)
+#
+# Generic list-section CRUD: pick item from menu, edit value via
+# inputbox, optional validator. Empty input deletes; Cancel aborts.
+# Exercised here through _edit_section_environment (env_ prefix +
+# _validate_env_kv validator) and _edit_section_volumes
+# (mount_ prefix + _validate_mount). Coverage flows through the
+# generic path either way — same code, just different parameters.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_list_section env_: add then back writes env_1" {
+  # pick "add" → inputbox accepts "FOO=bar" → loop returns to menu →
+  # pick "back" to exit.
+  queue "0|add" "0|FOO=bar" "0|back"
+  _edit_section_environment
+  [[ "$(ovr_get environment.env_1)" == "FOO=bar" ]]
+}
+
+@test "_edit_list_section env_: invalid value shows msgbox + retries" {
+  # First inputbox = invalid → msgbox + loop continues with the typed
+  # value preserved. Second inputbox = valid. Then back.
+  queue "0|add" "0|nokey" "0|FOO=bar" "0|back"
+  _edit_section_environment
+  [[ "$(ovr_get environment.env_1)" == "FOO=bar" ]]
+}
+
+@test "_edit_list_section env_: empty input on existing entry marks removed" {
+  # Pre-seed env_1, click into it, type empty → delete.
+  _override_set environment.env_1 "FOO=bar"
+  _TUI_CURRENT[environment.env_1]="FOO=bar"
+  queue "0|env_1" "0|" "0|back"
+  _edit_section_environment
+  is_removed environment.env_1
+}
+
+@test "_edit_list_section env_: add → next free index is max+1" {
+  _override_set environment.env_1 "FOO=bar"
+  _TUI_CURRENT[environment.env_1]="FOO=bar"
+  queue "0|add" "0|BAZ=qux" "0|back"
+  _edit_section_environment
+  [[ "$(ovr_get environment.env_2)" == "BAZ=qux" ]]
+}
+
+@test "_edit_list_section env_: empty choice (Cancel) returns 0 immediately" {
+  queue "0|"
+  run _edit_section_environment
+  assert_success
+  [[ "${#_TUI_OVR_KEYS[@]}" -eq 0 ]]
+}
+
+@test "_edit_list_section env_: rc!=0 (Esc) returns 0 immediately" {
+  queue "1|"
+  run _edit_section_environment
+  assert_success
+}
+
+@test "_edit_list_section env_: edits existing entry replacing value" {
+  _override_set environment.env_1 "FOO=bar"
+  _TUI_CURRENT[environment.env_1]="FOO=bar"
+  queue "0|env_1" "0|FOO=baz" "0|back"
+  _edit_section_environment
+  [[ "$(ovr_get environment.env_1)" == "FOO=baz" ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_section_additional_contexts —
+#
+# Exercises the same _edit_list_section path as environment / volumes
+# but with the context_ prefix and the _validate_additional_context
+# validator. Confirms add / edit / remove / cancel / invalid-retry all
+# wire through correctly so seggpt-style repos can drive the workflow
+# from the TUI without hand-editing setup.conf.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_section_additional_contexts: add then back writes context_1" {
+  queue "0|add" "0|repo=.." "0|back"
+  _edit_section_additional_contexts
+  [[ "$(ovr_get additional_contexts.context_1)" == "repo=.." ]]
+}
+
+@test "_edit_section_additional_contexts: invalid name shows msgbox + retries" {
+  # First inputbox = invalid (missing =) → msgbox; loop continues.
+  # Second inputbox = valid. Then back.
+  queue "0|add" "0|noequals" "0|repo=.." "0|back"
+  _edit_section_additional_contexts
+  [[ "$(ovr_get additional_contexts.context_1)" == "repo=.." ]]
+}
+
+@test "_edit_section_additional_contexts: add → next free index is max+1" {
+  _override_set additional_contexts.context_1 "repo=.."
+  _TUI_CURRENT[additional_contexts.context_1]="repo=.."
+  queue "0|add" "0|vendor=../third_party" "0|back"
+  _edit_section_additional_contexts
+  [[ "$(ovr_get additional_contexts.context_2)" == "vendor=../third_party" ]]
+}
+
+@test "_edit_section_additional_contexts: empty input on existing entry marks removed" {
+  _override_set additional_contexts.context_1 "repo=.."
+  _TUI_CURRENT[additional_contexts.context_1]="repo=.."
+  queue "0|context_1" "0|" "0|back"
+  _edit_section_additional_contexts
+  is_removed additional_contexts.context_1
+}
+
+@test "_edit_section_additional_contexts: edits existing entry replacing value" {
+  _override_set additional_contexts.context_1 "repo=.."
+  _TUI_CURRENT[additional_contexts.context_1]="repo=.."
+  queue "0|context_1" "0|repo=../upstream" "0|back"
+  _edit_section_additional_contexts
+  [[ "$(ovr_get additional_contexts.context_1)" == "repo=../upstream" ]]
+}
+
+@test "_edit_section_additional_contexts: empty choice (Cancel) returns 0 immediately" {
+  queue "0|"
+  run _edit_section_additional_contexts
+  assert_success
+  [[ "${#_TUI_OVR_KEYS[@]}" -eq 0 ]]
+}
+
+@test "_edit_section_additional_contexts: rc!=0 (Esc) returns 0 immediately" {
+  queue "1|"
+  run _edit_section_additional_contexts
+  assert_success
+}
+
+@test "_edit_section_additional_contexts: docker-image:// schemes accepted" {
+  queue "0|add" "0|base=docker-image://debian:bookworm-slim" "0|back"
+  _edit_section_additional_contexts
+  [[ "$(ovr_get additional_contexts.context_1)" == "base=docker-image://debian:bookworm-slim" ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# the TUI validates through the shared schema registry, keyed by
+# (section, key) — NOT a validator name threaded through the call site.
+# _edit_list_entry must reject an invalid value for a registered key even
+# when no validator argument is passed; the registry is the single source.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_list_entry validates via the schema registry, no validator arg (#560)" {
+  # No validator argument: first input is an invalid port (registry must
+  # reject -> msgbox -> retry), second is valid and is written.
+  queue "0|not-a-port" "0|8080:80"
+  _edit_list_entry network port_ 1 "prompt"
+  [[ "$(ovr_get network.port_1)" == "8080:80" ]]
+}
+
+@test "_render_advanced_menu: additional_contexts choice dispatches to its editor" {
+  # Click additional_contexts → its editor immediately Cancels (empty
+  # menu pick) → user lands back on advanced menu → __back exits.
+  queue "0|additional_contexts" "0|" "0|__back"
+  run _render_advanced_menu
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_section_image — top-level menu dispatch into _edit_image_rule
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_section_image: add path appends rule at max+1" {
+  _override_set image.rule_1 "string:foo"
+  _TUI_CURRENT[image.rule_1]="string:foo"
+  queue "0|add" "0|string" "0|bar" "0|back"
+  _edit_section_image
+  [[ "$(ovr_get image.rule_2)" == "string:bar" ]]
+}
+
+@test "_edit_section_image: rule_1 click drills into _edit_image_rule" {
+  _override_set image.rule_1 "string:foo"
+  _TUI_CURRENT[image.rule_1]="string:foo"
+  queue "0|rule_1" "0|string" "0|baz" "0|back"
+  _edit_section_image
+  [[ "$(ovr_get image.rule_1)" == "string:baz" ]]
+}
+
+@test "_edit_section_image: back returns immediately" {
+  queue "0|back"
+  run _edit_section_image
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_section_network — _tui_select x2 (mode + ipc), conditional
+# branches: bridge → network_name + ports; ipc!=host → shm_size.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_section_network: host + host + private writes all modes, no shm prompt" {
+  queue "0|host" "0|host" "0|private"
+  _edit_section_network
+  [[ "$(ovr_get network.mode)" == "host" ]]
+  [[ "$(ovr_get network.ipc)" == "host" ]]
+  [[ "$(ovr_get network.pid)" == "private" ]]
+  [[ "$(ovr_get network.network_name)" == "" ]]
+}
+
+@test "_edit_section_network: bridge + host prompts for network_name + ports menu" {
+  # mode=bridge → ipc → pid → name inputbox + ports submenu (back immediately).
+  queue "0|bridge" "0|host" "0|private" "0|mynet" "0|back"
+  _edit_section_network
+  [[ "$(ovr_get network.mode)" == "bridge" ]]
+  [[ "$(ovr_get network.network_name)" == "mynet" ]]
+}
+
+@test "_edit_section_network: ipc=private prompts for shm_size" {
+  queue "0|host" "0|private" "0|private" "0|2gb"
+  _edit_section_network
+  [[ "$(ovr_get network.ipc)" == "private" ]]
+  [[ "$(ovr_get resources.shm_size)" == "2gb" ]]
+}
+
+@test "_edit_section_network: empty network_name allowed (compose default bridge)" {
+  queue "0|bridge" "0|host" "0|private" "0|" "0|back"
+  _edit_section_network
+  [[ "$(ovr_get network.network_name)" == "" ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _edit_section_deploy — gpu_mode select; off short-circuits remaining
+# count + capabilities flow.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_edit_section_deploy: off short-circuits — only writes gpu_mode" {
+  # Stub _detect_mig false so MIG branch does not fire (it would not
+  # be reached anyway since off returns early, but make the test
+  # robust against future ordering changes).
+  _detect_mig() { return 1; }
+  queue "0|off"
+  _edit_section_deploy
+  [[ "$(ovr_get deploy.gpu_mode)" == "off" ]]
+  ! ovr_get deploy.gpu_count
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Per-stage overrides UI
+# ════════════════════════════════════════════════════════════════════
+
+# Helper: stage a Dockerfile with the given non-baseline stages.
+# Returns the directory path on stdout so callers can pass it to
+# _list_dockerfile_stages_available's optional base-path arg —
+# FILE_PATH is readonly in setup_tui.sh, so tests can't override it.
+_make_dockerfile_with_stages() {
+  local _df="${BATS_TEST_TMPDIR}/Dockerfile"
+  {
+    echo 'FROM scratch AS sys'
+    echo 'FROM sys AS base'
+    echo 'FROM base AS devel'
+    local _s
+    for _s in "$@"; do
+      printf 'FROM devel AS %s\n' "${_s}"
+    done
+    echo 'FROM devel AS test'
+  } > "${_df}"
+  printf '%s' "${BATS_TEST_TMPDIR}"
+}
+
+@test "_list_dockerfile_stages_available: returns non-baseline stages in file order" {
+  local _base
+  _base="$(_make_dockerfile_with_stages headless gui web)"
+  local -a _out=()
+  _list_dockerfile_stages_available _out "${_base}"
+  [[ "${#_out[@]}" -eq 3 ]] || { echo "got ${_out[*]}"; return 1; }
+  [[ "${_out[0]}" == "headless" ]] || return 1
+  [[ "${_out[1]}" == "gui" ]] || return 1
+  [[ "${_out[2]}" == "web" ]] || return 1
+}
+
+@test "_list_dockerfile_stages_available: empty when only baseline stages" {
+  local _base
+  _base="$(_make_dockerfile_with_stages)"
+  local -a _out=()
+  _list_dockerfile_stages_available _out "${_base}"
+  [[ "${#_out[@]}" -eq 0 ]] || { echo "got ${_out[*]}"; return 1; }
+}
+
+@test "_list_dockerfile_stages_available: includes devel-test as an editable stage (#493)" {
+  # (A1'-b): devel-test is the override surface for the test
+  # service, so the per-stage TUI editor must offer it.
+  local _df="${BATS_TEST_TMPDIR}/Dockerfile"
+  cat > "${_df}" <<'EOF'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS headless
+EOF
+  local -a _out=()
+  _list_dockerfile_stages_available _out "${BATS_TEST_TMPDIR}"
+  printf '%s\n' "${_out[@]}" | grep -qx "devel-test" \
+    || { echo "devel-test missing from: ${_out[*]}"; return 1; }
+}
+
+@test "_list_dockerfile_stages_available: offers a --platform flagged stage (#875)" {
+  # The TUI is a fifth reader of the same FROM lines. If it keeps its own
+  # matcher it silently stops offering the per-stage override menu for a
+  # cross-build stage the compose emitter does emit a service for.
+  local _df="${BATS_TEST_TMPDIR}/Dockerfile"
+  cat > "${_df}" <<'EOF'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS runtime
+EOF
+  local -a _out=()
+  _list_dockerfile_stages_available _out "${BATS_TEST_TMPDIR}"
+  printf '%s\n' "${_out[@]}" | grep -qx "runtime" \
+    || { echo "runtime missing from: ${_out[*]}"; return 1; }
+}
+
+@test "_count_stage_overrides: counts unique non-empty keys across OVR + CURRENT" {
+  _TUI_OVR_KEYS=("stage:headless.gui.mode" "stage:headless.network.mode")
+  _TUI_OVR_VALUES=("off" "bridge")
+  _TUI_CURRENT[stage:headless.volumes.mount_1]="/cache:/cache"
+  _TUI_CURRENT[stage:gui.gui.mode]="auto"
+  local _c
+  _count_stage_overrides headless _c
+  [[ "${_c}" -eq 3 ]] || { echo "expected 3, got ${_c}"; return 1; }
+  _count_stage_overrides gui _c
+  [[ "${_c}" -eq 1 ]] || { echo "expected 1, got ${_c}"; return 1; }
+  _count_stage_overrides web _c
+  [[ "${_c}" -eq 0 ]] || { echo "expected 0, got ${_c}"; return 1; }
+}
+
+@test "_count_stage_overrides: skips empty values" {
+  _TUI_OVR_KEYS=("stage:headless.gui.mode")
+  _TUI_OVR_VALUES=("")
+  local _c
+  _count_stage_overrides headless _c
+  [[ "${_c}" -eq 0 ]] || { echo "expected 0, got ${_c}"; return 1; }
+}
+
+@test "_edit_stage_gui: explicit mode write" {
+  _make_dockerfile_with_stages headless
+  queue "0|off"
+  _edit_stage_gui headless
+  [[ "$(ovr_get stage:headless.gui.mode)" == "off" ]] || {
+    echo "expected stage:headless.gui.mode=off, got: '$(ovr_get stage:headless.gui.mode || echo MISSING)'"
+    return 1
+  }
+}
+
+@test "_edit_stage_gui: __inherit clears any existing override" {
+  _make_dockerfile_with_stages headless
+  _TUI_OVR_KEYS=("stage:headless.gui.mode")
+  _TUI_OVR_VALUES=("force")
+  queue "0|__inherit"
+  _edit_stage_gui headless
+  # is_removed first: a `!` statement is exempt from errexit anywhere but
+  # the body's last line, so the order is what makes both assert.
+  is_removed stage:headless.gui.mode
+  ! ovr_get stage:headless.gui.mode
+}
+
+@test "_edit_stage_scalar: writes the dotted key under stage namespace" {
+  _make_dockerfile_with_stages headless
+  queue "0|bridge"
+  _edit_stage_scalar headless network.mode
+  [[ "$(ovr_get stage:headless.network.mode)" == "bridge" ]] || return 1
+}
+
+@test "_edit_stage_scalar: empty input clears (inherit)" {
+  _TUI_OVR_KEYS=("stage:headless.network.mode")
+  _TUI_OVR_VALUES=("bridge")
+  queue "0|"
+  _edit_stage_scalar headless network.mode
+  ! ovr_get stage:headless.network.mode
+}
+
+@test "_edit_stage_list: __inherit toggle flips false then back to true (clears flag)" {
+  _make_dockerfile_with_stages headless
+  # First toggle: default true → false
+  queue "0|__inherit" "0|__back"
+  _edit_stage_list headless volumes mount_ volumes.mount_inherit
+  [[ "$(ovr_get stage:headless.volumes.mount_inherit)" == "false" ]] || {
+    echo "1st toggle: expected false, got: '$(ovr_get stage:headless.volumes.mount_inherit || echo MISSING)'"
+    return 1
+  }
+  # Second toggle: false → true (which means CLEAR the override)
+  queue "0|__inherit" "0|__back"
+  _edit_stage_list headless volumes mount_ volumes.mount_inherit
+  ! ovr_get stage:headless.volumes.mount_inherit
+}
+
+@test "_edit_stage_list: add appends a list entry under the stage namespace" {
+  _make_dockerfile_with_stages headless
+  # Add → enter "/cache:/cache" → __back
+  queue "0|add" "0|/cache:/cache" "0|__back"
+  _edit_stage_list headless volumes mount_ volumes.mount_inherit
+  [[ "$(ovr_get stage:headless.volumes.mount_1)" == "/cache:/cache" ]] || {
+    echo "got: '$(ovr_get stage:headless.volumes.mount_1 || echo MISSING)'"
+    return 1
+  }
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Menu restructure — Runtime / Mounts / Features sub-menus
+#
+# Promotes image + build to top-level main, regroups runtime concerns
+# (network/deploy/gui/environment) under Runtime, regroups mount
+# concerns (volumes/devices/tmpfs) under Mounts, and adds a Features
+# entry that exposes conditional/power-user features even when their
+# enabling preconditions are not met (per-stage overrides being the
+# first such feature). Advanced sub-menu is slimmed to truly-advanced
+# entries: security, additional_contexts, per_stage (conditional),
+# Reset to defaults.
+# ════════════════════════════════════════════════════════════════════
+
+# i18n keys for new top-level entries
+
+@test "i18n: main.runtime key exists across all 4 languages" {
+  [[ -n "${_TUI_MSG_EN[main.runtime]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_TW[main.runtime]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_CN[main.runtime]:-}" ]]
+  [[ -n "${_TUI_MSG_JA[main.runtime]:-}" ]]
+}
+
+@test "i18n: main.mounts key exists across all 4 languages" {
+  [[ -n "${_TUI_MSG_EN[main.mounts]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_TW[main.mounts]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_CN[main.mounts]:-}" ]]
+  [[ -n "${_TUI_MSG_JA[main.mounts]:-}" ]]
+}
+
+@test "i18n: main.features key exists across all 4 languages" {
+  [[ -n "${_TUI_MSG_EN[main.features]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_TW[main.features]:-}" ]]
+  [[ -n "${_TUI_MSG_ZH_CN[main.features]:-}" ]]
+  [[ -n "${_TUI_MSG_JA[main.features]:-}" ]]
+}
+
+# New sub-menu function existence
+
+@test "_render_runtime_menu function is defined" {
+  [[ "$(type -t _render_runtime_menu)" == "function" ]]
+}
+
+@test "_render_mounts_menu function is defined" {
+  [[ "$(type -t _render_mounts_menu)" == "function" ]]
+}
+
+@test "_render_features_menu function is defined" {
+  [[ "$(type -t _render_features_menu)" == "function" ]]
+}
+
+# Main menu dispatch — image + build promoted to top level
+
+@test "_render_main_menu: image choice dispatches to _edit_section_image" {
+  local _called=0
+  _edit_section_image() { _called=1; }
+  queue "0|image" "0|__save"
+  _render_main_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_main_menu: build choice dispatches to _edit_section_build" {
+  local _called=0
+  _edit_section_build() { _called=1; }
+  queue "0|build" "0|__save"
+  _render_main_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_main_menu: runtime choice dispatches to _render_runtime_menu" {
+  local _called=0
+  _render_runtime_menu() { _called=1; }
+  queue "0|runtime" "0|__save"
+  _render_main_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_main_menu: mounts choice dispatches to _render_mounts_menu" {
+  local _called=0
+  _render_mounts_menu() { _called=1; }
+  queue "0|mounts" "0|__save"
+  _render_main_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_main_menu: features choice dispatches to _render_features_menu" {
+  local _called=0
+  _render_features_menu() { _called=1; }
+  queue "0|features" "0|__save"
+  _render_main_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_main_menu: bare network/deploy/gui/volumes/environment no longer dispatch from main" {
+  # these live under Runtime / Mounts sub-menus. If a stale
+  # script keys them, no editor opens (no case branch matches), and
+  # the main loop simply continues until __save / Cancel.
+  local _net=0 _gui=0 _vol=0
+  _edit_section_network() { _net=1; }
+  _edit_section_gui()     { _gui=1; }
+  _edit_section_volumes() { _vol=1; }
+  queue "0|network" "0|gui" "0|volumes" "0|__save"
+  _render_main_menu
+  [[ "${_net}" -eq 0 && "${_gui}" -eq 0 && "${_vol}" -eq 0 ]]
+}
+
+# Runtime sub-menu
+
+@test "_render_runtime_menu: __back exits with 0" {
+  queue "0|__back"
+  run _render_runtime_menu
+  assert_success
+}
+
+@test "_render_runtime_menu: Cancel (rc!=0) exits via break" {
+  queue "1|"
+  run _render_runtime_menu
+  assert_success
+}
+
+@test "_render_runtime_menu: network choice dispatches to _edit_section_network" {
+  local _called=0
+  _edit_section_network() { _called=1; }
+  queue "0|network" "0|__back"
+  _render_runtime_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_runtime_menu: deploy choice dispatches to _edit_section_deploy" {
+  local _called=0
+  _edit_section_deploy() { _called=1; }
+  queue "0|deploy" "0|__back"
+  _render_runtime_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_runtime_menu: gui choice dispatches to _edit_section_gui" {
+  local _called=0
+  _edit_section_gui() { _called=1; }
+  queue "0|gui" "0|__back"
+  _render_runtime_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_runtime_menu: environment choice dispatches to _edit_section_environment" {
+  local _called=0
+  _edit_section_environment() { _called=1; }
+  queue "0|environment" "0|__back"
+  _render_runtime_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_runtime_menu: logging choice dispatches to _edit_section_logging (#328)" {
+  local _called=0
+  _edit_section_logging() { _called=1; }
+  queue "0|logging" "0|__back"
+  _render_runtime_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_edit_section_logging: global choice dispatches to _edit_logging_keys logging (#328)" {
+  local _seen=""
+  _edit_logging_keys() { _seen="$1"; }
+  queue "0|global" "0|__back"
+  _edit_section_logging
+  [[ "${_seen}" == "logging" ]]
+}
+
+@test "_edit_section_logging: devel choice dispatches to _edit_logging_keys logging.devel (#328)" {
+  local _seen=""
+  _edit_logging_keys() { _seen="$1"; }
+  queue "0|devel" "0|__back"
+  _edit_section_logging
+  [[ "${_seen}" == "logging.devel" ]]
+}
+
+@test "_edit_section_logging: test choice dispatches to _edit_logging_keys logging.test (#328)" {
+  local _seen=""
+  _edit_logging_keys() { _seen="$1"; }
+  queue "0|test" "0|__back"
+  _edit_section_logging
+  [[ "${_seen}" == "logging.test" ]]
+}
+
+@test "_edit_section_logging: runtime choice dispatches to _edit_logging_keys logging.runtime (#328)" {
+  local _seen=""
+  _edit_logging_keys() { _seen="$1"; }
+  queue "0|runtime" "0|__back"
+  _edit_section_logging
+  [[ "${_seen}" == "logging.runtime" ]]
+}
+
+# Mounts sub-menu
+
+@test "_render_mounts_menu: __back exits with 0" {
+  queue "0|__back"
+  run _render_mounts_menu
+  assert_success
+}
+
+@test "_render_mounts_menu: Cancel (rc!=0) exits via break" {
+  queue "1|"
+  run _render_mounts_menu
+  assert_success
+}
+
+@test "_render_mounts_menu: volumes choice dispatches to _edit_section_volumes" {
+  local _called=0
+  _edit_section_volumes() { _called=1; }
+  queue "0|volumes" "0|__back"
+  _render_mounts_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_mounts_menu: devices choice dispatches to _edit_section_devices" {
+  local _called=0
+  _edit_section_devices() { _called=1; }
+  queue "0|devices" "0|__back"
+  _render_mounts_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_mounts_menu: tmpfs choice dispatches to _edit_section_tmpfs" {
+  local _called=0
+  _edit_section_tmpfs() { _called=1; }
+  queue "0|tmpfs" "0|__back"
+  _render_mounts_menu
+  [[ "${_called}" -eq 1 ]]
+}
+
+# Features sub-menu — conditional discoverability (acceptance)
+
+@test "_render_features_menu: __back exits with 0" {
+  queue "0|__back"
+  run _render_features_menu
+  assert_success
+}
+
+@test "_render_features_menu: per_stage entry enters editor when stages exist" {
+  # When non-baseline stages are present, clicking per_stage opens
+  # _edit_section_per_stage (the existing editor — same entry point as
+  # the conditional Advanced entry).
+  local _base _called=0
+  _base="$(_make_dockerfile_with_stages headless)"
+  _edit_section_per_stage() { _called=1; }
+  queue "0|per_stage" "0|__back"
+  _render_features_menu "${_base}"
+  [[ "${_called}" -eq 1 ]]
+}
+
+@test "_render_features_menu: per_stage entry shows info msgbox + does NOT enter editor when no stages" {
+  # When no non-baseline stages exist, clicking per_stage shows an
+  # explanatory msgbox + returns; editor must not be entered.
+  local _base _editor=0 _msgbox=0
+  _base="$(_make_dockerfile_with_stages)"
+  _edit_section_per_stage() { _editor=1; }
+  _tui_msgbox() { _msgbox=1; return 0; }
+  export -f _tui_msgbox
+  queue "0|per_stage" "0|__back"
+  _render_features_menu "${_base}"
+  [[ "${_editor}" -eq 0 ]]
+  [[ "${_msgbox}" -eq 1 ]]
+}
+
+# Advanced sub-menu — image/build/devices/tmpfs moved out
+
+@test "_render_advanced_menu: image entry no longer dispatches" {
+  local _called=0
+  _edit_section_image() { _called=1; }
+  queue "0|image" "0|__back"
+  _render_advanced_menu
+  [[ "${_called}" -eq 0 ]]
+}
+
+@test "_render_advanced_menu: build entry no longer dispatches" {
+  local _called=0
+  _edit_section_build() { _called=1; }
+  queue "0|build" "0|__back"
+  _render_advanced_menu
+  [[ "${_called}" -eq 0 ]]
+}
+
+@test "_render_advanced_menu: devices entry no longer dispatches" {
+  local _called=0
+  _edit_section_devices() { _called=1; }
+  queue "0|devices" "0|__back"
+  _render_advanced_menu
+  [[ "${_called}" -eq 0 ]]
+}
+
+@test "_render_advanced_menu: tmpfs entry no longer dispatches" {
+  local _called=0
+  _edit_section_tmpfs() { _called=1; }
+  queue "0|tmpfs" "0|__back"
+  _render_advanced_menu
+  [[ "${_called}" -eq 0 ]]
+}
+
+@test "_render_advanced_menu: security still dispatches" {
+  local _called=0
+  _edit_section_security() { _called=1; }
+  queue "0|security" "0|__back"
+  _render_advanced_menu
+  [[ "${_called}" -eq 1 ]]
+}
