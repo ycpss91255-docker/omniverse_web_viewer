@@ -63,10 +63,6 @@ on:
         required: false
         type: boolean
         default: true
-      test_tools_version:
-        required: false
-        type: string
-        default: "latest"
       platforms:
         required: false
         type: string
@@ -87,6 +83,19 @@ on:
 jobs:
   resolve-matrix:
     runs-on: ubuntu-latest
+    # Every job of a worker bounds itself: GitHub's default is six hours,
+    # and it applies per matrix shard. `call-build` carries none because
+    # `timeout-minutes` is not accepted on a job that `uses:` another
+    # workflow -- its bound lives on build-worker's own jobs, which is
+    # where the work is.
+    timeout-minutes: 5
+    # This is a REUSABLE workflow: a job with no `permissions:` runs on
+    # the CALLING repo's whole grant. The job picks one of two inputs and
+    # writes it to GITHUB_OUTPUT -- it does not even check out -- so it
+    # declares the read-only block rather than inheriting a caller's
+    # `contents: write` (#957).
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.r.outputs.matrix }}
     steps:
@@ -110,6 +119,13 @@ jobs:
 
   call-build:
     needs: resolve-matrix
+    # Job-level permissions on a `uses:` job are the CEILING every job of
+    # the called workflow runs under. build-worker.yaml's five jobs each
+    # declare `contents: read` and nothing else, so this is the narrowest
+    # ceiling that satisfies all of them -- and it stops a caller's
+    # `packages: write` reaching them through this hop (#957).
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -126,7 +142,6 @@ jobs:
       # docker/build-push-action.
       build_args: ${{ matrix.build_args }}
       build_runtime: ${{ inputs.build_runtime }}
-      test_tools_version: ${{ inputs.test_tools_version }}
       platforms: ${{ inputs.platforms }}
       context_path: ${{ inputs.context_path }}
       dockerfile_path: ${{ inputs.dockerfile_path }}
@@ -140,6 +155,11 @@ jobs:
     needs: call-build
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads `needs.call-build.result` and exits. `contents: read` rather
+    # than `{}` keeps the block uniform with its siblings (#957).
+    permissions:
+      contents: read
     steps:
       - name: Aggregate matrix results
         env:

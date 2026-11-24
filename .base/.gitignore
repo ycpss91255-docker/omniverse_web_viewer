@@ -1,6 +1,37 @@
 coverage/
+# The per-shard coverage trees the pre-PR mirror's --coverage-matrix keeps,
+# laid out as CI's coverage-gate downloads the shard artifacts.
+coverage-shards/
 .env
+.env.local
+/deploy/
 multi_run/
+# The per-worktree setup.conf override. base self-uses the docker
+# namespace it ships, so a base checkout can carry one too, and it must
+# never be committed -- an untracked layer that got committed would
+# silently become everyone's config.
+.setup.conf.local
+# Wrapper transcripts (#606/#609). base runs its own wrappers during the
+# test suite, which writes transcripts under log/ (any depth, e.g.
+# script/docker/log/). The canonical .gitignore sync targets consumer
+# repos, not base itself, so ignore them here directly.
+log/
+# Released trees materialised by script/test/prepare-prev-release.sh for
+# the released-caller compatibility spec. Derived from this repo's own tags
+# (never hand-written), regenerated on demand, and deliberately parked at
+# the repo root rather than under test/: every lint driver scans a fixed
+# root list, and an old release inside one of those roots would be linted
+# as if it were current source.
+.prev-release/
+# The config generator binary script/test/test.sh copies out of this
+# checkout's config-gen image for config_gen_bridge_golden_spec.bats
+# (base#1469). Derived on every run, never committed.
+.config-gen-bin/
+# Bytecode CPython writes beside dockerfile/toml_bridge.py whenever the
+# bridge is run from the checkout rather than from its image. Derived,
+# per-interpreter, and no part of what the image copies.
+__pycache__/
+*.pyc
 *.swp
 *.swo
 .DS_Store
@@ -8,6 +39,7 @@ multi_run/
 .idea/
 
 # Claude Code session state when launched inside this sub-repo.
-# Workspace-level Claude config lives in ycpss91255-docker/claude-workspace.
+# Workspace-level Claude config lives in ycpss91255-lab/claude-workspace.
 .claude
 CLAUDE.md
+test/bats/.shard-weights

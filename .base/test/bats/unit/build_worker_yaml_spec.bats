@@ -1,0 +1,1636 @@
+#!/usr/bin/env bats
+#
+# build_worker_yaml_spec.bats — structural assertions for the
+# `.github/workflows/build-worker.yaml` reusable workflow.
+#
+# Reusable workflows can't be unit-tested by exec'ing them, but their
+# structural invariants (which inputs exist, which `with:` keys
+# forward into docker/build-push-action) are still grep-able. These
+# tests lock the changes — `context_path` / `dockerfile_path`
+# inputs and the corresponding `context:` / `file:` lines in the 3
+# build steps — so a future refactor that drops one of them lights up
+# CI red instead of silently breaking nested-Dockerfile downstreams.
+#
+# why: Structural assertions for `.github/workflows/build-worker.yaml` (#195
+# + #243 + #272 + #273 + #378 b1). Reusable workflows are not exec'd by
+# these tests; instead grep patterns lock the YAML invariants —
+# `context_path` / `dockerfile_path` inputs declared with the right
+# defaults, all 4 `docker/build-push-action` steps (devel-test / devel /
+# runtime-test / runtime after #243) forwarding those inputs, no leftover
+# `context: .` / `file: ./Dockerfile` literals, the GHA-cache plumbing
+# (#272: `cache_variant` input, `Compute cache scope` step; #378 b1:
+# per-target scope suffix so a late-stage COPY change in one target no
+# longer cascades into siblings' manifests; #980: exactly one backend,
+# selected by no input, because a second one needed a permission a called
+# job cannot hold), and the #273 doc-only PR
+# fast-pass (`path-filter` job; Phase 2 classifier is pure shell via `git
+# diff --name-only base...head` + `case` glob, no `dorny/paths-filter`
+# dependency; 6-path allowlist; compute-matrix + build gated on
+# `code_changed`; docker-build aggregator short-circuits on doc-only PRs).
+#
+# Grouped by concern:
+#
+# - `inputs.context_path` declared with `default: "."`
+#
+# - `inputs.dockerfile_path` declared with `default: ""`
+#
+# - 4 build steps reference `inputs.context_path` (#243 added runtime-test)
+#
+# - 4 build steps reference `inputs.dockerfile_path` with `format()`
+# fallback
+#
+# - No leftover `context: .` literals
+#
+# - No leftover `file: ./Dockerfile` literals
+#
+# - Default values together preserve repo-root-Dockerfile callers
+#
+# - User build-args use long form matching Dockerfile.example sys stage
+# (#198: USER_NAME / USER_GROUP / USER_UID / USER_GID across 4 build steps +
+# no short-form regression)
+#
+# - `build_contexts` input forwards to docker/build-push-action
+# `build-contexts:` (#207: input declared with empty default, 4 build steps
+# forward, default preserves zero-diff)
+#
+# - #243 stage rename + runtime-test smoke: `target: devel-test` (renamed
+# from `test`), no leftover `target: test`, `target: runtime-test` exists,
+# runtime-test gated on the resolved runtime answer (>=2 occurrences shared
+# with runtime gate)
+#
+# - #272 + #378 b1 GHA buildx cache: `cache_variant` input declared with
+# empty default, `Compute cache scope` step emits `id: cache` + base key (no
+# `-cache` suffix; per-target suffix appended at use site), 4 build steps
+# use per-target `<base>-<target>-cache` gha scopes, no legacy shared-scope
+# leftover (negative regression), 4 build steps preserve `mode=max`,
+# default preserves zero-diff for single-call callers
+#
+# - #980 one cache backend: the `cache_backend` input and its `registry`
+# arm are gone. That arm's cache export needed `packages: write` on jobs
+# that declare a read-only block, and a called job gets exactly the block
+# it declares, so it was unreachable from the day it shipped. Asserted as
+# a property -- every cache line names `type=gha` outright, no input
+# selects a backend, no `docker/login-action` -- because the next second
+# backend is unreachable for the same reason
+#
+# - #273 doc-only PR fast-pass (Phase 1 + Phase 2 shell rewrite):
+# `path-filter` job declared, classifier is pure shell (`git diff
+# --name-only base...head` + `case` glob; no `dorny/paths-filter`
+# dependency), reads EVENT_NAME / BASE_SHA / HEAD_SHA from env: keys so the
+# case body stays portable, non-PR event short-circuits before git diff
+# (BASE_SHA / HEAD_SHA empty on push / tag / workflow_dispatch), 6-path
+# allowlist (`**/*.md`, `doc/**`, `LICENSE`, `.gitignore`,
+# `.github/CODEOWNERS`, `.github/dependabot.yml`) in a single `case` arm,
+# `compute-matrix` + `build` jobs gated on `code_changed == 'true'` (2
+# occurrences), `docker-build` aggregator handles `code_changed == 'false'`
+# short-circuit + `needs: [path-filter, build]`, non-PR triggers always set
+# `code_changed=true`
+#
+# - #470 opt-in `free_disk_space` for large BASE_IMAGE repos: input declared
+# `type: boolean` default `false`, step gated on `inputs.free_disk_space`,
+# uses `jlumbroso/free-disk-space@...`, positioned before `Set up Docker
+# Buildx` so the overlayfs snapshot dir has room
+#
+# - #925 runtime gate read from the Dockerfile: a `Resolve runtime stages`
+# step delegates to `runtime_stages.sh`, exports `build_runtime` to
+# `GITHUB_OUTPUT`, both runtime build steps gate on
+# `steps.runtime.outputs.build_runtime`, and no build step gates on
+# `inputs.build_runtime` directly
+#
+# - #802 push worker logic down: `compute-matrix` delegates to
+# `compute_matrix.sh` (no inline platform fan-out) and version-matches it
+# via `job_workflow_sha` into `.worker-base`, `Compute cache scope`
+# delegates to `cache_scope.sh` (feeds IMAGE_NAME / CACHE_VARIANT /
+# HARDWARE, no inline derivation), build job checks out base worker source
+# into `.worker-base`
+#
+# - #957 per-job least privilege, over a job list DERIVED from the workflow
+# (never a roster in the spec -- the five-name loop this replaced stayed
+# green when a sixth job asking `contents: write` was appended): every job
+# declares its own `permissions:` block (a bare job inherits the CALLER's
+# grant), no job names `packages: write` (a called job that asks for a scope
+# its caller did not grant fails the run instead of intersecting down), no
+# job's entry set is anything but `contents: read` (comments stripped so a
+# rationale quoting a grant cannot stand in for one; a job with no block
+# surfaces as `<no entries>` and fails the same way), and the `build` job's
+# rationale never cites the preflight probe as proof of a caller's package
+# grant (the preflight is capped at `contents: read` itself). Each of the
+# four asserts its own population first -- a floor on the derived job count,
+# cross-checked against a second reading of the file -- so an extractor that
+# stopped matching fails instead of reporting a clean scan
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  WF="/source/.github/workflows/build-worker.yaml"
+  assert_spec_subject "${WF}" \
+      "the reusable build worker this spec pins"
+}
+
+# ── Inputs declared ────────────────────────────────────────────
+
+@test "build-worker.yaml: declares context_path input with default '.'" {
+  run code_grep -A 3 '^      context_path:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: string'
+  assert_output --partial 'default: "."'
+}
+
+@test "build-worker.yaml: declares dockerfile_path input with empty default" {
+  run code_grep -A 3 '^      dockerfile_path:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: string'
+  assert_output --partial 'default: ""'
+}
+
+# ── Build steps forward both inputs ────────────────────────────
+
+@test "build-worker.yaml: 4 build steps all reference inputs.context_path (#243 added runtime-test)" {
+  # Four `docker/build-push-action` calls after
+  # devel-test / devel / runtime-test / runtime stages. Each must read
+  # context from the new input; `context: .` would silently work for
+  # repo-root-Dockerfile callers but break the nested-Dockerfile use
+  # case the issue body documented.
+  run code_grep -c 'context: ${{ inputs.context_path }}' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: 4 build steps all forward inputs.dockerfile_path with format() fallback" {
+  # The `||` short-circuit means an empty dockerfile_path falls back
+  # to `<context_path>/Dockerfile`, matching docker/build-push-action's
+  # implicit default. Override path lets callers pin a non-standard
+  # filename.
+  run code_grep -c "file: \${{ inputs.dockerfile_path || format('{0}/Dockerfile', inputs.context_path) }}" "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: no leftover hardcoded 'context: .' lines" {
+  # Catches partial-refactor regressions where one of the 3 stages
+  # gets reverted by accident. The file should have ZERO
+  # `context: .` literals — every reference reads from the input.
+  run code_grep -c '^          context: \.$' "${WF}"
+  [ "${status}" -ne 0 ] || [ "${output}" = "0" ]
+}
+
+@test "build-worker.yaml: no hardcoded Dockerfile path bypassing the input" {
+  # Belt-and-braces against someone hard-coding `file: ./Dockerfile`
+  # in one stage and forgetting that callers expect the input to flow
+  # through.
+  run code_grep -E '^[[:space:]]+file: \./Dockerfile$' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+# ── Backwards compatibility ──────────────────────────────────────────
+
+@test "build-worker.yaml: defaults preserve repo-root-Dockerfile behavior" {
+  # Both inputs default such that an existing caller passing only
+  # `image_name:` still resolves to context=. and file=./Dockerfile —
+  # what every downstream main.yaml expects. Asserts the
+  # combination, not just each default in isolation.
+  local _ctx _df
+  _ctx="$(code_grep -A 3 '^      context_path:' "${WF}" | grep 'default:' | head -1)"
+  _df="$(code_grep -A 3 '^      dockerfile_path:' "${WF}" | grep 'default:' | head -1)"
+  [[ "${_ctx}" == *'"."'* ]]
+  [[ "${_df}" == *'""'* ]]
+}
+
+# ── User build-args alignment with Dockerfile.example ──────────
+
+@test "build-worker.yaml: 4 build steps pass USER_NAME=ci (long form, matching Dockerfile.example sys stage)" {
+  # the workflow passed `USER=ci` (short form) which the
+  # Dockerfile only sees in the devel stage; the sys-stage useradd
+  # reads USER_NAME and stuck on the default "user". The container
+  # then USER-switched to "ci" with no /etc/passwd entry, exploding
+  # any RUN that resolved the username.
+  run code_grep -c '^            USER_NAME=ci$' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: 4 build steps pass USER_GROUP=ci (long form)" {
+  run code_grep -c '^            USER_GROUP=ci$' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: 4 build steps pass USER_UID=1000 (long form)" {
+  run code_grep -c '^            USER_UID=1000$' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: 4 build steps pass USER_GID=1000 (long form)" {
+  run code_grep -c '^            USER_GID=1000$' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+@test "build-worker.yaml: no short-form USER=/GROUP=/UID=/GID= build-args (regression #198)" {
+  # The Generate-.env step at the top of the workflow uses long-form
+  # writes via `printf 'USER_NAME=...'`; only build-args lines (8-space
+  # indent inside the build steps) are at risk. Anchor on that
+  # indentation to avoid false positives from the env-file write.
+  run code_grep -E '^            (USER|GROUP|UID|GID)=' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+# ── build_contexts input forwards to docker/build-push-action ──
+
+@test "build-worker.yaml: declares build_contexts input with empty default" {
+  # added compose's `additional_contexts:` for local builds, but
+  # CI invokes `docker/build-push-action` directly (bypassing compose),
+  # so the named contexts never reached BuildKit. adds the input
+  # the workflow needs to forward them to the action's `build-contexts:`
+  # field. Default is empty so existing callers see zero diff.
+  run code_grep -A 3 '^      build_contexts:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: string'
+  assert_output --partial 'default: ""'
+}
+
+@test "build-worker.yaml: 4 build steps forward inputs.build_contexts to docker/build-push-action build-contexts:" {
+  # Four docker/build-push-action calls after (devel-test / devel
+  # / runtime-test / runtime). Each must forward the input so named
+  # contexts work end-to-end in CI.
+  run code_grep -c '^          build-contexts: \${{ inputs.build_contexts }}$' "${WF}"
+  assert_success
+  assert_output "8"
+}
+
+# ──stage rename + runtime-test smoke step ──────────────────────
+
+@test "build-worker.yaml: devel-test build step uses target: devel-test (renamed from target: test)" {
+  # the test stage was named `test`; renamed to `devel-test`
+  # for symmetry with the new `runtime-test` stage. The literal target
+  # line must reflect the new name.
+  run code_grep -E '^          target: devel-test$' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: no leftover target: test (the renamed stage)" {
+  # If we forget to update one of the build steps, this catches it.
+  run code_grep -E '^          target: test$' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+@test "build-worker.yaml: runtime-test build step exists and uses target: runtime-test" {
+  run code_grep -E '^          target: runtime-test$' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: runtime-test build step is gated on the resolved runtime answer" {
+  # Same gate as the runtime stage build, so a repo whose Dockerfile
+  # declares no runtime split skips both cleanly. The gate used to read
+  # `inputs.build_runtime` directly, the disagreement the resolver removed;
+  # it now reads the resolver step, asserted twice below (runtime-test and
+  # runtime).
+  run code_grep -c "^        if: \${{ steps.runtime.outputs.build_runtime == 'true' }}\$" "${WF}"
+  assert_success
+  [[ "${output}" -ge 2 ]] || { echo "expected >=2 runtime gates, got ${output}"; return 1; }
+}
+
+@test "build-worker.yaml: resolves the runtime gate from the caller's Dockerfile (#925)" {
+  # The Dockerfile is the single source of truth for whether a runtime
+  # stage exists. The worker asks the resolver, version-matched via the
+  # .worker-base checkout, instead of trusting a second declaration in the
+  # caller's main.yaml that nothing kept in agreement.
+  run code_grep -c 'bash .worker-base/script/ci/build_worker/runtime_stages.sh' "${WF}"
+  assert_success
+  assert_output "1"
+}
+
+@test "build-worker.yaml: the resolver step exports build_runtime to GITHUB_OUTPUT (#925)" {
+  run code_grep -E 'echo "build_runtime=\$\{effective\}" >> "\$\{GITHUB_OUTPUT\}"' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: runtime + runtime-test build steps gate on the resolved value, not the raw input (#925)" {
+  # Two gates, both reading the resolver's output. A raw
+  # `if: ${{ inputs.build_runtime }}` is what shipped a runtime-test build
+  # against a Dockerfile that declares no such stage.
+  run code_grep -c "^        if: \${{ steps.runtime.outputs.build_runtime == 'true' }}\$" "${WF}"
+  assert_success
+  assert_output "2"
+}
+
+@test "build-worker.yaml: no build step gates on inputs.build_runtime directly (#925)" {
+  run grep -n '^        if: ${{ inputs.build_runtime }}$' "${WF}"
+  [ "${status}" -ne 0 ] || { echo "raw input gate still present: ${output}"; return 1; }
+}
+
+@test "build-worker.yaml: build_contexts default preserves zero-diff for existing callers (#207)" {
+  # The combined safety net: with empty default + per-step plumbing,
+  # callers that don't pass build_contexts get an empty action input,
+  # which docker/build-push-action treats as "no extra contexts" — the
+  # exact behaviour.
+  local _bc
+  _bc="$(code_grep -A 3 '^      build_contexts:' "${WF}" | grep 'default:' | head -1)"
+  [[ "${_bc}" == *'""'* ]]
+}
+
+# ──GHA buildx cache (per-(repo, variant, arch)) ────────────────
+
+@test "build-worker.yaml: declares cache_variant input with empty default (#272)" {
+  # New optional input for repos that call build-worker.yaml multiple
+  # times with the same image_name but different build_args (the
+  # env/ros{,2}_distro pattern). Default empty so existing single-call
+  # callers see no scope-key shape change.
+  run code_grep -A 3 '^      cache_variant:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: string'
+  assert_output --partial 'default: ""'
+}
+
+@test "build-worker.yaml: Compute cache scope step emits id: cache with base key in GITHUB_OUTPUT (#272 + #378 + #802)" {
+  # The step computes the per-(repo, variant, arch) base
+  # `${image_name}[-${cache_variant}]-${hardware}` once; per-target
+  # suffix (`-devel-test-cache`, `-devel-cache`, `-runtime-test-cache`,
+  # `-runtime-cache`) is appended at the use site. See the b1 mitigation
+  # of for why the shape changed from a single shared `<base>-cache`
+  # scope to 4 per-target scopes. The derivation is now delegated to
+  # cache_scope.sh; the step keeps `id: cache` + a `key=` GITHUB_OUTPUT.
+  run code_grep -E '^        id: cache$' "${WF}"
+  assert_success
+  run code_grep -E '^          echo "key=\$\{key\}" >> "\$\{GITHUB_OUTPUT\}"$' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: 4 build steps use per-target gha cache scopes (#378 b1, #980)" {
+  # all 4 build steps shared `${steps.cache.outputs.key}` so a
+  # late-stage COPY in devel cascaded the manifest pointer in the
+  # shared scope, invalidating runtime / runtime-test caches on the
+  # next PR. each target has its own scope; one scope's manifest update
+  # no longer affects the others.
+  #
+  # Spelled as one literal per line rather than as the `cache_backend`
+  # ternary that used to select it: the registry arm of that ternary was
+  # unreachable from the day it shipped and was removed with the input,
+  # and what a gha caller executes is unchanged either way.
+  for _target in devel-test devel runtime-test runtime; do
+    # base#1702: each line is gated on disable_cache, so the scope sits inside
+    # a format() call; the literal scope spelling is unchanged.
+    run code_grep -F "cache-from: \${{ !inputs.disable_cache && format('type=gha,scope={0}-${_target}-cache', steps.cache.outputs.key)" "${WF}"
+    assert_success
+    run code_grep -F "cache-to: \${{ !inputs.disable_cache && format('type=gha,scope={0}-${_target}-cache,mode=max" "${WF}"
+    assert_success
+  done
+}
+
+@test "build-worker.yaml: extra_stages caches the same way the standard steps do (#980)" {
+  # The extra-stages loop drives buildx directly, so its cache ref is
+  # built in shell rather than by the action. It must land on the same
+  # per-scope gha spelling; a second backend here was the shape that let
+  # `registry` look supported while being unreachable.
+  run code_grep -F 'type=gha,scope=%s' "${WF}"
+  assert_success
+  run code_grep -F 'type=registry' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+  # Both buildx invocations (test-stage + stage) go through build_stage,
+  # whose first attempt takes its flags from set_cache_flags (base#1702),
+  # so the selection helpers are called once.
+  run code_grep -cF -e '--cache-from "$(cache_from_for ' "${WF}"
+  assert_success
+  assert_output "1"
+  run code_grep -cF -e '--cache-to "$(cache_to_for ' "${WF}"
+  assert_success
+  assert_output "1"
+}
+
+# why: With the cache off there is no cache-to, so no export for the warn
+# script to read; calling it anyway reports a missing export on every
+# extra-stage build of a caller that turned the cache off on purpose.
+@test "build-worker.yaml: DISABLE_CACHE=true skips the extra-stage cache-export warn calls (#1702)" {
+  DISABLE_CACHE=true run _extra_stages 'FROM debian:bookworm AS foo
+FROM debian:bookworm AS foo-test' foo
+  assert_success
+  assert_output --partial '--target foo-test'
+  refute_output --partial 'cache export'
+}
+
+# why: The extra stages are built by a shell step, not the action, so the
+# 4-step YAML guards cannot see them. This runs the real step (which reads
+# `inputs.disable_cache` through an env var, as it does every input) against
+# the stubbed docker: without it, disable_cache would turn the cache off for
+# the main targets and silently leave it on for every extra stage.
+@test "build-worker.yaml: DISABLE_CACHE=true passes no cache flag to the extra-stage builds (#1702)" {
+  DISABLE_CACHE=true run _extra_stages 'FROM debian:bookworm AS foo
+FROM debian:bookworm AS foo-test' foo
+  assert_success
+  assert_output --partial '--target foo-test'
+  assert_output --partial '--target foo '
+  refute_output --partial '--cache-from'
+  refute_output --partial '--cache-to'
+}
+
+# why: The opposite direction: a gate that dropped the flags whatever the
+# input says would pass the DISABLE_CACHE=true case and quietly take the
+# cache away from every existing caller.
+@test "build-worker.yaml: DISABLE_CACHE=false keeps the cache flags on the extra-stage builds (#1702)" {
+  DISABLE_CACHE=false run _extra_stages 'FROM debian:bookworm AS foo' foo
+  assert_success
+  assert_output --partial '--cache-from type=gha,scope=key-foo-cache'
+  assert_output --partial '--cache-to type=gha,scope=key-foo-cache,mode=max,ignore-error=true'
+}
+
+# why: With no cache-to there is no export vertex, so each of the 4 warn
+# steps would report a missing export on every build of a caller that
+# turned the cache off on purpose -- a warning that is always wrong.
+@test "build-worker.yaml: disable_cache skips the 4 cache-export warn steps (#1702)" {
+  local _id
+  for _id in build_devel_test build_devel build_runtime_test build_runtime; do
+    run code_grep -cF "if: \${{ steps.${_id}.outcome == 'success' && !inputs.disable_cache }}" "${WF}"
+    assert_output "1"
+  done
+}
+
+# why: Pins the one expression spelling that works. `!disable && format(...)
+# || ''` gives the scope string when enabled and '' when disabled (the
+# action then passes no cache flag). The natural-looking
+# `disable && '' || format(...)` does not: '' is falsy, so it falls through
+# to the cache it was meant to turn off.
+@test "build-worker.yaml: disable_cache empties cache-from and cache-to on the 4 build steps (#1702)" {
+  local _target
+  for _target in devel-test devel runtime-test runtime; do
+    run code_grep -cF "cache-from: \${{ !inputs.disable_cache && format('type=gha,scope={0}-${_target}-cache', steps.cache.outputs.key) || '' }}" "${WF}"
+    assert_output "1"
+    run code_grep -cF "cache-to: \${{ !inputs.disable_cache && format('type=gha,scope={0}-${_target}-cache,mode=max,ignore-error=true', steps.cache.outputs.key) || '' }}" "${WF}"
+    assert_output "1"
+  done
+}
+
+# ── disable_cache input (base#1702) ──────────────────────────────────
+
+# why: Default false is what keeps every existing caller on the cache it
+# uses today; a true default would turn the cache off for all of them
+# without any of them opting in.
+@test "build-worker.yaml: declares disable_cache input as boolean default false (#1702)" {
+  run code_grep -A 3 '^      disable_cache:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: boolean'
+  assert_output --partial 'default: false'
+}
+
+# _extra_stages <dockerfile-body> <extra_stages>
+#   Runs the workflow's OWN "Build extra stages" step -- lifted out of the
+#   YAML, not a copy of it -- against a Dockerfile written from
+#   <dockerfile-body>, with `docker` replaced by a stub that prints its
+#   argv. What the step decided to build is therefore READ OFF the run
+#   (`--target <stage>` in the output) rather than re-derived by the spec.
+#
+#   `.worker-base` is symlinked to this checkout because that is the path
+#   the build job checks base's own worker source out to; a resolver the
+#   step calls from there runs here as the same file.
+_extra_stages() {
+  local _dir="${BATS_TEST_TMPDIR}/extra"
+  rm -rf "${_dir}"
+  mkdir -p "${_dir}/bin"
+  ln -s /source "${_dir}/.worker-base"
+  printf '%s\n' "${1}" > "${_dir}/Dockerfile"
+  mkdir -p "${_dir}/runner-temp"
+  # The stub also answers `--metadata-file F` the way buildx does, by
+  # writing a metadata JSON that names a build record of that build's own
+  # (`rec-<target>`), and answers `buildx history logs --progress plain
+  # <id>` on stderr, as buildx does, with a record whose cache export
+  # vertex ends in ERROR naming <id>. So a warning carries that error
+  # text only when the step handed the warn script its own build's
+  # metadata (base#1602).
+  cat > "${_dir}/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+printf 'docker %s\n' "$*"
+if [ "${1:-}" = buildx ] && [ "${2:-}" = history ] && [ "${3:-}" = logs ]; then
+  printf '#9 exporting to GitHub Actions Cache\n#9 ERROR: export failed for record %s\n' "${!#}" >&2
+  exit 0
+fi
+target='' meta=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --target) [ "$#" -gt 1 ] && target="$2" ;;
+    --metadata-file) [ "$#" -gt 1 ] && meta="$2" ;;
+  esac
+  shift
+done
+if [ -n "${meta}" ]; then
+  printf '{"buildx.build.ref":"builder/node/rec-%s"}\n' "${target}" > "${meta}"
+fi
+STUB
+  chmod +x "${_dir}/bin/docker"
+  yaml_step_run "${WF}" build 'Build extra stages' > "${_dir}/step.sh"
+  [ -s "${_dir}/step.sh" ] || return 2
+  (
+    cd "${_dir}" || return 2
+    env "PATH=${_dir}/bin:${PATH}" \
+        EXTRA_STAGES="${2}" CACHE_KEY=key RUNNER_TEMP="${_dir}/runner-temp" \
+        CONTEXT_PATH=. DOCKERFILE=Dockerfile \
+        BUILD_CONTEXTS_INPUT= BUILD_ARGS_INPUT= \
+        PLATFORM=linux/amd64 HARDWARE=x86_64 TEST_TOOLS_IMAGE=tools:1 \
+        bash step.sh
+  )
+}
+
+# why: The reported #1013 miss, asserted on what the step BUILDS rather
+# than on what its text says: the detector allowed one token between FROM
+# and AS, so the cross-build form the arm64 matrix invites declared nothing
+# and the stage's smoke test was silently not built.
+@test "build-worker.yaml: an extra stage's -test companion is found on a --platform FROM line (#1013)" {
+  # The detector matched ONE token between FROM and AS, so the standard
+  # cross-build form -- the one the arm64 matrix invites -- declared a
+  # stage the step could not see, and the stage's smoke test was silently
+  # not built. The sibling resolver (runtime_stages.sh) reads the same
+  # shape correctly; the comment above this step claimed the two agree.
+  run _extra_stages 'FROM debian:bookworm AS foo
+FROM --platform=$BUILDPLATFORM debian:bookworm AS foo-test' foo
+  assert_success
+  assert_output --partial '--target foo-test'
+  assert_output --partial '--target foo'
+}
+
+# why: The cost of widening a detector, pinned in the opposite direction:
+# inventing a `-test` target the Dockerfile does not declare fails the
+# build outright, which is a worse outcome than the miss it was fixing.
+@test "build-worker.yaml: an extra stage with no -test companion builds only itself (#1013)" {
+  # The other direction: widening the detector must not invent a test
+  # stage that the Dockerfile does not declare -- buildx would fail the
+  # build on a target that is not there.
+  run _extra_stages 'FROM debian:bookworm AS foo' foo
+  assert_success
+  assert_output --partial '--target foo'
+  refute_output --partial '--target foo-test'
+}
+
+# why: The structural half, and the one that stops #1013 recurring: two
+# readers of one fact with a comment asserting they agree is what produced
+# the miss. This fails if the file grows a `FROM ... AS` pattern of its own
+# again, which a behavioural case on a correct pattern cannot see.
+@test "build-worker.yaml: the extra-stages roster comes from the shared resolver (#1013)" {
+  # Two readers of one fact, with a comment asserting they agree, is how
+  # this file got a stage detector that missed the cross-build FROM form
+  # while its sibling resolver read it correctly. The roster is now read
+  # through script/ci/build_worker/stage_names.sh -- the same script
+  # runtime_stages.sh reads it through, which in turn calls the tree's one
+  # FROM-line matcher -- and this file carries no such pattern of its own.
+  run code_grep -F 'build_worker/stage_names.sh' "${WF}"
+  assert_success
+  run code_grep -E 'FROM\[\[:space:\]\]' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+# why: Docker allows `.` in a target name, so a membership test that reads
+# the caller's stage name as a regex finds a DIFFERENT stage: `foo.bar`
+# matches `fooxbar-test` and the step asks buildx for a target nothing
+# declares, failing the build over a companion that was never there.
+@test "build-worker.yaml: an extra stage's name is matched literally, not as a regex (#1013)" {
+  # The membership test read the stage name as a BASIC REGULAR EXPRESSION,
+  # so a metacharacter in it matched a DIFFERENT stage. Docker allows `.`
+  # in a target name, so `foo.bar` found `fooxbar-test` in the roster and
+  # the step asked buildx for `foo.bar-test` -- a target the Dockerfile
+  # does not declare, which fails the build for a companion that was never
+  # there. The sibling resolver already compares literally (`grep -Fx`).
+  run _extra_stages 'FROM debian:bookworm AS foo.bar
+FROM debian:bookworm AS fooxbar-test' foo.bar
+  assert_success
+  assert_output --partial '--target foo.bar'
+  refute_output --partial '--target foo.bar-test'
+}
+
+# why: The early-close-reader lint cannot reach here -- it scans *.sh under
+# dist/ and script/, and a workflow `run:` block is not a shell file -- so
+# this is the only thing standing between the step and a `grep -q` whose
+# SIGPIPE 141 becomes the pipeline's status under `pipefail`, turning a
+# stage that WAS found into one that reads as absent.
+@test "build-worker.yaml: the extra-stages step does not pipe its roster into an early-closing reader (#1013)" {
+  # The same shape the early-close-reader lint exists for, one file over
+  # from where the branch removed it: a quiet reader leaves at the first
+  # match, the writer upstream takes SIGPIPE, and under this step's
+  # `pipefail` its 141 becomes the pipeline's status -- so a stage that WAS
+  # found reads as absent and its smoke test is silently not built. That
+  # lint cannot see this: it scans *.sh under dist/ and script/, and a
+  # workflow `run:` block is not a shell file. The roster is a variable
+  # already in hand here, so no pipe is needed to read it.
+  local _step _line _code _bad=""
+  _step="$(yaml_step_run "${WF}" build 'Build extra stages')"
+  [ -n "${_step}" ] || {
+    echo "no run: block for the 'Build extra stages' step"
+    return 1
+  }
+  # Whole-line comments are dropped before the match, as the early-close
+  # lint drops them: the prose explaining the rule must not violate it.
+  _code="$(printf '%s\n' "${_step}" | grep -v '^[[:space:]]*#')" || :
+  while IFS= read -r _line; do
+    if [[ "${_line}" =~ \|[[:space:]]*(head|grep[[:space:]]+[^|]*-[A-Za-z]*q) ]]; then
+      _bad+="${_line}"$'\n'
+    fi
+  done <<< "${_code}"
+  [ -z "${_bad}" ] || {
+    echo "the extra-stages step pipes into a reader that stops reading:"
+    echo "${_bad}"
+    return 1
+  }
+}
+
+@test "build-worker.yaml: 4 distinct cache scopes exist, no shared scope leftover (#378 b1)" {
+  # Negative regression: ensure no legacy `cache-from:`/`cache-to:` line
+  # still references the bare base key (which would mean a build step
+  # was missed in the per-target migration).
+  run code_grep -cE '^          cache-(from|to): type=gha,scope=\$\{\{ steps\.cache\.outputs\.key \}\}(,|$)' "${WF}"
+  [ "${status}" -ne 0 ] || [ "${output}" = "0" ]
+}
+
+@test "build-worker.yaml: 4 build steps all set mode=max on cache-to (#272 preserved)" {
+  # mode=max exports all intermediate stage layers (including the heavy
+  # builder / source-build stages). One cache-to line per target.
+  run code_grep -cE "^          cache-to: .*type=gha,scope=.*,mode=max,ignore-error=true('|,).*\$" "${WF}"
+  assert_success
+  assert_output "4"
+}
+
+# why: A GitHub Actions Cache export is its own buildx vertex after the
+# image built, and without `ignore-error=true` its failure becomes the solve
+# error: isaac run 42753553284 went red on `#26 ERROR: error writing layer
+# blob` after the image built (base#1602). The class is every `type=gha`
+# cache-to a build step requests in either workflow, not the four lines the
+# issue names. The count is exact: 4 in build-worker.yaml plus the two
+# test-tools builders in self-test.yaml (test-tools-image-amd64 and
+# -arm64), the only self-test.yaml jobs that write the cache since
+# base#1588 (the consumers read it and carry no cache-to). A spec that
+# matches nothing, or a new producer nobody reviewed, cannot pass.
+@test "build-worker.yaml + self-test.yaml: every type=gha cache-to carries ignore-error=true (base#1602)" {
+  local _st="/source/.github/workflows/self-test.yaml" _all _bad
+  _all="$(yq -N '.. | select(tag == "!!map" and has("cache-to")) | .["cache-to"]' "${WF}" "${_st}" | grep -F 'type=gha')"
+  run grep -c . <<<"${_all}"
+  assert_success
+  [ "${output}" -eq 6 ] || {
+    echo "${output} type=gha cache-to found, want exactly 6" >&2
+    return 1
+  }
+  _bad="$(grep -vE "(^|,)ignore-error=true(,|'|\$)" <<<"${_all}" || true)"
+  [ -z "${_bad}" ] || {
+    echo "type=gha cache-to without ignore-error=true:" >&2
+    printf '%s\n' "${_bad}" >&2
+    return 1
+  }
+}
+
+# why: The extra-stages loop builds its cache-to in shell (cache_to_for),
+# so the yq enumeration above cannot see it. Read off what the step's own
+# buildx calls receive: with a stage and its -test companion the step runs
+# two builds, and each `--cache-to` it passes must end in
+# `,ignore-error=true`, or a failed export there still fails the job (base#1602).
+@test "build-worker.yaml: every --cache-to the extra-stages step passes ends in ignore-error=true (base#1602)" {
+  local _tos _bad
+  run _extra_stages 'FROM debian:bookworm AS foo
+FROM debian:bookworm AS foo-test' foo
+  assert_success
+  _tos="$(grep -oE -e '--cache-to [^ ]+' <<<"${output}" || true)"
+  run grep -c . <<<"${_tos}"
+  assert_output "2"
+  _bad="$(grep -vE ',ignore-error=true$' <<<"${_tos}" || true)"
+  [ -z "${_bad}" ] || {
+    echo "extra-stages --cache-to without a trailing ignore-error=true:" >&2
+    printf '%s\n' "${_bad}" >&2
+    return 1
+  }
+}
+
+# why: The extra-stages loop drives buildx itself, so its warn calls are
+# not steps the outcome gate can reach: each build that RUNS is followed by
+# one cache_export_warn.sh call labelled with its stage, and a -test
+# companion the Dockerfile does not declare is neither built nor warned
+# about (base#1602). The warn script runs for real against the stubbed
+# docker; its `::warning` lines are what a job log would show.
+@test "build-worker.yaml: an extra stage with no -test companion gets one cache-export warn call, labelled with the stage (base#1602)" {
+  local _warns
+  run _extra_stages 'FROM debian:bookworm AS foo' foo
+  assert_success
+  assert_output --partial '--target foo'
+  refute_output --partial '--target foo-test'
+  _warns="$(grep -E '^::warning title=cache export::' <<<"${output}" || true)"
+  run grep -c . <<<"${_warns}"
+  assert_output "1"
+  run grep -cE '^::warning title=cache export::foo: ' <<<"${_warns}"
+  assert_output "1"
+  # The warning is the stage's own record's export error, not the
+  # no-record fallback a missing --metadata-file falls back to.
+  assert_equal "${_warns}" \
+      '::warning title=cache export::foo: export failed for record rec-foo'
+}
+
+# why: The -test companion is a build of its own with its own cache
+# export, so when the Dockerfile declares it and it RUNS, it is followed by
+# its own warn call labelled with its own stage, not folded into the
+# stage's (base#1602). Two builds ran, so the log carries two warn lines.
+@test "build-worker.yaml: an extra stage and its -test companion each get one cache-export warn call, labelled with their own stage (base#1602)" {
+  local _warns
+  run _extra_stages 'FROM debian:bookworm AS foo
+FROM debian:bookworm AS foo-test' foo
+  assert_success
+  assert_output --partial '--target foo-test'
+  _warns="$(grep -E '^::warning title=cache export::' <<<"${output}" || true)"
+  run grep -c . <<<"${_warns}"
+  assert_output "2"
+  run grep -cE '^::warning title=cache export::foo-test: ' <<<"${_warns}"
+  assert_output "1"
+  run grep -cE '^::warning title=cache export::foo: ' <<<"${_warns}"
+  assert_output "1"
+  # Each warning is its own build's record's export error: the -test
+  # build reads rec-foo-test and the stage build reads rec-foo.
+  assert_equal "${_warns}" \
+      "$(printf '%s\n' \
+          '::warning title=cache export::foo-test: export failed for record rec-foo-test' \
+          '::warning title=cache export::foo: export failed for record rec-foo')"
+}
+
+# why: ignore-error=true turns a failed cache export green, so each build
+# that requests one must be followed by a step that reads that build's own
+# record and warns (base#1602). The warn step is gated on the build's
+# outcome: GitHub's steps context gives a skipped step outcome `skipped` and
+# a failed one `failure`, so `steps.<id>.outcome == 'success'` runs the warn
+# only after a build that ran and passed, never after a build skipped by its
+# own `if:` and never on top of a red build. The 6-line roster is the
+# enumeration of every step with `with.cache-to` in both files (the four
+# build-worker steps and the two test-tools builders, base#1588), so a new
+# producer without a warn step, or a gate naming another step, fails here.
+@test "build-worker.yaml + self-test.yaml: every cache-to build step is followed by a warn step gated on its own outcome (base#1602)" {
+  local _st="/source/.github/workflows/self-test.yaml" _rows _roster _expected
+  local _job _name _id _run _meta _if _bad=""
+  _rows="$(yq -N '
+    filename as $f
+    | .jobs | to_entries | .[] | .key as $j
+    | (.value.steps // []) as $s
+    | $s | to_entries | .[]
+    | select(.value.with["cache-to"] != null)
+    | .key as $i
+    | ($s | .[$i + 1]) as $n
+    | [($f | split("/") | .[-1]) + " " + $j, .value.name, (.value.id // "-"),
+       ((($n.run // "") | contains("cache_export_warn.sh")) | tostring),
+       ($n.env.BUILD_METADATA // "-"), ($n.if // "-")]
+    | @tsv' "${WF}" "${_st}" | grep .)"
+  _roster="$(cut -f1,2 <<<"${_rows}")"
+  _expected="$(printf '%s\t%s\n' \
+    'build-worker.yaml build' 'Build devel-test stage (includes lint + bats smoke)' \
+    'build-worker.yaml build' 'Build devel stage' \
+    'build-worker.yaml build' 'Build runtime-test stage (install check)' \
+    'build-worker.yaml build' 'Build runtime stage' \
+    'self-test.yaml test-tools-image-amd64' 'Build the test-tools image (writes the GHA cache)' \
+    'self-test.yaml test-tools-image-arm64' 'Build the test-tools image (writes the GHA cache)')"
+  assert_equal "${_roster}" "${_expected}"
+  while IFS=$'\t' read -r _job _name _id _run _meta _if; do
+    _if="${_if#\$\{\{ }"
+    _if="${_if% \}\}}"
+    if [[ "${_id}" == "-" ]]; then
+      _bad+="${_job} '${_name}': no id"$'\n'
+    elif [[ "${_run}" != "true" ]]; then
+      _bad+="${_job} '${_name}': next step does not run cache_export_warn.sh"$'\n'
+    elif [[ "${_meta}" != *"steps.${_id}.outputs.metadata"* ]]; then
+      _bad+="${_job} '${_name}': warn step BUILD_METADATA is '${_meta}'"$'\n'
+    elif [[ "${_if}" != "steps.${_id}.outcome == 'success'" \
+        && "${_if}" != "steps.${_id}.outcome == 'success' && !inputs.disable_cache" ]]; then
+      _bad+="${_job} '${_name}': warn step if: is '${_if}'"$'\n'
+    fi
+  done <<<"${_rows}"
+  [ -z "${_bad}" ] || {
+    printf '%s' "${_bad}" >&2
+    return 1
+  }
+}
+
+# why: The deletion asserted as a property rather than as the absence of
+# one string. `cache_backend: registry` could never work -- its cache
+# export needed `packages: write` on a job that declares a read-only block,
+# and a called job gets exactly the block it declares (#957) -- so every
+# line reachable only through it was unreachable from the day it shipped.
+# What must not come back is any SECOND cache backend selected by an input,
+# because `permissions:` accepts no expression and the next one is
+# unreachable for the same reason.
+@test "build-worker.yaml: the buildx cache has exactly one backend, chosen by no input (#980)" {
+  run code_grep -F 'cache_backend' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+  run code_grep -F 'docker/login-action' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+  # Every cache line the worker carries names the one backend outright.
+  local _lines _gha
+  _lines="$(code_grep -cE '^          cache-(from|to): ' "${WF}")"
+  _gha="$(code_grep -cE "^          cache-(from|to): .*type=gha,scope=" "${WF}")"
+  [[ "${_lines}" -eq 8 ]] || fail \
+      "expected the 4 build steps' 8 cache lines, found ${_lines} -- the equality below would be comparing two numbers that are both wrong"
+  [[ "${_gha}" -eq "${_lines}" ]] || fail \
+      "${_gha} of ${_lines} cache lines name type=gha outright; the rest select a backend some caller cannot reach"
+}
+
+@test "build-worker.yaml: cache_variant default preserves zero-diff for single-call callers (#272)" {
+  # Single-distro repos (agent/* + ros1_bridge-${distro} pattern) leave
+  # cache_variant unset; the scope key reduces to
+  # ${image_name}-${hardware}-<target>-cache (b1), which is still
+  # per-(repo, arch) and now also per-target.
+  local _cv
+  _cv="$(code_grep -A 3 '^      cache_variant:' "${WF}" | grep 'default:' | head -1)"
+  [[ "${_cv}" == *'""'* ]]
+}
+
+# ── Phase 1: doc-only PR fast-pass ────────────────────────────────
+
+@test "build-worker.yaml: declares path-filter job (#273)" {
+  # New job runs the doc-only classifier; outputs code_changed
+  # consumed by compute-matrix / build / docker-build downstream.
+  run code_grep -E '^  path-filter:$' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: path-filter classifier is pure shell (#273 Phase 2: no dorny/paths-filter)" {
+  # Phase 2 — dorny/paths-filter@v3 dependency dropped; classification
+  # is now `git diff --name-only base...head` + `case` glob in inline
+  # shell. Asserts the `uses:` import is gone (comments mentioning
+  # `dorny` for historical context are still fine) AND the shell
+  # driver is present.
+  run code_grep -E '^\s+uses:\s+dorny/paths-filter' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+  run code_grep -F 'git diff --name-only "${BASE_SHA}...${HEAD_SHA}"' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: classifier reads EVENT_NAME / BASE_SHA / HEAD_SHA from env (#273 Phase 2)" {
+  # Template tokens pre-expand into env vars so the shell case body
+  # stays portable to non-GitHub CI hosts — only the YAML env: keys
+  # bind to GitHub context.
+  run code_grep -F 'EVENT_NAME: ${{ github.event_name }}' "${WF}"
+  assert_success
+  run code_grep -F 'BASE_SHA: ${{ github.event.pull_request.base.sha }}' "${WF}"
+  assert_success
+  run code_grep -F 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: non-pull_request event short-circuits to code_changed=true before git diff (#273 Phase 2)" {
+  # Push / tag / workflow_dispatch never run the classifier loop —
+  # the early `[ ... != pull_request ] && exit 0` arm is essential
+  # because BASE_SHA / HEAD_SHA are empty on non-PR events.
+  run code_grep -E '\[ "\$\{EVENT_NAME\}" != "pull_request" \]' "${WF}"
+  assert_success
+}
+
+# _classify <git-stub-body>
+#   Runs the workflow's OWN `classify` step -- the script lifted out of the
+#   YAML, not a copy of it -- with `git` replaced by a stub whose body is
+#   <git-stub-body>. The step's GITHUB_OUTPUT lands in
+#   ${BATS_TEST_TMPDIR}/classify/out for the caller to read; the caller wraps
+#   the call in `run` and asserts on the STATUS, which is the whole point:
+#   the failure this covers is a step that exits 0 having learnt nothing.
+_classify() {
+  local _dir="${BATS_TEST_TMPDIR}/classify"
+  rm -rf "${_dir}"
+  mkdir -p "${_dir}/bin"
+  printf '%s\n' '#!/usr/bin/env bash' "${1}" > "${_dir}/bin/git"
+  chmod +x "${_dir}/bin/git"
+  yaml_step_run "${WF}" path-filter classify > "${_dir}/step.sh"
+  [ -s "${_dir}/step.sh" ] || return 2
+  : > "${_dir}/out"
+  env "PATH=${_dir}/bin:${PATH}" \
+      EVENT_NAME=pull_request BASE_SHA=1111111 HEAD_SHA=2222222 \
+      GITHUB_OUTPUT="${_dir}/out" \
+      bash "${_dir}/step.sh"
+}
+
+# why: The load-bearing case of the three. A failed diff used to deliver
+# zero lines through a process substitution the loop's status hides, so the
+# step said doc-only and the REQUIRED docker-build check went green having
+# built nothing. It asserts the step's OWN status, not merely non-zero, so
+# a harness that could not lift a script cannot stand in for the step
+# failing.
+@test "build-worker.yaml: a git diff that FAILS fails the classifier, it does not read as doc-only (#1013)" {
+  # The producer used to be a process substitution, `done < <(git diff ...)`,
+  # and a `while` loop's exit status is the LOOP's -- never the producer's.
+  # `set -eu` does not see it and `pipefail` would not either, a process
+  # substitution being no pipeline. So a diff that failed (base
+  # force-pushed, a partial fetch, a shallow clone without the base commit)
+  # delivered zero lines, classified as doc-only, and turned the REQUIRED
+  # docker-build check green having built nothing -- and the reason it built
+  # nothing was a failure nobody was told about.
+  run _classify 'exit 128'
+  # The step's OWN status, not merely non-zero: `_classify` returns 2 when
+  # it could not lift a script out of the YAML at all, and a bare
+  # `assert_failure` reads that harness-level miss as the step failing --
+  # which is how this case would stay green against a workflow whose
+  # classify step ran no shell at all.
+  assert_failure 1
+  assert_output --partial '::error::classify:'
+  run cat "${BATS_TEST_TMPDIR}/classify/out"
+  assert_success
+  refute_output --partial 'code_changed=false'
+}
+
+# why: The guard against buying safety by classifying everything as code.
+# Without this the failed-diff case is satisfied by a step that never says
+# doc-only at all, and every doc PR pays for a full image build.
+@test "build-worker.yaml: a diff of only allowlisted paths classifies doc-only (#1013)" {
+  # The fast-pass still has to happen -- the guard above must not buy its
+  # safety by classifying everything as code.
+  run _classify 'printf "%s\n" doc/adr/00000001-x.md README.md LICENSE'
+  assert_success
+  run cat "${BATS_TEST_TMPDIR}/classify/out"
+  assert_output --partial 'code_changed=false'
+}
+
+# why: The mixed diff, which is the shape most PRs have. One code path
+# among documentation must carry the whole change into a build; an
+# allowlist evaluated per file rather than per change-set would skip it.
+@test "build-worker.yaml: a diff carrying one non-allowlisted path classifies as code (#1013)" {
+  run _classify 'printf "%s\n" README.md script/setup.sh'
+  assert_success
+  run cat "${BATS_TEST_TMPDIR}/classify/out"
+  assert_output --partial 'code_changed=true'
+}
+
+@test "build-worker.yaml: doc-only allowlist case-glob covers all 6 documented paths (#273)" {
+  # **/*.md, doc/**, LICENSE, .gitignore, .github/CODEOWNERS,
+  # .github/dependabot.yml — match the issue body / design comment.
+  # Phase 2 expresses them as a single `case` arm with `|`-joined
+  # patterns; one grep checks the whole arm at once.
+  run code_grep -F '*.md|doc/*|LICENSE|.gitignore|.github/CODEOWNERS|.github/dependabot.yml' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: compute-matrix and build are gated on code_changed (#273)" {
+  # Both heavy jobs need needs.path-filter.outputs.code_changed == 'true'.
+  # Asserted per job rather than by counting the `if:` line: `build`'s gate
+  # is now a block scalar that ANDs the same-repo guard beside it, so a
+  # whole-file count of the single-line form reads 1 and says nothing about
+  # WHICH job lost its gate. Per-job is the claim that was meant.
+  run yaml_job_lines "${WF}" compute-matrix
+  assert_success
+  assert_output --partial "needs.path-filter.outputs.code_changed == 'true'"
+
+  run yaml_job_lines "${WF}" build
+  assert_success
+  assert_output --partial "needs.path-filter.outputs.code_changed == 'true'"
+}
+
+@test "build-worker.yaml: docker-build aggregator short-circuits to success on doc-only (#273)" {
+  # The aggregator must report success when code_changed == 'false'
+  # so branch protection's required check still resolves green even
+  # though the matrix was skipped. The classification reaches the step
+  # through `env:` rather than an inline `${{ }}`, which is what makes
+  # the branch drivable from a test rather than only greppable --
+  # workflow_failure_surface_spec runs this block against each shape.
+  run code_grep -F 'CODE_CHANGED: ${{ needs.path-filter.outputs.code_changed }}' "${WF}"
+  assert_success
+  run code_grep -F '[ "${CODE_CHANGED}" = "false" ]' "${WF}"
+  assert_success
+  # And it still needs both path-filter + build so the conditional
+  # has both data sources.
+  run code_grep -E '^    needs: \[path-filter, build\]$' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: non-pull_request event resolves code_changed=true (#273)" {
+  # Push to main / tag / workflow_dispatch must always run the full
+  # matrix — the doc-only fast-pass is PR-only.
+  run code_grep -F 'echo "code_changed=true"' "${WF}"
+  assert_success
+}
+
+# ──opt-in free_disk_space for large BASE_IMAGE repos ───────────
+
+@test "build-worker.yaml: declares free_disk_space input as boolean default false (#470)" {
+  # Opt-in step that pre-clears ~30 GB of pre-installed runner tooling
+  # (Android SDK, .NET, GHC, ...) so repos whose BASE_IMAGE doesn't fit
+  # in ubuntu-latest's ~14 GB (Isaac Sim ~15 GB extracted) stop hitting
+  # `no space left on device` during BuildKit COPY. Default false so
+  # the ~30 s cleanup overhead doesn't tax existing small-image callers.
+  run code_grep -A 3 '^      free_disk_space:' "${WF}"
+  assert_success
+  assert_output --partial 'required: false'
+  assert_output --partial 'type: boolean'
+  assert_output --partial 'default: false'
+}
+
+@test "build-worker.yaml: Free disk space step gated on inputs.free_disk_space (#470)" {
+  # The step is opt-in; without the gate every existing caller would
+  # pay the cleanup time even when they don't need it.
+  run code_grep -E "^[[:space:]]+if: \\\$\{\{ inputs\\.free_disk_space \\}\}$" "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: Free disk space step uses jlumbroso/free-disk-space (#470)" {
+  # The community action removes Android SDK / .NET / GHC / tool-cache
+  # without touching docker daemon state, which is what we need before
+  # buildx starts pulling the BASE_IMAGE.
+  run code_grep -E '^[[:space:]]+uses: jlumbroso/free-disk-space@' "${WF}"
+  assert_success
+}
+
+@test "build-worker.yaml: Free disk space step runs before Set up Docker Buildx (#470)" {
+  # Order matters — buildx allocates its overlayfs snapshot dir before
+  # the first COPY, so disk must be freed earlier in the job.
+  local _free _buildx
+  _free="$(grep -n '^      - name: Free disk space$' "${WF}" | cut -d: -f1)"
+  _buildx="$(grep -n '^      - name: Set up Docker Buildx$' "${WF}" | cut -d: -f1)"
+  [[ -n "${_free}" ]] || { echo "Free disk space step missing"; return 1; }
+  [[ -n "${_buildx}" ]] || { echo "Set up Docker Buildx step missing"; return 1; }
+  [[ "${_free}" -lt "${_buildx}" ]] || {
+    echo "expected Free disk space (line ${_free}) before Set up Docker Buildx (line ${_buildx})"
+    return 1
+  }
+}
+
+# ── worker logic pushed down to host-testable shell scripts ────────────
+
+@test "build-worker.yaml: compute-matrix delegates to the extracted compute_matrix.sh (#802)" {
+  # The platform -> matrix logic (the "a matrix condition that produces no
+  # jobs" semantic break) is pushed down into a pure-shell, host-testable
+  # script covered by build_worker_compute_matrix_spec.bats. The YAML step
+  # must call the script and keep only the GITHUB_OUTPUT plumbing -- the old
+  # inline `case linux/amd64)` fan-out logic must be gone from the YAML.
+  run code_grep -F 'bash .worker-base/script/ci/build_worker/compute_matrix.sh' "${WF}"
+  assert_success
+  run code_grep -F 'echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"' "${WF}"
+  assert_success
+  # No leftover inline platform fan-out (would mean the extraction was
+  # half-done and the untested inline copy could drift).
+  run code_grep -F '{"platform":"linux/amd64","runner":"ubuntu-latest","hardware":"x86_64"}' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+@test "build-worker.yaml: compute-matrix version-matches the script via job_workflow_sha (#802)" {
+  # The script is fetched from base at the SAME ref as this workflow, so the
+  # resolver can never drift from the worker it feeds -- the exact
+  # version-match pattern the caller-contract preflight uses. Assert the compute-matrix
+  # job checks out ycpss91255-lab/base at github.job_workflow_sha into
+  # the .worker-base path the delegating call reads from.
+  run yaml_job_lines "${WF}" compute-matrix
+  assert_success
+  assert_output --partial 'repository: ycpss91255-lab/base'
+  assert_output --partial 'ref: ${{ github.job_workflow_sha }}'
+  assert_output --partial 'path: .worker-base'
+}
+
+@test "build-worker.yaml: Compute cache scope delegates to the extracted cache_scope.sh (#802)" {
+  # The base-key derivation (with its per-target cache-scope bug history) is pushed
+  # down into a pure-shell, host-testable script covered by
+  # build_worker_cache_scope_spec.bats. The step must call the script,
+  # feed it IMAGE_NAME / CACHE_VARIANT / HARDWARE via env, and keep only
+  # the GITHUB_OUTPUT plumbing; the old inline `base="..."` derivation must
+  # be gone.
+  run code_grep -F 'bash .worker-base/script/ci/build_worker/cache_scope.sh' "${WF}"
+  assert_success
+  run code_grep -F 'echo "key=${key}" >> "${GITHUB_OUTPUT}"' "${WF}"
+  assert_success
+  run code_grep -F 'IMAGE_NAME: ${{ inputs.image_name }}' "${WF}"
+  assert_success
+  run code_grep -F 'CACHE_VARIANT: ${{ inputs.cache_variant }}' "${WF}"
+  assert_success
+  # No leftover inline scope derivation (would mean an untested copy could
+  # drift from the tested script).
+  run code_grep -F 'base="${{ inputs.image_name }}"' "${WF}"
+  [ "${status}" -ne 0 ] || [ -z "${output}" ]
+}
+
+@test "build-worker.yaml: build job checks out base worker source at job_workflow_sha into .worker-base (#802)" {
+  # The cache-scope script the build job runs is fetched at the worker's own
+  # ref, isolated in .worker-base so it never collides with the caller
+  # checkout at the workspace root.
+  run yaml_job_lines "${WF}" build
+  assert_success
+  assert_output --partial 'repository: ycpss91255-lab/base'
+  assert_output --partial 'ref: ${{ github.job_workflow_sha }}'
+  assert_output --partial 'path: .worker-base'
+}
+
+# ── Run-scoped names + cleanup, downstream half ────────────────
+
+@test "build-worker.yaml: the workspace path it writes is keyed to the run (#900)" {
+  # This is the downstream half of the same rule: every name CI creates
+  # must differ between two runs that share a host. The worker builds with
+  # `push: false` and no `tags:`, so it produces no NAMED docker artifact
+  # today -- but it does write a fixed host path into the .env it
+  # generates, and `runs-on: ${{ matrix.runner }}` is exactly the knob a
+  # self-hosted migration turns.
+  run code_grep -c 'WS_PATH=/tmp/workspace-ci-${{ github.run_id }}-${{ github.run_attempt }}' "${WF}"
+  assert_success
+  assert_output '1'
+  run code_grep -E 'WS_PATH=/tmp/workspace$' "${WF}"
+  assert_failure
+}
+
+@test "build-worker.yaml: the build job reclaims its own leftovers on if: always() (#900)" {
+  # Reached through the SAME .worker-base checkout the cache-scope script
+  # uses, so the collector is version-matched to the worker rather than
+  # copied into every caller repo.
+  run yaml_job_lines "${WF}" build
+  assert_success
+  assert_output --partial 'bash .worker-base/script/ci/reclaim.sh'
+  assert_output --partial 'if: always()'
+}
+
+@test "build-worker.yaml: downstream cleanup is ownership-scoped too (#900)" {
+  # A downstream self-hosted host is shared with every other repo in the
+  # org. A blanket prune there is worse, not better. Asserted over the
+  # code lines -- the rationale for a prohibition names the command it
+  # rules out.
+  run code_grep -E 'docker system prune|image prune -a|docker volume prune' "${WF}"
+  assert_failure
+}
+
+# ── Same-repository guard on the self-hosted-eligible build job ────────
+
+@test "build-worker.yaml: the build job carries the same-repo guard AND-ed with its code_changed gate (#766)" {
+  # `runs-on: ${{ matrix.runner }}` over a `fromJSON` matrix: the label
+  # set is computed at runtime, so nothing static can prove this job stays
+  # on a GitHub-hosted machine -- and the org registers an org-level
+  # self-hosted runner that public repos may use. The guard must not
+  # REPLACE the existing gate, or a doc-only PR would start paying for a
+  # full build; both conditions have to survive.
+  run yaml_job_lines "${WF}" build
+  assert_success
+  assert_output --partial "needs.path-filter.outputs.code_changed == 'true' &&"
+  assert_output --partial "(github.event_name != 'pull_request' &&"
+  assert_output --partial "github.event_name != 'merge_group' ||"
+  assert_output --partial 'github.event.pull_request.head.repo.full_name == github.repository ||'
+  # The group closes after the merge_group trust term (base#1587).
+  assert_output --partial "inputs.merge_group_same_repo == 'true')"
+}
+
+@test "build-worker.yaml: the guard tests the FORK, not the PR (#766)" {
+  # A condition that skipped on every pull_request would disable the
+  # worker for the same-repo PRs that are its entire PR-time workload.
+  # The first disjunct is what lets a same-repo PR -- and a tag push, a
+  # schedule, a workflow_dispatch -- through.
+  run yaml_job_lines "${WF}" build
+  assert_success
+  assert_output --partial "github.event_name != 'pull_request'"
+  # The negated form would invert the meaning: only fork PRs would run.
+  refute_output --partial "github.event.pull_request.head.repo.full_name != github.repository"
+}
+
+# why: The guard canon fails closed on merge_group, whose payload names no
+# head repository. The build job may open on a queue run only when the
+# caller passes a resolved answer that the whole group is same-repository,
+# and a caller that passes nothing must stay closed (base#1587).
+@test "build-worker.yaml: build opens on merge_group only on a merge_group_same_repo input that defaults to 'false' (base#1587)" {
+  # Expected values are the approved design's literals (design-r2
+  # section 2): a string input `merge_group_same_repo` with default
+  # 'false', and the build `if:` below, read through the YAML parser so
+  # the folded `>-` block is compared as GitHub sees it.
+  run _yaml_eval "${WF}" '.on.workflow_call.inputs.merge_group_same_repo.type'
+  assert_success
+  assert_output "string"
+  run _yaml_eval "${WF}" '.on.workflow_call.inputs.merge_group_same_repo.default | tag'
+  assert_success
+  assert_output '!!str'
+  run _yaml_eval "${WF}" '.on.workflow_call.inputs.merge_group_same_repo.default'
+  assert_success
+  assert_output "false"
+  run _yaml_eval "${WF}" '.jobs.build.if'
+  assert_success
+  assert_output "needs.path-filter.outputs.code_changed == 'true' && (github.event_name != 'pull_request' && github.event_name != 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'merge_group' && inputs.merge_group_same_repo == 'true')"
+}
+
+# why: On merge_group `build` is skipped unless the caller proved the group
+# same-repository, and docker-build must then refuse to certify, as it does
+# for a fork PR, or an unproven queue group would pass on a build that never
+# ran (base#1587).
+@test "build-worker.yaml: docker-build IS_FORK_PR applies the fork rule to a merge group not proven same-repository (base#1587)" {
+  # Expected literal is the approved design's (design-r2 section 2):
+  # today's pull_request expression, `||` the merge_group term that reads
+  # the merge_group_same_repo input and fails closed on anything but 'true'.
+  run _yaml_eval "${WF}" '.jobs["docker-build"].steps[] | select(.env.IS_FORK_PR != null) | .env.IS_FORK_PR'
+  assert_success
+  assert_output "\${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository || github.event_name == 'merge_group' && inputs.merge_group_same_repo != 'true' }}"
+}
+
+# ── Per-job least privilege ────────────────────────────────────
+
+# Print the name of every job in the worker that declares no permission
+# ENTRY of its own -- no `permissions:` block, or an inline one
+# (`permissions: read-all`, `permissions: {}`) that names no scope. Both
+# leave the job running on a grant base does not control.
+#
+# Read off the shared `yaml_permission_surface`, which asks a YAML parser.
+# This used to be a private awk that matched job keys as
+# `^  [A-Za-z0-9_-]+:[ \t]*$` and permission blocks as text: a job key
+# carrying a trailing comment (`sign-artifacts: # signs the images`) was
+# not a job to it, so the job -- and its grants -- was invisible to a
+# guard whose whole assertion is that nothing came back.
+_jobs_without_permissions() {
+  local _line
+  while IFS= read -r _line; do
+    case "${_line}" in
+      'BUG:'*)          printf '%s\n' "${_line}" ;;
+      *": <no entries>") printf '%s\n' "${_line%%:*}" ;;
+    esac
+  done < <(yaml_permission_surface "${WF}")
+}
+
+# The jobs this spec's least-privilege assertions run over: derived from the
+# workflow file by the shared `yaml_job_names`, never listed here.
+# `_assert_worker_job_population` is what every one of them calls FIRST,
+# because
+# an empty scan and a clean scan are the same output otherwise -- an
+# extractor that stopped matching, or a file that moved, would report "no
+# job grants too much" from zero jobs.
+#
+# The five names below are a FLOOR, not a roster: they are the jobs the
+# worker ships today, and the assertions themselves run over whatever
+# `yaml_job_names` returns, so a sixth job is scanned the day it lands
+# without this spec being edited.
+_assert_worker_job_population() {
+  local _derived _count _job _status=0
+  _derived="$(yaml_job_names "${WF}")" || _status=$?
+  [[ "${_status}" -eq 0 ]] || fail \
+      "the job derivation could not read ${WF}: ${_derived}"
+  _count="$(printf '%s\n' "${_derived}" | awk 'NF { n++ } END { print n + 0 }')"
+  [[ "${_count}" -ge 5 ]] || fail \
+      "expected at least the 5 jobs build-worker.yaml ships, derived ${_count} from ${WF} -- the scan below would have passed over an empty population"
+  # Every derived name must also appear as a two-space key in the file's own
+  # code lines. This is a CONFIRMATION that the parser read this file, not a
+  # second opinion about how many jobs it holds: a re-implementation of the
+  # same regex over the same input cannot disagree with the derivation about
+  # anything, which is what the previous "independent extraction" here
+  # actually was.
+  local _name _seen
+  while IFS= read -r _name; do
+    [[ -n "${_name}" ]] || continue
+    _seen=0
+    code_grep -E "^  \"?${_name}\"?:" "${WF}" >/dev/null || _seen=$?
+    [[ "${_seen}" -eq 0 ]] || fail \
+        "derived job '${_name}' has no '  ${_name}:' key in the code lines of ${WF} (grep exited ${_seen}) -- the derivation is not reading the file this spec is about"
+  done <<< "${_derived}"
+  for _job in preflight path-filter compute-matrix build docker-build; do
+    printf '%s\n' "${_derived}" | grep -x -- "${_job}" >/dev/null || fail \
+        "job '${_job}' is missing from the derived job list of ${WF}: either it was renamed (update this floor) or the extractor stopped seeing the file"
+  done
+}
+
+# Print every `<job>: <entry>` in the worker whose grant is not exactly
+# `contents: read` -- which includes the `<no entries>` placeholder
+# `yaml_permission_surface` emits for a job with no block at all. The job
+# list comes from the FILE, so this names the job added tomorrow.
+#
+# grep's status is pinned: 0 means it found elevations and prints them, 1
+# means every line was `<job>: contents: read`, and anything else is a
+# grep that could not read its input -- reported as a BUG line so it fails
+# the caller's `assert_output ''` instead of passing as "no match".
+_worker_jobs_granting_more_than_contents_read() {
+  local _out _status=0
+  _out="$(yaml_permission_surface "${WF}" \
+      | grep -vxE '[A-Za-z0-9_-]+: contents: read')" || _status=$?
+  case "${_status}" in
+    0) printf '%s\n' "${_out}" ;;
+    1) ;;
+    *) printf 'BUG: grep exited %s scanning the permission surface\n' \
+           "${_status}" ;;
+  esac
+}
+
+@test "build-worker.yaml: every job declares its own permissions block (#957)" {
+  # This is a REUSABLE workflow. A job with no `permissions:` inherits the
+  # CALLER's grant -- a downstream repo's token, not base's -- so a caller
+  # that legitimately grants `contents: write` or `packages: write`
+  # workflow-wide hands that write to jobs which only ever read. A job
+  # that declares a block gets exactly that block instead (capped by the
+  # caller, which it may narrow but never widen), which is the only place
+  # base can bound a permission it does not own.
+  _assert_worker_job_population
+  run _jobs_without_permissions
+  assert_success
+  assert_output ''
+}
+
+# Print `<job>: packages: write` for every job that names that scope in its
+# own permissions block. Read off the DERIVED permission surface, so a
+# mention of the scope anywhere but a job's own block -- an input
+# description telling a CALLER what to grant, a rationale comment quoting
+# what a job may not ask for -- is outside the jobs section, or stripped as
+# a comment, before matching. grep's status is pinned: 1 is "no job asks for
+# it", anything above that is a scan that failed and is reported rather than
+# read as a pass.
+_jobs_requesting_packages_write() {
+  local _out _status=0
+  _out="$(yaml_permission_surface "${WF}" \
+      | grep -E ': packages:[ \t]*write$')" || _status=$?
+  case "${_status}" in
+    0) printf '%s\n' "${_out}" ;;
+    1) ;;
+    *) printf 'BUG: grep exited %s scanning the permission surface\n' \
+           "${_status}" ;;
+  esac
+}
+
+@test "build-worker.yaml: no job requests packages: write (#957)" {
+  # A job in a CALLED workflow may only NARROW the calling job's grant,
+  # never widen it. Declaring any `permissions:` key sets every unnamed
+  # scope to `none`, so every current caller -- base's own worker-selftest,
+  # the seeded main.yaml, ros_distro / ros2_distro, and the ROS repos
+  # routed through multi-distro-build-worker.yaml -- reaches this workflow
+  # with `packages: none`. A job here naming `packages: write` is an
+  # ELEVATION, and GitHub rejects the whole run before it starts:
+  #   The nested job 'build' is requesting 'contents: read, packages:
+  #   write', but is only allowed 'contents: read, packages: none'.
+  # That is why the `registry` buildx cache backend was removed rather
+  # than documented: it needed this scope on a job whose declared block is
+  # read-only, so the preflight told a caller to grant something no caller
+  # could make reachable. Any write a future feature needs here is a
+  # CALLER-side grant; the worker may not declare it on their behalf.
+  _assert_worker_job_population
+  run _jobs_requesting_packages_write
+  assert_success
+  assert_output ''
+}
+
+@test "build-worker.yaml: the build job asks for contents: read alone (#957)" {
+  # The job builds but never pushes an image (`push: false`, no `tags:`),
+  # so with the GHA cache backend a checkout grant is all it needs.
+  # `permissions:` accepts no expression, so one static set has to serve
+  # every call, and the only set every caller can satisfy is the read-only
+  # one (see the elevation test above).
+  #
+  # "alone" is asserted as an EXACT entry set, not as presence: `packages:
+  # write` is only the scope this issue happened to find, and any other
+  # scope the caller did not grant (`id-token: write`, `attestations:
+  # write`, ...) fails a caller's run in exactly the same way.
+  run yaml_job_permission_entries "${WF}" build
+  assert_success
+  assert_output 'contents: read'
+}
+
+@test "build-worker.yaml: no job in the worker grants more than contents: read (#957)" {
+  # The whole permission surface, job list DERIVED from the file. Nothing
+  # here loops over known job names: the previous shape did, and a
+  # `sign-artifacts` job appended to the workflow with `contents: write`,
+  # `id-token: write` and `packages: read` left all 61 specs green.
+  # path-filter checks out and diffs; compute-matrix and docker-build only
+  # read `needs` / the repo; preflight probes with a token it deliberately
+  # keeps read-only. None touches a package, so none may inherit a caller's
+  # `packages: write`.
+  #
+  # The assertion is a PROPERTY over the derived set, not a pin of today's
+  # listing: a sixth job asking `contents: read` like its siblings passes
+  # untouched, and a sixth job asking anything else is named here on the
+  # day it lands. A job that declares no block at all surfaces as
+  # `<job>: <no entries>` and fails the same way.
+  _assert_worker_job_population
+  run _worker_jobs_granting_more_than_contents_read
+  assert_success
+  assert_output ''
+}
+
+# Print every comment PARAGRAPH inside the build job (a run of adjacent
+# `#` lines, joined) that cites the preflight while talking about a
+# package permission. Paragraph granularity matters: the claim is a
+# sentence, and a sentence wraps across comment lines.
+#
+# Both greps have their status pinned rather than `|| true`-ed: 1 is "no
+# paragraph says that", and 2 -- a grep that could not read its input, or a
+# build job that vanished -- must not arrive at the caller as an empty,
+# passing scan.
+_build_comments_citing_preflight_for_a_grant() {
+  local _out _status=0
+  _out="$(_build_comment_paragraphs \
+      | grep -i 'preflight' | grep -Ei 'packages|permission|grant')" \
+      || _status=$?
+  case "${_status}" in
+    0) printf '%s\n' "${_out}" ;;
+    1) ;;
+    *) printf 'BUG: grep exited %s scanning the build job comments\n' \
+           "${_status}" ;;
+  esac
+}
+
+# Every comment paragraph of the build job, one per line. Split out so the
+# test can assert the POPULATION it is scanning before reading anything
+# into an empty result.
+_build_comment_paragraphs() {
+  yaml_job_text "${WF}" build | awk '
+    /^[[:space:]]*#/ {
+      line = $0
+      sub(/^[[:space:]]*#[[:space:]]?/, "", line)
+      para = para " " line
+      next
+    }
+    { if (para != "") { print para; para = "" } }
+    END { if (para != "") { print para } }
+  '
+}
+
+@test "build-worker.yaml: the build job never cites the preflight as proof of a package grant (#957)" {
+  # The preflight job declares `permissions: contents: read`, so its own
+  # token carries `packages: none` no matter what the caller granted, and
+  # its write-scope probe cannot come back 202. Nothing in the build job
+  # may reason from that probe about a caller holding `packages: write`
+  # -- the probe is the thing that is broken, not the evidence that
+  # anything works. Tracked separately from this issue.
+  local _paragraphs
+  _paragraphs="$(_build_comment_paragraphs | awk 'END { print NR }')"
+  [[ "${_paragraphs}" -ge 10 ]] || fail \
+      "expected the build job to carry its explanatory comment paragraphs, extracted ${_paragraphs} -- the scan below would have read an empty job as a clean one"
+  run _build_comments_citing_preflight_for_a_grant
+  assert_success
+  assert_output ''
+}
+
+# ── Cache import failure retries once without the cache (base#1702) ─────
+
+# _step_code <step name>
+#   The code lines (comments dropped) of one build-job step, from its
+#   `- name:` line to the next step's.
+_step_code() {
+  code_lines "${WF}" | awk -v want="      - name: $1" '
+    /^      - name: / { on = ($0 == want) }
+    on { print }
+  '
+}
+
+# _assert_import_retry <id> <target> <first step name> <retry step name>
+#   One build step survives a failed cache import: the first attempt may
+#   fail without failing the job, and a second step runs only after that
+#   failure, builds the same target and names no cache-from, so nothing is
+#   imported. A structural check only: it pins the shape, it does not run
+#   a build.
+_assert_import_retry() {
+  local _id="$1" _target="$2" _first _retry
+  _first="$(_step_code "$3")"
+  _retry="$(_step_code "$4")"
+  [[ -n "${_first}" ]] || fail "no step named '$3'"
+  [[ -n "${_retry}" ]] || fail "no step named '$4'"
+  grep -Fq '        continue-on-error: true' <<< "${_first}" || fail \
+      "'$3' does not set continue-on-error, so a failed import still fails the job"
+  grep -Fq "if: \${{ steps.${_id}.outcome == 'failure' }}" <<< "${_retry}" || fail \
+      "'$4' is not gated on steps.${_id}.outcome being a failure"
+  grep -Fq "target: ${_target}" <<< "${_retry}" || fail \
+      "'$4' does not build target ${_target}"
+  if grep -Fq 'cache-from' <<< "${_retry}"; then
+    fail "'$4' still imports a cache"
+  fi
+}
+
+# why: devel-test is the first cache-from build in the job, so an evicted
+# GHA cache entry fails here before anything else runs; without the retry
+# one stale entry costs the caller a full rerun (isaac#364, base#1702).
+@test "build-worker.yaml: a failed devel-test cache import retries the stage once without cache-from (#1702)" {
+  _assert_import_retry build_devel_test devel-test \
+      "Build devel-test stage (includes lint + bats smoke)" \
+      "Retry devel-test stage without the cache import"
+}
+
+# why: devel is the image the job hands on, built from its own cache
+# scope, so it can hit an evicted entry even after devel-test imported
+# cleanly; a retry that still named cache-from would fail the same way.
+@test "build-worker.yaml: a failed devel cache import retries the stage once without cache-from (#1702)" {
+  _assert_import_retry build_devel devel \
+      "Build devel stage" \
+      "Retry devel stage without the cache import"
+}
+
+# why: runtime-test is the install check that gates the runtime image; a
+# stale import there would fail the job for a cache problem, not for a
+# broken install, and the report would blame the wrong thing.
+@test "build-worker.yaml: a failed runtime-test cache import retries the stage once without cache-from (#1702)" {
+  _assert_import_retry build_runtime_test runtime-test \
+      "Build runtime-test stage (install check)" \
+      "Retry runtime-test stage without the cache import"
+}
+
+# why: runtime is the last standard build and the one a release ships;
+# losing it to a stale import after every earlier stage passed is the
+# most expensive form of the base#1702 failure.
+@test "build-worker.yaml: a failed runtime cache import retries the stage once without cache-from (#1702)" {
+  _assert_import_retry build_runtime runtime \
+      "Build runtime stage" \
+      "Retry runtime stage without the cache import"
+}
+
+# _extra_stage_helpers
+#   The shell the "Build extra stages" step defines before its loop: the two
+#   cache spellings and `build_stage`, from `cache_from_for() {` through the
+#   the line before `blocklist=`. Printed as the step wrote it, so a spec
+#   can run the real function against a stub `docker` instead of grepping
+#   for what it is meant to do.
+_extra_stage_helpers() {
+  _step_code "Build extra stages" | awk '
+    /^          cache_from_for\(\) \{/ { on = 1 }
+    /^          blocklist=/ { exit }
+    on { print }
+  '
+}
+
+# _run_build_stage <failing call numbers, space separated>
+#   Runs the real `build_stage` for target `qa` with `docker` replaced by a
+#   stub that records each call's arguments, one line per call, in
+#   ${BATS_TEST_TMPDIR}/calls, and fails the numbered calls. Leaves bats'
+#   `run` result for the caller.
+_run_build_stage() {
+  local _src
+  _src="$(_extra_stage_helpers)"
+  [[ -n "${_src}" ]] || fail "the Build extra stages step defines no cache_from_for"
+  grep -Fq '          build_stage() {' <<< "${_src}" || fail \
+      "the Build extra stages step defines no build_stage function"
+  : > "${BATS_TEST_TMPDIR}/calls"
+  # Strict mode is turned on inside _t, not at the top of the bash -c
+  # string: under kcov a top-level command run with nounset on dies with
+  # "BASH_SOURCE: unbound variable" (see config_gen_mutation_targets_spec).
+  CALLS="${BATS_TEST_TMPDIR}/calls" FAIL="$1" run bash -c '
+    docker() {
+      echo "$*" >> "${CALLS}"
+      local n; n="$(wc -l < "${CALLS}")"
+      [[ " ${FAIL} " != *" ${n} "* ]]
+    }
+    DOCKERFILE=Dockerfile PLATFORM=linux/amd64 CONTEXT_PATH=.
+    build_arg_flags=(--build-arg X=1)
+    build_ctx_flags=()
+    '"${_src}"'
+    _t() { set -euo pipefail; build_stage qa scope-qa /dev/null; }
+    _t
+  '
+}
+
+# why: the load-bearing behaviour check: it runs the real build_stage
+# against a stub docker, so it proves the second call drops both cache
+# flags and keeps the target, which a grep of the step cannot show.
+@test "build-worker.yaml: a failed extra-stage build retries once without cache flags (#1702)" {
+  _run_build_stage "1"
+  assert_success
+  run wc -l < "${BATS_TEST_TMPDIR}/calls"
+  assert_output "2"
+  run grep -c -- '--cache-from' "${BATS_TEST_TMPDIR}/calls"
+  assert_output "1"
+  run sed -n 1p "${BATS_TEST_TMPDIR}/calls"
+  assert_output --partial '--cache-from type=gha,scope=scope-qa'
+  run sed -n 2p "${BATS_TEST_TMPDIR}/calls"
+  assert_output --partial '--target qa'
+  refute_output --partial '--cache-from'
+  refute_output --partial '--cache-to'
+}
+
+# why: build_stage only protects the calls routed through it; a buildx
+# call added straight into the loop would import a stale cache with no
+# second attempt and every other spec here would still pass.
+@test "build-worker.yaml: both extra-stage builds go through build_stage, the only caller of buildx (#1702)" {
+  # Two invocations (the stage's -test and the stage) share one retry. A
+  # third `docker buildx build` outside the helper would be a build that
+  # fails on a stale cache import with no second attempt.
+  local _step _calls
+  _step="$(_step_code "Build extra stages")"
+  _calls="$(grep -c 'docker buildx build' <<< "${_step}" || true)"
+  [[ "${_calls}" -eq 2 ]] || fail "expected the 2 buildx calls inside build_stage, found ${_calls}"
+  run grep -c '^ *build_stage "\${[a-z_]*}" ' <<< "${_step}"
+  assert_output "2"
+}
+
+# why: The generated Dockerfile declares `ARG TEST_TOOLS_IMAGE` with no
+# default and uses it in `FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage`, so a
+# build step that omits the build-arg fails with a blank base name. Scoped
+# to the Build devel stage step: the same line already sits in the
+# devel-test and runtime-test steps, so a whole-file match would pass
+# without the fix (base#1670).
+@test "build-worker.yaml: the Build devel stage step passes TEST_TOOLS_IMAGE from the testtools step output (base#1670)" {
+  local _args
+  _args="$(yq -N '.. | select(tag == "!!map" and .name == "Build devel stage") | .with["build-args"]' "${WF}")"
+  [ -n "${_args}" ] || {
+    echo "no Build devel stage step with build-args found" >&2
+    return 1
+  }
+  run grep -Fx 'TEST_TOOLS_IMAGE=${{ steps.testtools.outputs.image }}' <<<"${_args}"
+  assert_success
+}
+
+# why: The generated template has `ARG TEST_TOOLS_IMAGE` with no default
+# and an uncommented `FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage`.
+# base#1670 saw `--target devel` fail without the build-arg ("base name
+# (${TEST_TOOLS_IMAGE}) should not be blank"). A `--target runtime` build
+# without it was not run; this step gets the same build-arg as its
+# siblings. Scoped to that step: the devel-test, devel and runtime-test
+# steps already carry the line, so a whole-file match would pass without
+# the fix (base#1680).
+@test "build-worker.yaml: the Build runtime stage step passes TEST_TOOLS_IMAGE from the testtools step output (base#1680)" {
+  local _args
+  _args="$(yq -N '.. | select(tag == "!!map" and .name == "Build runtime stage") | .with["build-args"]' "${WF}")"
+  [ -n "${_args}" ] || {
+    echo "no Build runtime stage step with build-args found" >&2
+    return 1
+  }
+  run grep -Fx 'TEST_TOOLS_IMAGE=${{ steps.testtools.outputs.image }}' <<<"${_args}"
+  assert_success
+}
+
+# why: The no-cache retry of the runtime build (base#1702) rebuilds the
+# same `--target runtime` with the same Dockerfile, so it needs the same
+# TEST_TOOLS_IMAGE build-arg as the first attempt. Without it, a stale
+# cache import moves the failure from the import to a blank base name
+# instead of recovering. Scoped to the retry step: the first attempt
+# already carries the line (base#1680).
+@test "build-worker.yaml: the runtime no-cache retry step passes TEST_TOOLS_IMAGE from the testtools step output (base#1680)" {
+  local _args
+  _args="$(yq -N '.. | select(tag == "!!map" and .name == "Retry runtime stage without the cache import") | .with["build-args"]' "${WF}")"
+  [ -n "${_args}" ] || {
+    echo "no Retry runtime stage step with build-args found" >&2
+    return 1
+  }
+  run grep -Fx 'TEST_TOOLS_IMAGE=${{ steps.testtools.outputs.image }}' <<<"${_args}"
+  assert_success
+}
