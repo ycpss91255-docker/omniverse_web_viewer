@@ -142,7 +142,7 @@ jobs:
     # build and carries no registry login). Read is all it can justify.
     permissions:
       contents: read
-    uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v0.43.0-rc7
+    uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@v0.43.0-rc7
     with:
       image_name: omniverse_web_viewer
       submodules: recursive
@@ -279,7 +279,7 @@ jobs:
     # upstream -- but here means THIS job, not the whole workflow.
     permissions:
       contents: write
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.43.0-rc7
+    uses: ycpss91255-lab/base/.github/workflows/release-worker.yaml@v0.43.0-rc7
     with:
       archive_name_prefix: omniverse_web_viewer
 
