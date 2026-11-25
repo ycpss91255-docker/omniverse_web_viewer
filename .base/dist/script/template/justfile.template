@@ -1,0 +1,92 @@
+# `just template ...` -- scaffold + manage repo-local command groups
+# (ADR-00000010). The `template` namespace, reached via the consumer entry's
+# `mod? template`.
+
+# Arguments reach a recipe body as "$@", not as an unquoted {{args}}
+# interpolation, which hands the recipe's own shell a string to re-split.
+# Measured against a recorder on this file before the change: `just
+# template help --lang 'zh TW'` reached help.sh as FOUR arguments
+# (`template`, `--lang`, `zh`, `TW`) and `just template help 'foo|bar'`
+# became a shell pipeline that died with `bar: not found` at 127.
+# base#1284 swept script/test/justfile.test; base#1289 is the same sweep
+# across the namespace modules, and this is its template slice.
+#
+# The precondition, re-established for THIS file rather than inherited:
+# before this change `grep -nE '\$[0-9@*]'` over it matched nothing (it
+# matches the forwarding line and these comments now). `new` below takes a
+# NAMED parameter, so `set positional-arguments` does put the group name
+# in `$1` inside that recipe -- and its body reads `{{quote(name)}}`,
+# never a positional, so the setting changes the meaning of no existing
+# line. There is no `-h` text scan here to leave as an interpolation.
+set positional-arguments := true
+
+# Default: bare `just template` prints help (the `default` recipe must come
+# first -- a module otherwise treats the first recipe, `new`, as default and
+# errors because it needs an argument). `default` delegates to `help` so the
+# usage text has a single source. The blank line below detaches this
+# rationale from the --list doc (base#1326).
+
+# Print the template help (same as `just template help`)
+default: help
+
+# `help` is a named twin of `default` reachable as `just template help` (and
+# `just template h`), since the dashed `just template --help` cannot be a just
+# recipe/alias -- with a `help` recipe present just then hints "Did you mean
+# 'help'?" instead of a bare error. Bare `just template` prints the same via
+# `default`.
+alias h := help
+
+# just template help (or `just template h`) -> language-aware recipe listing:
+# translated one-line summaries via the shared `_msg help` i18n renderer
+# (honours $LANG / --lang). Bare `just template` prints the same via `default`.
+# The blank line below detaches this rationale from the --list doc, which
+# just takes from the last comment line above the recipe (base#1326).
+
+# List the template recipes in your language (--lang / $LANG)
+help *args:
+    @"$(dirname "$(readlink -f '{{source_file()}}')")/../docker/lib/help.sh" template "$@"
+
+# Scaffold a new repo-local command group: create script/local/<name>/ from
+# the skeleton and register it in script/local/justfile.local.
+#
+# `cd {{justfile_directory}}` lands at the repo root (the entry's dir,
+# reliable whether reached via `--working-directory` or a bare invocation;
+# `[no-cd]` / `invocation_directory` are not, so the scaffolder runs from
+# a known-good cwd) before running new.sh, which writes to ./script/local/.
+#
+# `{{quote(name)}}`, and NOT a hand-written quote around it. An
+# interpolation is TEXT handed to the recipe's own shell, so the bare form
+# re-split it: `just template new 'two words'` reached new.sh as two
+# arguments, and new.sh -- which validates `^[a-z][a-z0-9_-]*$`, and so
+# would have refused the real name -- was handed `words`, created that
+# group, registered it in script/local/justfile.local and exited 0
+# (base#1299).
+#
+# Measured against a recorder that prints its argument count and then one
+# line per argument, for each of the three forms a reviewer reaches for:
+#
+#   name          {{name}}         '{{name}}'           {{quote(name)}}
+#   two words     2 args           1 arg                1 arg
+#   foo|bar       PIPELINE, 127    1 arg                1 arg
+#   two'words     SYNTAX ERROR     SYNTAX ERROR         1 arg
+#   a''b          1 arg `ab`       1 arg `ab`           1 arg `a''b`
+#   ' --help #    SYNTAX ERROR     2 args: `` `--help`  1 arg
+#   $USER         1 arg `<user>`   1 arg, literal       1 arg, literal
+#   deploy-aws    1 arg            1 arg                1 arg
+#   (empty)       0 args           1 empty arg          1 empty arg
+#
+# The `' --help #` row is why the hand-written quote is not enough: it
+# closes the quote the recipe opened and hands new.sh a FLAG, which that
+# script answers by printing its help and exiting 0. `quote()` is just's
+# own shell-escaper -- it wraps in single quotes and escapes embedded
+# apostrophes -- and is the only form right for every input.
+#
+# A fourth form, `"{{name}}"`, fixes the re-split and is wrong for its
+# own reason: it EXPANDS, so `$USER` arrives as the operator's name,
+# which satisfies the validator and scaffolds a group named after them.
+# The blank line below detaches this rationale from the --list doc
+# (base#1326).
+
+# Scaffold a new repo-local command group in script/local/<name>/
+new name:
+    @cd {{justfile_directory()}} && script/template/new.sh {{quote(name)}}

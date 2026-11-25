@@ -1,0 +1,4420 @@
+#!/usr/bin/env bats
+#
+# why: Mirrors `lib/setup_cmd.sh`. The git-style subcommand dispatcher and
+# its mutating verbs (#49): dispatch (Phase B-1), `set` / `show` / `list`
+# (Phase B-2), `add` / `remove` (Phase B-3), and `reset` + BREAKING no-arg →
+# help (Phase B-4) — round-trips, validators, no-`.env`-regen, comment
+# preservation, and end-to-end subprocess cases. Also the per-section
+# setup.conf parameter end-to-end coverage (#202, merged from the former
+# `setup_section_validate_spec.bats`) exercising `_setup_validate_kv` /
+# `_setup_known_section`: one key per test asserted through to
+# `compose.yaml` / `.env`, across `[deploy]`, `[gui]`, `[network]`,
+# `[resources]`, `[environment]`, `[tmpfs]`, `[devices]`, `[volumes]
+# mount_2..N`, and `[security]` privileged, with companion negatives for
+# cleared keys, plus the isolated `_setup_known_section` / `SCHEMA_SECTIONS`
+# (#561) unit checks.
+
+bats_require_minimum_version 1.5.0
+
+load "${BATS_TEST_DIRNAME}/setup_spec_helper"
+# ════════════════════════════════════════════════════════════════════
+# Subcommand dispatch (Phase B-1)
+#
+# setup.sh grew a git-style subcommand dispatcher so build.sh / run.sh
+# stop sourcing it (which historically caused's _msg shadow bug).
+# Subcommands wired in B-1: `apply` (default) + `check-drift`. Legacy
+# flag-only invocation (`setup.sh --base-path X --lang Y`) still maps
+# to apply for backward compat.
+# ════════════════════════════════════════════════════════════════════
+
+@test "main no-arg prints help and exits 0 (#49 Phase B-4 BREAKING)" {
+  # Pre-B-4 the no-arg path silently aliased to `apply`. Now it prints
+  # the same help screen as -h, so accidental invocations don't
+  # clobber .env / compose.yaml without an explicit subcommand.
+  run main
+  assert_success
+  assert_output --partial "Usage:"
+  assert_output --partial "Subcommands:"
+}
+
+@test "main legacy flag-only invocation now errors (#49 Phase B-4 BREAKING)" {
+  # `setup.sh --base-path X --lang Y` (no subcommand) used to alias to
+  # apply. B-4 removes that; the user must type `apply` explicitly.
+  LOG_FORMAT=json run --separate-stderr main --base-path "${TEMP_DIR}" --lang en
+  assert_refusal 1 conf_unknown_subcmd subcmd=--base-path
+}
+
+@test "main apply subcommand regenerates .env + compose.yaml" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  assert [ -f "${TEMP_DIR}/.env.generated" ]
+  assert [ -f "${TEMP_DIR}/compose.yaml" ]
+}
+
+@test "main rejects unknown subcommand" {
+  LOG_FORMAT=json run --separate-stderr main bogus-subcommand
+  assert_refusal 1 conf_unknown_subcmd subcmd=bogus-subcommand
+}
+
+@test "main check-drift returns 0 when .env missing (no-op)" {
+  run main check-drift --base-path "${TEMP_DIR}"
+  assert_success
+}
+
+@test "main check-drift returns 0 when nothing changed" {
+  local _h=""
+  _compute_conf_hash "${TEMP_DIR}" _h
+  write_env "${TEMP_DIR}/.env.generated" \
+    "user" "group" "$(id -u)" "$(id -g)" \
+    "x86_64" "hub" "false" \
+    "img" "${TEMP_DIR}" \
+    "tw.archive.ubuntu.com" "mirror.twds.com.tw" "Asia/Taipei" \
+    "host" "host" "private" "true" "all" "gpu" \
+    "false" "${_h}" ""
+  detect_gui() { local -n _o=$1; _o="false"; }
+  detect_gpu() { local -n _o=$1; _o="false"; }
+
+  run main check-drift --base-path "${TEMP_DIR}"
+  assert_success
+}
+
+@test "main check-drift returns non-zero when conf hash drifts" {
+  local _h_old=""
+  _compute_conf_hash "${TEMP_DIR}" _h_old
+  write_env "${TEMP_DIR}/.env.generated" \
+    "user" "group" "$(id -u)" "$(id -g)" \
+    "x86_64" "hub" "false" \
+    "img" "${TEMP_DIR}" \
+    "tw.archive.ubuntu.com" "mirror.twds.com.tw" "Asia/Taipei" \
+    "host" "host" "private" "true" "all" "gpu" \
+    "false" "${_h_old}" ""
+  detect_gui() { local -n _o=$1; _o="false"; }
+  detect_gpu() { local -n _o=$1; _o="false"; }
+
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[gpu]
+mode = "off"
+EOF
+
+  LOG_FORMAT=json run --separate-stderr main check-drift --base-path "${TEMP_DIR}"
+  assert_refusal 1 env_drift_detail "detail=setup.toml modified since last setup"
+  assert_log_event env_drift_detected "${stderr}"
+}
+
+@test "check-drift prints WARN when per-repo setup.toml is missing (#186)" {
+  # No TEMP_DIR/setup.toml created — check-drift should announce the
+  # template-default fallback the same way `apply` does, so users
+  # running the build.sh drift-check path see the heads-up too.
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main check-drift --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_output --partial "[setup] WARN :"
+  assert_output --partial "no per-repo setup.toml"
+}
+
+@test "check-drift prints WARN when per-repo setup.toml has no section headers (#186)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+# only comments, no [section] headers
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main check-drift --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_output --partial "[setup] WARN :"
+  assert_output --partial "per-repo setup.toml has no section overrides"
+}
+
+@test "check-drift stays silent when per-repo setup.toml has at least one section" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[gpu]
+mode = "auto"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main check-drift --base-path '${TEMP_DIR}' 2>&1
+  "
+  refute_output --partial "no per-repo setup.toml"
+  refute_output --partial "per-repo setup.toml has no section overrides"
+}
+
+@test "check-drift --lang zh-TW prints WARN in Traditional Chinese when setup.toml missing (#186)" {
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main check-drift --base-path '${TEMP_DIR}' --lang zh-TW 2>&1
+  "
+  assert_output --partial "[setup] WARN :"
+  assert_output --partial "未找到"
+}
+
+@test "main check-drift rejects unknown flag" {
+  LOG_FORMAT=json run --separate-stderr main check-drift --bogus
+  assert_refusal 1 conf_unknown_arg arg=--bogus
+}
+
+@test "setup.sh check-drift via subprocess emits stderr + non-zero exit on drift" {
+  # End-to-end: invoke the script as a subprocess (the way build.sh / run.sh
+  # do after B-1) instead of `source` + function call. Validates the
+  # subcommand dispatch path actually works when the script is executed.
+  mkdir -p "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib" \
+           "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper" \
+           "${TEMP_DIR}/sandbox/.base/dist/config/docker"
+  cp /source/dist/script/docker/wrapper/setup.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh"
+  cp /source/dist/script/docker/lib/i18n.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/i18n.sh"
+  cp /source/dist/script/docker/lib/_tui_conf.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/_tui_conf.sh"
+  # setup.sh sources _lib.sh for the _log_* helpers; _lib.sh
+  # is an umbrella that sources lib/*.sh sub-libs
+  cp /source/dist/script/docker/lib/_lib.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/_lib.sh"
+  cp /source/dist/script/docker/lib/* "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/"
+  cp /source/dist/setup.toml "${TEMP_DIR}/sandbox/.base/dist/setup.toml"
+
+  bash "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh" apply \
+    --base-path "${TEMP_DIR}/sandbox" >/dev/null 2>&1
+
+  # drift hash covers template + setup.conf. Mutating .local
+  # after apply triggers detection.
+  cat > "${TEMP_DIR}/sandbox/setup.toml" <<'EOF'
+[gpu]
+mode = "off"
+EOF
+
+  LOG_FORMAT=json run --separate-stderr bash "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh" \
+    check-drift --base-path "${TEMP_DIR}/sandbox"
+  assert_refusal 1 env_drift_detail "detail=setup.toml modified since last setup"
+  assert_log_event env_drift_detected "${stderr}"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Subcommand: set / show / list (Phase B-2)
+#
+# `setup.sh set <section>.<key> <value>` writes to setup.conf via
+# `_upsert_conf_value` (no .env regen — `apply` is the explicit gate).
+# `show` and `list` read setup.conf via `_load_setup_conf_full` so
+# they share the TUI's view of the file.
+# ════════════════════════════════════════════════════════════════════
+
+@test "set writes a value into an existing section, round-trip via show" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set deploy.gpu_count all --base-path "${TEMP_DIR}"
+  assert_success
+  run main show deploy.gpu_count --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "all"
+}
+
+@test "set creates a new key when section exists but key is absent" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+EOF
+  run main set network.ipc host --base-path "${TEMP_DIR}"
+  assert_success
+  run main show network.ipc --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "host"
+}
+
+@test "set creates section + key when section is absent" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[image]
+
+[[image.rules]]
+rule = "@basename"
+EOF
+  run main set resources.shm_size 512m --base-path "${TEMP_DIR}"
+  assert_success
+  run main show resources.shm_size --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "512m"
+}
+
+@test "set project.name accepts a compose-legal name and show round-trips it (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set project.name myrepo-wt2 --base-path "${TEMP_DIR}"
+  assert_success
+  run main show project.name --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "myrepo-wt2"
+}
+
+@test "set project.name rejects a name docker compose would reject (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set project.name "Not A Project" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=project key=name
+}
+
+@test "apply records the resolved project name in .env.generated (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  # The template already carries a [project] table and TOML refuses a
+  # second header for the same table, so the name is set in place rather
+  # than appended. `name = ""` is unique to [project] in the template.
+  sed -i 's/^name = ""$/name = "myrepo-wt2"/' "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -Fx 'PROJECT_NAME=myrepo-wt2' "${TEMP_DIR}/.env.generated"
+  assert_success
+}
+
+@test "apply keeps the recorded name when the DERIVATION changes, and carries the new one (#920)" {
+  # The rename nobody asks for: `just upgrade` runs init.sh, which runs
+  # `setup apply`, and what the default derives can change under a stack
+  # that is still up. The project name is the key compose finds those
+  # containers by and compose cannot relabel a running container, so apply
+  # records the name the checkout already had and carries the resolved one
+  # beside it. The wrapper adopts it once the old project is empty.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  local _derived=""
+  _derived="$(grep -m1 '^PROJECT_NAME=' "${TEMP_DIR}/.env.generated")"
+  _derived="${_derived#PROJECT_NAME=}"
+  [[ -n "${_derived}" ]] || fail "apply recorded no project name"
+
+  # A recorded name that no longer matches what the default derives --
+  # the shape a repo carries once it has recorded one at all.
+  sed -i "s/^PROJECT_NAME=.*/PROJECT_NAME=local-legacy/" \
+    "${TEMP_DIR}/.env.generated"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -Fx 'PROJECT_NAME=local-legacy' "${TEMP_DIR}/.env.generated"
+  assert_success
+  run grep -Fx "PROJECT_NAME_PENDING=${_derived}" "${TEMP_DIR}/.env.generated"
+  assert_success
+}
+
+@test "apply carries the name a PRE-record env file runs under, rather than reading it as fresh (#920)" {
+  # The population this deferral was written for is the one that has not
+  # upgraded yet, and its .env.generated has no PROJECT_NAME key at all:
+  # the emitter interpolated `name: ${DOCKER_HUB_USER}-${IMAGE_NAME}` and
+  # the wrapper assembled the same string for its -p. Read as a fresh
+  # checkout, that file would take the newly derived name with nothing
+  # pending -- the silent rename over a live stack, on precisely the repos
+  # that are mid-migration.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  local _derived="" _image=""
+  _derived="$(grep -m1 '^PROJECT_NAME=' "${TEMP_DIR}/.env.generated")"
+  _derived="${_derived#PROJECT_NAME=}"
+  _image="$(grep -m1 '^IMAGE_NAME=' "${TEMP_DIR}/.env.generated")"
+  _image="${_image#IMAGE_NAME=}"
+  [[ -n "${_derived}" && -n "${_image}" ]] || fail "apply recorded no name"
+
+  # Turn it back into the older shape: drop the key, and leave a hub user
+  # that detection no longer yields -- a `docker logout`, or a login as a
+  # different account, between the last apply and this one.
+  sed -i '/^PROJECT_NAME=/d' "${TEMP_DIR}/.env.generated"
+  sed -i 's/^DOCKER_HUB_USER=.*/DOCKER_HUB_USER=bobhub/' \
+    "${TEMP_DIR}/.env.generated"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  # The name the LIVE containers carry, reconstructed from the same file.
+  run grep -Fx "PROJECT_NAME=bobhub-${_image}" "${TEMP_DIR}/.env.generated"
+  assert_success
+  run grep -Fx "PROJECT_NAME_PENDING=${_derived}" "${TEMP_DIR}/.env.generated"
+  assert_success
+}
+
+@test "apply adds no pending name when a PRE-record env file still derives the same name (#920)" {
+  # The other half: the reconstruction must not manufacture a rename. A
+  # repo whose recorded hub user is still the detected one runs under the
+  # name apply resolves, so the ordinary upgrade stays silent.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  sed -i '/^PROJECT_NAME=/d' "${TEMP_DIR}/.env.generated"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -c '^PROJECT_NAME_PENDING=' "${TEMP_DIR}/.env.generated"
+  assert_failure
+}
+
+@test "apply on a fresh checkout records the resolved name with nothing pending (#920)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -c '^PROJECT_NAME_PENDING=' "${TEMP_DIR}/.env.generated"
+  assert_failure
+}
+
+@test "apply drops a pending name once the derivation agrees again (#920)" {
+  # The pending key is a note about a divergence, not state to maintain:
+  # every apply re-derives it, so a resolution that agrees again clears it.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  local _derived=""
+  _derived="$(grep -m1 '^PROJECT_NAME=' "${TEMP_DIR}/.env.generated")"
+  _derived="${_derived#PROJECT_NAME=}"
+
+  sed -i "s/^PROJECT_NAME=.*/PROJECT_NAME=local-legacy/" \
+    "${TEMP_DIR}/.env.generated"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -Fx "PROJECT_NAME_PENDING=${_derived}" "${TEMP_DIR}/.env.generated"
+  assert_success
+
+  # The wrapper's adoption, done by hand: the recorded name is the
+  # resolved one again.
+  sed -i "s/^PROJECT_NAME=.*/PROJECT_NAME=${_derived}/" \
+    "${TEMP_DIR}/.env.generated"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -Fx "PROJECT_NAME=${_derived}" "${TEMP_DIR}/.env.generated"
+  assert_success
+  run grep -c '^PROJECT_NAME_PENDING=' "${TEMP_DIR}/.env.generated"
+  assert_failure
+}
+
+@test "apply takes a CONFIGURED rename at once and warns about the old project (#920, #893)" {
+  # `[project] name` exists so a second worktree does not share the
+  # first's derived name; deferring it would defeat it exactly when the
+  # shared name is occupied. Taken at once, therefore -- and said out
+  # loud, because compose cannot relabel whatever is still up under the
+  # old name.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  # Set in place: TOML refuses a second [project] header, and the
+  # template already ships one. `name = ""` is unique to it.
+  sed -i 's/^name = ""$/name = "myrepo-wt1"/' "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  run grep -Fx 'PROJECT_NAME=myrepo-wt1' "${TEMP_DIR}/.env.generated"
+  assert_success
+
+  sed -i 's/^name = "myrepo-wt1"$/name = "myrepo-wt2"/' "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  assert_output --partial "myrepo-wt1"
+  assert_output --partial "myrepo-wt2"
+  assert_output --partial "no longer addressed by this checkout"
+  run grep -Fx 'PROJECT_NAME=myrepo-wt2' "${TEMP_DIR}/.env.generated"
+  assert_success
+  run grep -c '^PROJECT_NAME_PENDING=' "${TEMP_DIR}/.env.generated"
+  assert_failure
+}
+
+@test "the shipped template ships [project] name empty, so an upgrade changes nothing (#893)" {
+  # The section must exist in setup.toml too: setup.local.toml is the
+  # LOCAL VARIANT of setup.toml and shares its grammar. A section that
+  # only ever appeared in .local would be a second schema.
+  run grep -Fx '[project]' /source/dist/setup.toml
+  assert_success
+  # The TOML empty string is `""`, not an empty right-hand side: a bare
+  # `name =` would make the whole file unparseable.
+  run grep -E '^name = ""$' /source/dist/setup.toml
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --local: which file a write lands in, and saying so when it will not
+# be the file that is read
+#
+# The default target stays setup.toml -- the committed, shared value.
+# --local targets the gitignored setup.local.toml. Writing the committed
+# file while .local already defines that section is NOT refused: under
+# section-replace the write is provably inert ON THIS MACHINE, but the
+# value is still the one CI and every other checkout uses. It is warned,
+# as a certainty rather than a possibility, naming the section.
+#
+# A write that lands where the read path does not look is the failure the
+# earlier committed setup.conf.local died of, which is why this is a hard
+# requirement and not a nicety.
+# ════════════════════════════════════════════════════════════════════
+
+@test "set --local writes setup.local.toml and leaves setup.toml alone (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set --local project.name myrepo-wt2 --base-path "${TEMP_DIR}"
+  assert_success
+  run grep -Fx 'name = "myrepo-wt2"' "${TEMP_DIR}/setup.local.toml"
+  assert_success
+  run grep -Fx 'name = "myrepo-wt2"' "${TEMP_DIR}/setup.toml"
+  assert_failure
+}
+
+@test "set without --local still writes setup.toml (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set project.name myrepo --base-path "${TEMP_DIR}"
+  assert_success
+  run grep -Fx 'name = "myrepo"' "${TEMP_DIR}/setup.toml"
+  assert_success
+  [[ ! -e "${TEMP_DIR}/setup.local.toml" ]] \
+    || fail "a plain set created the local override file"
+}
+
+@test "set --local reports the gitignored file it created (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set --local project.name myrepo-wt2 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "setup.local.toml"
+}
+
+@test "set warns, names the section and points at --local when .local shadows it (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/setup.local.toml"
+  run main set network.mode host --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "network"
+  assert_output --partial "setup.local.toml"
+  assert_output --partial "--local"
+  # Warned, NOT refused: the value is still what CI and every other
+  # checkout of this repo will use. The writer emits TOML, so the stored
+  # scalar is a quoted basic string.
+  run grep -Fx 'mode = "host"' "${TEMP_DIR}/setup.toml"
+  assert_success
+}
+
+@test "set does not warn about a section the local layer does not define (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/setup.local.toml"
+  run main set gui.mode off --base-path "${TEMP_DIR}"
+  assert_success
+  refute_output --partial "setup.local.toml"
+}
+
+@test "set --local does not warn about the file it is writing (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/setup.local.toml"
+  run main set --local network.mode host --base-path "${TEMP_DIR}"
+  assert_success
+  refute_output --partial "may have no effect"
+}
+
+@test "add --local appends to the local layer's section (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main add --local volumes.mount /tmp/wt2:/data --base-path "${TEMP_DIR}"
+  assert_success
+  # The entry is a `[[volumes]]` block (source / target); the bridge
+  # joins it back into the mount the user typed.
+  run toml_bridge_parse "${TEMP_DIR}/setup.local.toml" --kv
+  assert_success
+  assert_line 'volumes	mount_1	/tmp/wt2:/data'
+  run grep -F '/tmp/wt2' "${TEMP_DIR}/setup.toml"
+  assert_failure
+}
+
+@test "remove --local removes from the local layer (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  # `volumes.mount_1` is the first `[[volumes]]` block (source / target);
+  # the bridge joins it back into the mount the user typed.
+  printf '[[volumes]]\nsource = "/tmp/wt2"\ntarget = "/data"\n' \
+    > "${TEMP_DIR}/setup.local.toml"
+  run main remove --local volumes.mount_1 --base-path "${TEMP_DIR}"
+  assert_success
+  # The mount is spelled across two fields now, so the removed entry is
+  # pinned twice: its source text is gone from the file, and the parsed
+  # view no longer offers the mount at any slot. The mount string itself
+  # never appears literally in TOML, which is why the old
+  # `grep -F '/tmp/wt2:/data'` could no longer carry the claim.
+  run grep -F '/tmp/wt2' "${TEMP_DIR}/setup.local.toml"
+  assert_failure
+  run toml_bridge_parse "${TEMP_DIR}/setup.local.toml" --kv
+  assert_success
+  refute_output --partial '/tmp/wt2:/data'
+}
+
+@test "add warns when the local layer shadows the section it appends to (#893)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[[volumes]]\nsource = "/tmp/wt2"\ntarget = "/data"\n' \
+    > "${TEMP_DIR}/setup.local.toml"
+  run main add volumes.mount /tmp/shared:/data --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "volumes"
+  assert_output --partial "--local"
+}
+
+@test "set rejects an unknown section with non-zero exit + Unknown section stderr" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set bogus.key value --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_section_not_found section=bogus
+}
+
+# why: the issue's `set` half. `set deploy.gpu_cuont 1` wrote a key no reader
+# reads, and only the next `apply` refused it as apply_unknown_key; the refusal
+# belongs before the write, in apply's terms, with the file left byte-identical.
+@test "set refuses an unknown key up front and leaves setup.toml untouched (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/setup.toml.before"
+  # A refused spec exits 2, the usage class, not the generic 1
+  # (base#1399).
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_cuont 1 --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=deploy key=gpu_cuont
+  assert_stderr_contains "no reader reads it"
+  run cmp "${TEMP_DIR}/setup.toml.before" "${TEMP_DIR}/setup.toml"
+  assert_success
+}
+
+# why: --local writes setup.local.toml instead; this pins that the refusal
+# leaves that file byte-identical too, not only setup.toml.
+@test "set --local refuses an unknown key and leaves setup.local.toml untouched (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[deploy]\ngpu_count = "1"\n' > "${TEMP_DIR}/setup.local.toml"
+  cp "${TEMP_DIR}/setup.local.toml" "${TEMP_DIR}/setup.local.toml.before"
+  LOG_FORMAT=json run --separate-stderr main set --local deploy.gpu_cuont 1 --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=deploy key=gpu_cuont
+  run cmp "${TEMP_DIR}/setup.local.toml.before" "${TEMP_DIR}/setup.local.toml"
+  assert_success
+}
+
+# why: the guard's false-positive side: a schema key and a free-form
+# build.tz, which has no validator, must both still be written.
+@test "set still accepts a known key (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main set deploy.gpu_count 1 --base-path "${TEMP_DIR}"
+  assert_success
+  run main set build.tz Asia/Taipei --base-path "${TEMP_DIR}"
+  assert_success
+}
+
+@test "set rejects an invalid gpu_count value" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_count -1 --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=deploy key=gpu_count
+}
+
+@test "set rejects an invalid mount string" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set volumes.mount_5 not-a-mount --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=volumes key=mount_5
+}
+
+@test "set rejects an invalid cgroup_rule" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set devices.cgroup_rule_1 "garbage rule" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=devices key=cgroup_rule_1
+}
+
+@test "set rejects an invalid env_kv" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set environment.env_5 "missing-equals" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=environment key=env_5
+}
+
+@test "set rejects an invalid port mapping" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set network.port_5 "abc:def" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=network key=port_5
+}
+
+# ──────────────────────────────────────────────────────────────────
+# setup.sh routes through the shared schema registry, so `set` /
+# `add` now reject the same values the TUI already rejected. These keys
+# were historically free-form in setup.sh (the divergence closes).
+# ──────────────────────────────────────────────────────────────────
+
+@test "set rejects an invalid target_arch (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set build.target_arch sparc --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=build key=target_arch
+}
+
+@test "set rejects an invalid build network (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set build.network carrier-pigeon --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=build key=network
+}
+
+@test "set rejects an invalid gpu_runtime (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_runtime podman --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=deploy key=gpu_runtime
+}
+
+@test "set rejects an invalid network_name (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set network.network_name "-bad" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=network key=network_name
+}
+
+@test "set rejects an invalid device mount (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set devices.device_1 noslash --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=devices key=device_1
+}
+
+@test "add rejects an invalid capability (#560 schema unification)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main add security.cap_add lowercase --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=security key=cap_add_1
+}
+
+@test "set rejects a malformed dotted key (no dot)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set deploy_gpu_count all --base-path "${TEMP_DIR}"
+  assert_bridge_refusal 1 "Usage: setup.sh set"
+}
+
+@test "set rejects a newline-bearing value rather than corrupting setup.conf (#688)" {
+  # A value like $'A=b\nstray' would, written unguarded by
+  # _upsert_conf_value's `printf '%s = %s\n'`, leave the stray second
+  # line as an orphan, un-keyed entry that corrupts the INI on the next
+  # read. `set` must refuse it; the file must keep exactly one env_1 line
+  # and gain no orphan line.
+  #
+  # WHICH guard refuses it is no longer this case's to say. `environment`
+  # is a TYPED key, so _validate_env_kv rejects the newline first and the
+  # writer is never reached -- the comment here used to claim the
+  # opposite, and the case passed unchanged with the writer's own refusal
+  # deleted. The case below is the one that reaches the writer.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "A=b"
+EOF
+  LOG_FORMAT=json run --separate-stderr main set environment.env_1 $'BAZ=qux\nmalicious_section_break' --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=environment key=env_1
+  # No orphan line: the corrupting payload must not reach the file.
+  run grep -c 'malicious_section_break' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+  # The original clean value is untouched. `[environment] env_N` has no
+  # array-of-tables home in the bridge, so it stays a quoted scalar.
+  run grep -c '^env_1 = "A=b"$' "${TEMP_DIR}/setup.toml"
+  assert_output "1"
+}
+
+# why: The only case that reaches `set`'s conf_write_failed branch, and the
+# reason base#1220 found that branch emitting an unregistered id. A FREE-FORM
+# key is the shape that gets there: it is not in the schema registry, so
+# _schema_validate accepts any value. It must still be a key a reader reads
+# (base#1374 refuses any other before the write), so it is build.tz, one of
+# the free-form keys _setup_known_key admits and the newline refusal happens at the
+# writer sink instead. The case above names the same defect and cannot see
+# it -- its key is typed, so validation intercepts the value first and that
+# case stays green with the writer's guard deleted. What is asserted here is
+# POSITIVE and not only a refusal: the operator must READ the writer's
+# complaint and `set`'s own diagnostic naming the key. An unregistered body
+# makes lib/log.sh print its 'unregistered log body' refusal in their place,
+# so the refutation beside them is what pins the registry half
+@test "set reports the write failure for a key validation does not intercept" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[build]
+tz = "clean"
+EOF
+  LOG_FORMAT=json run --separate-stderr main set build.tz $'a\nb' --base-path "${TEMP_DIR}"
+  # The writer's refusal, and the set-level diagnostic naming the key --
+  # both are what the registry's own complaint would have replaced.
+  assert_refusal 2 conf_write_failed section=build key=tz
+  assert_log_event conf_upsert_newline_rejected "${stderr}"
+  # The original clean value is untouched and no orphan line was written.
+  run grep -c '^tz = "clean"$' "${TEMP_DIR}/setup.toml"
+  assert_output "1"
+}
+
+@test "set with no arguments fails clean (no shell error)" {
+  LOG_FORMAT=json run --separate-stderr main set
+  assert_bridge_refusal 1 "Usage: setup.sh set"
+  refute_stderr_contains "unbound variable"
+  refute_stderr_contains "syntax error"
+}
+
+@test "set does NOT regenerate .env (mtime unchanged after set)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  # Seed .env via apply so it exists.
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+  "
+  assert_success
+  assert [ -f "${TEMP_DIR}/.env.generated" ]
+  local _before
+  _before="$(stat -c %Y "${TEMP_DIR}/.env.generated")"
+  # Wait one second so mtime resolution can register a difference if regen happened.
+  sleep 1
+  run main set network.mode host --base-path "${TEMP_DIR}"
+  assert_success
+  local _after
+  _after="$(stat -c %Y "${TEMP_DIR}/.env.generated")"
+  assert_equal "${_before}" "${_after}"
+}
+
+@test "show prints the value of a single key" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run main show network.mode --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "host"
+}
+
+@test "show prints all entries of a whole section in on-disk order" {
+  # A [table] merges KEY BY KEY (ADR-37), so the dump is the template's
+  # [network] keys in template order carrying this file's values, then
+  # the key this file adds that the template does not have. The fixture
+  # names every template key so each slot can be pinned by index --
+  # otherwise "in on-disk order" would only be claimed for the first two
+  # lines and guessed at for the rest.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+pid = "host"
+network_name = "br0"
+privileged = true
+EOF
+  run main show network --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line --index 0 "mode = host"
+  assert_line --index 1 "ipc = host"
+  assert_line --index 2 "pid = host"
+  assert_line --index 3 "network_name = br0"
+  assert_line --index 4 "privileged = true"
+}
+
+@test "show <section> keeps the per-service [logging.<svc>] keys out of the parent dump (#955)" {
+  # The whole-section dump decided membership with a raw dot-prefix
+  # match (`${_section}.`*), the exact test _conf_split_nskey's doc
+  # comment forbids: `logging.` prefixes `logging.web.driver` too, so a
+  # per-service override was listed under the parent [logging] as a
+  # bogus `web.driver` key. Membership is _conf_split_nskey's question.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+EOF
+  run main show logging --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line "driver = json-file"
+  refute_output --partial "web.driver"
+  # `web.driver` is only the SYMPTOM spelling. The property is that the
+  # per-service VALUE is not in the parent dump at all, whatever key it
+  # arrives under: a splitter that resolved `logging.web.driver` to
+  # section `logging` + key `driver` would print `driver = local` here
+  # -- no `web.driver` token, same defect. `show <section>` prints keys
+  # without headers, so the value's absence is the positional claim.
+  refute_line "driver = local"
+}
+
+@test "show logging.<svc> dumps the sub-section it accepts as a valid section (#955)" {
+  # `_setup_known_section` accepts `logging.?*`, so [logging.web] is a
+  # section the tool considers legal -- but the spec split reads a bare
+  # `logging.web` as section `logging` + key `web`, and the key lookup
+  # failed with "Key not found". A section the tool accepts must be
+  # readable.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+max_size = "1m"
+EOF
+  run main show logging.web --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line --index 0 "driver = local"
+  assert_line --index 1 "max_size = 1m"
+}
+
+@test "show reports a typo under [logging] as a missing KEY, not an empty section (#955)" {
+  # The sub-section fallback is two conjuncts and only the SECOND one
+  # separates a legitimate dump from swallowing a typo:
+  # `_setup_known_section` accepts `logging.?*` for ANY non-empty
+  # suffix, so every mistyped key under [logging] reaches the fallback
+  # and passes the first conjunct. Drop `&& _setup_dump_section` and
+  # `show logging.drivr` returns 0 having printed nothing -- a silent
+  # success for a typo.
+  #
+  # The sibling "missing key" case uses `network.nope`, which fails the
+  # FIRST conjunct and never reaches the guard, so it cannot stand in
+  # for this one.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+EOF
+  LOG_FORMAT=json run --separate-stderr main show logging.drivr --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=logging.drivr
+  # Names the KEY the user typed, not the parent section: the error has
+  # to point at the typo.
+  # ... and reports it as the KEY kind. The spec `logging.drivr` is
+  # embedded verbatim in BOTH candidate messages, so that token alone
+  # cannot tell `conf_key_not_found` from a `conf_section_not_found`
+  # that calls the typo an unknown SECTION -- the very swap the case
+  # name forbids. The error-kind display string is what separates them,
+  # so pin it, and refute both section-flavoured strings the tree can
+  # emit here (`section_not_found` and `unknown_section`).
+  refute_stderr_contains "Section not found"
+  refute_stderr_contains "Unknown section"
+  refute_stderr_contains "driver = json-file"
+}
+
+@test "show returns non-zero on a missing key" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+EOF
+  LOG_FORMAT=json run --separate-stderr main show network.nope --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=network.nope
+}
+
+@test "show falls back to template baseline when section absent in .local (#174)" {
+  # this test asserted that show fails when the requested
+  # section is missing from the per-repo file. Now show reads
+  # the merged view (template ← .local), so the template baseline
+  # always provides the section even when .local omits it. Switching
+  # the assertion: show succeeds and surfaces the template's keys.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+EOF
+  run main show resources --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "shm_size"
+}
+
+@test "show rejects an unknown section name" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main show bogus.key --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_section_not_found section=bogus
+}
+
+@test "show with no arguments fails clean" {
+  LOG_FORMAT=json run --separate-stderr main show
+  assert_bridge_refusal 1 "Usage: setup.sh show"
+}
+
+@test "list with no arg prints every section header + key" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[image]
+
+[[image.rules]]
+rule = "@basename"
+
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run main list --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "[image]"
+  assert_output --partial "rule_1 = @basename"
+  assert_output --partial "[network]"
+  assert_output --partial "mode = host"
+}
+
+@test "list emits a per-service logging key once, under its own section (#955)" {
+  # `list` output is documented as "suitable for piping into other
+  # tooling", so its section membership has to survive a round-trip.
+  # The dot-prefix match printed `logging.web.driver` under BOTH
+  # [logging] (as `web.driver`) and [logging.web] (as `driver`) -- the
+  # same value twice, once under the wrong section, and piping that
+  # back reproduces the dotted-key-in-[logging] file _write_setup_conf
+  # was fixed to stop writing.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+EOF
+  run main list --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "[logging.web]"
+  refute_output --partial "web.driver"
+  # A bare token count cannot separate the negative case from the
+  # positive one: a splitter resolving `logging.web.driver` to section
+  # `logging` + key `driver` prints ONE `driver = local`, spelled
+  # identically, under the WRONG header. So parse the dump into its
+  # blocks and assert WHICH header each value sits under -- that is the
+  # claim in this test's name, and the round-trip property `list` owes
+  # its documented consumers.
+  local _line _cur="" _parent="" _sub=""
+  while IFS= read -r _line; do
+    if [[ "${_line}" == \[*\] ]]; then
+      _cur="${_line#[}"
+      _cur="${_cur%]}"
+    elif [[ "${_cur}" == "logging" ]]; then
+      _parent+="${_line}"$'\n'
+    elif [[ "${_cur}" == "logging.web" ]]; then
+      _sub+="${_line}"$'\n'
+    fi
+  done <<< "${output}"
+  [[ "${_parent}" == *"driver = json-file"* ]] \
+    || fail "[logging] block lost its own key. Block was: ${_parent}"
+  [[ "${_parent}" != *"driver = local"* ]] \
+    || fail "the [logging.web] value was dumped under [logging]. Block was: ${_parent}"
+  [[ "${_sub}" == *"driver = local"* ]] \
+    || fail "[logging.web] block is missing its own key. Block was: ${_sub}"
+  # ... and exactly once in the whole dump, so it is not ALSO restated
+  # somewhere the block parse above does not look.
+  local _hits
+  _hits="$(printf '%s\n' "${output}" | grep -c '^driver = local$' || true)"
+  [[ "${_hits}" == "1" ]] \
+    || fail "expected the sub-section value exactly once, saw ${_hits}"
+}
+
+@test "no setup.conf namespace-key reader re-derives section membership with a trailing-dot glob on a lone section variable (#955)" {
+  # The CHANGELOG entry and _conf_split_nskey's doc comment both claim
+  # one owner for "which section does this key belong to". This is that
+  # claim as an assertion: a glob that pastes a literal dot onto a lone
+  # section-name variable and matches the rest (`== "${sec}."*`) is
+  # exactly the re-derivation that bound `logging.web.driver` to the
+  # parent [logging]. Readers must ask _conf_split_nskey (or
+  # _setup_dump_section, which wraps it). The guard is structural
+  # because its subject is the reader that does NOT exist yet: a new
+  # one has no behavioural test to catch it.
+  #
+  # WHAT THE NAME PROMISES IS WHAT THE BODY CHECKS. Two nearby spellings
+  # are deliberately OUT, and the name says "a lone section variable"
+  # rather than "any dot-prefix" so nobody reads coverage into them:
+  #
+  #   (a) `== "${_ns}.${_prefix}"*` -- a dot between TWO variables, live
+  #       in setup_tui.sh (1848/1855/2381/2388). Benign: `_prefix` is a
+  #       list-slot stem (`env_`, `port_`) inside an ALREADY-resolved
+  #       namespace, and every hit is then required to strip to
+  #       `^[0-9]+$`, so `environment.env_1.foo` is rejected by the
+  #       numeric test, not misrouted.
+  #   (b) a prefix assembled on an earlier line (`_prefix="stage:${_s}."`
+  #       then `== "${_prefix}"*`), live at setup_tui.sh:2161-2172.
+  #       Benign for the same reason and for a second one: it counts
+  #       every key under one stage on purpose, so a deeper key SHOULD
+  #       be included.
+  #
+  # Catching (a)/(b) would mean matching two live, correct call sites
+  # and then exempting them by path -- the hand-listed roster this
+  # guard exists to avoid. A narrow name that is true beats a wide one
+  # that is not; if a real membership bug is ever written in those
+  # spellings, this guard will not see it, and that is stated here
+  # rather than implied away.
+  #
+  # POPULATION IS DERIVED, NEVER LISTED -- ROOT AND FILE SHAPE INCLUDED.
+  # The root is /source/dist, the whole shipped payload (what
+  # init/upgrade copies to a consumer's .base/dist, cf.
+  # init_rollback_spec.bats), not one subdirectory of it: a reader
+  # dropped into dist/script/base/ ships just as far as one in
+  # dist/script/docker/, and the earlier docker-only root let that one
+  # through green. Within the root the find carries NO -name filter
+  # either: membership is decided by what a file's CODE says, not by
+  # what it is called, so a reader shipped as `.bash`, as `bashrc`, or
+  # with no extension at all is scanned like any other -- an `*.sh`
+  # filter is a roster spelled as a glob, and dist/ already ships
+  # extensionless shell (config/shell/bashrc). Every file whose CODE
+  # calls `_load_setup_conf_full` / `_setup_effective_full` -- the two
+  # functions that produce the namespace-key view -- is a reader, so a
+  # lib or wrapper added tomorrow is scanned with no edit here. Nothing
+  # else in dist/ matches, so the non-shell payload simply never enters
+  # the loop. schema.sh is out because it calls neither:
+  # `_schema_section_keys` prefix-matches the static SCHEMA_VALIDATOR
+  # registry, whose section names carry no dot. The match is over CODE
+  # lines, so _tui_conf.sh -- which names `_load_setup_conf_full` only
+  # in its header prose -- is correctly not a reader.
+  local _root=/source/dist
+  [[ -d "${_root}" ]] || fail \
+    "missing ${_root} -- the shipped tree this guard derives its population from"
+  local -a _readers=()
+  local _f
+  while IFS= read -r _f; do
+    if code_grep -qE '_load_setup_conf_full|_setup_effective_full' "${_f}"; then
+      _readers+=("${_f}")
+    fi
+  done < <(find "${_root}" -type f | sort)
+
+  # A scan that found nothing is not a pass. Four readers exist today
+  # (conf.sh, setup_cmd.sh, setup_conf.sh, setup_tui.sh); the floor is
+  # a REGRESSION floor -- the derivation returning fewer than it
+  # already covered means the derivation broke, not that the tree got
+  # clean.
+  (( ${#_readers[@]} >= 4 )) || fail \
+    "derived only ${#_readers[@]} namespace-key readers under ${_root}; the derivation broke (renamed helper? moved tree?), so this guard scanned almost nothing: ${_readers[*]}"
+
+  # One spelling is not the property. The glob binds a variable holding
+  # a section name to a literal dot and a wildcard, and bash writes that
+  # several ways: the dot inside the quotes or outside, the variable
+  # bare, braced, subscripted, or braced with a modifier
+  # (`${_sec:-x}."*`, `${_sec,,}."*`), in `==` or in a `case` pattern.
+  # All of them are the same defect, so all of them match here. The
+  # brace body is "anything but a closing brace", which is what admits
+  # the modifier forms the earlier `[A-Za-z0-9_]`-only body dropped.
+  #
+  # QUOTING IS A CLASS, NOT ONE CHARACTER. bash quotes that literal dot
+  # with either quote character, so `"${_sec}"'.'*` and `${_sec}'.'*`
+  # are the same defect as `"${_sec}."*` -- a single-quoted dot was
+  # invisible while this matched one optional `"`. The quantifier is
+  # `*`, not `?`, for the same reason: `"${_sec}"'.'*` carries TWO
+  # quote characters between the closing brace and the dot.
+  #
+  # One further spelling is deliberately OUT, alongside (a)/(b) above:
+  #
+  #   (c) indirect expansion, `"${!_ref}."*`. The reference alternation
+  #       requires a name character straight after `${`, so `${!...}`
+  #       is not matched. That is deliberate rather than overlooked: the
+  #       name says "a lone SECTION variable", and an indirect reference
+  #       names a variable that names the section -- one level removed,
+  #       and unused anywhere in dist/. If a membership bug is ever
+  #       written that way this guard will not see it, and that is
+  #       stated here rather than implied away.
+  local _var_ref='(\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*)'
+  local _quotes=$'[\'"]*'
+  local _dot_glob="${_var_ref}${_quotes}\\.${_quotes}\\*"
+
+  local _view="${TEMP_DIR}/reader-code-view.txt" _status _hits
+  for _f in "${_readers[@]}"; do
+    assert_spec_subject "${_f}" "a shipped setup.conf namespace-key reader"
+    code_lines "${_f}" > "${_view}" || true
+    [[ -s "${_view}" ]] || fail \
+      "${_f} has no code lines -- scanning it would assert nothing"
+    _status=0
+    _hits="$(grep -E "${_dot_glob}" "${_view}")" || _status=$?
+    # Pinned to exactly 1: 0 is a live instance, 2 is a scan that never
+    # read the file, and a bare assert_failure cannot tell them apart.
+    (( _status == 1 )) || fail \
+      "grep exited ${_status} scanning ${_f} (want exactly 1: read it, matched nothing). Offending code lines:
+${_hits}"
+  done
+}
+
+@test "list <section> mirrors show <section>" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run main list network --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line --index 0 "mode = host"
+  assert_line --index 1 "ipc = host"
+}
+
+@test "list <section> rejects an unknown section" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main list bogus --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_section_not_found section=bogus
+}
+
+@test "set / show / list run end-to-end via subprocess" {
+  mkdir -p "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib" \
+           "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper" \
+           "${TEMP_DIR}/sandbox/config/docker"
+  cp /source/dist/script/docker/wrapper/setup.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh"
+  cp /source/dist/script/docker/lib/i18n.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/i18n.sh"
+  cp /source/dist/script/docker/lib/_tui_conf.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/_tui_conf.sh"
+  # setup.sh sources _lib.sh for the _log_* helpers; _lib.sh
+  # is an umbrella that sources lib/*.sh sub-libs
+  cp /source/dist/script/docker/lib/_lib.sh "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/_lib.sh"
+  cp /source/dist/script/docker/lib/* "${TEMP_DIR}/sandbox/.base/dist/script/docker/lib/"
+  cp /source/dist/setup.toml "${TEMP_DIR}/sandbox/setup.toml"
+
+  run bash "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh" \
+    set network.mode bridge --base-path "${TEMP_DIR}/sandbox"
+  assert_success
+
+  run bash "${TEMP_DIR}/sandbox/.base/dist/script/docker/wrapper/setup.sh" \
+    show network.mode --base-path "${TEMP_DIR}/sandbox"
+  assert_success
+  assert_output "bridge"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Subcommand: add / remove (Phase B-3)
+#
+# `setup.sh add <section>.<list> <value>` finds the next `<list>_N`
+# (max+1) and writes via `_upsert_conf_value`.
+# `setup.sh remove <section>.<key>` deletes a single keyed entry.
+# `setup.sh remove <section>.<list> <value>` deletes the first key
+# under <section> matching `<list>_*` whose value equals <value>.
+# Validators wired through the same `_setup_validate_kv` table B-2
+# uses for `set`. No .env regen — `apply` is still the explicit gate.
+# ════════════════════════════════════════════════════════════════════
+
+@test "main add appends mount to next available slot" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+EOF
+  run main add volumes.mount /b:/b --base-path "${TEMP_DIR}"
+  assert_success
+  run main show volumes.mount_2 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/b:/b"
+}
+
+@test "main add to empty section creates _1" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+EOF
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main show environment.env_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "FOO=bar"
+}
+
+@test "main add bootstraps setup.conf empty when missing (#174)" {
+  rm -f "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/setup.toml"
+  run main add volumes.mount /foo:/bar --base-path "${TEMP_DIR}"
+  assert_success
+  assert [ -f "${TEMP_DIR}/setup.toml" ]
+  # show reads template ← .local merge; the new mount lands in .local
+  # and the merged view surfaces it through the next mount_<N> slot.
+  run main show volumes.mount_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "/foo:/bar"
+}
+
+@test "main add picks max+1 even with gap from prior remove" {
+  # A `[[volumes]]` array is DENSE: a mount's number is its position in
+  # the array, so a hole in the numbering can no longer be written down
+  # and `remove` closes the array up instead of leaving one. The max+1
+  # rule over a genuinely sparse list is exercised by "main add then
+  # remove round-trips" below, over `[environment]`, whose numbered keys
+  # stay plain scalars and so can still skip a number.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+
+[[volumes]]
+source = "/c"
+target = "/c"
+EOF
+  run main add volumes.mount /d:/d --base-path "${TEMP_DIR}"
+  assert_success
+  run main show volumes.mount_3 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/d:/d"
+}
+
+@test "main add rejects unknown section" {
+  : > "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main add bogus.list /a:/a --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_section_not_found section=bogus
+}
+
+# why: the issue's own reproduction. The family is `build.arg`; `build.args`
+# appended `args_1` to [build], which only the next `apply` refused as
+# apply_unknown_key. The refusal belongs before the write, in apply's terms.
+@test "main add refuses an unknown family up front and leaves setup.toml untouched (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/setup.toml.before"
+  # Same usage class as `set` (base#1399).
+  LOG_FORMAT=json run --separate-stderr main add build.args MYARG=1 --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=build key=args
+  assert_stderr_contains "no reader reads it"
+  run cmp "${TEMP_DIR}/setup.toml.before" "${TEMP_DIR}/setup.toml"
+  assert_success
+}
+
+# why: --local writes setup.local.toml instead; this pins that the refusal
+# leaves that file byte-identical too, not only setup.toml.
+@test "main add --local refuses an unknown family and leaves setup.local.toml untouched (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf '[deploy]\ngpu_count = "1"\n' > "${TEMP_DIR}/setup.local.toml"
+  cp "${TEMP_DIR}/setup.local.toml" "${TEMP_DIR}/setup.local.toml.before"
+  LOG_FORMAT=json run --separate-stderr main add --local build.args MYARG=1 --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=build key=args
+  run cmp "${TEMP_DIR}/setup.local.toml.before" "${TEMP_DIR}/setup.local.toml"
+  assert_success
+}
+
+# why: the dotted [logging.<svc>] spelling splits at the rightmost dot; this
+# pins that the family check covers that per-service sub-section as well.
+@test "main add refuses an unknown family under a logging.<svc> sub-section (base#1374)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+TOML
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/setup.toml.before"
+  LOG_FORMAT=json run --separate-stderr main add logging.web.tags alpha --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=logging.web key=tags
+  run cmp "${TEMP_DIR}/setup.toml.before" "${TEMP_DIR}/setup.toml"
+  assert_success
+}
+
+# why: the guard's false-positive side: a family is judged by its `_1` slot,
+# and every shipped family must still resolve that way.
+@test "main add still accepts the known families (base#1374)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  run main add build.arg MYARG=1 --base-path "${TEMP_DIR}"
+  assert_success
+  run main add volumes.mount /tmp/a:/a --base-path "${TEMP_DIR}"
+  assert_success
+  run main add network.port 8080:80 --base-path "${TEMP_DIR}"
+  assert_success
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+}
+
+@test "main add writes no dotted key into [logging] for a logging.<svc> spec (#955)" {
+  # `add` derived <section>/<list> with its own dot-split instead of
+  # asking _conf_split_nskey, so `logging.web.<list>` split at the FIRST
+  # dot: section `logging`, list `web.<list>`. That is the same
+  # misrouting _write_setup_conf was fixed for -- the slot was appended
+  # to the parent [logging] block as a bogus dotted key `web.<list>_N`,
+  # which no reader ever resolves back to the [logging.web] service.
+  # No list family is read under [logging.<svc>], so since base#1374
+  # `add` refuses the spec before writing; the split rule itself is
+  # pinned in conf_accessor_spec.bats. What stays pinned here is that
+  # neither the parent nor the sub-section gains a key.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+EOF
+  LOG_FORMAT=json run --separate-stderr main add logging.web.tag alpha --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_unknown_key table=logging.web key=tag
+
+  # No dotted key is injected anywhere, and no slot is written.
+  run grep -c '^web\.tag' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+  run grep -c '^tag_1' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+  # The parent section keeps exactly its own key ...
+  local -a _pk=() _pv=()
+  _parse_ini_section "${TEMP_DIR}/setup.toml" "logging" _pk _pv
+  [[ "${_pk[*]}" == "driver" ]]
+  # ... and so does the sub-section.
+  local -a _sk=() _sv=()
+  _parse_ini_section "${TEMP_DIR}/setup.toml" "logging.web" _sk _sv
+  [[ "${_sk[*]}" == "driver" ]]
+}
+
+@test "main add rejects invalid mount value" {
+  : > "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main add volumes.mount not-a-mount --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=volumes key=mount_1
+}
+
+@test "main add rejects missing list / value" {
+  LOG_FORMAT=json run --separate-stderr main add --base-path "${TEMP_DIR}"
+  assert_bridge_refusal 1 "Usage: setup.sh add"
+  LOG_FORMAT=json run --separate-stderr main add volumes.mount --base-path "${TEMP_DIR}"
+  assert_bridge_refusal 1 "Usage: setup.sh add"
+}
+
+@test "main add does not regen .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+EOF
+  : > "${TEMP_DIR}/.env.generated"
+  local _before
+  _before="$(stat -c '%Y' "${TEMP_DIR}/.env.generated")"
+  sleep 1
+  run main add volumes.mount /b:/b --base-path "${TEMP_DIR}"
+  assert_success
+  local _after
+  _after="$(stat -c '%Y' "${TEMP_DIR}/.env.generated")"
+  assert_equal "${_before}" "${_after}"
+}
+
+@test "main remove drops keyed entry" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+
+[[volumes]]
+source = "/b"
+target = "/b"
+
+[[volumes]]
+source = "/c"
+target = "/c"
+EOF
+  run main remove volumes.mount_2 --base-path "${TEMP_DIR}"
+  assert_success
+  # A mount's number is its position in the `[[volumes]]` array, so
+  # dropping an entry leaves a shorter array with the survivors closed up
+  # behind it: /a:/a keeps slot 1, /c:/c -- never /b:/b -- is what slot 2
+  # now holds, and there is no slot 3. Asserting the other way round would
+  # claim the array keeps a hole where the removed entry was, which TOML
+  # cannot spell. The entry removed is above slot 1 because slot 1 of
+  # `[volumes]` is the workspace bind by position: a removal that would
+  # promote another mount into it is refused, not compacted, and
+  # conf_toml_writer_spec carries that case.
+  LOG_FORMAT=json run --separate-stderr main show volumes.mount_3 --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=volumes.mount_3
+  run main show volumes.mount_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/a:/a"
+  run main show volumes.mount_2 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/c:/c"
+}
+
+@test "main remove by value finds matching key in list" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+
+[[volumes]]
+source = "/b"
+target = "/b"
+
+[[volumes]]
+source = "/c"
+target = "/c"
+EOF
+  run main remove volumes.mount /b:/b --base-path "${TEMP_DIR}"
+  assert_success
+  # The named VALUE is what has to disappear, and in a dense
+  # `[[volumes]]` array the survivors close up behind it: /b:/b is in no
+  # slot, /a:/a keeps slot 1, /c:/c moves into slot 2, and the list is
+  # one shorter. Every slot is pinned so "removed by value" cannot be
+  # confused with "overwrote the wrong entry".
+  run main show volumes.mount_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/a:/a"
+  run main show volumes.mount_2 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "/c:/c"
+  LOG_FORMAT=json run --separate-stderr main show volumes.mount_3 --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=volumes.mount_3
+}
+
+@test "main remove fails when key missing" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+EOF
+  LOG_FORMAT=json run --separate-stderr main remove volumes.mount_99 --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=volumes.mount_99
+}
+
+@test "main remove by value fails when no value matches" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = "/a"
+target = "/a"
+EOF
+  LOG_FORMAT=json run --separate-stderr main remove volumes.mount /nonexistent:/x --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_key_not_found key=volumes.mount value=/nonexistent:/x
+}
+
+@test "main remove rejects unknown section" {
+  : > "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main remove bogus.key --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_section_not_found section=bogus
+}
+
+@test "main remove preserves comments + remaining keys" {
+  # The in-section comment sits under [network] rather than beside the
+  # mount being dropped: a `[[volumes]]` block IS the entry, so removing
+  # it removes its whole body, comment lines included. What this case
+  # pins is that the rewrite is not a wholesale regeneration -- comments
+  # and keys the remove did not name come through verbatim.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+# Top-of-file comment
+[[volumes]]
+source = "/a"
+target = "/a"
+
+[[volumes]]
+source = "/b"
+target = "/b"
+
+[network]
+# inline comment
+mode = "host"
+EOF
+  run main remove volumes.mount_2 --base-path "${TEMP_DIR}"
+  assert_success
+  # remove modifies setup.toml in-place; comments and
+  # untouched keys survive the rewrite.
+  run cat "${TEMP_DIR}/setup.toml"
+  assert_output --partial "Top-of-file comment"
+  assert_output --partial "inline comment"
+  assert_output --partial 'source = "/a"'
+  assert_output --partial 'target = "/a"'
+  assert_output --partial 'mode = "host"'
+  # The dropped entry is gone: /b was the only source and target spelled
+  # that way, so no field of the removed block is left behind. (`mount_2`
+  # is not a string the TOML file ever contained, so the old refutation
+  # of that token would now hold vacuously.) The entry dropped is the one
+  # above slot 1, because slot 1 of `[volumes]` is the workspace bind by
+  # position and a removal there is refused rather than compacted --
+  # conf_toml_writer_spec carries that case.
+  refute_output --partial '"/b"'
+  # ... and the array is one shorter, with slot 1 where it was.
+  run toml_bridge_parse "${TEMP_DIR}/setup.toml" --kv
+  assert_success
+  assert_line 'volumes	mount_1	/a:/a'
+  refute_line --regexp '^volumes	mount_2	'
+}
+
+@test "main add then remove round-trips" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+EOF
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main add environment.env BAZ=qux --base-path "${TEMP_DIR}"
+  assert_success
+  run main show environment --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial "env_1 = FOO=bar"
+  assert_output --partial "env_2 = BAZ=qux"
+  run main remove environment.env_1 --base-path "${TEMP_DIR}"
+  assert_success
+  run main add environment.env NEW=val --base-path "${TEMP_DIR}"
+  assert_success
+  run main show environment.env_3 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "NEW=val"
+}
+
+# ── remove gives back the file add started from (base#1363) ───────────
+#
+# `remove` rewrites setup.toml in place, so it must touch only the entry
+# it removes: no blank line added at a table boundary, every `x = []`
+# declaration left where and in the order it was, and a table that `add`
+# created dropped again once its last key goes. Otherwise an add-then-
+# remove round trip leaves a different file, and SETUP_CONF_HASH reports
+# drift for a configuration that did not change. The fixture is shaped
+# like the shipped setup.toml: several tables, `[[...]]` arrays, and more
+# than one `x = []` in one table. Every case runs in ${TEMP_DIR}, never
+# the live tree (base#1075).
+
+# _write_roundtrip_fixture <file>
+#   Write a setup.toml shaped like the shipped one, with no [environment]
+#   table, so `add environment.env` has to create it.
+_write_roundtrip_fixture() {
+  cat > "$1" <<'EOF'
+# setup.toml -- round-trip fixture (base#1363)
+
+[project]
+name = ""
+
+[[image.rules]]
+rule = "prefix:docker_"
+
+[[image.rules]]
+rule = "@basename"
+
+[build]
+target_arch = ""
+network = "auto"
+
+[[build.args]]
+key = "TZ"
+value = "Asia/Taipei"
+
+[deploy]
+gpu_mode = "auto"
+gpu_count = "all"
+
+[network]
+mode = "host"
+ipc = "host"
+ports = []
+
+[security]
+privileged = false
+cap_add = []
+cap_drop = []
+security_opt = []
+
+[resources]
+shm_size = ""
+
+[logging]
+driver = "json-file"
+max_file = 3
+EOF
+}
+
+# _conf_hash_of <dir>
+#   Print the SETUP_CONF_HASH line `apply` wrote into <dir>/.env.generated.
+_conf_hash_of() {
+  grep '^SETUP_CONF_HASH=' "$1/.env.generated"
+}
+
+# why: the issue's own reproduction: a table `add` creates has to go again with
+# its last key, and no other line of a shipped-shaped file may move.
+@test "add then remove environment.env gives back a byte-identical setup.toml (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml"
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  # The [environment] table `add` created goes with its last key, and no
+  # other line moves: the diff is empty.
+  run diff -u "${TEMP_DIR}/before.toml" "${TEMP_DIR}/setup.toml"
+  assert_success
+  assert_output ""
+}
+
+# why: the `[[...]]` half of the round trip; the only case where the emptied
+# `ports = []` declaration has to come back in its own place.
+@test "add then remove network.port gives back a byte-identical setup.toml (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml"
+  run main add network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run diff -u "${TEMP_DIR}/before.toml" "${TEMP_DIR}/setup.toml"
+  assert_success
+  assert_output ""
+}
+
+# why: pins the in-place guarantee without `add` in the loop, so a writer that
+# only undoes its own appends cannot pass by luck.
+@test "remove of an existing key changes only that key's line (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  printf '\n[environment]\nenv_1 = "A=1"\nenv_2 = "B=2"\n' \
+    >> "${TEMP_DIR}/setup.toml"
+  # Expected: the same file with the env_2 line gone and nothing else --
+  # blank lines, `ports = []` and the three [security] declarations in
+  # their order all stay put.
+  grep -vFx 'env_2 = "B=2"' "${TEMP_DIR}/setup.toml" > "${TEMP_DIR}/want.toml"
+  run main remove environment.env_2 --base-path "${TEMP_DIR}"
+  assert_success
+  run diff -u "${TEMP_DIR}/want.toml" "${TEMP_DIR}/setup.toml"
+  assert_success
+  assert_output ""
+}
+
+# why: the symptom operators saw: each call added a line, so a file drifted
+# further with every round instead of settling.
+@test "repeated add/remove rounds do not grow setup.toml (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  local _lines _i
+  _lines="$(wc -l < "${TEMP_DIR}/setup.toml")"
+  for _i in 1 2 3; do
+    run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+    assert_success
+    run main remove environment.env FOO=bar --base-path "${TEMP_DIR}"
+    assert_success
+    assert_equal "$(wc -l < "${TEMP_DIR}/setup.toml")" "${_lines}"
+  done
+}
+
+# why: the hash is over file bytes, so this is what turns a cosmetic diff into
+# a false drift report on the next build.
+@test "SETUP_CONF_HASH is unchanged by an environment.env add/remove round trip (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  local _before
+  _before="$(_conf_hash_of "${TEMP_DIR}")"
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  assert_equal "$(_conf_hash_of "${TEMP_DIR}")" "${_before}"
+}
+
+# why: the same drift guarantee for the `[[...]]` path, which rewrites through
+# a different branch of the writer.
+@test "SETUP_CONF_HASH is unchanged by a network.port add/remove round trip (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  local _before
+  _before="$(_conf_hash_of "${TEMP_DIR}")"
+  run main add network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  assert_equal "$(_conf_hash_of "${TEMP_DIR}")" "${_before}"
+}
+
+# _assert_roundtrip <section.list> <value>
+#   Run `add` then `remove` of <value> on ${TEMP_DIR}/setup.toml and
+#   assert the file is byte-identical to what it was before the add.
+_assert_roundtrip() {
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml"
+  run main add "$1" "$2" --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove "$1" "$2" --base-path "${TEMP_DIR}"
+  assert_success
+  run diff -u "${TEMP_DIR}/before.toml" "${TEMP_DIR}/setup.toml"
+  assert_success
+  assert_output ""
+}
+
+# why: review round 1 found dropping the created table took every blank line
+# before it, the file's own trailing one included; the first fixture
+# ended without one and could not see it.
+@test "add then remove environment.env keeps the file's trailing blank line (base#1363)" {
+  # The [environment] table `add` appends goes again with its key, and
+  # only the one blank line `add` put before it goes with it: the blank
+  # line the file already ended with stays.
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  printf '\n' >> "${TEMP_DIR}/setup.toml"
+  _assert_roundtrip environment.env FOO=bar
+}
+
+# why: the end-of-file `[[...]]` path dropped every blank line held before a
+# removed block; only a file ending in a block plus a blank line reaches it.
+@test "add then remove network.port keeps the blank line after a [[...]] block at the end of the file (base#1363)" {
+  # The added [[network.ports]] block lands after the one the file ends
+  # with; removing it must not take the trailing blank line along.
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  sed -i '/^ports = \[\]$/d' "${TEMP_DIR}/setup.toml"
+  printf '\n[[network.ports]]\nhost = "80"\ncontainer = "80"\n\n' \
+    >> "${TEMP_DIR}/setup.toml"
+  _assert_roundtrip network.port 8080:8080
+}
+
+# why: `add` writes the same bytes with or without an empty [environment]
+# already present, so only the header note it writes tells them apart;
+# without this case deleting every emptied table passes.
+@test "add then remove environment.env keeps an empty [environment] table that was already there (base#1363)" {
+  # `remove` drops only a table `add` created; one the file already held,
+  # empty, stays as it was.
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  printf '\n[environment]\n' >> "${TEMP_DIR}/setup.toml"
+  _assert_roundtrip environment.env FOO=bar
+}
+
+# why: the mid-file variant with the user's own header comment, which an
+# indiscriminate table drop also deleted.
+@test "add then remove environment.env keeps an empty [environment] table whose header carries a comment (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  sed -i 's/^\[logging\]$/[environment] # host interfaces\n\n[logging]/' \
+    "${TEMP_DIR}/setup.toml"
+  grep -qFx '[environment] # host interfaces' "${TEMP_DIR}/setup.toml"
+  _assert_roundtrip environment.env FOO=bar
+}
+
+# why: ties the trailing-blank fix to the drift report it would otherwise
+# trigger.
+@test "SETUP_CONF_HASH is unchanged by a round trip on a file ending in a blank line (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  printf '\n' >> "${TEMP_DIR}/setup.toml"
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  local _before
+  _before="$(_conf_hash_of "${TEMP_DIR}")"
+  run main add environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove environment.env FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  assert_equal "$(_conf_hash_of "${TEMP_DIR}")" "${_before}"
+}
+
+# _move_ports_decl <file> <decl-line>
+#   Replace the fixture's trailing `ports = []` in [network] with
+#   <decl-line>, placed BEFORE `ipc = "host"`, so the declaration is no
+#   longer where a writer that re-creates it at the table's end would put
+#   it back.
+_move_ports_decl() {
+  local _f="$1" _decl="$2"
+  grep -vFx 'ports = []' "${_f}" > "${_f}.tmp"
+  awk -v d="${_decl}" '$0 == "ipc = \"host\"" { print d } { print }' \
+    "${_f}.tmp" > "${_f}"
+  rm -f "${_f}.tmp"
+  grep -qFx -- "${_decl}" "${_f}"
+}
+
+# why: review round 2 found remove re-created an emptied `ports = []` at the
+# end of [network], after `ipc`, so a declaration the file kept anywhere
+# else moved; the first fixture put it last and could not see that.
+@test "add then remove network.port keeps an empty-array declaration before another key in place (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  _move_ports_decl "${TEMP_DIR}/setup.toml" 'ports = []'
+  _assert_roundtrip network.port 8080:8080
+}
+
+# why: the declaration came back canonically spelled, so an operator's note on
+# why the list is empty, and their own spacing, were lost by a round trip.
+@test "add then remove network.port keeps an empty-array declaration's comment and spacing (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  _move_ports_decl "${TEMP_DIR}/setup.toml" 'ports  =  [ ]   # nothing published'
+  _assert_roundtrip network.port 8080:8080
+}
+
+# why: the declaration has to survive a remove that leaves the list non-empty,
+# or only a single-entry round trip gives the file back.
+@test "add two network.port entries then remove both keeps the declaration in place (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  _move_ports_decl "${TEMP_DIR}/setup.toml" 'ports = []  # host networking'
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml"
+  run main add network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main add network.port 9090:9090 --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove network.port 9090:9090 --base-path "${TEMP_DIR}"
+  assert_success
+  run diff -u "${TEMP_DIR}/before.toml" "${TEMP_DIR}/setup.toml"
+  assert_success
+  assert_output ""
+}
+
+# why: ties the moved, annotated declaration to the drift report a changed
+# byte would trigger.
+@test "SETUP_CONF_HASH is unchanged by a network.port round trip with a moved, annotated declaration (base#1363)" {
+  _write_roundtrip_fixture "${TEMP_DIR}/setup.toml"
+  _move_ports_decl "${TEMP_DIR}/setup.toml" 'ports = [ ]  # nothing published'
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  local _before
+  _before="$(_conf_hash_of "${TEMP_DIR}")"
+  run main add network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main remove network.port 8080:8080 --base-path "${TEMP_DIR}"
+  assert_success
+  run main apply --base-path "${TEMP_DIR}"
+  assert_success
+  assert_equal "$(_conf_hash_of "${TEMP_DIR}")" "${_before}"
+}
+
+@test "main add validates env_kv format" {
+  : > "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main add environment.env "no-equals-sign" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=environment key=env_1
+}
+
+@test "main add free-form image rule accepts arbitrary string" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[image]
+
+[[image.rules]]
+rule = "@basename"
+EOF
+  run main add image.rule "prefix:my_" --base-path "${TEMP_DIR}"
+  assert_success
+  run main show image.rule_2 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output "prefix:my_"
+}
+
+# ── add / remove speak setup.toml's vocabulary (base#1354) ────────────
+#
+# `volumes.mount`, `network.port` and `devices.cgroup_rule` are arrays of
+# tables in setup.toml: `add` appends a `[[volumes]]` /
+# `[[network.ports]]` / `[[devices.cgroup_rules]]` entry, and no
+# `mount_N` / `port_N` / `cgroup_rule_N` key is written to the file. Only
+# `environment.env` writes a numbered `env_N` key. The help and the
+# confirmation line must name what the file holds. Every case runs
+# against a fixture in ${TEMP_DIR}, never the live tree (base#1075).
+
+# _toml_block_fields <file> <header> <n>
+#   Print the fields of the <n>-th `<header>` block of <file>, joined by
+#   ", " -- the entry as setup.toml spells it, read from the written file.
+_toml_block_fields() {
+  awk -v hdr="$2" -v want="$3" '
+    $0 == hdr { n++; inb = (n == want); next }
+    /^\[/     { inb = 0; next }
+    inb && NF { out = out (out == "" ? "" : ", ") $0 }
+    END       { print out }
+  ' "$1"
+}
+
+# why: the help is where an operator learns what `add` writes; it named a
+# `<list>_N` key setup.toml never holds, so the file they then open shows
+# a `[[...]]` entry the help never mentioned.
+@test "help: add/remove describe array entries, not <list>_N keys (base#1354)" {
+  run main -h
+  assert_success
+  # The add + remove blocks of the help, up to the next subcommand.
+  local _blk
+  _blk="$(printf '%s\n' "${output}" | sed -n '/^  add <section>\.<list>/,/^  reset /p')"
+  [[ -n "${_blk}" ]]
+  # One line per claim: newlines and indentation folded to single spaces,
+  # so a statement wrapped across help lines is matched whole.
+  local _flat
+  _flat="$(printf '%s' "${_blk}" | tr -s ' \n' '  ')"
+  # Which list appends which array-of-tables entry, and that it appends.
+  [[ "${_flat}" == *'`volumes.mount`, `network.port` and `devices.cgroup_rule` append a new `[[volumes]]`, `[[network.ports]]` or `[[devices.cgroup_rules]]` entry built from the value'* ]]
+  [[ "${_flat}" == *'`add volumes.mount /foo:/bar` appends `[[volumes]]` with source = "/foo", target = "/bar"'* ]]
+  # Only environment.env writes a numbered key, and it is the next free one.
+  [[ "${_flat}" == *'`environment.env` writes the next free `env_N` key'* ]]
+  # The CLI address stays, and is said to be an entry, not a key.
+  [[ "${_flat}" == *'`volumes.mount_2` is the 2nd `[[volumes]]` entry'* ]]
+  # With that one permitted address taken out, no array list is spoken
+  # of as a numbered key: no mount_N / port_N / cgroup_rule_N (any index
+  # spelling), no <list>_N, no max+1 numbering.
+  local _rest="${_flat//'`volumes.mount_2` is the 2nd `[[volumes]]` entry'/}"
+  [[ ! "${_rest}" =~ (mount|port|cgroup_rule|device|tmpfs)_(N|[0-9]+|\<|\*) ]]
+  [[ "${_rest}" != *'<list>_'* ]]
+  [[ "${_rest}" != *'max+1'* ]]
+  [[ "${_rest}" != *'mount_<next>'* ]]
+}
+
+# why: the confirmation is the one line that says what landed in the file;
+# it named `[volumes] mount_2`, a key nobody can find in setup.toml. Read
+# back from the written fixture so the line cannot drift from the write.
+@test "add volumes.mount confirms the [[volumes]] entry it wrote (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[volumes]]
+source = "/a"
+target = "/a"
+TOML
+  run main add volumes.mount /b:/b --base-path "${TEMP_DIR}"
+  assert_success
+  local _want
+  _want="$(_toml_block_fields "${TEMP_DIR}/setup.toml" '[[volumes]]' 2)"
+  [[ "${_want}" == *'source = "/b"'* ]]
+  assert_line "[setup] add [[volumes]] ${_want}"
+  refute_output --partial 'mount_'
+}
+
+# why: the port entry splits into host / container fields, a different
+# shape from a mount, so the label has to follow the per-array field spec.
+@test "add network.port confirms the [[network.ports]] entry it wrote (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[network]
+mode = "bridge"
+TOML
+  run main add network.port 8080:80 --base-path "${TEMP_DIR}"
+  assert_success
+  local _want
+  _want="$(_toml_block_fields "${TEMP_DIR}/setup.toml" '[[network.ports]]' 1)"
+  [[ "${_want}" == *'host = "8080"'* ]]
+  assert_line "[setup] add [[network.ports]] ${_want}"
+  refute_output --partial 'port_'
+}
+
+# why: a one-field entry under a dotted array path; the INI name
+# `cgroup_rule_1` is neither the header nor the field the file holds.
+@test "add devices.cgroup_rule confirms the [[devices.cgroup_rules]] entry it wrote (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[devices]
+TOML
+  run main add devices.cgroup_rule 'c 189:* rwm' --base-path "${TEMP_DIR}"
+  assert_success
+  local _want
+  _want="$(_toml_block_fields "${TEMP_DIR}/setup.toml" '[[devices.cgroup_rules]]' 1)"
+  [[ "${_want}" == *'rule = "c 189:* rwm"'* ]]
+  assert_line "[setup] add [[devices.cgroup_rules]] ${_want}"
+  refute_output --partial 'cgroup_rule_'
+}
+
+# why: remove-by-value has to say WHICH entry went; naming the CLI index
+# `mount_2` does not tell the operator what is now missing from the file.
+@test "remove volumes.mount <value> confirms the [[volumes]] entry it dropped (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[volumes]]
+source = "/a"
+target = "/a"
+
+[[volumes]]
+source = "/b"
+target = "/b"
+TOML
+  local _want
+  _want="$(_toml_block_fields "${TEMP_DIR}/setup.toml" '[[volumes]]' 2)"
+  run main remove volumes.mount /b:/b --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line "[setup] remove [[volumes]] ${_want}"
+  refute_output --partial 'mount_'
+  # The entry named is the one gone from the written file.
+  run grep -c '^source = "/b"$' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+}
+
+# why: a `[[tmpfs]]` block with separate `path` and `size` flattens to
+# `/tmp/x:size=64m`; a label rebuilt from that value printed one `path`
+# field the file never held. The label is read from the file before the
+# write.
+@test "remove tmpfs.tmpfs_1 names the [[tmpfs]] entry with its own fields (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[tmpfs]]
+path = "/tmp/x"
+size = "64m"
+TOML
+  local _want
+  _want="$(_toml_block_fields "${TEMP_DIR}/setup.toml" '[[tmpfs]]' 1)"
+  [[ "${_want}" == 'path = "/tmp/x", size = "64m"' ]]
+  run main remove tmpfs.tmpfs_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line "[setup] remove [[tmpfs]] ${_want}"
+  refute_output --partial 'size=64m'
+  run grep -c '^path = "/tmp/x"$' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+}
+
+# why: a field value may span lines. `path = """` + newline + `/tmp/x"""`
+# is the TOML string `/tmp/x` (the newline after the opener is trimmed),
+# and a reader that keeps only `key = value` lines printed `path = """`
+# and lost the path the operator removed.
+@test "remove tmpfs.tmpfs_1 names a multi-line path by its whole value (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[tmpfs]]
+path = """
+/tmp/x"""
+size = "64m"
+TOML
+  run main remove tmpfs.tmpfs_1 --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line '[setup] remove [[tmpfs]] path = "/tmp/x", size = "64m"'
+  refute_output --partial '"""'
+  # The entry named is the one gone from the written file.
+  run grep -c '/tmp/x' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+}
+
+# why: the other multi-line spellings carry the same value: a literal
+# `'''` string, a line-ending backslash that folds the next line in, and
+# an array split over lines. Each label is one line and names the value
+# TOML reads, so a literal string is respelled as the basic string it
+# equals.
+@test "entry label renders every multi-line field value whole (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[tmpfs]]
+path = '''
+/tmp/lit\dir'''
+
+[[tmpfs]]
+path = """/tmp/\
+    folded"""
+size = "64m"
+
+[[volumes]]
+source = "/a"
+target = [
+  "/b",  # comment
+  "/c",
+]
+TOML
+  local _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" tmpfs tmpfs_1 _lbl
+  [[ "${_lbl}" == '[[tmpfs]] path = "/tmp/lit\\dir"' ]]
+  _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" tmpfs tmpfs_2 _lbl
+  [[ "${_lbl}" == '[[tmpfs]] path = "/tmp/folded", size = "64m"' ]]
+  _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" volumes mount_1 _lbl
+  [[ "${_lbl}" == '[[volumes]] source = "/a", target = [ "/b", "/c", ]' ]]
+}
+
+# why: a line inside a multi-line string is text, not a header; counting
+# it as `[[tmpfs]]` shifted every later block by one and named the wrong
+# entry.
+@test "entry label does not count a header-shaped line inside a multi-line string (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[tmpfs]]
+path = """
+[[tmpfs]]
+"""
+
+[[tmpfs]]
+path = "/tmp/second"
+TOML
+  local _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" tmpfs tmpfs_2 _lbl
+  [[ "${_lbl}" == '[[tmpfs]] path = "/tmp/second"' ]]
+  _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" tmpfs tmpfs_1 _lbl
+  [[ "${_lbl}" == '[[tmpfs]] path = "[[tmpfs]]\n"' ]]
+}
+
+# why: `[[devices]]` is the other spelling of `device_N`; rebuilding the
+# label from the value named `[[devices.bindings]]`, a table absent from
+# the file. add and remove both decline such a file, so the label helper
+# is pinned directly.
+@test "entry label of a [[devices]] block names [[devices]], not [[devices.bindings]] (base#1354)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[[devices]]
+path = "/dev/fuse"
+
+[[devices]]
+path = "/dev/x"
+TOML
+  local _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" devices device_2 _lbl
+  [[ "${_lbl}" == '[[devices]] path = "/dev/x"' ]]
+  _lbl=""
+  _setup_toml_entry_label "${TEMP_DIR}/setup.toml" devices device_1 _lbl
+  [[ "${_lbl}" == '[[devices]] path = "/dev/fuse"' ]]
+  # A slot the file does not hold is no label at all.
+  run _setup_toml_entry_label "${TEMP_DIR}/setup.toml" devices device_3 _lbl
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Subcommand: reset (Phase B-4)
+#
+# `setup.sh reset [--yes]` overwrites <base-path>/setup.toml with the
+# template default. Existing setup.conf → setup.toml.bak; existing
+# .env → .env.bak (one-shot rollback path). Does NOT regenerate .env
+# — the user invokes apply afterwards, or build/run will trigger
+# auto-regen via drift detection on next run. --yes skips the
+# interactive confirmation prompt; non-tty without --yes refuses to
+# proceed (safety guard against accidental invocation in pipelines).
+# ════════════════════════════════════════════════════════════════════
+
+@test "main reset --yes clears setup.conf + setup.conf so next apply rebuilds (#174)" {
+  mkdir -p "${TEMP_DIR}/.base/dist"
+  cp /source/dist/setup.toml "${TEMP_DIR}/.base/dist/setup.toml"
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+# user-customized
+[network]
+mode = "bridge"
+EOF
+  : > "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    _SETUP_SCRIPT_DIR='${TEMP_DIR}/.base/script/docker'
+    mkdir -p \"\${_SETUP_SCRIPT_DIR}\"
+    source /source/dist/script/docker/wrapper/setup.sh
+    main reset --yes --base-path '${TEMP_DIR}'
+  "
+  assert_success
+  # Override + materialized snapshot both removed — the next apply will
+  # rebuild setup.conf purely from the template baseline.
+  refute [ -f "${TEMP_DIR}/setup.toml" ]
+  refute [ -f "${TEMP_DIR}/setup.toml" ]
+}
+
+@test "main reset --yes backs up prior setup.conf to .local.bak (#174)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+# CUSTOM_MARKER
+[network]
+mode = "bridge"
+EOF
+  run main reset --yes --base-path "${TEMP_DIR}"
+  assert_success
+  assert [ -f "${TEMP_DIR}/setup.toml.bak" ]
+  run grep CUSTOM_MARKER "${TEMP_DIR}/setup.toml.bak"
+  assert_success
+}
+
+@test "main reset --yes backs up prior .env.generated to .env.generated.bak" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  printf 'IMAGE_NAME=customimg\n' > "${TEMP_DIR}/.env.generated"
+  run main reset --yes --base-path "${TEMP_DIR}"
+  assert_success
+  assert [ -f "${TEMP_DIR}/.env.generated.bak" ]
+  run grep "IMAGE_NAME=customimg" "${TEMP_DIR}/.env.generated.bak"
+  assert_success
+}
+
+@test "main reset --yes does NOT regenerate .env" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  : > "${TEMP_DIR}/.env.generated"
+  local _before
+  _before="$(stat -c '%Y' "${TEMP_DIR}/.env.generated")"
+  sleep 1
+  run main reset --yes --base-path "${TEMP_DIR}"
+  assert_success
+  # Either .env still has its prior mtime (file untouched), or it was
+  # moved to .env.bak — but a fresh derived .env should NOT exist yet.
+  if [[ -f "${TEMP_DIR}/.env.generated" ]]; then
+    local _after
+    _after="$(stat -c '%Y' "${TEMP_DIR}/.env.generated")"
+    assert_equal "${_before}" "${_after}"
+  fi
+}
+
+@test "main reset without --yes refuses non-tty (no confirmation possible)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  # Bats runs without a controlling TTY — without --yes the handler
+  # must refuse rather than silently destroy state.
+  LOG_FORMAT=json run --separate-stderr main reset --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_reset_needs_yes
+  refute [ -f "${TEMP_DIR}/setup.toml.bak" ]
+}
+
+@test "main reset rejects unknown flag" {
+  LOG_FORMAT=json run --separate-stderr main reset --bogus --base-path "${TEMP_DIR}"
+  assert_refusal 1 conf_unknown_arg arg=--bogus
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Per-section setup.conf parameter end-to-end coverage
+#
+# Each test sets a single key in <repo>/setup.toml and asserts the
+# expected line appears in compose.yaml or .env. Companion negative
+# tests confirm the corresponding compose / env block is omitted when
+# the key is empty / cleared. Ensures every key documented in
+# .base/dist/setup.toml has a setting → output assertion.
+# ════════════════════════════════════════════════════════════════════
+
+# ── [deploy] ─────────────────────────────────────────────────────────
+
+@test "[deploy] gpu_mode = off omits deploy.resources block from compose.yaml" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "off"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'deploy:' '${TEMP_DIR}/compose.yaml' | head -1
+  "
+  assert_output ""
+}
+
+@test "[deploy] gpu_mode = force emits deploy.resources GPU block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "force"
+gpu_count = "all"
+gpu_capabilities = "gpu compute"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E 'driver: nvidia' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[deploy] gpu_count = 2 emits count: 2 in compose deploy block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "force"
+gpu_count = 2
+gpu_capabilities = "gpu"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E 'count: 2$' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[deploy] gpu_capabilities multi-value emits as YAML array" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "force"
+gpu_count = "all"
+gpu_capabilities = "gpu compute utility"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'capabilities: [gpu, compute, utility]' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+# ── [deploy] gpu_capabilities: the empty value (base#1267) ───────────
+#
+# `set` reported success over a configuration the next `apply` refuses.
+# `_conf_upsert_scalar` writes `gpu_capabilities = ""` -- the key present
+# and empty, not cleared -- `deploy.sh`'s `gpu` default applies only when
+# the key is ABSENT, and `generate_compose_yaml` takes the capability list
+# as `"${6:?}"` and aborts on it. The three cases below drive the real
+# entry point and read the end state back through the real merge, because
+# the hole was invisible to any reading of the validator: the gate accepted
+# the empty string by POLICY (SCHEMA_EMPTY's `allow` default), before the
+# validator was ever called.
+
+# why: base#1267 -- the refusal itself, plus the end state a `set` that
+# reports success must not have produced. The before/after value comes from
+# `_conf_get` over `_setup_conf_handle`, the readers' own view, rather than
+# from a grep on the file, and the file is additionally held byte-identical
+# because "refused" and "rewrote it anyway" are different outcomes
+@test "set deploy.gpu_capabilities '' is refused and the conf is untouched (base#1267)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  cp "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml"
+
+  local _was
+  _setup_conf_handle "${TEMP_DIR}" _EFF_BEFORE
+  _was="$(_conf_get _EFF_BEFORE deploy gpu_capabilities "")"
+  [ -n "${_was}" ] || fail "the template resolves no gpu_capabilities, so this case would assert nothing"
+
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_capabilities "" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=deploy key=gpu_capabilities value=
+
+  cmp -s "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/before.toml" \
+    || fail "a refused set rewrote setup.toml"
+
+  local _now
+  _setup_conf_handle "${TEMP_DIR}" _EFF_AFTER
+  _now="$(_conf_get _EFF_AFTER deploy gpu_capabilities "")"
+  assert_equal "${_now}" "${_was}"
+}
+
+# why: base#1267 -- what the refusal is FOR. The measured failure was not
+# the stored empty string but the apply after it: `.env`, `.env.generated`
+# and `.env.local` were written, then `generate_compose_yaml` aborted with
+# a raw `parameter null or not set`, so no compose.yaml was produced at
+# all. Asserted on the emitted artifact, through `apply`, so this stays a
+# claim about the generator rather than about the gate that now guards it
+@test "apply after the refused set still emits compose.yaml (base#1267)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_capabilities "" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=deploy key=gpu_capabilities value=
+
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  refute_output --partial "parameter null or not set"
+  assert [ -f "${TEMP_DIR}/compose.yaml" ]
+}
+
+# why: base#1267 -- `--local` is the same writer against a different file,
+# so a gate that only closed the committed path would leave the hole open
+# one flag away. The gitignored override must not even be CREATED by a
+# refused set: `_setup_write_target` touches it into existence, and an
+# empty setup.local.toml is itself a state the chain reports on
+@test "set --local deploy.gpu_capabilities '' is refused and creates no local layer (base#1267)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set deploy.gpu_capabilities "" --local --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=deploy key=gpu_capabilities value=
+  assert [ ! -f "$(_setup_conf_local_path "${TEMP_DIR}")" ]
+}
+
+# ── apply is atomic over its four artifacts (base#1270) ──────────────
+#
+# Measured on 0e7e0845: an apply over `gpu_capabilities = ""` wrote
+# `.env`, `.env.generated` and `.env.local`, then `generate_compose_yaml`
+# aborted on its `${6:?}` guard with bash's `6: parameter null or not set`,
+# leaving no compose.yaml. Both cases below drive the real `apply` over a
+# conf on disk and assert on the artifacts it leaves, not on a validator.
+
+# why: base#1270 -- a first-ever apply that is refused must leave none of
+# the four files behind, and the refusal must name the key and the conf
+# file it came from instead of a positional-parameter error
+@test "apply refused on an empty deploy.gpu_capabilities writes none of the four files (base#1270)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[deploy]
+gpu_mode = "force"
+gpu_count = "all"
+gpu_capabilities = ""
+TOML
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}'
+  "
+  assert_refusal 1 apply_conf_value_empty "file=${TEMP_DIR}/setup.toml" table=deploy key=gpu_capabilities
+  refute_stderr_contains "parameter null or not set"
+
+  local _f
+  for _f in .env .env.generated .env.local compose.yaml; do
+    [[ ! -e "${TEMP_DIR}/${_f}" ]] \
+      || fail "a refused first apply left ${_f} behind"
+  done
+}
+
+# why: base#1270 -- a refused apply over an existing set must leave every
+# one of the four files byte-identical, the operator's `.env.local`
+# included: a refusal that rewrote half the set is the half-written
+# bundle the issue reports
+@test "apply refused on an empty deploy.gpu_capabilities leaves the previous set byte-identical (base#1270)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'TOML'
+[deploy]
+gpu_mode = "force"
+gpu_count = "all"
+gpu_capabilities = "gpu"
+TOML
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' 2>&1
+  "
+  assert_success
+  printf 'OPERATOR_OVERRIDE=1\n' >> "${TEMP_DIR}/.env.local"
+
+  local _f
+  mkdir -p "${TEMP_DIR}/before"
+  for _f in .env .env.generated .env.local compose.yaml; do
+    [[ -f "${TEMP_DIR}/${_f}" ]] || fail "the good apply produced no ${_f}"
+    cp -p "${TEMP_DIR}/${_f}" "${TEMP_DIR}/before/${_f}"
+  done
+
+  sed -i 's/^gpu_capabilities = "gpu"$/gpu_capabilities = ""/' "${TEMP_DIR}/setup.toml"
+  grep -qx 'gpu_capabilities = ""' "${TEMP_DIR}/setup.toml" \
+    || fail "the fixture did not clear gpu_capabilities"
+
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}'
+  "
+  assert_refusal 1 apply_conf_value_empty "file=${TEMP_DIR}/setup.toml" table=deploy key=gpu_capabilities
+
+  for _f in .env .env.generated .env.local compose.yaml; do
+    cmp -s "${TEMP_DIR}/before/${_f}" "${TEMP_DIR}/${_f}" \
+      || fail "a refused apply changed ${_f}"
+  done
+}
+
+# ── a refusal INSIDE generate_compose_yaml, after the env emitters ran ─
+#
+# The two cases above are refused before any emitter runs, so they hold
+# even without staging. The cases below use valid [deploy] GPU values and
+# a Dockerfile stage named `latest` (a reserved tag namespace), which
+# `generate_compose_yaml` refuses only after `write_env`,
+# `write_container_env` and `_scaffold_env_local` have already written
+# their files. Only staging keeps those writes out of the output dir.
+
+# _r1270_conf <dir>
+#   Write the issue's [deploy] shape with VALID GPU values.
+_r1270_conf() {
+  cat > "$1/setup.toml" <<'TOML'
+[deploy]
+gpu_mode = "force"
+gpu_count = "all"
+gpu_capabilities = "gpu"
+TOML
+}
+
+# _r1270_apply <dir> [<prelude>]
+#   Run the real `apply` over <dir> in a fresh shell. <prelude> is bash
+#   evaluated after setup.sh is sourced and before `main` runs, for the
+#   cases that make one filesystem operation fail.
+_r1270_apply() {
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    ${2:-}
+    main apply --base-path '$1'
+  "
+}
+
+# _r1270_snapshot <dir> <into> <file>...
+_r1270_snapshot() {
+  local _d="$1" _into="$2" _f; shift 2
+  mkdir -p "${_into}"
+  for _f in "$@"; do
+    [[ -f "${_d}/${_f}" ]] || fail "the fixture has no ${_f}"
+    cp -p "${_d}/${_f}" "${_into}/${_f}"
+  done
+}
+
+# _r1270_assert_same <dir> <from> <file>...
+_r1270_assert_same() {
+  local _d="$1" _from="$2" _f; shift 2
+  for _f in "$@"; do
+    [[ -f "${_d}/${_f}" && ! -L "${_d}/${_f}" ]] \
+      || fail "a refused apply removed or replaced ${_f}"
+    cmp -s "${_from}/${_f}" "${_d}/${_f}" \
+      || fail "a refused apply changed ${_f}"
+  done
+}
+
+# _r1270_assert_absent <dir> <file>...
+_r1270_assert_absent() {
+  local _d="$1" _f; shift
+  for _f in "$@"; do
+    [[ ! -e "${_d}/${_f}" && ! -L "${_d}/${_f}" ]] \
+      || fail "a refused apply left ${_f} behind"
+  done
+}
+
+# _r1270_assert_no_stage <dir>
+#   No staging directory survives a refusal.
+_r1270_assert_no_stage() {
+  local _left
+  _left="$(find "$1" -maxdepth 1 -name '.setup-apply.*' -print)"
+  [[ -z "${_left}" ]] || fail "a refused apply left ${_left} behind"
+}
+
+# _r1270_legacy_env <dir>
+#   The pre-split layout: `.env` IS the cache (it carries the auto-gen
+#   marker) and there is no `.env.generated` yet.
+_r1270_legacy_env() {
+  printf 'IMAGE_NAME=legacycache\nSETUP_CONF_HASH=deadbeef\n' > "$1/.env"
+}
+
+_R1270_RESERVED_DOCKERFILE=$'FROM ubuntu AS devel\nFROM devel AS latest\n'
+
+# why: base#1270 -- the emitters that run before generate_compose_yaml
+# must write into staging, so a first apply refused inside the compose
+# emitter leaves none of the four files (and no staging dir)
+@test "apply refused inside generate_compose_yaml on a first apply writes none of the four files (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf '%s' "${_R1270_RESERVED_DOCKERFILE}" > "${TEMP_DIR}/Dockerfile"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 stage_reserved_tag stage=latest
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_absent "${TEMP_DIR}" .env .env.generated .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 -- the same late refusal over an existing set must leave
+# every one of the four files byte-identical
+@test "apply refused inside generate_compose_yaml leaves the previous set byte-identical (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_apply "${TEMP_DIR}"
+  assert_success
+  printf 'OPERATOR_OVERRIDE=1\n' >> "${TEMP_DIR}/.env.local"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local compose.yaml
+
+  # A changed conf, so a regenerated set would differ from the old one.
+  sed -i 's/^gpu_capabilities = "gpu"$/gpu_capabilities = "gpu compute"/' \
+    "${TEMP_DIR}/setup.toml"
+  printf '%s' "${_R1270_RESERVED_DOCKERFILE}" > "${TEMP_DIR}/Dockerfile"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 stage_reserved_tag stage=latest
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 -- the legacy `.env`-is-the-cache promotion runs before
+# the emitters; a late refusal must leave the legacy `.env` where it was
+# and create neither `.env.generated` nor `.env.bak`
+@test "apply refused inside generate_compose_yaml leaves a legacy .env cache unpromoted (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf '%s' "${_R1270_RESERVED_DOCKERFILE}" > "${TEMP_DIR}/Dockerfile"
+  _r1270_legacy_env "${TEMP_DIR}"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 stage_reserved_tag stage=latest
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+  _r1270_assert_absent "${TEMP_DIR}" .env.generated .env.bak .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 1 -- a `compose.yaml` that is a directory
+# made the commit move the staged file INSIDE it, after the env files had
+# already been replaced, and apply then reported success. A destination
+# that is not a regular file is refused before anything is moved.
+@test "apply refuses a compose.yaml that is a directory and leaves the previous set byte-identical (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_apply "${TEMP_DIR}"
+  assert_success
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local
+  rm -f "${TEMP_DIR}/compose.yaml"
+  mkdir "${TEMP_DIR}/compose.yaml"
+  sed -i 's/^gpu_capabilities = "gpu"$/gpu_capabilities = "gpu compute"/' \
+    "${TEMP_DIR}/setup.toml"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 apply_output_unusable "path=${TEMP_DIR}/compose.yaml"
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local
+  [[ -d "${TEMP_DIR}/compose.yaml" ]] || fail "compose.yaml is no longer the directory"
+  [[ -z "$(ls -A "${TEMP_DIR}/compose.yaml")" ]] \
+    || fail "apply wrote into the compose.yaml directory"
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 1 -- the legacy backup is part of the
+# commit: a `.env.bak` that is a directory must refuse the apply before
+# the legacy `.env` is replaced, not copy the cache into the directory
+@test "apply refuses a legacy promotion whose .env.bak is a directory and leaves .env as it was (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_legacy_env "${TEMP_DIR}"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+  mkdir "${TEMP_DIR}/.env.bak"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 apply_output_unusable "path=${TEMP_DIR}/.env.bak"
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+  _r1270_assert_absent "${TEMP_DIR}" .env.generated .env.local compose.yaml
+  [[ -z "$(ls -A "${TEMP_DIR}/.env.bak")" ]] \
+    || fail "apply wrote into the .env.bak directory"
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 1 -- a failed legacy backup copy was not
+# checked, so the cache was replaced with no backup taken. It must stop
+# the apply with the legacy `.env` untouched.
+@test "apply stops when the legacy .env backup cannot be written and leaves .env as it was (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_legacy_env "${TEMP_DIR}"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+
+  _r1270_apply "${TEMP_DIR}" '
+    cp() { [[ "${*: -1}" == */.env.bak ]] && return 1; command cp "$@"; }
+  '
+  assert_refusal 1 apply_commit_failed "path=${TEMP_DIR}/.env"
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+  _r1270_assert_absent "${TEMP_DIR}" .env.generated .env.bak .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# _R1270_MV_FAILS_ON_COMPOSE
+#   A prelude whose `mv` fails ONCE, on the first move whose destination
+#   is the output's compose.yaml -- i.e. part-way through the commit,
+#   after the env files have been moved into place.
+_R1270_MV_FAILS_ON_COMPOSE='
+  mv() {
+    if [[ "${*: -1}" == */compose.yaml && ! -e "${BATS_TEST_TMPDIR}/mv-failed" ]]; then
+      : > "${BATS_TEST_TMPDIR}/mv-failed"
+      return 1
+    fi
+    command mv "$@"
+  }
+'
+
+# why: base#1270 review round 1 -- a move that fails part-way through the
+# commit must put back what the earlier moves replaced, so the refusal
+# still leaves the previous set byte-identical and reports failure
+@test "apply rolls back a commit that fails part-way and leaves the previous set byte-identical (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_apply "${TEMP_DIR}"
+  assert_success
+  printf 'OPERATOR_OVERRIDE=1\n' >> "${TEMP_DIR}/.env.local"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local compose.yaml
+  sed -i 's/^gpu_capabilities = "gpu"$/gpu_capabilities = "gpu compute"/' \
+    "${TEMP_DIR}/setup.toml"
+
+  export BATS_TEST_TMPDIR
+  _r1270_apply "${TEMP_DIR}" "${_R1270_MV_FAILS_ON_COMPOSE}"
+  assert_refusal 1 apply_commit_failed "path=${TEMP_DIR}/compose.yaml"
+  refute_output --partial "[setup] USER="
+  [[ -e "${BATS_TEST_TMPDIR}/mv-failed" ]] || fail "the injected mv failure never fired"
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 1 -- the same part-way failure on a first
+# apply must remove what the earlier moves created
+@test "apply rolls back a commit that fails part-way on a first apply and leaves none of the four files (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+
+  export BATS_TEST_TMPDIR
+  _r1270_apply "${TEMP_DIR}" "${_R1270_MV_FAILS_ON_COMPOSE}"
+  assert_refusal 1 apply_commit_failed "path=${TEMP_DIR}/compose.yaml"
+  [[ -e "${BATS_TEST_TMPDIR}/mv-failed" ]] || fail "the injected mv failure never fired"
+
+  _r1270_assert_absent "${TEMP_DIR}" .env .env.generated .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 1 -- on the legacy layout the rollback must
+# also undo the backup and the promotion: `.env` back to the legacy
+# cache, no `.env.generated`, no `.env.bak`
+@test "apply rolls back a part-way commit over a legacy .env cache (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_legacy_env "${TEMP_DIR}"
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+
+  export BATS_TEST_TMPDIR
+  _r1270_apply "${TEMP_DIR}" "${_R1270_MV_FAILS_ON_COMPOSE}"
+  assert_refusal 1 apply_commit_failed "path=${TEMP_DIR}/compose.yaml"
+  [[ -e "${BATS_TEST_TMPDIR}/mv-failed" ]] || fail "the injected mv failure never fired"
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" .env
+  _r1270_assert_absent "${TEMP_DIR}" .env.generated .env.bak .env.local compose.yaml
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 2 -- an existing `.env.local` is never
+# rewritten, so it never reached the commit's type check. A directory
+# there let apply replace the other three files and report success over
+# an env-file set compose cannot read. It must refuse with the set intact.
+@test "apply refuses a .env.local that is a directory and leaves the previous set byte-identical (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  _r1270_apply "${TEMP_DIR}"
+  assert_success
+  _r1270_snapshot "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated compose.yaml
+  rm -f "${TEMP_DIR}/.env.local"
+  mkdir "${TEMP_DIR}/.env.local"
+  sed -i 's/^gpu_capabilities = "gpu"$/gpu_capabilities = "gpu compute"/' \
+    "${TEMP_DIR}/setup.toml"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 apply_output_unusable "path=${TEMP_DIR}/.env.local"
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_same "${TEMP_DIR}" "${BATS_TEST_TMPDIR}/before" \
+    .env .env.generated compose.yaml
+  [[ -d "${TEMP_DIR}/.env.local" ]] || fail ".env.local is no longer the directory"
+  [[ -z "$(ls -A "${TEMP_DIR}/.env.local")" ]] \
+    || fail "apply wrote into the .env.local directory"
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 2 -- the same check on a first apply, with
+# a fifo: none of the other three files may appear
+@test "apply refuses a .env.local that is a fifo on a first apply and writes none of the other files (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  mkfifo "${TEMP_DIR}/.env.local"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_refusal 1 apply_output_unusable "path=${TEMP_DIR}/.env.local"
+  refute_output --partial "[setup] USER="
+
+  _r1270_assert_absent "${TEMP_DIR}" .env .env.generated compose.yaml
+  [[ -p "${TEMP_DIR}/.env.local" ]] || fail ".env.local is no longer the fifo"
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+# why: base#1270 review round 2 -- the check must not refuse an operator
+# `.env.local` compose can read: a symlink to a regular file is kept as
+# it is, link and contents, and apply succeeds
+@test "apply keeps a .env.local that is a symlink to a regular file and succeeds (base#1270)" {
+  _r1270_conf "${TEMP_DIR}"
+  printf 'FROM ubuntu AS devel\n' > "${TEMP_DIR}/Dockerfile"
+  printf 'OPERATOR_OVERRIDE=1\n' > "${BATS_TEST_TMPDIR}/operator.env"
+  ln -s "${BATS_TEST_TMPDIR}/operator.env" "${TEMP_DIR}/.env.local"
+
+  _r1270_apply "${TEMP_DIR}"
+  assert_success
+
+  [[ -L "${TEMP_DIR}/.env.local" ]] || fail ".env.local is no longer the symlink"
+  [[ "$(readlink "${TEMP_DIR}/.env.local")" == "${BATS_TEST_TMPDIR}/operator.env" ]] \
+    || fail ".env.local points somewhere else"
+  [[ "$(cat "${BATS_TEST_TMPDIR}/operator.env")" == "OPERATOR_OVERRIDE=1" ]] \
+    || fail "apply rewrote the operator's .env.local"
+  [[ -f "${TEMP_DIR}/compose.yaml" ]] || fail "apply wrote no compose.yaml"
+  _r1270_assert_no_stage "${TEMP_DIR}"
+}
+
+@test "[deploy] runtime = nvidia emits runtime: nvidia at service level" {
+  # `runtime` is the permanent alias and is consulted only when the
+  # effective config sets no canonical `gpu_runtime`. A [table] merges
+  # key by key (ADR-37), so the template's `gpu_runtime = "auto"` shows
+  # through unless this file says otherwise, and clearing it is the only
+  # way a per-repo file can state "no canonical runtime here" -- without
+  # that line the alias is never read and this case would assert the
+  # alias while exercising the template default.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "off"
+gpu_runtime = ""
+runtime = "nvidia"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E '^    runtime: nvidia$' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[deploy] runtime = off omits runtime line entirely" {
+  # `gpu_runtime` cleared for the same reason as the positive case above:
+  # otherwise the template's `auto` wins, the alias is never read, and
+  # this negative would hold without `runtime = off` being seen at all.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[deploy]
+gpu_mode = "off"
+gpu_runtime = ""
+runtime = "off"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c '^    runtime:' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+# ── [gui] ────────────────────────────────────────────────────────────
+
+@test "[gui] mode = off omits X11 / DISPLAY env from compose" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[gui]
+mode = "off"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c 'DISPLAY' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+@test "[gui] mode = force emits X11 environment + /tmp/.X11-unix mount" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[gui]
+mode = "force"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F '/tmp/.X11-unix:/tmp/.X11-unix:ro' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+# ── [network] ────────────────────────────────────────────────────────
+
+@test "[network] mode = host writes NETWORK_MODE=host to .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep '^NETWORK_MODE=' '${TEMP_DIR}/.env.generated'
+  "
+  assert_output "NETWORK_MODE=host"
+}
+
+@test "[network] ipc = private writes IPC_MODE=private to .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "private"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep '^IPC_MODE=' '${TEMP_DIR}/.env.generated'
+  "
+  assert_output "IPC_MODE=private"
+}
+
+@test "[network] pid = host writes PID_MODE=host to .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+pid = "host"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep '^PID_MODE=' '${TEMP_DIR}/.env.generated'
+  "
+  assert_output "PID_MODE=host"
+}
+
+@test "[network] pid default (private) writes PID_MODE=private to .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep '^PID_MODE=' '${TEMP_DIR}/.env.generated'
+  "
+  assert_output "PID_MODE=private"
+}
+
+@test "[network] pid default (private) omits pid: line from compose.yaml" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep 'pid:' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_failure
+}
+
+@test "[network] pid = host emits pid: host in compose.yaml" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+pid = "host"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'pid: \${PID_MODE}' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[network] network_name = my_bridge under mode=bridge emits external network ref" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "bridge"
+ipc = "private"
+network_name = "my_bridge"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E '^networks:' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[network] port_1 = 8080:80 emits ports: block under bridge mode" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "bridge"
+ipc = "private"
+
+[[network.ports]]
+host = 8080
+container = 80
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E '8080:80' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[[network.ports]] under mode=host is silently dropped" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+ipc = "host"
+
+[[network.ports]]
+host = 8080
+container = 80
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c '8080:80' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+# ── [resources] ──────────────────────────────────────────────────────
+
+@test "[resources] shm_size = 2gb under ipc=private emits shm_size: 2gb" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+ipc = "private"
+
+[resources]
+shm_size = "2gb"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E 'shm_size: 2gb' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[resources] shm_size empty omits shm_size line" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[resources]
+shm_size = ""
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c 'shm_size:' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+# ── [environment] ────────────────────────────────────────────────────
+
+@test "[environment] env_1 = ROS_DOMAIN_ID=7 lands in the generated .env (#868)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "ROS_DOMAIN_ID=7"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F \"ROS_DOMAIN_ID='7'\" '${TEMP_DIR}/.env'
+  "
+  assert_success
+}
+
+@test "[environment] empty section omits environment: block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c '^    environment:' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+# ── [tmpfs] ──────────────────────────────────────────────────────────
+
+@test "[tmpfs] tmpfs_1 = /tmp emits tmpfs: block with the entry" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[tmpfs]]
+path = "/tmp"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E '^      - /tmp$' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[tmpfs] tmpfs_1 with size= suffix preserved verbatim" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[tmpfs]]
+path = "/tmp/cache:size=1g"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F '/tmp/cache:size=1g' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+# why: base#1095 -- the whole point of registering a tmpfs validator is
+# the artifact, not the error message: `tmpfs` was the one section that
+# validated nothing, so a value carrying a newline was accepted by
+# `setup.sh set` and _emit_tmpfs_block -- which reads the string with
+# `while IFS= read -r` -- wrote each line as a tmpfs entry of its own.
+# The assertion is therefore in two halves: the write is refused, AND
+# the generated compose.yaml carries no entry it did not already have.
+# Grepping only for the refusal would pass on a tree that refused the
+# write and then emitted the value from a stale layer anyway.
+@test "[tmpfs] a tmpfs_1 carrying a newline is refused before it can reach compose.yaml (base#1095)" {
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  LOG_FORMAT=json run --separate-stderr main set tmpfs.tmpfs_1 "$(printf '/tmp\n      - /evil')" --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_invalid_value section=tmpfs key=tmpfs_1
+
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c -- '- /evil' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+@test "[tmpfs] empty section omits tmpfs: block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[tmpfs]
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c '^    tmpfs:' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+# ── [devices] ────────────────────────────────────────────────────────
+
+@test "[devices] device_1 = /dev/video0:/dev/video0 emits devices: block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[devices]]
+path = "/dev/video0:/dev/video0"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E -- '- /dev/video0:/dev/video0' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[devices] cgroup_rule_1 emits device_cgroup_rules: block" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[devices.cgroup_rules]]
+rule = "c 189:* rwm"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'c 189:* rwm' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+# why: a device binding and a cgroup rule are two independent lists that
+# a real conf carries together -- bind /dev/dri AND allow major 189. While
+# `devices` held ONE array, the two could not coexist in one document:
+# `[[devices]]` made the name an array and the rule needed a `[devices]`
+# table of the same name. This is the case that says they coexist, which
+# is the whole point of giving each its own nested array.
+@test "[devices] a binding and a cgroup rule coexist in one setup.toml" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[devices.bindings]]
+path = "/dev/dri:/dev/dri"
+
+[[devices.cgroup_rules]]
+rule = "c 189:* rwm"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E -- '- /dev/dri:/dev/dri' '${TEMP_DIR}/compose.yaml'
+    grep -F 'c 189:* rwm' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+  assert_output --partial '/dev/dri:/dev/dri'
+  assert_output --partial 'c 189:* rwm'
+}
+
+# why: the shipped writer, not a hand-edit, is how a consumer adds a rule.
+# `set` on a cgroup rule in a repo that already has a binding wrote the
+# rule as a scalar under a `[devices]` table while the binding held
+# `[[devices]]` -- one name as both a table and an array of tables, which
+# TOML refuses. The repo was left with a setup.toml no reader can parse,
+# written by the supported command. Both families now address their own
+# nested array, so the file the writer produces round-trips.
+@test "set on a cgroup rule beside a device binding writes a readable file" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[devices.bindings]]
+path = "/dev/dri:/dev/dri"
+EOF
+  run main set devices.cgroup_rule_1 "c 189:* rwm" --base-path "${TEMP_DIR}"
+  assert_success
+  # The parser the shipped readers use has to accept what the writer wrote.
+  run bash -c "
+    source /source/dist/script/docker/lib/toml_bridge.sh
+    toml_bridge_parse '${TEMP_DIR}/setup.toml' --kv
+  "
+  assert_success
+  assert_line $'devices\tdevice_1\t/dev/dri:/dev/dri'
+  assert_line $'devices\tcgroup_rule_1\tc 189:* rwm'
+}
+
+# ── [volumes] mount_2..N ─────────────────────────────────────────────
+
+@test "[volumes] mount_2 = /data:/data emits as additional volume entry" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = ""
+
+[[volumes]]
+source = "/data"
+target = "/data"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -E -- '- /data:/data' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+@test "[volumes] mount_N supports :ro suffix" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[volumes]]
+source = ""
+
+[[volumes]]
+source = "/etc/machine-id"
+target = "/etc/machine-id"
+mode = "ro"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F '/etc/machine-id:/etc/machine-id:ro' '${TEMP_DIR}/compose.yaml'
+  "
+  assert_success
+}
+
+# ── [security] privileged toggle ─────────────────────────────────────
+
+@test "[security] privileged = false writes PRIVILEGED=false to .env" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[security]
+privileged = false
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep '^PRIVILEGED=' '${TEMP_DIR}/.env.generated'
+  "
+  assert_output "PRIVILEGED=false"
+}
+
+# ── apply-time trust boundary (hand-edited setup.conf) ────────────────
+# apply reads setup.conf via the conf.sh readers and emits compose.yaml
+# with NO schema revalidation (validation lives only on the set/add write
+# paths). These tests pin the apply-time contract for malformed /
+# metacharacter values that a user can hand-write into the file.
+
+@test "[environment] apply does NOT execute a command-substitution env value (#687)" {
+  # A `$(...)` payload in env_1 must reach compose.yaml as inert text, not
+  # be executed at apply time (it stays text; compose's own layer never
+  # runs it either since there is no eval).
+  rm -f "${TEMP_DIR}/pwn687"
+  # The heredoc expands ${TEMP_DIR}, so the `$` of the payload is carried
+  # in a variable rather than written as `\$`: a backslash in the SOURCE
+  # of the heredoc is not a backslash in the file bash writes, and a TOML
+  # basic string has no `\$` escape, so the literal spelling would read
+  # as a malformed fixture to anything that parses the body as written.
+  local _dollar='$'
+  cat > "${TEMP_DIR}/setup.toml" <<EOF
+[environment]
+env_1 = "EVIL=${_dollar}(touch ${TEMP_DIR}/pwn687)"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+  "
+  [ ! -e "${TEMP_DIR}/pwn687" ]
+}
+
+@test "[environment] apply emits an injection-style env value on a single line (#687)" {
+  # The INI reader is line-oriented, so a hand-written value cannot smuggle
+  # a real newline; the metacharacter payload stays on one environment:
+  # entry and never becomes a second YAML key.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "EVIL=$(touch /tmp/x)"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c 'EVIL=' '${TEMP_DIR}/.env'
+  "
+  assert_output "1"
+}
+
+# why: a hand-written invalid policy (bypassing the set-path validator)
+# must not reach compose.yaml as a bogus `restart: sometimes`. The fixture
+# carries a deployable stage and first shows a valid policy IS emitted
+# there; without that, a fixture with no deployable stage emits no
+# `restart:` for any policy and the refutation below cannot fail. Each
+# apply's status is asserted before the grep that replaces it, so the
+# malformed case proves apply succeeds with the policy omitted.
+@test "[lifecycle] apply emits a valid restart policy and drops a malformed one (#687)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS runtime
+DOCK
+  printf '[lifecycle]\nrestart = "always"\n' > "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+  "
+  assert_success
+  run grep -cE '^    restart: always$' "${TEMP_DIR}/compose.yaml"
+  assert_output "1"
+
+  printf '[lifecycle]\nrestart = "sometimes"\n' > "${TEMP_DIR}/setup.toml"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+  "
+  assert_success
+  run grep -cE '^    restart:' "${TEMP_DIR}/compose.yaml"
+  assert_output "0"
+}
+
+@test "[environment] apply carries an env value containing a colon-space into .env (#698)" {
+  # A validator-accepted value with a YAML-structural ': ' (e.g.
+  # MSG=a: b) emitted UNQUOTED parses as the mapping {MSG=a: b} —
+  # silent env corruption. The emit must wrap each entry as a
+  # double-quoted YAML scalar, mirroring ports/cgroup.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "MSG=a: b"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F \"MSG='a: b'\" '${TEMP_DIR}/.env'
+  "
+  assert_success
+}
+
+@test "[environment] apply carries an env value with a leading flow indicator into .env (#698)" {
+  # A leading '*' (YAML alias/flow indicator) emitted unquoted breaks
+  # the parse; quoting makes it an inert scalar.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "GLOB=*"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'GLOB=' '${TEMP_DIR}/.env'
+  "
+  assert_success
+}
+
+@test "[environment] apply carries an env value with an inline ' #' marker into .env (#698)" {
+  # An unquoted ' #' truncates the YAML scalar at the comment; quoting
+  # preserves the whole value.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "NOTE=a #b"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F \"NOTE='a #b'\" '${TEMP_DIR}/.env'
+  "
+  assert_success
+}
+
+@test "[environment] apply carries an embedded double-quote / backslash into .env (#698)" {
+  # The YAML double-quoted scalar must escape \" and \\ so the value
+  # round-trips verbatim (mirrors the Dockerfile baked-ENV sink).
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[environment]
+env_1 = "Q=a\"b\\c"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -F 'Q=' '${TEMP_DIR}/.env'
+  "
+  assert_success
+}
+
+@test "[network] apply does not emit a literal network_mode: line for a bogus hand-edited mode (#698)" {
+  # apply does no schema revalidation, so a hand-edited [stage:*]
+  # network.mode bypasses the set-path validator. A bogus value must be
+  # dropped (fall back to the env-var ref) rather than emit a malformed
+  # literal `network_mode: bogus` that breaks `docker compose up`.
+  cat > "${TEMP_DIR}/Dockerfile" <<'EOF'
+FROM scratch AS sys
+FROM sys AS base
+FROM base AS devel
+FROM devel AS headless
+EOF
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+mode = "host"
+
+["stage:headless"]
+"network.mode" = "bogus: value"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    grep -c 'network_mode: bogus' '${TEMP_DIR}/compose.yaml' || true
+  "
+  assert_output "0"
+}
+
+@test "[network] apply does not emit a literal ipc:/pid: line for a bogus hand-edited mode (#698)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'EOF'
+FROM scratch AS sys
+FROM sys AS base
+FROM base AS devel
+FROM devel AS headless
+EOF
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[network]
+ipc = "host"
+pid = "private"
+
+["stage:headless"]
+"network.ipc" = "bogus: value"
+"network.pid" = "bogus: value"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' >/dev/null 2>&1
+    { grep -c 'ipc: bogus' '${TEMP_DIR}/compose.yaml' || true; } | head -1
+  "
+  assert_output "0"
+}
+
+
+# ── [deploy] runtime -> gpu_runtime (W3 permanent alias) ────────────────
+@test "_setup_known_section recognises additional_contexts" {
+  _setup_known_section "additional_contexts"
+}
+
+@test "_setup_known_section recognises logging + [logging.<svc>] sub-section (#328)" {
+  _setup_known_section "logging"
+  _setup_known_section "logging.runtime"
+  _setup_known_section "logging.devel"
+  run _setup_known_section "logging."
+  assert_failure
+  run _setup_known_section "loggings"
+  assert_failure
+}
+
+@test "_setup_known_section recognises every SCHEMA_SECTIONS member (#561)" {
+  local _s
+  for _s in "${SCHEMA_SECTIONS[@]}"; do
+    _setup_known_section "${_s}"
+  done
+}
+
+@test "_setup_known_section derives from SCHEMA_SECTIONS, not a copy (#561)" {
+  # A section registered only in SCHEMA_SECTIONS must become known
+  # without hand-editing _setup_known_section.
+  SCHEMA_SECTIONS+=(brandnew)
+  _setup_known_section "brandnew"
+}
+
+# ── post-setup hook on the failure path ─────────────────────────────
+#
+# The post-setup hook must fire whether the subcommand succeeded or not.
+# These run setup.sh as a SCRIPT rather than sourcing it, because that is
+# the only way `set -euo pipefail` is in force -- setup.sh sets strict mode
+# only when it is the entry point, and the defect is an unguarded
+# subcommand call aborting main before the hook line is reached.
+# hook.sh resolves a setup hook under $PWD (setup.sh exports no FILE_PATH),
+# so the sandbox is the working directory.
+
+# _seed_post_setup_hook <exit_code>
+_seed_post_setup_hook() {
+  mkdir -p "${TEMP_DIR}/script/hooks/post"
+  printf '#!/usr/bin/env bash\necho POST_SETUP_HOOK_FIRED\nexit %s\n' "$1" \
+    > "${TEMP_DIR}/script/hooks/post/setup.sh"
+  chmod +x "${TEMP_DIR}/script/hooks/post/setup.sh"
+}
+
+@test "setup.sh runs the post-setup hook when the subcommand fails (#956)" {
+  _seed_post_setup_hook 0
+  cd "${TEMP_DIR}"
+  # `show <unknown-section>` is a deterministic post-dispatch failure (rc 2).
+  run -2 bash /source/dist/script/docker/wrapper/setup.sh \
+    show bogus-section --base-path "${TEMP_DIR}"
+  assert_output --partial "POST_SETUP_HOOK_FIRED"
+}
+
+@test "setup.sh post-setup hook failure overrides a failing subcommand rc (#956)" {
+  _seed_post_setup_hook 9
+  cd "${TEMP_DIR}"
+  run -9 bash /source/dist/script/docker/wrapper/setup.sh \
+    show bogus-section --base-path "${TEMP_DIR}"
+  assert_output --partial "POST_SETUP_HOOK_FIRED"
+}
+
+@test "setup.sh apply aborts where a handler command fails mid-apply (#956)" {
+  # errexit must stay in force INSIDE the subcommand handlers. Bash
+  # suppresses `set -e` for the whole call tree of a `||` left operand, so
+  # guarding the dispatch itself (`_setup_dispatch ... || _rc=$?`) turns
+  # every unguarded mid-handler failure -- an unwritable .env, ENOSPC --
+  # into a silent exit 0 that still prints the done message and leaves
+  # build/run consuming a half-written config set.
+  #
+  # The trigger here is a real one, not an injected stub: a corrupt
+  # .env.generated (the truncated cache an interrupted apply leaves
+  # behind) makes _setup_apply's unguarded `source "${_env_file}"` fail
+  # before a single file is written. Run as a SCRIPT -- strict mode is
+  # only in force when setup.sh is the entry point.
+  printf 'FOO=1\n((( \n' > "${TEMP_DIR}/.env.generated"
+  cd "${TEMP_DIR}"
+  run ! bash /source/dist/script/docker/wrapper/setup.sh \
+    apply --base-path "${TEMP_DIR}" -q
+  # Aborting AT the failure, not carrying on to the end of apply.
+  assert [ ! -f "${TEMP_DIR}/compose.yaml" ]
+  assert [ ! -f "${TEMP_DIR}/.env" ]
+}
+
+@test "setup.sh finalizes the transcript when the post-setup hook fails (#956)" {
+  # ADR-00000007: a non-interactive verb leaves log/<verb>/<ts>-<id>.log --
+  # ANSI stripped, closed with a transcript_complete line, latest.log
+  # repointed. The failing run is the one worth reading, and moving the
+  # post-hook onto the EXIT trap put a hook `exit` INSIDE that trap: it
+  # terminates the shell mid-atexit-loop, before the handler finalizes, so
+  # the run leaves only the unstripped .raw and latest.log still names the
+  # previous run. The hook's rc must win without costing the transcript.
+  _seed_post_setup_hook 9
+  cd "${TEMP_DIR}"
+  run -9 env WRAPPER_TRANSCRIPT=true \
+    bash /source/dist/script/docker/wrapper/setup.sh \
+    show bogus-section --base-path "${TEMP_DIR}"
+  assert_output --partial "POST_SETUP_HOOK_FIRED"
+  assert_equal "$(find "${TEMP_DIR}/log/setup" -name '*.raw' | wc -l)" 0
+  assert [ -L "${TEMP_DIR}/log/setup/latest.log" ]
+  run cat "${TEMP_DIR}/log/setup/latest.log"
+  assert_output --partial "POST_SETUP_HOOK_FIRED"
+  assert_output --partial "transcript_complete exit_code=9"
+}
+
+# why: `add` means append, and under ADR-00000037 an array is replaced
+# whole by the highest layer that defines it -- so the moment the target
+# file declares one it owes the FULL list. The slot was chosen from the
+# target file's OWN section whenever that section had any key at all, a
+# rule that was true under the pre-ADR-37 blanket section-replace and is
+# not true now. Measured: a repo `setup.toml` carrying only
+# `[build] network = "host"` inherits the template's three build
+# arguments, and `add build.arg FOO=bar` chose `arg_1` and wrote an array
+# of one, which array-replace made the whole effective list. The two
+# mirrors and the timezone were gone, from the one command whose entire
+# job is to add. Asserted through `list`, which is the resolved view, not
+# through the file -- the file is a layer, and the question is what the
+# chain answers.
+@test "main add appends to the effective list instead of replacing it (base#1148)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[build]
+network = "host"
+EOF
+  run main add build.arg FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run main list build --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial 'arg_1 = APT_MIRROR_UBUNTU=tw.archive.ubuntu.com'
+  assert_output --partial 'arg_2 = APT_MIRROR_DEBIAN=mirror.twds.com.tw'
+  assert_output --partial 'arg_3 = TZ=Asia/Taipei'
+  assert_output --partial 'arg_4 = FOO=bar'
+}
+
+# why: The other direction, and the leak the "at or below" rule exists to
+# stop. A write to the committed `setup.toml` must never materialise the
+# gitignored `setup.local.toml`'s entries into it: that file is the
+# operator's alone, and copying it down would publish it to everyone who
+# clones the repo while also freezing a value they never chose. The
+# baseline for a repo-targeted add is template + repo, so the local
+# layer's own entry stays where it was and still wins the merge.
+@test "main add does not copy the local layer's entries into the committed file (base#1148)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[build]
+network = "host"
+EOF
+  cat > "${TEMP_DIR}/setup.local.toml" <<'EOF'
+[[build.args]]
+key = "SECRET_MIRROR"
+value = "internal.example"
+EOF
+  run main add build.arg FOO=bar --base-path "${TEMP_DIR}"
+  assert_success
+  run grep -c 'SECRET_MIRROR' "${TEMP_DIR}/setup.toml"
+  assert_output "0"
+  # The committed file carries the template's three plus the new one.
+  run grep -c '^\[\[build.args\]\]$' "${TEMP_DIR}/setup.toml"
+  assert_output "4"
+}
+
+# why: `add` prefers to REUSE an empty slot -- a template placeholder
+# gets filled rather than appended past -- and when it does, the entries
+# that matter sit AFTER the one being written. The materialisation loop
+# covered only the indices below it, so a committed array whose first
+# block is empty and whose second is `KEEP=yes` lost `KEEP=yes` entirely
+# to `add --local`: the local layer declared an array of ONE and
+# array-replace made that the whole effective list. Every populated index
+# except the slot being filled is materialised now.
+@test "main add --local keeps an inherited entry that sits after the reused slot (base#1148)" {
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[[build.args]]
+
+[[build.args]]
+key = "KEEP"
+value = "yes"
+EOF
+  run main add build.arg NEW=yes --local --base-path "${TEMP_DIR}"
+  assert_success
+  run main list build --base-path "${TEMP_DIR}"
+  assert_success
+  assert_output --partial 'arg_1 = NEW=yes'
+  assert_output --partial 'arg_2 = KEEP=yes'
+}
+
+# why: The empty-array declaration is what the deploy refusal reads, and
+# TOML spells it several ways. A line matcher saw `args = []` and missed
+# both the multiline `args = [` / `]` and the inline
+# `build = { args = [] }` -- each of which changes the effective
+# configuration (the template's three build args resolve to zero) while
+# emitting no KV row, because there is no entry to emit. The declarations
+# come from the bridge's own parse now, so the spelling cannot hide one.
+@test "main deploy: an emptied array in any spelling is still a local override (base#1148)" {
+  local _f
+  for _f in 'args = [\n]' 'args = []'; do
+    printf '[build]\n%b\n' "${_f}" > "${TEMP_DIR}/setup.local.toml"
+    local -a _sects=()
+    _setup_conf_local_sections "${TEMP_DIR}" _sects
+    assert_equal "${#_sects[@]}" "1"
+    assert_equal "${_sects[0]}" "build"
+  done
+  printf 'build = { args = [] }\n' > "${TEMP_DIR}/setup.local.toml"
+  local -a _inline=()
+  _setup_conf_local_sections "${TEMP_DIR}" _inline
+  assert_equal "${#_inline[@]}" "1"
+  assert_equal "${_inline[0]}" "build"
+}
+
+# why: A FAILED READ IS NOT AN EMPTY LIST. The effective view is what
+# tells `add` which slot to append at; taken as empty when the read
+# FAILED, the search finds nothing, picks index 1, and the write lands on
+# top of whatever is already there while reporting success -- an `add`
+# that overwrites. The merge fails for a reason the operator can hit: an
+# unparseable layer. `_conf_load_layers` already says what went wrong and
+# refuses to report an empty configuration as a loaded one, so `add`
+# stops before any write instead of inheriting its silence.
+@test "main add refuses when the effective configuration cannot be read (base#1148)" {
+  # The TARGET is valid and the layer BELOW it is not, which is the only
+  # shape that reaches this guard: the commit gate in front of the writer
+  # catches an unparseable target on its own, so a test that broke the
+  # target would be asserting the gate instead of this.
+  # toml-fixture-lint: allow the parser's refusal of this layer IS the assertion
+  printf '[build\n' > "${TEMP_DIR}/setup.toml"
+  cat > "${TEMP_DIR}/setup.local.toml" <<'EOF'
+[[build.args]]
+key = "KEEP"
+value = "yes"
+EOF
+  LOG_FORMAT=json run --separate-stderr main add build.arg NEW=value --local --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_write_failed section=build key=arg
+  assert_refusal 2 conf_toml_merge_failed "${TEMP_DIR}/setup.toml"
+  # And the entry that was there is still there, byte for byte.
+  run grep -c 'KEEP' "${TEMP_DIR}/setup.local.toml"
+  assert_output "1"
+  run grep -c 'NEW' "${TEMP_DIR}/setup.local.toml"
+  assert_output "0"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The devel generate stage as a parameterised API (ADR-00000036, base#1087)
+#
+# `apply` could only write into the repo it read, so a second instance's
+# generation overwrote the first's and two parameter sets meant two
+# checkouts. The two parameters this section pins -- `--local-conf` for the
+# chain's top layer and `--output` for the emitted set -- are what make one
+# repo answer N calls. Every assertion goes through `main apply`, the real
+# entry point, and reads the emitted artifact rather than the source text.
+# ════════════════════════════════════════════════════════════════════
+
+_ppa_repo() {
+  # A minimal repo the real apply can generate from: the shipped template
+  # conf plus a Dockerfile, which is what the stage scan reads.
+  cp /source/dist/setup.toml "${TEMP_DIR}/setup.toml"
+  cat > "${TEMP_DIR}/Dockerfile" <<'DF'
+FROM ubuntu:24.04 AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS runtime
+DF
+}
+
+# why: `--output` is the whole point of the parameterised call: the emitted
+# set lands in the directory the caller names. Asserted on the artifacts in
+# that directory AND on their absence from the repo, because an apply that
+# wrote both places would satisfy a one-sided check while still letting a
+# second call clobber the first.
+@test "apply --output writes the generated set into the caller's directory (base#1087)" {
+  _ppa_repo
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  assert [ -f "${_out}/compose.yaml" ]
+  assert [ -f "${_out}/.env.generated" ]
+  assert [ -f "${_out}/.env" ]
+  assert [ ! -f "${TEMP_DIR}/compose.yaml" ]
+  assert [ ! -f "${TEMP_DIR}/.env.generated" ]
+}
+
+# why: base#1087's acceptance criterion, end to end: two calls differing
+# only in a caller-supplied local layer and an output directory produce two
+# complete sets that differ in the parameterised value, with the repo
+# unmodified. The value is read back out of the EMITTED compose.yaml, so a
+# call that resolved the parameter but emitted the repo's value fails here.
+@test "two apply calls over one repo emit two sets that differ in the parameterised value (base#1087)" {
+  _ppa_repo
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/a.toml"
+  printf '[network]\nmode = "host"\n' > "${TEMP_DIR}/b.toml"
+  local _digest_before
+  _digest_before="$(sha256sum "${TEMP_DIR}/setup.toml" | cut -d' ' -f1)"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/a.toml' --output '${TEMP_DIR}/inst-a' -q 2>&1
+    main apply --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/b.toml' --output '${TEMP_DIR}/inst-b' -q 2>&1
+  "
+  assert_success
+  # NETWORK_MODE is the parameterised value; it reaches the emitted set
+  # through .env.generated, which is what compose interpolates from.
+  run grep -c '^NETWORK_MODE=bridge$' "${TEMP_DIR}/inst-a/.env.generated"
+  assert_success
+  run grep -c '^NETWORK_MODE=host$' "${TEMP_DIR}/inst-b/.env.generated"
+  assert_success
+  # The repo is not mutated by a call.
+  assert_equal "$(sha256sum "${TEMP_DIR}/setup.toml" | cut -d' ' -f1)" "${_digest_before}"
+  assert [ ! -f "${TEMP_DIR}/setup.local.toml" ]
+}
+
+# why: generate_compose_yaml derived the repo root from the OUTPUT path
+# (`dirname "${_out}"`), so an output directory alone would make it scan a
+# Dockerfile that is not there and emit no service for any non-baseline
+# stage -- a quietly incomplete artifact, not a failure. The repo's
+# `runtime` stage is the observation.
+@test "apply --output keeps the Dockerfile-derived stage services in the emitted compose (base#1087)" {
+  _ppa_repo
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  run grep -E '^  runtime:' "${_out}/compose.yaml"
+  assert_success
+}
+
+# why: `context: .` resolves against the compose file's own directory, so an
+# emitted set in the caller's directory would build from a directory with no
+# Dockerfile in it. The property is that every build context the emitted
+# file names resolves to a directory that holds the Dockerfile -- derived
+# from the artifact's own `context:` lines, not from a path spelled here.
+@test "apply --output emits build contexts that resolve to the repo (base#1087)" {
+  _ppa_repo
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  local -a _ctxs=()
+  while IFS= read -r _c; do _ctxs+=("${_c}"); done < <(
+    sed -n 's/^ *context: *//p' "${_out}/compose.yaml"
+  )
+  (( ${#_ctxs[@]} > 0 )) || fail "the emitted compose names no build context"
+  local _c
+  for _c in "${_ctxs[@]}"; do
+    # Resolved the way compose resolves it: relative to the compose file.
+    [[ "${_c}" == /* ]] || _c="${_out}/${_c}"
+    assert [ -f "${_c}/Dockerfile" ]
+  done
+}
+
+# why: An override naming a file that is not there resolves to an absent
+# layer, which the chain treats as contributing nothing -- so the call would
+# emit the template defaults and report success. A parameterised API handed
+# something it cannot honour must refuse.
+@test "apply --local-conf refuses a path that names no file (base#1087)" {
+  _ppa_repo
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/nope.toml' --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 conf_local_override_unusable "path=${TEMP_DIR}/nope.toml"
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+# why: An output directory that cannot be created is the same class: the
+# call cannot be honoured, so it refuses rather than reporting a set it
+# never wrote. A plain file in the way is the reachable spelling.
+@test "apply --output refuses when the named directory cannot be created (base#1087)" {
+  _ppa_repo
+  : > "${TEMP_DIR}/not-a-dir"
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/not-a-dir' -q
+  "
+  assert_refusal 1 apply_output_unusable "path=${TEMP_DIR}/not-a-dir"
+}
+
+# why: "The repo is not mutated by a call" is a property of the whole
+# apply, not of its writers: _reconcile_workspace_path rewrites
+# <repo>/setup.toml on first-time bootstrap and on a stale absolute
+# mount_1. Observed by handing a repo with no setup.toml to an --output
+# call -- the bootstrap case -- and asserting it is refused rather than
+# served by writing into the repo.
+@test "apply --output refuses a call that would write into the repo's conf (base#1087)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DF'
+FROM ubuntu:24.04 AS sys
+FROM sys AS devel
+DF
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 apply_repo_conf_unsettled "path=${TEMP_DIR}/setup.toml"
+  assert_stderr_contains "without --output"
+  # Refused AND put back: the bootstrap had already written the file by
+  # the time the call could tell, so a refusal that only returned 1 would
+  # leave the repo changed anyway.
+  assert [ ! -f "${TEMP_DIR}/setup.toml" ]
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+# why: Without --output the apply is exactly what every existing checkout
+# runs, writing into the repo. Pinned beside the parameterised path so a
+# regression there cannot hide behind the new tests.
+@test "apply without --output still writes into the repo root (base#1087)" {
+  _ppa_repo
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' -q 2>&1
+  "
+  assert_success
+  assert [ -f "${TEMP_DIR}/compose.yaml" ]
+  assert [ -f "${TEMP_DIR}/.env.generated" ]
+  # And its build contexts stay the repo-relative `.` every downstream
+  # repo's committed artifact carries.
+  run grep -c '^      context: \.$' "${TEMP_DIR}/compose.yaml"
+  assert_success
+}
+
+# why: deploy's reproducibility refusal is built on
+# _setup_conf_local_sections, so a caller-supplied layer has to reach it:
+# otherwise the refusal would inspect the operator's absent default file,
+# clear the call, and bake a bundle out of untracked configuration. The
+# refusal naming the CALLER's file is the observation.
+@test "deploy --local-conf routes the reproducibility refusal at the caller's file (base#1087)" {
+  _ppa_repo
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/a.toml"
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main deploy --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/a.toml' --stage runtime --dry-run
+  "
+  assert_refusal 1 deploy_local_override_refused "file=${TEMP_DIR}/a.toml" sections=network
+}
+
+# why: `build.context` was not the only repo-relative path in the emitted
+# file. A `config/<component>/` bind, a relative `[volumes] mount_N` and an
+# `[additional_contexts]` path are all resolved by compose against the
+# compose file's own directory, so a relocated set would mount paths inside
+# the output directory -- which docker CREATES, empty and root-owned,
+# rather than failing. The property is therefore asked of the ARTIFACT:
+# every host path it names resolves to something that exists. Derived from
+# the emitted file's own lines, so a path kind added to the emitter later
+# is covered the day it appears.
+@test "apply --output emits no host path that fails to resolve (base#1087)" {
+  _ppa_repo
+  mkdir -p "${TEMP_DIR}/config/demo" "${TEMP_DIR}/extra" "${TEMP_DIR}/ctxdir"
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[additional_contexts]]
+name = "shared"
+source = "./ctxdir"
+EOF
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  local -a _paths=()
+  local _l _p
+  while IFS= read -r _l; do
+    _paths+=("${_l}")
+  done < <(
+    # `context: <p>`, the RHS of an `additional_contexts` entry, and the
+    # LHS of every `- <host>:<container>` volume line.
+    sed -n \
+      -e 's/^ *context: *//p' \
+      -e 's/^ *[A-Za-z0-9_][A-Za-z0-9_-]*: *\(\.\{1,2\}\/[^ ]*\)$/\1/p' \
+      -e 's/^ *- \([^:$][^:]*\):\/.*$/\1/p' \
+      "${_out}/compose.yaml"
+  )
+  (( ${#_paths[@]} > 0 )) || fail "the emitted compose names no host path"
+  # Anti-vacuity: the fixture ships a config/<component>/ directory, so
+  # its bind must be one of the paths collected. A run that found only
+  # the build contexts would be a weaker test than it looks.
+  local _saw_component=0
+  for _p in "${_paths[@]}"; do
+    [[ "${_p}" == */config/demo ]] && _saw_component=1
+  done
+  (( _saw_component )) || fail "the config-component bind is not among: ${_paths[*]}"
+  for _p in "${_paths[@]}"; do
+    # Unresolvable by construction: an interpolation is a per-instance
+    # overlay value (ADR-00000022), not a path this file can be read for.
+    [[ "${_p}" == *'${'* ]] && continue
+    [[ "${_p}" == /* ]] || _p="${_out}/${_p}"
+    assert [ -e "${_p}" ]
+  done
+}
+
+# why: A relative --base-path leaves the repo root spelled `.`, which is
+# the one spelling that is WRONG in a relocated file and right in a
+# co-located one -- compose resolves it against the output directory
+# either way. Generation succeeded and the build then could not find the
+# Dockerfile, so the emitted context is canonicalised rather than copied.
+@test "apply --output canonicalises a relative --base-path into the emitted context (base#1087)" {
+  _ppa_repo
+  run bash -c "
+    cd '${TEMP_DIR}' || exit 1
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path . --output ./inst-1 -q 2>&1
+  "
+  assert_success
+  local _ctx
+  _ctx="$(sed -n 's/^ *context: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  assert [ -f "${_ctx}/Dockerfile" ]
+}
+
+# why: --print-resolved returns before any artifact is written, and the
+# repo-preservation check sat after it -- so the one option combination
+# that writes nothing was also the one that left a bootstrapped setup.toml
+# behind. The check belongs where the mutation happens, not where the
+# writes do.
+@test "apply --output --print-resolved preserves the repo it would have bootstrapped (base#1087)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DF'
+FROM ubuntu:24.04 AS sys
+FROM sys AS devel
+DF
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' --print-resolved
+  "
+  assert_refusal 1 apply_repo_conf_unsettled "path=${TEMP_DIR}/setup.toml"
+  assert [ ! -f "${TEMP_DIR}/setup.toml" ]
+}
+
+# why: `--local-conf=` and `--output=` parse to the empty string, and an
+# empty value read as "the option was not given" turns both refusal
+# contracts off from the command line: the chain silently falls back to the
+# repo's own local layer, and the set is written into the repo. An option
+# that was SUPPLIED is validated on its value, not on its emptiness.
+@test "apply refuses an empty --local-conf= value (base#1087)" {
+  _ppa_repo
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --local-conf= --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 conf_local_override_unusable path=
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+@test "apply refuses an empty --output= value instead of writing into the repo (base#1087)" {
+  _ppa_repo
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output= -q
+  "
+  assert_refusal 1 apply_output_unusable path=
+  assert [ ! -f "${TEMP_DIR}/compose.yaml" ]
+}
+
+@test "deploy refuses an empty --local-conf= value (base#1087)" {
+  _ppa_repo
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main deploy --base-path '${TEMP_DIR}' --local-conf= --stage runtime --dry-run
+  "
+  assert_refusal 1 conf_local_override_unusable path=
+}
+
+# why: A bare relative `additional_contexts` source is a LOCAL path, not a
+# named anything -- the volume classifier's rule (a bare left-hand side is
+# a Docker named volume) does not hold here, so a rebase that only moved
+# `./` and `../` left `shared=ctxdir` and `shared=.` resolving into the
+# output directory. The other half is that a non-local source --
+# `docker-image://`, an `oci-layout://`, a git or http URL, a `target:` /
+# `service:` reference -- must NOT be rebased, or the rebase breaks a
+# context that was never a path.
+@test "apply --output rebases a bare relative additional context and leaves a non-local one (base#1087)" {
+  _ppa_repo
+  mkdir -p "${TEMP_DIR}/ctxdir"
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[additional_contexts]]
+name = "bare"
+source = "ctxdir"
+
+[[additional_contexts]]
+name = "dot"
+source = "."
+
+[[additional_contexts]]
+name = "img"
+source = "docker-image://alpine:3.22"
+
+[[additional_contexts]]
+name = "abs"
+source = "/etc"
+EOF
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  local _bare _dot _img _abs
+  _bare="$(sed -n 's/^ *bare: *//p' "${_out}/compose.yaml" | head -1)"
+  _dot="$(sed -n 's/^ *dot: *//p' "${_out}/compose.yaml" | head -1)"
+  _img="$(sed -n 's/^ *img: *//p' "${_out}/compose.yaml" | head -1)"
+  _abs="$(sed -n 's/^ *abs: *//p' "${_out}/compose.yaml" | head -1)"
+  assert [ -d "${_bare}" ]
+  assert [ -f "${_dot}/Dockerfile" ]
+  assert_equal "${_img}" "docker-image://alpine:3.22"
+  assert_equal "${_abs}" "/etc"
+}
+
+# why: The relocated paths are emitted into YAML, and an absolute repo
+# path is whatever the operator's directory is called. A `#` in it makes
+# compose read the rest of the line as a comment -- generation succeeds and
+# the build runs against the truncated path -- and a `: ` invalidates the
+# document outright. The co-located `.` is a safe plain scalar and must
+# stay unquoted, so the quoting is decided by the VALUE, not by the flag.
+@test "apply --output quotes a relocated path that YAML would mis-read (base#1087)" {
+  local _repo="${TEMP_DIR}/repo #1"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  local _line
+  _line="$(grep -m1 '^ *context: ' "${_out}/compose.yaml")"
+  # Quoted, so the `#` is part of the scalar rather than starting a
+  # comment, and the quoted value still names the repo.
+  [[ "${_line}" == *'context: "'* ]] || fail "context not quoted: ${_line}"
+  local _ctx="${_line#*context: \"}"
+  _ctx="${_ctx%\"}"
+  assert [ -f "${_ctx}/Dockerfile" ]
+}
+
+# why: An --output call must not write the conf chain at all. The first cut
+# enforced that by photographing the chain and ROLLING IT BACK on a
+# mismatch, which attributes any concurrent write -- another `setup set`, an
+# operator's edit, an edit to the caller's own local file -- to this call
+# and discards it. The guarantee is therefore that the call does not write,
+# asserted over the whole chain rather than over the one file the
+# reconciliation happens to touch today.
+@test "apply --output leaves every conf layer byte-identical (base#1087)" {
+  _ppa_repo
+  printf '[network]\nmode = "bridge"\n' > "${TEMP_DIR}/a.toml"
+  printf '[gpu]\nmode = "force"\n' > "${TEMP_DIR}/setup.local.toml"
+  local -A _before=()
+  local _f
+  for _f in "${TEMP_DIR}/setup.toml" "${TEMP_DIR}/setup.local.toml" "${TEMP_DIR}/a.toml"; do
+    _before["${_f}"]="$(sha256sum "${_f}" | cut -d' ' -f1)"
+  done
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/a.toml' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  for _f in "${!_before[@]}"; do
+    assert_equal "$(sha256sum "${_f}" | cut -d' ' -f1)" "${_before[${_f}]}"
+  done
+}
+
+# why: Two ways the relocated emitter can corrupt a source it should have
+# left alone, both reporting a successful generation. An unbraced
+# `$SHARED_CTX` is compose interpolation just as `${...}` is, so rebasing
+# it yields `<repo>/$SHARED_CTX`, which compose expands to
+# `<repo>//tmp/shared`. An scp-style git remote is `user@host:path` for ANY
+# ssh user, so recognising only the literal `git@` turned a valid remote
+# into a local-looking path the build cannot fetch.
+@test "apply --output leaves a compose-interpolated additional context alone (base#1087)" {
+  _ppa_repo
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[additional_contexts]]
+name = "unbraced"
+source = "$SHARED_CTX"
+
+[[additional_contexts]]
+name = "remote"
+source = "builder@example.com:org/repo.git"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _u _r
+  _u="$(sed -n 's/^ *unbraced: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  _r="$(sed -n 's/^ *remote: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  assert_equal "${_u}" '$SHARED_CTX'
+  assert_equal "${_r}" "builder@example.com:org/repo.git"
+}
+
+# why: A `$` the FILESYSTEM put in the repo's own directory name is a
+# literal, and compose interpolates the emitted file -- so an unescaped
+# `${MISSING}` expands to nothing and the build targets a directory that
+# is not the repo. YAML quoting does not prevent it: interpolation happens
+# after the parse, so the root has to carry `$$`.
+@test "apply --output escapes a dollar the repo's own name carries (base#1087)" {
+  local _repo="${TEMP_DIR}/repo\${MISSING}"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _ctx
+  _ctx="$(sed -n 's/^ *context: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  # Escaped for compose: `$$` is how a literal dollar survives
+  # interpolation. Unescaped, `${MISSING}` expands to nothing and the
+  # build targets a directory that is not the repo.
+  [[ "${_ctx}" == *'$${MISSING}'* ]] || fail "dollar not escaped: ${_ctx}"
+}
+
+# why: A short-form bind is `host:container[:mode]`, so a relocated root
+# carrying a colon produces `/tmp/repo:one/config/demo:/opt/demo` and
+# compose rejects the whole file with "too many colons" -- and YAML
+# quoting cannot help, because the ambiguity is in the mount grammar, not
+# the document. The co-located artifact has no such problem (`./config/x`
+# carries no root), so relocation is what introduces it and relocation is
+# what refuses: an artifact that cannot be expressed is not emitted and
+# called a success.
+@test "apply --output refuses a repo root that mount syntax cannot express (base#1087)" {
+  local _repo="${TEMP_DIR}/repo:one"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 compose_relocated_root_unusable "path=${_repo}"
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+# why: The [logging] local_path bind is assembled by its own helper and
+# was emitted raw, so it was the one host path that bypassed the
+# serialiser every other one goes through -- "the site added later is the
+# one that was missed", here and now rather than later. Raw for the
+# mkdir it performs, serialised for the line it emits.
+@test "apply --output serialises the logging bind built from the repo root (base#1087)" {
+  local _repo="${TEMP_DIR}/repo #1"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  python3 - "${_repo}/setup.toml" <<'PY'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace('local_path = ""', 'local_path = "./logs"', 1)
+open(p, "w").write(s)
+PY
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _line
+  _line="$(grep -m1 -E '^ *- .*:/var/log/' "${TEMP_DIR}/inst-1/compose.yaml")"
+  [[ -n "${_line}" ]] || fail "no logging bind emitted"
+  [[ "${_line}" == *'- "'* ]] || fail "logging bind not quoted: ${_line}"
+}
+
+# why: `_conf_load_layers` dispatches on every layer's FILENAME, so a
+# caller-supplied layer whose name does not end in `.toml` -- an
+# orchestrator's mktemp file, say -- silently switches the whole chain to
+# the INI parser: tables stop merging key by key and get replaced whole,
+# array entries are dropped, and quotes stay in scalar values. The address
+# must not be able to change the grammar of the chain it joins, so a name
+# the readers would misparse is refused rather than accepted and reparsed.
+@test "apply --local-conf refuses a name the chain's parser would misread (base#1087)" {
+  _ppa_repo
+  printf '[gpu]\nmode = "force"\n' > "${TEMP_DIR}/params"
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --local-conf '${TEMP_DIR}/params' --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 conf_local_override_unusable "path=${TEMP_DIR}/params"
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+# why: A [devices] entry carrying mount propagation is emitted as a
+# LONG-FORM bind, by its own emitter, from its own input string -- so it
+# was a third host-path population that the volume rebase did not reach.
+# Its `source:` resolved inside the output directory, mounting the wrong
+# tree or failing at startup, with generation reporting success.
+@test "apply --output rebases a device entry emitted as a bind mount (base#1087)" {
+  _ppa_repo
+  mkdir -p "${TEMP_DIR}/device-tree"
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[devices.bindings]]
+path = "./device-tree:/mnt/devices:rshared"
+EOF
+  local _out="${TEMP_DIR}/inst-1"
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${_out}' -q 2>&1
+  "
+  assert_success
+  local _src
+  _src="$(sed -n 's/^ *source: *//p' "${_out}/compose.yaml" | head -1)"
+  [[ -n "${_src}" ]] || fail "no long-form bind emitted for the device entry"
+  assert [ -d "${_src}" ]
+}
+
+# why: A device entry WITHOUT propagation is emitted into the plain
+# `devices:` list, by a different pair of emitters from the long-form bind
+# -- so rebasing it put the repo root into a line that still bypassed the
+# scalar serialiser. With a root carrying ` #`, YAML keeps only the path up
+# to it and the device target is lost, generation reporting success.
+@test "apply --output serialises a plain device binding carrying the root (base#1087)" {
+  local _repo="${TEMP_DIR}/repo #hash"
+  mkdir -p "${_repo}/device"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  cat >> "${_repo}/setup.toml" <<'EOF'
+
+[[devices.bindings]]
+path = "./device:/dev/example"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _line
+  _line="$(grep -m1 -E '^ *- .*:/dev/example' "${TEMP_DIR}/inst-1/compose.yaml")"
+  [[ -n "${_line}" ]] || fail "no plain device entry emitted"
+  [[ "${_line}" == *'- "'* ]] || fail "plain device entry not quoted: ${_line}"
+}
+
+# why: the rebase used to consult `_classify_volume_lhs`, which listed no
+# `../` among its bind prefixes, so a parent-relative host path read as a
+# Docker named volume and a `../device-tree` bind kept resolving against
+# the output directory even though the rebase helper handles
+# parent-relative paths explicitly. The rebase decides on the population
+# it actually moves, `./` and `../`, rather than borrowing a verdict
+# answering a different question -- and since base#1257 the classifier
+# asks the same repo-relative predicate, so neither reading can call this
+# path a volume any more.
+@test "apply --output rebases a parent-relative bind source (base#1087)" {
+  mkdir -p "${TEMP_DIR}/outer/device-tree"
+  local _repo="${TEMP_DIR}/outer/repo"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  cat >> "${_repo}/setup.toml" <<'EOF'
+
+[[devices.bindings]]
+path = "../device-tree:/mnt/devices:rshared"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _src
+  _src="$(sed -n 's/^ *source: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  [[ -n "${_src}" ]] || fail "no long-form bind emitted"
+  assert [ -d "${_src}" ]
+}
+
+# why: Only interpolation that decides the path's ROOT has to stay
+# untouched. `./contexts/${FLAVOUR}` is an explicitly relative local path
+# with an interpolated leaf, and a blanket "any dollar sign means
+# non-local" left it resolving against the output directory. The explicit
+# relative prefix is read first, and the interpolation is carried through.
+@test "apply --output rebases a relative context with an interpolated leaf (base#1087)" {
+  _ppa_repo
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[additional_contexts]]
+name = "flavoured"
+source = "./contexts/${FLAVOUR}"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _v
+  _v="$(sed -n 's/^ *flavoured: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  [[ "${_v}" == "${TEMP_DIR}/contexts/"* ]] || fail "not rebased: ${_v}"
+  [[ "${_v}" == *'${FLAVOUR}'* ]] || fail "interpolation lost: ${_v}"
+}
+
+# why: `.` and `..` are valid bind sources on their own -- the repo root
+# and its parent -- and the rebase matched only a prefix with a following
+# slash, so `.:/mnt/repo:rshared` kept resolving to the output directory.
+# A dot-only source is the spelling most likely to be used for exactly the
+# thing relocation breaks: mounting the repo itself.
+@test "apply --output rebases a dot-only bind source (base#1087)" {
+  _ppa_repo
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[devices.bindings]]
+path = ".:/mnt/repo:rshared"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _src
+  _src="$(sed -n 's/^ *source: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  assert [ -f "${_src}/Dockerfile" ]
+}
+
+# why: A newline in the repo's own directory name is emitted literally
+# into the artifact, which compose then rejects outright, and it also
+# splits the newline-separated lists the rebase feeds -- one entry becomes
+# two, neither of them a mount. Refused with the colon, for the same
+# reason: what cannot be expressed is not written and reported as a
+# generated set.
+@test "apply --output refuses a repo root carrying a line break (base#1087)" {
+  local _repo="${TEMP_DIR}/re"$'\n'"po"
+  mkdir -p "${_repo}"
+  cp /source/dist/setup.toml "${_repo}/setup.toml"
+  printf 'FROM ubuntu:24.04 AS sys\nFROM sys AS devel\n' > "${_repo}/Dockerfile"
+  run --separate-stderr bash -c "
+    export LOG_FORMAT=json
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${_repo}' --output '${TEMP_DIR}/inst-1' -q
+  "
+  assert_refusal 1 compose_relocated_root_unusable "path=${_repo}"
+  assert [ ! -f "${TEMP_DIR}/inst-1/compose.yaml" ]
+}
+
+# why: `contexts/${FLAVOUR}` is a bare relative path whose ROOT is fixed
+# and whose leaf is interpolated, so it is as local as `./contexts/...`.
+# Only an interpolation that decides the root -- a value that STARTS with
+# one -- can be left alone, and a dollar sign anywhere was standing in for
+# that distinction.
+@test "apply --output rebases a bare context with an interpolated component (base#1087)" {
+  _ppa_repo
+  cat >> "${TEMP_DIR}/setup.toml" <<'EOF'
+
+[[additional_contexts]]
+name = "bareflav"
+source = "contexts/${FLAVOUR}"
+
+[[additional_contexts]]
+name = "rooted"
+source = "${CTX_ROOT}/shared"
+EOF
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' --output '${TEMP_DIR}/inst-1' -q 2>&1
+  "
+  assert_success
+  local _b _r
+  _b="$(sed -n 's/^ *bareflav: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  _r="$(sed -n 's/^ *rooted: *//p' "${TEMP_DIR}/inst-1/compose.yaml" | head -1)"
+  [[ "${_b}" == "${TEMP_DIR}/contexts/"* ]] || fail "not rebased: ${_b}"
+  [[ "${_b}" == *'${FLAVOUR}'* ]] || fail "interpolation lost: ${_b}"
+  # The one that DOES decide its own root stays exactly as configured.
+  assert_equal "${_r}" '${CTX_ROOT}/shared'
+}
+
+# why: Escaping the whole assembled logging mount was a regression on the
+# PLAIN apply too: a `${LOG_INSTANCE}` the operator put in
+# `[logging] local_path` became the literal `$${LOG_INSTANCE}`, so compose
+# stopped substituting it and the logs mounted a directory named after the
+# variable. Only the filesystem-derived prefix is a literal that needs
+# escaping; what the operator configured is an interpolation they meant.
+@test "apply preserves an interpolation configured in [logging] local_path (base#1087)" {
+  _ppa_repo
+  python3 - "${TEMP_DIR}/setup.toml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace('local_path = ""', 'local_path = "/tmp/${LOG_INSTANCE}"', 1)
+open(p, "w").write(s)
+PY
+  run bash -c "
+    source /source/dist/script/docker/wrapper/setup.sh
+    main apply --base-path '${TEMP_DIR}' -q 2>&1
+  "
+  assert_success
+  local _line
+  _line="$(grep -m1 -E '^ *- .*:/var/log/' "${TEMP_DIR}/compose.yaml")"
+  [[ -n "${_line}" ]] || fail "no logging bind emitted"
+  [[ "${_line}" == *'${LOG_INSTANCE}'* ]] || fail "interpolation lost: ${_line}"
+  [[ "${_line}" != *'$${LOG_INSTANCE}'* ]] || fail "interpolation escaped: ${_line}"
+}
+
+# why: base#1185 -- the splitter gained a second way to answer non-zero,
+#      and `show` was reading both as "this spec names a whole section"
+@test "show tells a dotless spec from a split it could not make (base#1185)" {
+  # `show` is the one caller of `_conf_split_nskey` that acts on the
+  # failure rather than skipping the key: a dotless spec is legal here
+  # and means "dump the whole section". It used to recognise that case
+  # from the split's STATUS, which was sound while "no dot" was the only
+  # way to fail. base#1185 added a second -- a registry that cannot be
+  # read -- and under the old reading `show logging.web.driver` would
+  # then try to dump a section called `logging.web.driver` and report
+  # `conf_section_not_found` for it: a true-sounding message about the
+  # wrong problem.
+  #
+  # It now reads the SPEC. A dotted spec that cannot be split is a
+  # refusal and is propagated; only a genuinely dotless one is a section.
+  cat > "${TEMP_DIR}/setup.toml" <<'EOF'
+[logging]
+driver = "json-file"
+
+[logging.web]
+driver = "local"
+EOF
+  # The dotless path still works, and still means the whole section.
+  run main show logging --base-path "${TEMP_DIR}"
+  assert_success
+  assert_line --index 0 "driver = json-file"
+
+  # With the registry gone, a dotted spec is refused -- and the failure
+  # it reports is the registry's, not a fabricated missing section.
+  #
+  # `network.mode`, not `logging.web.driver`: `_setup_known_section`
+  # accepts `logging.?*` for ANY suffix, so under the old reading the
+  # whole spec passed AS a section and nothing looked wrong. This arm
+  # was green against the very shape it exists to catch until a
+  # mutation said otherwise. `network.mode` is dotted, splits normally
+  # in a loaded tree, and is not a section under any reading.
+  # Called in THIS shell rather than through a `bash -c` that sources
+  # _lib.sh: `_setup_msg` lives in the setup.sh wrapper, so in a
+  # _lib.sh-only subshell the section error renders as an empty string
+  # and `refute_output --partial "Unknown section"` passes for the
+  # wrong reason. That made this arm vacuous; a mutation caught it.
+  unset SCHEMA_SUBSECTIONED
+  LOG_FORMAT=json run --separate-stderr _setup_show network.mode --base-path "${TEMP_DIR}"
+  assert_refusal 2 conf_subsection_registry_missing nskey=network.mode
+  # The refusal is judged by its event id; the message text travels in
+  # the JSON line's `display`, which is where the fabricated one would
+  # show. And NOT the fabricated one: under the old reading this printed
+  # `Unknown section: network.mode`, sending the reader after a section
+  # they never asked for.
+  refute_stderr_contains "Unknown section"
+}

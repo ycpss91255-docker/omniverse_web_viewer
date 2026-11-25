@@ -1,7 +1,17 @@
 # `test/<category>/<tool>/` subdir layout for multi-tool repos
 
+> Serves: PRD invariant 7 (rigorous test bar) -- test layout; superseded
+> by ADR-00000012 (tool-first).
+
 - **Date:** 2026-06-05
-- **Status:** Accepted
+- **Status:** Superseded by ADR-00000012
+
+> **Superseded (2026-06-23, ADR-00000012).** The category-first layout
+> decided here was reversed to
+> **tool-first** (`test/<tool>/<category>/`) in ADR-00000012, to align the
+> test tree with the per-tool driver model introduced by ADR-00000011 §5.
+> The context and trade-offs below remain accurate; only the chosen
+> direction changed.
 
 ## Context
 

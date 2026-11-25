@@ -1,0 +1,2206 @@
+#!/usr/bin/env bash
+#
+# dockerfile_migrate.sh - declarative Dockerfile-migration list.
+#
+# A deep module behind a small interface: `apply_migrations <dockerfile>`
+# iterates an ordered, data-driven list of {detect, transform} migrations
+# and applies each migration whose `detect` matches. It replaces the
+# accreting pile of one-off seds that upgrade.sh Step 5 used to carry to
+# heal downstream Dockerfiles after a base contract change.
+#
+# Each migration `X` is two functions:
+#   _migrate_X_detect <file>   exit 0 -> migration applies to this file
+#   _migrate_X_apply  <file>   perform the (idempotent) rewrite
+# and one entry in the ordered `_MIGRATIONS` array. apply_migrations runs
+# them in array order; this lets later migrations build on the shape an
+# earlier one normalised (e.g. the lib-COPY split before the wrapper-COPY
+# rename).
+#
+# Apply policy (inherited from upgrade.sh's Step-5 convention):
+#   - `detect` matches a known shape -> `apply` runs and is IDEMPOTENT
+#     (a second run is a no-op).
+#   - structure does not match / anchor missing / ambiguous -> `detect`
+#     returns non-zero so the migration is SKIPPED; where a partial /
+#     custom shape is recognised the `apply` _log_warn's and leaves the
+#     file untouched rather than force-rewriting.
+#
+# Compatible with ADR-00000006: the `.base` path contract is frozen; this
+# restructures the heal MECHANISM, not the frozen paths.
+#
+# Style: Google Shell Style Guide.
+
+# Guard against double-sourcing.
+if [[ -n "${_DOCKER_LIB_DOCKERFILE_MIGRATE_SOURCED:-}" ]]; then
+  return 0
+fi
+_DOCKER_LIB_DOCKERFILE_MIGRATE_SOURCED=1
+
+# Self-source the conf-chain resolver. The pip-helper migration has to
+# know whether anything redirects the CONFIG_SRC build arg, and the set of
+# files that can say so is lib/setup_conf.sh's _setup_conf_layers -- the
+# one place the chain's membership and precedence are defined. Pulled in
+# directly (idempotent via its own double-source guard) so the load order
+# of _lib.sh is not load-bearing: init.sh and upgrade.sh source this file
+# on its own, without setup.sh.
+#
+# _DFM_TEMPLATE_DIST_DIR is the other half of that. _setup_conf_layers
+# places the template layer from _SETUP_SCRIPT_DIR, which ONLY setup.sh
+# sets; init.sh / upgrade.sh have no such global, and a chain that
+# silently loses its lowest layer would let a template-level redirect go
+# unseen. This file ships at <template>/dist/script/docker/lib/, so its
+# own directory locates dist/ in both callers -- the subtree root
+# upgrade.sh sources from and the template dir init.sh sources from --
+# without either having to pass anything.
+_dfm_lib_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+# shellcheck source=dist/script/docker/lib/setup_conf.sh
+source "${_dfm_lib_dir}/setup_conf.sh"
+readonly _DFM_TEMPLATE_DIST_DIR="${_dfm_lib_dir}/../../.."
+unset _dfm_lib_dir
+
+# ── Internal helpers ────────────────────────────────────────────────────────
+
+# _dfm_entrypoint_path <dockerfile>
+#   Resolve the conventional sibling entrypoint (script/entrypoint.sh) next
+#   to a repo-root Dockerfile. Echoes the path (whether or not it exists).
+_dfm_entrypoint_path() {
+  local _file="$1"
+  printf '%s/script/entrypoint.sh' "$(dirname -- "${_file}")"
+}
+
+# _dfm_join_copy_statements <file>
+#   Emit the file with backslash-continued lines folded into single logical
+#   lines, so a detect grep can reason about a whole COPY statement (multi-
+#   distro repos hand-list moved files across continuation lines).
+_dfm_join_copy_statements() {
+  local _file="$1"
+  awk '
+    { line = line $0 }
+    /\\[[:space:]]*$/ { sub(/\\[[:space:]]*$/, " ", line); next }
+    { print line; line = "" }
+    END { if (line != "") print line }
+  ' "${_file}"
+}
+
+# ── What a run rewrote: the record its caller stages from ───────────────────
+#
+# A migration's output has to be COMMITTED, and the script that commits is
+# never this one. An upgrade is driven by the consumer's OWN vendored
+# upgrade.sh -- a copy that shipped in an older release and cannot be
+# changed retroactively -- and each of those stages a pair of filenames
+# hardcoded when it shipped. v0.41.0's reaches the Dockerfile only down a
+# branch these migrations never take, so on a cross-version upgrade the
+# file this list had just rewritten was left uncommitted while the same run
+# told the user to `git push` (base#1036).
+#
+# So a run says what it rewrote and its caller stages exactly that. The
+# record is NOT a list of names kept somewhere -- a list decays the first
+# time a migration touches one more file, which is how the sibling
+# entrypoint arrived here.
+#
+# TWO WAYS INTO THE RECORD, and the second is what closes it.
+#
+#   1. The write helpers. _dfm_sed / _dfm_install record the path when the
+#      bytes actually changed, so a migration whose detect fired but whose
+#      sed matched nothing contributes nothing. They are the idiom because
+#      they are precise and they reach ANY path, including one outside the
+#      set below.
+#   2. The dispatcher reconciles. Before the run it snapshots every file
+#      the migration list may write (_dfm_targets: the Dockerfile and its
+#      sibling entrypoint) and afterwards records each one whose CONTENT
+#      differs -- created, deleted or rewritten -- however it was written.
+#
+# (2) exists because (1) alone is a promise, not a guarantee. Its first
+# guard was a grep asserting every write in this file was `sed -i` or `mv`
+# as the first token of a line: `sed -E -i`, `sed --in-place`, a write
+# after an `&&`, a `cp`, a `tee`, a `>` redirect all sailed past it, so a
+# migration could rewrite a file the record never named and the suite
+# stayed green -- base#1036 recurring, with "proceed" as the default on a
+# shape nobody had thought of. Modelling shell syntax in a grep answers
+# the wrong question. Whether the file changed is answerable directly, so
+# the dispatcher answers it, and a migration author cannot get it wrong by
+# writing in an unanticipated way.
+_DFM_TOUCHED=()
+_DFM_CHANGED=()
+_DFM_TARGETS=()
+_DFM_BEFORE_DIR=""
+
+# _dfm_record <path>
+#   Add <path> to this run's record, once.
+_dfm_record() {
+  local _path="${1:?BUG: _dfm_record expects a path}"
+  local _seen
+  for _seen in ${_DFM_TOUCHED[@]+"${_DFM_TOUCHED[@]}"}; do
+    [[ "${_seen}" == "${_path}" ]] && return 0
+  done
+  _DFM_TOUCHED+=("${_path}")
+  return 0
+}
+
+# _dfm_changed <path>
+#   Note that a write helper just changed <path>: the record above, and the
+#   pending notice _dfm_take_changed reads.
+_dfm_changed() {
+  _dfm_record "$1"
+  _DFM_CHANGED+=("$1")
+}
+
+# _dfm_take_changed <path>
+#   True when a write helper changed <path> since this was last asked, and
+#   forgets it. A migration reports a file as patched only then: a detect
+#   that fired and a rewrite that changed no byte is not a patch (base#2138).
+_dfm_take_changed() {
+  local _path _found=1
+  local -a _rest=()
+  for _path in ${_DFM_CHANGED[@]+"${_DFM_CHANGED[@]}"}; do
+    if [[ "${_path}" == "$1" ]]; then _found=0; else _rest+=("${_path}"); fi
+  done
+  _DFM_CHANGED=(${_rest[@]+"${_rest[@]}"})
+  return "${_found}"
+}
+
+# _dfm_sed <file> <sed_arg>...
+#   `sed -i` over <file>, recorded when it actually changed the bytes. The
+#   file comes FIRST so the record cannot be skipped by an argument order
+#   that happens to put it last.
+_dfm_sed() {
+  local _file="${1:?BUG: _dfm_sed expects a file}"
+  shift
+  local _before
+  _before="$(mktemp)"
+  cp -- "${_file}" "${_before}"
+  sed -i "$@" "${_file}"
+  cmp -s -- "${_before}" "${_file}" || _dfm_changed "${_file}"
+  rm -f -- "${_before}"
+  return 0
+}
+
+# _dfm_install <file> <rewritten>
+#   Put a rewritten copy in place of <file>, recorded when the bytes
+#   differ. The awk-driven migrations build their output beside the
+#   original and land it through here. The rewritten copy takes the
+#   original's mode first: it comes from a bare mktemp (0600), and an
+#   entrypoint landed at 0600 drops its 100755 bit in git (base#1323).
+_dfm_install() {
+  local _file="${1:?BUG: _dfm_install expects a file}"
+  local _new="${2:?BUG: _dfm_install expects the rewritten file}"
+  local _changed=0
+  cmp -s -- "${_file}" "${_new}" || _changed=1
+  chmod --reference="${_file}" -- "${_new}"
+  mv -- "${_new}" "${_file}"
+  (( _changed )) && _dfm_changed "${_file}"
+  return 0
+}
+
+# _dfm_targets <dockerfile>
+#   Every path the migration list may write for this Dockerfile: the file
+#   itself and the sibling entrypoint the entrypoint-side migrations heal.
+#   Printed whether or not each one exists -- a file that APPEARS during a
+#   run was written by it just as much as one that changed.
+#
+#   This is the reconciliation's scope, and the only thing in the record
+#   that is still a list. It is a short and structural one -- the argument
+#   the dispatcher was handed, plus the path _dfm_entrypoint_path derives
+#   from it -- rather than a roster of migrations, so it does not decay as
+#   migrations are added. A migration that writes somewhere else entirely
+#   has to go through the write helpers to be recorded; it also has to
+#   invent the path, which is the moment to widen this.
+_dfm_targets() {
+  local _file="${1:?BUG: _dfm_targets expects a Dockerfile path}"
+  printf '%s\n' "${_file}" "$(_dfm_entrypoint_path "${_file}")"
+}
+
+# _dfm_snapshot_targets <dockerfile>
+#   Take a byte copy of every target that exists, so the reconciliation
+#   below can compare CONTENT rather than mtime. Keyed by position in
+#   _DFM_TARGETS, which both halves then read instead of enumerating twice.
+_dfm_snapshot_targets() {
+  local _file="$1"
+  _DFM_TARGETS=()
+  mapfile -t _DFM_TARGETS < <(_dfm_targets "${_file}")
+
+  # No scratch dir is a degraded record, not a failed migration: the write
+  # helpers still report. Say so rather than reconciling against nothing.
+  if ! _DFM_BEFORE_DIR="$(mktemp -d)"; then
+    _DFM_BEFORE_DIR=""
+    _log_warn upgrade dockerfile_migration_snapshot_failed "display=  cannot snapshot the migration targets; a rewrite made outside the write helpers will not be reported"
+    return 0
+  fi
+
+  local _i
+  for _i in "${!_DFM_TARGETS[@]}"; do
+    [[ -f "${_DFM_TARGETS[${_i}]}" ]] || continue
+    cp -- "${_DFM_TARGETS[${_i}]}" "${_DFM_BEFORE_DIR}/${_i}"
+  done
+}
+
+# _dfm_reconcile_targets
+#   Close the record over the snapshot: every target whose content the run
+#   changed -- rewritten, created or deleted -- is recorded, whatever wrote
+#   it. _dfm_record is idempotent, so a file the write helpers already
+#   reported is not named twice.
+_dfm_reconcile_targets() {
+  [[ -n "${_DFM_BEFORE_DIR}" ]] || return 0
+
+  local _i _target _copy
+  for _i in "${!_DFM_TARGETS[@]}"; do
+    _target="${_DFM_TARGETS[${_i}]}"
+    _copy="${_DFM_BEFORE_DIR}/${_i}"
+    if [[ -f "${_copy}" ]]; then
+      if [[ ! -f "${_target}" ]] || ! cmp -s -- "${_copy}" "${_target}"; then
+        _dfm_record "${_target}"
+      fi
+    elif [[ -f "${_target}" ]]; then
+      _dfm_record "${_target}"
+    fi
+  done
+
+  rm -rf -- "${_DFM_BEFORE_DIR}"
+  _DFM_BEFORE_DIR=""
+  _DFM_TARGETS=()
+  return 0
+}
+
+# migrated_files
+#   Every path THIS run of apply_migrations rewrote, one per line, in the
+#   order the migrations reached them. Prints nothing when a run changed
+#   nothing, which is what makes "stage what was rewritten" a no-op rather
+#   than a special case at the caller.
+migrated_files() {
+  (( ${#_DFM_TOUCHED[@]} > 0 )) || return 0
+  printf '%s\n' "${_DFM_TOUCHED[@]}"
+}
+
+# ── Dispatcher ──────────────────────────────────────────────────────────────
+
+# apply_migrations <dockerfile_path>
+#   Iterate _MIGRATIONS in order; for each whose _migrate_<name>_detect
+#   matches the file, run _migrate_<name>_apply. Migrations that do not
+#   detect are silently skipped (not applicable to this repo's shape).
+#   Returns 0 unless the path is unusable.
+#
+#   The run's record (migrated_files above) is reset here, so what it
+#   reports is what THIS run rewrote -- a second, idempotent run reports
+#   nothing rather than repeating the first run's answer -- and closed
+#   here, by comparing the target files either side of the loop. A
+#   migration cannot leave a rewrite out of the record by writing in a
+#   shape nobody anticipated.
+#
+#   The run now SAYS what it did (base#1189). It used to say nothing at
+#   all unless the Dockerfile was missing, so "no migration applied to
+#   this tree" and "no detector recognised this tree" were byte-identical
+#   output: nothing. Base was bitten twice -- `downstream_to_dist`
+#   matched a prerelease-only layout no consumer had, and the repo-owned
+#   smoke COPY (base#1044) sat outside every detector's scope -- and both
+#   were found by a person noticing, months later.
+#
+#   What it reports is the COUNT and the NAMES, not a verdict. The loop
+#   cannot identify the unrecognised case: all sixteen detectors
+#   returning false is also exactly what a fully-migrated Dockerfile
+#   looks like, so a warning on that condition would fire on every
+#   healthy upgrade and be trained away inside a week. `0 of 16` beside
+#   `3 of 16` is something an operator who believed an old Dockerfile had
+#   been migrated can read; it is not something that decides for them.
+#
+#   This does NOT add a positive signal of currency -- a marker saying
+#   "this file IS in the current shape", which is the only thing that
+#   could separate unrecognised from up to date. That is a design
+#   question and is deliberately left to its own issue.
+#
+#   The word is MATCHED, not applied. A matching detector runs its
+#   handler, and a handler is not obliged to change anything:
+#   `entrypoint_orchestrator` and `bringup_residue` only warn, both
+#   ending "Nothing was changed here", and `arg_user` only warns
+#   "Dockerfile unchanged" (base#1322); all three match again on every
+#   subsequent run. `1 matched ... 0 rewritten` is the true shape of
+#   that, and `1 applied ... 0 rewritten` would read as a migration
+#   that completed.
+#
+#   That second number is what `_dfm_reconcile_targets` learned, which
+#   had no `_log_*` of its own, so the reconciliation step is not left
+#   as the silent half of a reporting function.
+apply_migrations() {
+  local _file="${1:?apply_migrations requires a Dockerfile path}"
+  _DFM_TOUCHED=()
+  _DFM_CHANGED=()
+
+  if [[ ! -f "${_file}" ]]; then
+    _log_info upgrade dockerfile_migration_skipped "display=  no Dockerfile at ${_file} — skip migrations"
+    return 0
+  fi
+
+  _dfm_snapshot_targets "${_file}"
+
+  local _name
+  local -a _am_fired=()
+  for _name in "${_MIGRATIONS[@]}"; do
+    if "_migrate_${_name}_detect" "${_file}"; then
+      "_migrate_${_name}_apply" "${_file}"
+      _am_fired+=("${_name}")
+    fi
+  done
+
+  _dfm_reconcile_targets
+
+  # The names come from the array that just ran, never from a second
+  # list: a restated set rots on the seventeenth migration.
+  local _am_names="none"
+  (( ${#_am_fired[@]} > 0 )) && _am_names="${_am_fired[*]}"
+  _log_info upgrade dockerfile_migrations_reported \
+    "display=  Dockerfile migrations: ${#_am_fired[@]} of ${#_MIGRATIONS[@]} matched (${_am_names}), ${#_DFM_TOUCHED[@]} file(s) rewritten" \
+    "matched=${#_am_fired[@]}" \
+    "available=${#_MIGRATIONS[@]}" \
+    "names=${_am_names}" \
+    "rewritten=${#_DFM_TOUCHED[@]}"
+}
+
+# ── Migration 0: shipped-tree dir rename .base/downstream/ -> .base/dist/ ────
+#
+# base's shipped tree was renamed downstream/ -> dist/ (terminology
+# de-overload: "downstream" now means only the repo). A consumer Dockerfile
+# that hand-references the subtree interior -- the lint-stage
+#   COPY .base/downstream/script/docker/lib    /lint/lib
+#   COPY .base/downstream/script/docker/wrapper /lint/wrapper
+# (the Region C path the earlier base/downstream split wrote in) -- breaks
+# with "COPY source not found" once the directory is gone. Rewrite every
+# .base/downstream/ COPY source to .base/dist/. Runs first so any later
+# migration sees the canonical dist/ path. Idempotent: once rewritten no
+# .base/downstream/ remains, so detect returns non-zero on a second run.
+_migrate_downstream_to_dist_detect() {
+  local _file="$1"
+  grep -q '\.base/downstream/' "${_file}"
+}
+
+_migrate_downstream_to_dist_apply() {
+  local _file="$1"
+  _dfm_sed "${_file}" 's#\.base/downstream/#.base/dist/#g'
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: .base/downstream/ -> .base/dist/ (#714)"
+  fi
+}
+
+# ── Migration 1: wrapper COPY shape A/B -> wrapper/*.sh ─────────────────────
+#
+# v0.41.0 moved the user-facing wrappers (build/run/exec/stop/prune.sh) out
+# of the flat .base/script/docker/ root into .base/script/docker/wrapper/.
+# Two pre-v0.41.0 lint-stage COPY shapes then resolve to zero files:
+#   A  COPY *.sh /lint/                       (root-anchored, the shape)
+#   B  COPY .base/script/docker/*.sh /lint/   (flat top-level glob)
+# Both heal to the current wrapper-glob shape:
+#   COPY .base/script/docker/wrapper/*.sh /lint/
+# Idempotent: a Dockerfile already on the wrapper/ shape is not detected.
+_migrate_wrapper_copy_detect() {
+  local _file="$1"
+  grep -qE '^[[:space:]]*COPY[[:space:]]+\*\.sh[[:space:]]+/lint/' "${_file}" \
+    || grep -qE '^[[:space:]]*COPY[[:space:]]+\.base/script/docker/\*\.sh[[:space:]]+/lint/' "${_file}"
+}
+
+_migrate_wrapper_copy_apply() {
+  local _file="$1"
+  # Shape A: root-anchored glob.
+  _dfm_sed "${_file}" -E 's|^([[:space:]]*)COPY[[:space:]]+\*\.sh[[:space:]]+/lint/|\1COPY .base/script/docker/wrapper/*.sh /lint/|'
+  # Shape B: flat top-level .base glob.
+  _dfm_sed "${_file}" -E 's|^([[:space:]]*)COPY[[:space:]]+\.base/script/docker/\*\.sh[[:space:]]+/lint/|\1COPY .base/script/docker/wrapper/*.sh /lint/|'
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: wrapper COPY -> .base/script/docker/wrapper/*.sh (#567 m1)"
+  fi
+}
+
+# ── Migration 2: retired .base/dockerfile/setup pip helper ──────────────────
+#
+# v0.41.0 retired the .base/dockerfile/setup pip flow. The downstream RUN
+#   RUN PIP_BREAK_SYSTEM_PACKAGES=1 pip install --no-cache-dir \
+#       -r "${CONFIG_DIR}"/pip/requirements.txt
+# (optionally preceded by a "# Setup pip packages" comment) installs base's
+# empty placeholder in most repos, so it is a no-op once the helper is gone
+# — and a hard failure if CONFIG_DIR/pip/requirements.txt is absent, since
+# the shipped dist/config/ no longer carries one. Drop both lines.
+#
+# WHAT THE LINE ALONE CANNOT SAY, and why this migration reads more than
+# the Dockerfile. dist/dockerfile/Dockerfile layers the config directory
+# twice: `.base/dist/config` (base's own, no pip/ any more) and then the
+# repo's `${CONFIG_SRC}` -- ARG CONFIG_SRC="config", i.e. <repo>/config --
+# onto the same ${CONFIG_DIR}. So the in-image
+# ${CONFIG_DIR}/pip/requirements.txt IS the repo's own file, and the RUN
+# line is byte-identical whether that file is the placeholder or a real
+# dependency list. Deleting it in the second case removes a WORKING install:
+# the build still succeeds and the packages are silently gone. This
+# migration reaches every consumer repo mechanically through
+# `just base upgrade`, so a delete it cannot justify is a delete it must not do.
+#
+# The precondition is checkable, so it is checked: the requirements file
+# sits next to the Dockerfile the migration was handed. The line is dropped
+# only where the install is PROVABLY inert -- the file is absent (the
+# build-breaking case the migration exists for) or carries nothing but
+# blanks and comments. Anything with a real requirement in it is kept and
+# reported, per the apply policy at the top of this file: a shape the
+# migration does not recognise is warned about, never force-rewritten.
+#
+# WHICH directory that file sits in is itself a question, and answering it
+# "config/, always" would narrow the silent package loss rather than close
+# it. CONFIG_SRC is a build ARG: a repo can redeclare it in its own
+# Dockerfile, or set it as a compose build arg via a
+# `[build] arg_N = CONFIG_SRC=...` entry in setup.toml. Either way
+# ${CONFIG_DIR} is overlaid from <repo>/<something-else>, config/ holds
+# nothing the RUN line reads, and reading it anyway would report "not
+# populated" over a real dependency list. So the source directory has to
+# RESOLVE to the default before its contents count as proof; where the
+# migration cannot locate it -- redirected, or simply not there -- the
+# install is unprovable and the line is kept, same as any other shape this
+# migration does not recognise.
+#
+# The delete is also line-based, so it is only safe on a pip line that is a
+# complete physical instruction. Inside a backslash-continued RUN, removing
+# one physical line either dangles the previous line's continuation (which
+# swallows the next instruction) or orphans the tail as a bare
+# non-instruction line (a Dockerfile parse error). Those shapes are kept and
+# reported too; restructuring someone's compound RUN is not a mechanical
+# edit.
+
+# The one spelling of the retired helper line, shared by the detector, the
+# continuation check and the delete. `\%...%` addresses the sed so the
+# pattern's own slashes need no escaping.
+readonly _DFM_PIP_HELPER_RE='pip install .*-r[[:space:]]+.*\$\{?CONFIG_DIR\}?.*/pip/requirements\.txt'
+
+# A physical line that continues onto the next one. Held in a variable
+# because an inline `=~` right-hand side loses one level of backslash to
+# quote removal, which would silently turn this into "a literal [".
+readonly _DFM_LINE_CONTINUES_RE='\\[[:space:]]*$'
+
+# The default of the Dockerfile's `ARG CONFIG_SRC` -- the repo directory the
+# layer-2 `COPY "${CONFIG_SRC}" "${CONFIG_DIR}"` overlays onto ${CONFIG_DIR}.
+readonly _DFM_CONFIG_SRC_DEFAULT='config'
+
+# The conf keys that redirect the overlay, as one pattern, in both
+# spellings of a build arg.
+#
+# TOML is the shipped format: a build arg is an `[[build.args]]` block
+# whose `key` is CONFIG_SRC, and the name is a quoted string there -- the
+# `key = "CONFIG_SRC"` alternative is what makes this probe able to read a
+# real setup.toml at all. The bare `arg_N = CONFIG_SRC=<dir>` under
+# `[build]` is the INI spelling it replaced, kept so a layer written before
+# the conversion still answers. Neither alternative matches a section,
+# because a key of either shape means nothing outside its own.
+#
+# Grepping the layer rather than resolving the conf chain is deliberate:
+# the caller needs the per-layer three-answer status below (a layer that
+# says no is not a layer that could not be read), which a whole-chain merge
+# collapses into one.
+#
+# EVERY SPELLING TOML ALLOWS FOR THE SAME ENTRY, because this probe
+# authorises a DELETE and a redirect it fails to see is the expensive
+# answer. Three were missing and each is ordinary:
+#   - a TRAILING COMMENT. The quoted value had to END the line, so
+#     `key = "CONFIG_SRC" # use project dependencies` read as no
+#     redirect -- and an operator who points CONFIG_SRC somewhere is
+#     exactly the one who writes down why. A `#` after the CLOSING quote
+#     is a comment; one inside the quotes is content, which is why the
+#     optional comment sits outside them.
+#   - a QUOTED KEY. `"key" = "CONFIG_SRC"` is the same entry.
+#   - a QUOTED SCALAR in the INI-shaped spelling. A hand-edited or
+#     part-converted layer carries `arg_1 = "CONFIG_SRC=myconfig"`.
+# Widening this pattern can only make the guard refuse MORE deletions,
+# which is the safe direction for it; narrowing it is what cost a working
+# pip install.
+readonly _DFM_CONF_REDIRECT_RE=$'^[[:space:]]*(arg_[0-9]+[[:space:]]*=[[:space:]]*[\'"]?CONFIG_SRC=|[\'"]?key[\'"]?[[:space:]]*=[[:space:]]*[\'"]CONFIG_SRC[\'"][[:space:]]*(#.*)?$)'
+readonly _DFM_ARG_REDIRECT_RE='^[[:space:]]*ARG[[:space:]]+CONFIG_SRC='
+
+# The floor the conf chain must clear. _setup_conf_layers documents three
+# layers -- template, per-repo, per-worktree -- and this guard authorises a
+# DELETE, so a chain that came back shorter means a layer dropped out of
+# the resolution and the scan did not see the population it is answering
+# for. That is a refusal, not a pass.
+readonly _DFM_CONF_LAYER_FLOOR=3
+
+# READING A STATUS IN THIS FILE. Every decision below comes from some
+# command's exit status, and each one of them has THREE answers, not two:
+#
+#   YES              the thing is there / the property holds
+#   NO               it is provably not there -- the check OBSERVED its
+#                    absence, having read everything it had to read
+#   I-COULD-NOT-TELL the check returned "not found" without observing
+#                    anything: grep exited 2, a directory could not be
+#                    traversed, a path did not resolve
+#
+# The third answer must never authorise an action. Migration 2 is the only
+# one here that DELETES a line on the strength of what it read outside the
+# Dockerfile, so it is the one where the distinction is load-bearing: its
+# guards return 0/1/2 and only 1 -- the observed NO -- reaches the delete.
+# Every other migration decides only whether to ADD or rewrite a known
+# shape, so an unanswered question in its DETECT means "detect did not
+# fire" and the file is left alone, which is already the safe direction:
+# _dfm_needs_dl4006 / _dfm_needs_dl3006 and every `_detect` fold 2 into
+# "no", and _dfm_pip_line_is_standalone returns non-zero (= keep the line)
+# when it cannot read the file at all.
+#
+# ONE migration asks an unanswered question in its APPLY instead, where
+# that argument does not reach it, and it is NOT fixed: _migrate_smoke_copy
+# globs <repo>/.base/dist/test/bats/smoke/*/ to decide which per-stage
+# folders the freshly pulled subtree ships, and its `[[ -d ]] || continue`
+# reads a path it could not traverse as "this stage ships no folder". The
+# Dockerfile is then rewritten with the shared baseline COPY alone and the
+# `-test` stage silently loses the smoke specs it used to run -- the same
+# "a path nobody read is not an empty one" this block is about, one
+# migration further down. Stated rather than implied, and pinned by
+# dockerfile_migrate_spec ("an unresolvable per-stage path costs the stage
+# its own COPY") so the deviation is a measured fact; a follow-up issue
+# carries the fix, which is why this block does not claim it is closed.
+
+# _dfm_dir_is_readable <path>
+#   Exit 0 when <path> is a directory this process can stat AND list, 1
+#   otherwise -- it is not a directory, the path did not resolve (a
+#   dangling or looping symlink, a non-directory component), or its mode
+#   forbids reading or searching it.
+#
+#   This is the question the word "absent" depends on. `[[ -f <dir>/x ]]`
+#   is false both when x is not in <dir> and when <dir> was never read,
+#   and only the first is proof; a caller that folds the second into it
+#   turns an unreadable directory into permission to delete. Callers ask
+#   this BEFORE they are allowed to call a missing file absent.
+_dfm_dir_is_readable() {
+  local _dir="$1"
+  [[ -d "${_dir}" && -r "${_dir}" && -x "${_dir}" ]]
+}
+
+# _dfm_conf_declares_redirect <conf_file>
+#   Exit 0 when this layer redirects CONFIG_SRC, 1 when it provably does
+#   not, 2 when the question could not be answered. The third status is
+#   the point: a caller that folds it into "no match" turns an unreadable
+#   layer into permission to delete.
+#
+#   A TOML LAYER IS ASKED OF THE READER, NOT OF ITS TEXT. The question is
+#   "does the build receive CONFIG_SRC", and the answer belongs to the
+#   bridge: `[build] args` is the same array whether it is written as
+#   `[[build.args]]` blocks, as an inline `args = [{ key = "CONFIG_SRC",
+#   ... }]`, or spread over several lines, and every one of those reaches
+#   the build identically. A pattern over the text answers for the
+#   spelling it was written against and silently says NO to the rest --
+#   which, for a probe that authorises a DELETE, is the expensive
+#   direction. Two spellings were patched into the regex one review round
+#   apart before this was moved; a third would have followed.
+#
+#   The bridge gives the SAME three answers, per layer, which is what the
+#   header above requires: a row for the family is YES, a successful parse
+#   with no such row is a provable NO, and a parse that did not happen --
+#   unreadable file, no bridge available -- is the unanswered question. A
+#   whole-chain merge would have collapsed the per-layer granularity; one
+#   parse per layer does not.
+#
+#   The regex stays for a NON-TOML layer, which has one spelling and no
+#   reader to ask.
+_dfm_conf_declares_redirect() {
+  local _conf="$1" _st=0
+  if [[ "${_conf}" == *.toml ]]; then
+    local _kv=""
+    _kv="$(toml_bridge_parse "${_conf}" --kv 2>/dev/null)" || return 2
+    local _row _s _k _v
+    while IFS= read -r _row; do
+      [[ -n "${_row}" ]] || continue
+      _conf_kv_split "${_row}" _s _k _v
+      [[ "${_s}" == "build" ]] || continue
+      [[ "${_k}" == arg_* ]] || continue
+      [[ "${_v}" == "CONFIG_SRC="* ]] || continue
+      return 0
+    done <<< "${_kv}"
+    return 1
+  fi
+  grep -qE "${_DFM_CONF_REDIRECT_RE}" "${_conf}" || _st=$?
+  case "${_st}" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# _dfm_pip_config_dir <dockerfile>
+#   Print the repo directory ${CONFIG_DIR} is overlaid from, or exit
+#   non-zero when this migration cannot know it. Non-zero on each of the
+#   three ways the answer stops being a provable <repo>/config: something
+#   redirects CONFIG_SRC (an `ARG CONFIG_SRC=<non-default>` in the
+#   Dockerfile itself, or a `[build] arg_N = CONFIG_SRC=...` in ANY layer
+#   of the setup.toml chain, which reaches the build as a compose build
+#   arg); the default directory is not next to the Dockerfile at all; or
+#   some layer of the chain could not be READ, which is not the same as a
+#   layer that says nothing. A bare `ARG CONFIG_SRC` with no `=` is a
+#   per-stage re-scope, not a redirect, and is ignored.
+#
+#   The conf layers are DERIVED from _setup_conf_layers rather than listed
+#   here. The chain is three files, not the two per-repo ones: the lowest
+#   is the template's own setup.toml inside .base/dist, and the build
+#   reads all three (setup_cmd.sh -> _setup_conf_handle ->
+#   _setup_conf_layers). A repo that never ran `init.sh --gen-conf` has no
+#   per-repo conf at all and runs on template defaults, so a hand-listed
+#   roster would answer "no redirect" for exactly the repos whose answer
+#   comes from the layer it omitted -- and delete their pip install.
+_dfm_pip_config_dir() {
+  local _file="$1"
+  local _dir
+  _dir="$(dirname -- "${_file}")"
+
+  # The Dockerfile's own ARG. Read through a variable rather than a
+  # process substitution so grep's status is not thrown away: exit 2 here
+  # would present an unscanned file as "no ARG CONFIG_SRC", i.e. as the
+  # default.
+  local _args _st=0
+  _args="$(grep -E "${_DFM_ARG_REDIRECT_RE}" "${_file}")" || _st=$?
+  case "${_st}" in
+    0|1) ;;
+    *) return 1 ;;
+  esac
+
+  local _line _val
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    [[ -n "${_line}" ]] || continue
+    _val="${_line#*=}"
+    _val="${_val%\"}"; _val="${_val#\"}"
+    _val="${_val%\'}"; _val="${_val#\'}"
+    [[ "${_val}" == "${_DFM_CONFIG_SRC_DEFAULT}" ]] || return 1
+  done <<< "${_args}"
+
+  local -a _layers=()
+  _setup_conf_layers "${_dir}" _layers "${_DFM_TEMPLATE_DIST_DIR}"
+  (( ${#_layers[@]} >= _DFM_CONF_LAYER_FLOOR )) || return 1
+
+  local _conf _cst
+  for _conf in "${_layers[@]}"; do
+    if [[ ! -f "${_conf}" ]]; then
+      # An absent layer declares nothing, which is a legitimate NO -- but
+      # only once this has OBSERVED the absence. `[[ -f ]]` also answers
+      # false for a layer that exists and is not a readable regular file,
+      # and for one whose directory could not be traversed; both are
+      # I-COULD-NOT-TELL, and a chain with an unread layer in it cannot
+      # say the build reads <repo>/config.
+      _dfm_dir_is_readable "$(dirname -- "${_conf}")" || return 1
+      [[ -e "${_conf}" || -L "${_conf}" ]] && return 1
+      continue
+    fi
+    _cst=0
+    _dfm_conf_declares_redirect "${_conf}" || _cst=$?
+    # 1 -- and only 1 -- is "this layer provably declares no redirect".
+    # 0 is a redirect and 2 is an unanswered question; both mean the
+    # overlay source is not <repo>/config as far as this guard can prove.
+    (( _cst == 1 )) || return 1
+  done
+
+  [[ -d "${_dir}/${_DFM_CONFIG_SRC_DEFAULT}" ]] || return 1
+  printf '%s' "${_dir}/${_DFM_CONFIG_SRC_DEFAULT}"
+}
+
+# _dfm_pip_requirements_populated <config_dir>
+#   Exit 0 when the repo ships a requirements file with at least one real
+#   requirement (any line that is neither blank nor a `#` comment), 1 when
+#   it PROVABLY ships none -- the file is absent, which is the case whose
+#   build the migration is repairing, or it was read end to end and holds
+#   nothing but blanks and comments -- and 2 when the question could not
+#   be answered because something on the way to the file, or the file
+#   itself, could not be read.
+#
+#   The third status is the point, and it is the same one
+#   _dfm_conf_declares_redirect carries. It has TWO sources here, not one.
+#   `grep -q` exits 2 when it scanned nothing -- and, before grep is ever
+#   reached, `[[ -f ]]` answers false both for a file that is not there
+#   and for a path that could not be traversed at all (a mode that
+#   forbids searching config/ or config/pip/, a symlink that does not
+#   resolve). Only the first is the absence this migration repairs; the
+#   second is a file nobody read, and a file nobody read is not a file
+#   with nothing in it. Takes the RESOLVED config source dir, so it is
+#   never the one that decides where to look.
+_dfm_pip_requirements_populated() {
+  local _config_dir="$1"
+  local _pip_dir="${_config_dir}/pip"
+  local _req="${_pip_dir}/requirements.txt"
+
+  if [[ ! -f "${_req}" ]]; then
+    # Walk down to the file, refusing at the first level this process
+    # could not read. Absence counts as proof only below a directory that
+    # was actually listed.
+    _dfm_dir_is_readable "${_config_dir}" || return 2
+    if [[ -e "${_pip_dir}" || -L "${_pip_dir}" ]]; then
+      _dfm_dir_is_readable "${_pip_dir}" || return 2
+      # pip/ was read; something sits at requirements.txt that is not a
+      # regular file this process can open.
+      [[ -e "${_req}" || -L "${_req}" ]] && return 2
+    fi
+    # config/ was read and holds no pip/requirements.txt: the observed
+    # absence, and the v0.41.0 build breakage this migration exists for.
+    return 1
+  fi
+
+  local _st=0
+  grep -qE '^[[:space:]]*[^#[:space:]]' "${_req}" || _st=$?
+  case "${_st}" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# _dfm_pip_line_is_standalone <dockerfile>
+#   Exit 0 when every matched helper line is a complete physical
+#   instruction -- it neither continues the previous line nor continues
+#   onto the next. Only that shape survives a line-based delete intact.
+#
+#   Exit 1 both when one of them does not AND when the file could not be
+#   READ at all. The loop below reads through a redirect, and a redirect
+#   that fails leaves the loop unrun: without the status check the
+#   unconditional `return 0` at the end would answer "standalone, safe to
+#   delete" for a file nothing opened. This is the leg of the status block
+#   at the top of the file that names this function, so it has to hold --
+#   I-COULD-NOT-TELL never authorises the delete.
+#
+#   Two probes, because one does not cover it. `[[ -f ]]` answers for
+#   every path that is not a regular file to begin with: a missing one,
+#   an unresolvable symlink, and a DIRECTORY -- which the redirect alone
+#   reads as clean, since on Linux open(2) on a directory succeeds, the
+#   first `read` fails with EISDIR, and the loop then exits with the
+#   status of its last assignment, 0. The redirect's own status answers
+#   for the rest: a path that IS a regular file and still could not be
+#   opened (its mode, a mount that went away between the test and the
+#   open). Neither is redundant and neither is the whole probe.
+_dfm_pip_line_is_standalone() {
+  local _file="$1"
+  [[ -f "${_file}" ]] || return 1
+  local _line _prev_cont=false _cont _read_st=0
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    if [[ "${_line}" =~ ${_DFM_LINE_CONTINUES_RE} ]]; then
+      _cont=true
+    else
+      _cont=false
+    fi
+    if [[ "${_line}" =~ ${_DFM_PIP_HELPER_RE} ]] \
+        && { [[ "${_prev_cont}" == true ]] || [[ "${_cont}" == true ]]; }; then
+      return 1
+    fi
+    _prev_cont="${_cont}"
+  done < "${_file}" || _read_st=$?
+  [[ "${_read_st}" -eq 0 ]] || return 1
+  return 0
+}
+
+_migrate_pip_helper_detect() {
+  local _file="$1"
+  grep -qE "${_DFM_PIP_HELPER_RE}" "${_file}"
+}
+
+_migrate_pip_helper_apply() {
+  local _file="$1"
+
+  local _config_dir
+  if ! _config_dir="$(_dfm_pip_config_dir "${_file}")"; then
+    _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: retired CONFIG_DIR pip helper line kept — CONFIG_DIR is not provably overlaid from <repo>/config here (CONFIG_SRC is redirected, a conf layer could not be read, or that directory is absent), so what the line installs cannot be read from here; drop it by hand if it installs nothing (#567 m2)"
+    return 0
+  fi
+
+  # 1 -- and only 1 -- is "this repo provably installs nothing here", the
+  # single status that may reach the delete below. 0 is a real requirement
+  # list and 2 is an unanswered question; both keep the line.
+  local _rst=0
+  _dfm_pip_requirements_populated "${_config_dir}" || _rst=$?
+  case "${_rst}" in
+    0)
+      _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: retired CONFIG_DIR pip helper line kept — config/pip/requirements.txt carries real requirements, so the line still installs them (#567 m2)"
+      return 0
+      ;;
+    1) ;;
+    *)
+      _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: retired CONFIG_DIR pip helper line kept — config/pip/requirements.txt could not be read, so what the line installs is unknown; a file this migration never read is not a file with nothing in it (#567 m2)"
+      return 0
+      ;;
+  esac
+
+  if ! _dfm_pip_line_is_standalone "${_file}"; then
+    _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: retired CONFIG_DIR pip helper line kept — it is part of a backslash-continued RUN a line delete would break; drop it by hand (#567 m2)"
+    return 0
+  fi
+
+  _dfm_sed "${_file}" -E "\\%${_DFM_PIP_HELPER_RE}%d"
+  _dfm_sed "${_file}" '/^# Setup pip packages$/d'
+  if _dfm_take_changed "${_file}"; then
+    _log_warn upgrade dockerfile_patched "display=  Dockerfile patched: dropped retired CONFIG_DIR pip helper line (#567 m2) — re-add an explicit pip step if you ship a real requirements file"
+  fi
+}
+
+# ── Migration 3: explicit hand-listed lib/wrapper COPYs ─────────────────────
+#
+# Multi-distro repos hand-listed the moved top-level files in their lint
+# stage, e.g. `COPY .base/script/docker/_lib.sh .base/script/docker/i18n.sh
+# /lint/` or a backslash-continued block of build/run/exec/stop.sh. All
+# moved under lib/ and wrapper/ in v0.41.0, so these resolve to zero files.
+# The stage already pulls them via the `lib` dir COPY + the wrapper glob, so
+# the explicit COPYs are redundant and broken — delete the whole COPY
+# statement (handling backslash continuation).
+#
+# The match anchors on a top-level `.base/script/docker/<name>.sh` reference
+# (a bare file directly under docker) whose COPY destination is the lint
+# sandbox `/lint/`. The `/lint/` constraint scopes this to the lint-stage
+# redundant COPYs and deliberately spares unrelated runtime helper COPYs
+# (e.g. `_entrypoint_logging.sh` -> /usr/local/lib/base/, healed by
+# migration 4). It also does NOT match migration-1's output
+# `.base/script/docker/wrapper/*.sh` (path segment + glob) nor the
+# `.base/script/docker/lib` dir COPY (no `.sh`).
+_migrate_explicit_copy_detect() {
+  local _file="$1"
+  local _stmt
+  _stmt="$(_dfm_join_copy_statements "${_file}")"
+  grep -qE 'COPY[[:space:]]+.*\.base/script/docker/[A-Za-z_]+\.sh.*[[:space:]]/lint/' <<<"${_stmt}"
+}
+
+_migrate_explicit_copy_apply() {
+  local _file="$1"
+  local _tmp
+  _tmp="$(mktemp)"
+  # awk state machine: when a COPY statement (possibly spanning backslash
+  # continuations) references a top-level .base/script/docker/<name>.sh AND
+  # targets the /lint/ sandbox, drop every physical line of that statement;
+  # otherwise pass through verbatim.
+  awk '
+    /^[[:space:]]*COPY[[:space:]]/ {
+      stmt = $0; buf = $0 ORS; cont = ($0 ~ /\\[[:space:]]*$/)
+      while (cont) {
+        if ((getline nxt) <= 0) { break }
+        stmt = stmt " " nxt; buf = buf nxt ORS
+        cont = (nxt ~ /\\[[:space:]]*$/)
+      }
+      if (stmt ~ /\.base\/script\/docker\/[A-Za-z_]+\.sh/ && stmt ~ /[[:space:]]\/lint\//) { next }
+      printf "%s", buf; next
+    }
+    { print }
+  ' "${_file}" > "${_tmp}"
+  _dfm_install "${_file}" "${_tmp}"
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: dropped redundant explicit lib/wrapper COPY(s) (#567 m3)"
+  fi
+}
+
+# ── Migration 4: _entrypoint_logging.sh -> runtime/logging.sh rename ────────
+#
+# The host-log helper was renamed `_entrypoint_logging.sh` -> `logging.sh`
+# and relocated under runtime/ (-> current). Two downstream references
+# break: the Dockerfile COPY of the helper into /usr/local/lib/base/, and
+# the entrypoint's `source /usr/local/lib/base/_entrypoint_logging.sh`. The
+# Dockerfile COPY is healed in place; when a sibling script/entrypoint.sh
+# exists next to the Dockerfile, its source line is healed too (the helper's
+# baked path /usr/local/lib/base/_entrypoint_logging.sh -> .../logging.sh).
+_migrate_logging_rename_detect() {
+  local _file="$1"
+  # Fire when EITHER the Dockerfile COPY or the sibling entrypoint still
+  # references the retired helper name. A partial migration (Dockerfile
+  # hand-fixed to runtime/logging.sh, entrypoint still sourcing the old
+  # /usr/local/lib/base/_entrypoint_logging.sh) must still heal the
+  # entrypoint, otherwise the container cannot source the renamed helper.
+  grep -q '_entrypoint_logging\.sh' "${_file}" && return 0
+  local _entry
+  _entry="$(_dfm_entrypoint_path "${_file}")"
+  [[ -f "${_entry}" ]] && grep -q '_entrypoint_logging\.sh' "${_entry}"
+}
+
+_migrate_logging_rename_apply() {
+  local _file="$1"
+  # Dockerfile COPY: old flat helper path -> new runtime/ path, both src and
+  # the baked dest filename.
+  _dfm_sed "${_file}" -E \
+    's#\.base/(downstream/|dist/)?script/docker/(runtime/)?_entrypoint_logging\.sh#.base/dist/script/docker/runtime/logging.sh#g'
+  _dfm_sed "${_file}" 's|/usr/local/lib/base/_entrypoint_logging\.sh|/usr/local/lib/base/logging.sh|g'
+
+  # Heal the sibling entrypoint's baked source path, if present. The
+  # Dockerfile sits at the repo root; the entrypoint is the conventional
+  # script/entrypoint.sh.
+  local _entry
+  _entry="$(_dfm_entrypoint_path "${_file}")"
+  if [[ -f "${_entry}" ]] && grep -q '_entrypoint_logging\.sh' "${_entry}"; then
+    _dfm_sed "${_entry}" 's|/usr/local/lib/base/_entrypoint_logging\.sh|/usr/local/lib/base/logging.sh|g'
+    if _dfm_take_changed "${_entry}"; then
+      _log_info upgrade entrypoint_patched "display=  entrypoint patched: _entrypoint_logging.sh -> logging.sh source (#567 m4)"
+    fi
+  fi
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: _entrypoint_logging.sh -> runtime/logging.sh (#567 m4)"
+  fi
+}
+
+# ── Migration 5: hadolint rules surfaced by the slimmed .hadolint.yaml ──────
+#
+# v0.41.0 slimmed .hadolint.yaml so it no longer ignores a batch of
+# rules the v0.41.0 template Dockerfile already satisfies but older
+# downstream Dockerfiles do not. This migration mechanically heals the same
+# violations the ad-hoc fanout fixed by hand (each sub-fix is idempotent):
+#   DL3007  pin `FROM bats/bats:latest` / `FROM alpine:latest` helper stages
+#   DL3046  `useradd -u`  -> `useradd -l -u`
+#   DL3003  `RUN cd /lint && hadolint ...` gains an inline
+#           `# hadolint ignore=DL3003`. Rewriting it to `WORKDIR /lint` would
+#           move every later instruction of the stage, and the image, into
+#           /lint (base#2150); dropping the `cd` would lose the
+#           .hadolint.yaml hadolint reads from its working directory
+#   DL3042  `pip install -r` -> `pip install --no-cache-dir -r`
+#   DL4006  alpine lint-tools stage gains a `SHELL [ash -o pipefail]`
+#   DL3006  parameterized `FROM ${BASE_IMAGE}` / `${TEST_TOOLS_IMAGE}` gains
+#           an inline `# hadolint ignore=DL3006` (an ARG-driven base image
+#           cannot be explicitly tagged)
+#   DL3066  a literal `USER root` gains an inline `# hadolint ignore=DL3066`
+#           (the rule postdates hadolint 2.12.0, so no existing consumer
+#           Dockerfile answers it, and every one of them has the line)
+_migrate_hadolint_detect() {
+  local _file="$1"
+  grep -Eq '^FROM (bats/bats|alpine):latest' "${_file}" && return 0
+  _dfm_needs_dl3046 "${_file}" && return 0
+  _dfm_needs_dl3003 "${_file}" && return 0
+  grep -Eq 'pip install[[:space:]]+-r' "${_file}" && return 0
+  _dfm_needs_dl4006 "${_file}" && return 0
+  _dfm_needs_dl3006 "${_file}" && return 0
+  _dfm_needs_dl3066 "${_file}" && return 0
+  return 1
+}
+
+# _dfm_needs_dl3046 <file>
+#   True when a `useradd` that sets a uid carries no `-l`, whatever order
+#   its flags are in. Same head/tail split and same scan window as the
+#   transform, so detect and apply cannot disagree about which line is a
+#   candidate.
+_dfm_needs_dl3046() {
+  local _file="$1"
+  awk '
+    function _dfm_scan(_text) {
+      if (match(_text, /(&&|\|\||;|\|)/)) {
+        return substr(_text, 1, RSTART - 1)
+      }
+      return _text
+    }
+    {
+      if (match($0, /(^|[[:space:]])useradd[[:space:]]+/)) {
+        _scan = _dfm_scan(substr($0, RSTART + RLENGTH))
+        if (_scan ~ /(^|[[:space:]])(-[[:alnum:]]*u|--uid)([[:space:]]|=)/ &&
+            _scan !~ /(^|[[:space:]])(-[[:alnum:]]*l|--no-log-init)([[:space:]]|$)/) {
+          found = 1
+        }
+      }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "${_file}"
+}
+
+# _dfm_needs_dl4006 <file>
+#   True when an `alpine ... AS lint-tools` stage is present without a
+#   following SHELL ash-pipefail directive.
+_dfm_needs_dl4006() {
+  local _file="$1"
+  grep -Eq '^FROM alpine:[^[:space:]]+ AS lint-tools' "${_file}" \
+    && ! grep -Fq 'SHELL ["/bin/ash", "-o", "pipefail", "-c"]' "${_file}"
+}
+
+# _dfm_needs_dl3006 <file>
+#   True when a parameterized `FROM ${IMAGE}` lacks a preceding inline ignore.
+_dfm_needs_dl3006() {
+  local _file="$1"
+  awk '
+    /^FROM \$\{[A-Za-z_]+\}/ && prev !~ /hadolint ignore=DL3006/ { found=1 }
+    { prev=$0 }
+    END { exit (found ? 0 : 1) }
+  ' "${_file}"
+}
+
+# _DFM_AWK_PRAGMA
+#   awk functions reading a hadolint pragma as hadolint does: alone in its
+#   comment, with optional blanks around `=` and the commas.
+# shellcheck disable=SC2016
+_DFM_AWK_PRAGMA='
+  function pragma(text) {
+    return text ~ /^[ \t]*#[ \t]*hadolint[ \t]+ignore[ \t]*=[ \t]*[A-Z0-9]+([ \t]*,[ \t]*[A-Z0-9]+)*[ \t\r]*(#.*)?$/
+  }
+  function ignores(text, rule) {
+    if (!pragma(text)) { return 0 }
+    match(text, /=[ \t]*[A-Z0-9]+([ \t]*,[ \t]*[A-Z0-9]+)*/)
+    return (substr(text, RSTART, RLENGTH) ",") ~ ("[=, \t]" rule "[, \t]")
+  }
+  function lint_run(text) {
+    return text ~ /^[ \t]*RUN[ \t]+cd[ \t]+\/lint[ \t]+&&[ \t]+hadolint[ \t]/
+  }
+'
+
+# _dfm_needs_dl3003 <file>
+#   True when a `RUN cd /lint && hadolint ...` is present whose preceding
+#   line does not already ignore DL3003.
+_dfm_needs_dl3003() {
+  local _file="$1"
+  awk "${_DFM_AWK_PRAGMA}"'
+    lint_run($0) && !ignores(prev, "DL3003") { found=1 }
+    { prev=$0 }
+    END { exit (found ? 0 : 1) }
+  ' "${_file}"
+}
+
+# _dfm_needs_dl3066 <file>
+#   True when a literal `USER root` is present whose preceding line does not
+#   already ignore DL3066.
+#
+#   Only the literal `root` is in scope. DL3066 asks for a NUMERIC user-id so
+#   a host or orchestrator can resolve the identity a container runs as, and
+#   `root` is the one name every image resolves by definition. Any other
+#   literal user is the case the rule is worth having, and `USER "${USER}"`
+#   -- the identity these images actually ship with -- is a parameter
+#   hadolint does not evaluate. Neither is touched.
+_dfm_needs_dl3066() {
+  local _file="$1"
+  awk '
+    /^[[:space:]]*USER[[:space:]]+"?root"?[[:space:]]*$/ &&
+      prev !~ /hadolint ignore=[A-Za-z0-9,]*DL3066/ { found=1 }
+    { prev=$0 }
+    END { exit (found ? 0 : 1) }
+  ' "${_file}"
+}
+
+_migrate_hadolint_apply() {
+  local _file="$1"
+  # DL3007: pin the helper-stage :latest tags.
+  #
+  # Both versions are hoisted onto lines of their own rather than written
+  # inline in the sed. Inline they were TWO versions on ONE line, which no
+  # marker can address (a marker owns a line, and extraction anchors on one
+  # coordinate), so neither was watched -- and the bats tag had drifted two
+  # minors behind this repo's own bats pin while being written into every
+  # downstream Dockerfile this function migrates.
+  #
+  # The alpine series here is the one base itself builds on -- see
+  # ARG ALPINE_VERSION in dockerfile/Dockerfile.test-tools, whose recorded
+  # end-of-life fails base's own suite 180 days out. Keeping the two equal
+  # is asserted by dockerfile_migrate_spec.bats, so this literal cannot
+  # quietly become the older of two dates: it wrote an end-of-life series
+  # into every consumer Dockerfile it healed, during an upgrade, which is
+  # the moment nobody reads the diff. The marker on it is the other half of
+  # the same argument -- the spec keeps it equal to base's pin, the marker
+  # is what makes a proposal to move both arrive at all.
+  # tool-pin: migrate-bats dockerhub bats/bats pattern=^[0-9]+\.[0-9]+\.[0-9]+$
+  local _bats_tag='1.13.0'
+  # tool-pin: migrate-alpine dockerhub library/alpine pattern=^[0-9]+\.[0-9]+$
+  local _alpine_tag='3.23'
+  _dfm_sed "${_file}" -E "s|^FROM bats/bats:latest|FROM bats/bats:${_bats_tag}|; s|^FROM alpine:latest|FROM alpine:${_alpine_tag}|"
+  # DL3046: useradd -l (idempotent — only adds when not already present).
+  #
+  # `-l` goes directly after the `useradd` token, not in front of `-u`.
+  # Anchoring on `useradd -u` matches only the order base's own template
+  # happens to use; a downstream repo writes
+  # `useradd -m -s /bin/bash -u ...` and the anchored form walks past it,
+  # leaving DL3046 live in a Dockerfile the migration reported as patched.
+  # Rewriting the head of the command instead makes the position of the
+  # flag being answered irrelevant. The flags are read from the useradd's
+  # OWN command segment -- the text after the token, cut at the first
+  # `&&`, `||`, `;` or `|` -- because the conflict-handling branch every
+  # downstream Dockerfile carries writes `usermod -l` after an `&&`, and
+  # scanning to end of line reads that sibling flag as this command
+  # already answering DL3046. The heal would then never fire and the
+  # migration would report a patched Dockerfile with the finding still
+  # live in it.
+  local _tmp3046
+  _tmp3046="$(mktemp)"
+  awk '
+    function _dfm_scan(_text) {
+      if (match(_text, /(&&|\|\||;|\|)/)) {
+        return substr(_text, 1, RSTART - 1)
+      }
+      return _text
+    }
+    {
+      if (match($0, /(^|[[:space:]])useradd[[:space:]]+/)) {
+        _head = substr($0, 1, RSTART + RLENGTH - 1)
+        _tail = substr($0, RSTART + RLENGTH)
+        _scan = _dfm_scan(_tail)
+        if (_scan ~ /(^|[[:space:]])(-[[:alnum:]]*u|--uid)([[:space:]]|=)/ &&
+            _scan !~ /(^|[[:space:]])(-[[:alnum:]]*l|--no-log-init)([[:space:]]|$)/) {
+          $0 = _head "-l " _tail
+        }
+      }
+      print
+    }
+  ' "${_file}" > "${_tmp3046}"
+  _dfm_install "${_file}" "${_tmp3046}"
+  # DL3042: pip --no-cache-dir (idempotent).
+  _dfm_sed "${_file}" -E 's|pip install[[:space:]]+-r|pip install --no-cache-dir -r|'
+  _dfm_sed "${_file}" -E 's|pip install --no-cache-dir --no-cache-dir|pip install --no-cache-dir|'
+  # DL3003: inline ignore before each unguarded `RUN cd /lint && hadolint`,
+  # extending a pragma that is already there for the reason given at DL3066.
+  if _dfm_needs_dl3003 "${_file}"; then
+    local _tmp3003
+    _tmp3003="$(mktemp)"
+    awk "${_DFM_AWK_PRAGMA}"'
+      function flush() { if (have) { print held; have = 0 } }
+      lint_run($0) && pragma(held) && !ignores(held, "DL3003") {
+        sub(/=[ \t]*[A-Z0-9]+/, "&,DL3003", held)
+      }
+      lint_run($0) && !pragma(held) {
+        flush()
+        match($0, /^[ \t]*/)
+        held = substr($0, 1, RLENGTH) "# hadolint ignore=DL3003"
+        have = 1
+      }
+      { flush(); held = $0; have = 1 }
+      END { flush() }
+    ' "${_file}" > "${_tmp3003}"
+    _dfm_install "${_file}" "${_tmp3003}"
+  fi
+
+  # DL4006: SHELL ash-pipefail right after the alpine lint-tools FROM.
+  if _dfm_needs_dl4006 "${_file}"; then
+    _dfm_sed "${_file}" -E '/^FROM alpine:[^[:space:]]+ AS lint-tools/a SHELL ["/bin/ash", "-o", "pipefail", "-c"]'
+  fi
+
+  # DL3006: inline ignore before each unguarded parameterized FROM.
+  if _dfm_needs_dl3006 "${_file}"; then
+    local _tmp
+    _tmp="$(mktemp)"
+    awk '
+      /^FROM \$\{[A-Za-z_]+\}/ && prev !~ /hadolint ignore=DL3006/ { print "# hadolint ignore=DL3006" }
+      { print; prev=$0 }
+    ' "${_file}" > "${_tmp}"
+    _dfm_install "${_file}" "${_tmp}"
+  fi
+  # DL3066: inline ignore before each unguarded literal `USER root`.
+  #
+  # A pragma already sitting above the instruction is EXTENDED, never
+  # displaced: hadolint binds an ignore to the NEXT LINE, so inserting a
+  # second pragma between an existing one and its instruction would silently
+  # re-arm the rule that pragma was answering (the shipped shape of a real
+  # downstream Dockerfile is `# hadolint ignore=DL3002` directly above
+  # `USER root`). The inserted line copies the USER line's own indentation
+  # so the pragma cannot land outside a block it was meant to sit in.
+  if _dfm_needs_dl3066 "${_file}"; then
+    local _tmp3066
+    _tmp3066="$(mktemp)"
+    awk '
+      function flush(  ) { if (have) { print held; have = 0 } }
+      {
+        if ($0 ~ /^[[:space:]]*USER[[:space:]]+"?root"?[[:space:]]*$/) {
+          if (have && held ~ /hadolint ignore=/) {
+            if (held !~ /hadolint ignore=[A-Za-z0-9,]*DL3066/) {
+              sub(/hadolint ignore=[A-Za-z0-9,]+/, "&,DL3066", held)
+            }
+            print held
+            have = 0
+          } else {
+            flush()
+            match($0, /^[[:space:]]*/)
+            print substr($0, 1, RLENGTH) "# hadolint ignore=DL3066"
+          }
+          print $0
+          next
+        }
+        flush()
+        held = $0
+        have = 1
+      }
+      END { flush() }
+    ' "${_file}" > "${_tmp3066}"
+    _dfm_install "${_file}" "${_tmp3066}"
+  fi
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: hadolint DL3007/DL3046/DL3003/DL3042/DL4006/DL3006/DL3066 (#567 m5, #946)"
+  fi
+}
+
+# ── Migration 6: noetic entrypoint SC1090 directive ─────────────────────────
+#
+# The noetic sensor entrypoints `source "/opt/ros/${ROS_DISTRO}/setup.bash"`
+# with a stale `# shellcheck disable=SC1091` directive. The non-constant
+# path triggers SC1090 (not SC1091), so the slimmed v0.41.0 lint stage fails.
+# Broaden the directive to `SC1090,SC1091` on the sibling entrypoint.
+_migrate_sc1090_detect() {
+  local _entry
+  _entry="$(_dfm_entrypoint_path "$1")"
+  [[ -f "${_entry}" ]] || return 1
+  grep -Eq '^[[:space:]]*#[[:space:]]*shellcheck disable=SC1091[[:space:]]*$' "${_entry}"
+}
+
+_migrate_sc1090_apply() {
+  local _entry
+  _entry="$(_dfm_entrypoint_path "$1")"
+  _dfm_sed "${_entry}" -E 's|^([[:space:]]*#[[:space:]]*shellcheck disable=)SC1091([[:space:]]*)$|\1SC1090,SC1091\2|'
+  if _dfm_take_changed "${_entry}"; then
+    _log_info upgrade entrypoint_patched "display=  entrypoint patched: shellcheck SC1091 -> SC1090,SC1091 (#567 m6)"
+  fi
+}
+
+# ── Migration 7 (facet B): ARG USER is reported, never rewritten ─────
+#
+# v0.41.0 compose/CI pass the build args USER_NAME / USER_GROUP / USER_UID /
+# USER_GID. A downstream Dockerfile still declaring `ARG USER` receives no
+# value for it. The earlier automatic rewrite (bare `ARG USER` ->
+# `ARG USER="${USER_NAME}"`) is retired (base#1322). It rewrote every
+# bare `ARG USER` line, in any stage, without looking at how the user is
+# created; in a layout where `sys` creates the account from its own
+# defaulted `ARG USER` and only later stages declare a bare one, the
+# rewrite left `sys` alone, and where `sys` never declares USER_NAME a
+# rewritten stage may switch to `USER ""` and run as root. A correct port
+# changes `sys` and the later stages together, which needs knowing how
+# each repo creates its user, so this migration only warns, naming the file and line and the
+# manual port the template uses. It never changes the bytes.
+#
+# Every `ARG` instruction that declares USER warns -- bare, with a
+# default, as a later name in a multi-name ARG, or continued over lines
+# (`ARG \` + `USER`, `ARG USER=\` + its default). One whose USER default
+# names USER_NAME (what the retired rewrite wrote) also says the image may
+# run as root, and so does a declaration whose quotes the scan cannot
+# balance. One with any other default names that default: the image builds
+# that user, not the one compose passes (base#1348). The scan has no stage
+# or heredoc model: any physical line that itself reads `ARG USER...` warns
+# too, even inside a heredoc body or another instruction's continuation. A
+# false positive is accepted (base#1322).
+# SC2016: ${USER_NAME} is Dockerfile text the user copies, never expanded here.
+# shellcheck disable=SC2016
+_DFM_ARG_USER_PORT='manual port: in sys declare ARG USER_NAME / USER_GROUP / USER_UID / USER_GID and create the user from them (dist/dockerfile/Dockerfile:214, :298), then in each later stage alias ARG USER="${USER_NAME}" (dist/dockerfile/Dockerfile:329)'
+
+# _DFM_UNICODE_SPACES
+#   The UTF-8 encodings of the non-ASCII characters Go's unicode.IsSpace
+#   accepts (U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029,
+#   U+202F, U+205F, U+3000), as an ERE alternation. Docker's parser counts
+#   them as whitespace wherever it trims or splits words.
+_DFM_UNICODE_SPACES=$'\xc2\x85|\xc2\xa0|\xe1\x9a\x80|\xe2\x80\x80|\xe2\x80\x81|\xe2\x80\x82|\xe2\x80\x83|\xe2\x80\x84|\xe2\x80\x85|\xe2\x80\x86|\xe2\x80\x87|\xe2\x80\x88|\xe2\x80\x89|\xe2\x80\x8a|\xe2\x80\xa8|\xe2\x80\xa9|\xe2\x80\xaf|\xe2\x81\x9f|\xe3\x80\x80'
+
+# _dfm_arg_user_scan <dockerfile>
+#   Print `<line> root|bare|literal [<value>]` for every ARG declaring USER
+#   (ONBUILD ARG too), sorted by line. `root` is a USER_NAME default or a
+#   declaration the scan cannot read, `literal` any other default, empty
+#   or blank ones included (printed after it and one space, byte for byte,
+#   one layer of matching outer quotes removed; base#1348), `bare` no
+#   default. <line> is the physical line its instruction
+#   starts on. Lines are joined as Docker's parser joins them (moby/buildkit
+#   frontend/dockerfile/parser/parser.go): a line ending in the escape
+#   character (trailing blanks allowed, not an escaped escape) continues,
+#   the character and the newline are removed and nothing is inserted;
+#   comment and blank lines inside a continuation are dropped. Trailing
+#   CR/LF and a UTF-8 byte-order mark on line 1 are ignored, and every
+#   Unicode space counts as whitespace; a literal default is still printed
+#   with the bytes the Dockerfile wrote, Unicode spaces included.
+#
+#   The scan never decides where an instruction starts: it joins forward
+#   from EVERY line that could open an ARG (after a heredoc, a directive or
+#   a continuation it might misread), once with `\` and once with the
+#   backtick as the escape character, and merges the results. A join that
+#   goes too far can only add a warning, never hide one; a false positive
+#   is accepted. The scan with the escape the parser directives make
+#   active runs first, so where both read an ARG the form and default it
+#   names are the ones Docker reads; the other scan only adds lines or
+#   raises one to root (base#1348).
+_dfm_arg_user_scan() {
+  LC_ALL=C awk -v uws="${_DFM_UNICODE_SPACES}" '
+    BEGIN {
+      nu = split(uws, US, "|")
+      for (u = 1; u <= nu; u++) { UB[u] = US[u]; gsub(/./, " ", UB[u]) }
+    }
+    # classify <instruction text> <original text> <line>: record when it
+    # is an ARG naming USER. <text> is read; <original text> is the same
+    # instruction with its Unicode spaces kept, of the same length, so the
+    # default named is cut from it at the same position (base#1348).
+    function classify(text, otext, ln,    rest, orest, i, c, q, ts, len, n, toks, tpos, j, name, val, form, lit, hasdef, u) {
+      sub(/^[[:space:]]+/, "", text)
+      # ONBUILD ARG declares the ARG in every build FROM this image.
+      while (tolower(substr(text, 1, 7)) == "onbuild" && substr(text, 8, 1) ~ /[[:space:]]/) {
+        text = substr(text, 8); sub(/^[[:space:]]+/, "", text)
+      }
+      if (tolower(substr(text, 1, 3)) != "arg" || substr(text, 4, 1) !~ /[[:space:]]/) return
+      rest = substr(text, 4)
+      # Only leading text was cut, so rest is the tail of otext.
+      orest = substr(otext, length(otext) - length(rest) + 1)
+      # Each token is the raw text between unquoted, unescaped blanks, cut
+      # out with substr once it ends (never built a character at a time,
+      # which is quadratic on a long continued value).
+      n = 0; ts = 0; q = ""; len = length(rest)
+      for (i = 1; i <= len; i++) {
+        c = substr(rest, i, 1)
+        if (q == "" && index(ws, c)) { if (ts) { toks[++n] = substr(rest, ts, i - ts); tpos[n] = ts }; ts = 0; continue }
+        if (!ts) ts = i
+        # The escape character escapes the next one outside quotes and
+        # inside double quotes (`"a\" b"` stays one token); single quotes
+        # take it literally. An escaped Unicode space is one character:
+        # all of its bytes (spaces in rest) are skipped, not just the first.
+        if (c == esc && q != "\047" && i < len) {
+          i++
+          if (substr(rest, i, 1) == " ")
+            for (u = 1; u <= nu; u++)
+              if (substr(orest, i, length(US[u])) == US[u]) { i += length(US[u]) - 1; break }
+          continue
+        }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == "\047") q = c
+      }
+      if (ts) { toks[++n] = substr(rest, ts); tpos[n] = ts }
+      form = ""
+      for (j = 1; j <= n; j++) {
+        name = toks[j]; val = ""
+        if (index(name, "=")) { val = substr(name, index(name, "=") + 1); name = substr(name, 1, index(name, "=") - 1) }
+        if (name != "USER") continue
+        if (form == "") form = "bare"
+        # The last USER default is the one Docker keeps. Whether it has a
+        # default is the `=`, not its contents: `USER=""` is a default.
+        hasdef = index(toks[j], "=") > 0
+        # The value as written: the same span of the original text.
+        lit = hasdef ? substr(orest, tpos[j] + index(toks[j], "="), length(val)) : ""
+        if (lit ~ /^".*"$/ || lit ~ /^\047.*\047$/) lit = substr(lit, 2, length(lit) - 2)
+        # A USER_NAME default, or one whose `${` never closes, warns as root.
+        if (val ~ /USER_NAME/ || val ~ /\$\{[^}]*$/) form = "root"
+        # An empty `USER=` followed by a name-less token is a shape the scan
+        # cannot read (the default may sit on the continued line, e.g.
+        # `ARG USER=\` + `  "${USER_NAME}"`): it warns as root.
+        if (val == "" && index(toks[j], "=") && j < n && !index(toks[j + 1], "=")) form = "root"
+      }
+      # A quote that never closes leaves the whole declaration unreadable.
+      if (form != "" && q != "") form = "root"
+      # Any other default, empty or blank included, is a literal user
+      # name (base#1348).
+      if (form == "bare" && hasdef) form = "literal"
+      # A USER the token walk did not reach (a shape it misreads) still
+      # warns, as may-run-as-root; a false positive is accepted.
+      if (form == "" && rest ~ /(^|[[:space:]"\047])USER([[:space:]=]|$)/) form = "root"
+      if (form != "" && (!(ln in found) || form == "root")) { found[ln] = form; value[ln] = lit }
+    }
+    # continues <line>: true when <line> ends in the escape character that
+    # is not itself escaped (trailing blanks allowed), or is that character
+    # alone; sets body to the line without it.
+    function continues(line,    t, k) {
+      t = line; sub(/[ \t]+$/, "", t); k = length(t)
+      if (k == 0 || substr(t, k, 1) != esc) return 0
+      if (k > 1 && substr(t, k - 1, 1) == esc) return 0
+      body = substr(t, 1, k - 1); return 1
+    }
+    # viable <text>: 2 once <text> is an ARG or ONBUILD ARG instruction,
+    # 1 while it is still a prefix of one, 0 when it can never be one.
+    function viable(text,    r) {
+      r = tolower(text); sub(/^[[:space:]]+/, "", r)
+      while (r ~ /^onbuild[[:space:]]/) { r = substr(r, 8); sub(/^[[:space:]]+/, "", r) }
+      if (r ~ /^arg[[:space:]]/) return 2
+      return r == "" || index("arg", r) == 1 || index("onbuild", r) == 1
+    }
+    # joined <line>: the instruction text that starts at physical <line>,
+    # or "" once the join can no longer be an ARG. Joining only appends,
+    # so a text that is not viable never becomes one, and stopping there
+    # keeps a long continuation from being re-walked from every line.
+    # Past 4096 bytes the text is not built (awk string work on it would
+    # be quadratic): toolong is set, and longuser says whether USER shows
+    # as a word, so classify is skipped and the caller warns as unreadable
+    # instead. Two checks set it, and either is enough (a false positive is
+    # accepted). The first matches the previous line plus this one, with
+    # the start of the previous line counted as a word boundary. The second
+    # matches tail plus this line, where tail keeps the last 5 bytes joined
+    # so far (a boundary character plus USER), so a USER split over any
+    # number of continued lines is seen (base#1336) while each line is
+    # still read once. A cut tail is prefixed with "_" so its first byte
+    # never reads as the start of the instruction. Skipped comment and
+    # blank lines leave prev and tail as they are.
+    # obuf is the same join over the original lines (O), byte for byte:
+    # a piece of L is a prefix of its line and O[j] has the same length.
+    function joined(i,    buf, j, v, k, piece, prev, tail) {
+      buf = ""; obuf = ""; v = 1; toolong = 0; longuser = 0; prev = ""; tail = ""
+      for (j = i; j <= nl; j++) {
+        if (j > i && L[j] ~ /^[[:space:]]*(#|$)/) continue
+        k = continues(L[j]); piece = k ? body : L[j]
+        if ((prev piece) ~ /(^|[[:space:]"\047=])USER([[:space:]=]|$)/) longuser = 1
+        prev = piece
+        tail = tail piece
+        if (tail ~ /(^|[[:space:]"\047=])USER([[:space:]=]|$)/) longuser = 1
+        if (length(tail) > 6) tail = "_" substr(tail, length(tail) - 4)
+        if (!toolong) {
+          buf = buf piece; obuf = obuf substr(O[j], 1, length(piece))
+          if (v == 1) { v = viable(buf); if (!v) return "" }
+          if (length(buf) > 4096) { toolong = 1; buf = ""; obuf = "" }
+        }
+        if (!k) break
+      }
+      return buf
+    }
+    {
+      # Scanned as the parser reads it; the bytes are never touched.
+      line = $0
+      if (NR == 1) sub(/^\357\273\277/, "", line)
+      sub(/[\r\n]+$/, "", line)
+      O[++nl] = line
+      # Each Unicode space becomes as many ASCII spaces as it has bytes,
+      # so L[i] reads as Docker reads it and keeps the positions of O[i].
+      for (u = 1; u <= nu; u++) gsub(US[u], UB[u], line)
+      L[nl] = line
+      # Parser directives lead the file; the first other line ends them.
+      # `# escape=` + backtick makes the backtick the active escape.
+      if (!ddone) {
+        if (line ~ /^[[:space:]]*#[[:space:]]*[A-Za-z][A-Za-z0-9]*[[:space:]]*=/) {
+          dn = line; sub(/^[[:space:]]*#[[:space:]]*/, "", dn)
+          dv = dn; sub(/[[:space:]]*=.*/, "", dn)
+          sub(/^[^=]*=[[:space:]]*/, "", dv); sub(/[[:space:]]+$/, "", dv)
+          if (tolower(dn) == "escape") actesc = dv
+        } else ddone = 1
+      }
+    }
+    END {
+      ws = " \t\n\v\f\r"
+      # The active escape is scanned first: a line both scans read as an
+      # ARG keeps the form and value it gives, and the other scan can only
+      # add a line or raise one to root.
+      act = (actesc == "`") ? "`" : "\\"
+      for (e = 1; e <= 2; e++) {
+        esc = (e == 1) ? act : (act == "`" ? "\\" : "`")
+        for (i = 1; i <= nl; i++)
+          if (L[i] ~ /^[[:space:]]*[AaOo\\`]/) {
+            t = joined(i)
+            if (!toolong) classify(t, obuf, i)
+            else if (longuser) found[i] = "root"
+          }
+      }
+      # Only a literal carries its value: everything after the second
+      # space, kept byte for byte (it may be empty or blank-padded).
+      for (ln in found)
+        if (found[ln] == "literal") print ln, found[ln], value[ln]
+        else print ln, found[ln]
+    }
+  ' "$1" | sort -n
+}
+
+_migrate_arg_user_detect() {
+  [[ -n "$(_dfm_arg_user_scan "$1")" ]]
+}
+
+_migrate_arg_user_apply() {
+  local _file="$1"
+  local _row _ln _form _val
+  # The value is cut out by position, not split by read: a split would
+  # strip its boundary blanks (base#1348).
+  while IFS= read -r _row; do
+    _ln="${_row%% *}"; _row="${_row#* }"
+    _form="${_row%% *}"; _val=""
+    [[ "${_form}" == literal ]] && _val="${_row#literal }"
+    if [[ "${_form}" == root ]]; then
+      _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: ${_file}:${_ln}: ARG USER defaults to USER_NAME (an earlier upgrade's rewrite) or could not be read -- if sys never declares USER_NAME and creates the user from it, the image may run as root; ${_DFM_ARG_USER_PORT} (base#1322)"
+    elif [[ "${_form}" == literal ]]; then
+      _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: ${_file}:${_ln}: ARG USER defaults to \"${_val}\" and compose passes no USER build arg -- the image builds that user, not the one compose passes, unless the build is given --build-arg USER; ${_DFM_ARG_USER_PORT} (base#1348)"
+    else
+      _log_warn upgrade dockerfile_unchanged "display=  Dockerfile unchanged: ${_file}:${_ln}: ARG USER has no default and compose passes no USER build arg -- unless a parent stage declares ARG USER (which this stage then inherits), the image does not get the user compose passes; ${_DFM_ARG_USER_PORT} (base#1322)"
+    fi
+  done < <(_dfm_arg_user_scan "${_file}")
+}
+
+# ── Migration 8 (facet B): nounset-guard the entrypoint ROS source ─────
+#
+# Under `set -u`, sourcing /opt/ros/$ROS_DISTRO/setup.bash dies on the
+# unbound AMENT_TRACE_SETUP_FILES the ament setup chain references, so the
+# container exits the instant it starts and `just run` fails. CI never
+# catches this — smoke runs at Dockerfile build time and never starts the
+# container / runs the ENTRYPOINT. Bracket the source with `set +u` before
+# and `set -u` after so unbound vars inside setup.bash do not abort PID 1.
+#
+# Only fires when the entrypoint actually runs under nounset AND the source
+# is not already inside a stretch of the file that turned it off: one
+# `set +u` may guard several sources, and a `set -u` written after one of
+# them would end the repo's own bracket early (base#2149).
+#
+# _dfm_entry_runs_under_nounset <dockerfile>
+#   True when the file beside <dockerfile> executes with nounset in effect.
+#   TWO independent sources, and the second is nowhere in the file:
+#     - the file turns it on itself (`set -u` / `set -eu` / `set -euo
+#       pipefail`) -- the whole story while the repo's own file IS the
+#       ENTRYPOINT;
+#     - the Dockerfile names base's orchestrator as the ENTRYPOINT, and the
+#       orchestrator SOURCES this file under its own `set -euo pipefail`
+#       (ADR-00000032). A repo that migrated to that model carrying the
+#       bringup init.sh seeded BEFORE it -- which has no `set` line at all
+#       -- runs its ROS source under nounset for the first time, with
+#       nothing in the file saying so.
+#   Reads the orchestrator ENTRYPOINT through _dfm_bringup_on_orchestrator
+#   so that spelling lives in one place; it is defined further down and
+#   both are in scope by the time apply_migrations calls either.
+_dfm_entry_runs_under_nounset() {
+  local _file="$1"
+  local _entry
+  _entry="$(_dfm_entrypoint_path "${_file}")"
+  [[ -f "${_entry}" ]] || return 1
+  if grep -Eq '^[[:space:]]*set[[:space:]]+-[a-z]*u' "${_entry}"; then
+    return 0
+  fi
+  _dfm_bringup_on_orchestrator "${_file}" >/dev/null
+}
+
+_migrate_nounset_source_detect() {
+  local _entry
+  _entry="$(_dfm_entrypoint_path "$1")"
+  [[ -f "${_entry}" ]] || return 1
+  _dfm_entry_runs_under_nounset "$1" || return 1
+  _dfm_nounset_scan detect "$1"
+}
+
+# _dfm_nounset_scan <detect|apply> <dockerfile>
+#   Read the sibling entrypoint once, tracking whether nounset is on. detect
+#   succeeds when a ROS setup.bash source is reached with it on; apply prints
+#   the file with each such source bracketed, above any shellcheck directive
+#   that belongs to it. One program for both, so they cannot disagree about
+#   which source is guarded.
+#
+#   The state starts on -- detect has asked _dfm_entry_runs_under_nounset
+#   for the file -- and follows the `set` commands as written, in any
+#   spelling. A `set -u` ends a bracket only when it is not nested deeper
+#   than the `set +u` that opened it -- by indentation, or by standing inside
+#   `(`, `{` or a one-line `then` / `else` / `do`: whether that one runs is
+#   not known here. A bracket that may still be open is read as open, because
+#   leaving a source as the repo wrote it is the side that cannot break a
+#   working container.
+_dfm_nounset_scan() {
+  local _entry
+  _entry="$(_dfm_entrypoint_path "$2")"
+  awk -v mode="$1" '
+    # +1 turns nounset on, -1 turns it off, 0 says nothing about it.
+    function toggle(cmd,    n, w, k, r, way) {
+      n = split(cmd, w, /[ \t]+/)
+      if (w[1] != "set") { return 0 }
+      r = 0
+      for (k = 2; k <= n && w[k] ~ /^[-+][A-Za-z]/; k++) {
+        way = (w[k] ~ /^-/) ? 1 : -1
+        if (w[k] ~ /^.[A-Za-z]*u/) { r = way }
+        if (w[k] ~ /^.[A-Za-z]*o$/ && w[++k] ~ /^nounset/) { r = way }
+      }
+      return r
+    }
+    # The command without what it stands inside, which sets nested.
+    function bared(cmd) {
+      sub(/^[ \t]+/, "", cmd)
+      while (cmd ~ /^([({]|(then|else|do)[ \t]|[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\))/) {
+        sub(/^([({]|then|else|do|[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\))[ \t]*/, "", cmd)
+        if (cmd != "") { nested = 1 }
+      }
+      return cmd
+    }
+    function command(cmd,    way) {
+      if (cmd ~ /^((fi|done|esac)([^A-Za-z0-9_]|$)|[})])/) { nested = 0 }
+      way = toggle(cmd)
+      if (way < 0 && (on || indent + nested < depth)) { on = 0; depth = indent + nested }
+      if (way > 0 && indent + nested <= depth) { on = 1 }
+      if (cmd !~ ros) { return }
+      seen = 1
+      if (on) { bare = 1 }
+    }
+    # What a subshell sets ends with it.
+    function enter() { sub_on = on; sub_depth = depth; sub_indent = indent; inside = 1 }
+    function leave() { on = sub_on; depth = sub_depth; inside = 0 }
+    function line(    part, n, i, was) {
+      match($0, /^[ \t]*/)
+      indent = RLENGTH
+      if (inside && indent == sub_indent && $0 ~ /^[ \t]*\)/) { leave() }
+      if ($0 ~ /^[ \t]*\(([^(]|$)/) { enter() }
+      seen = 0
+      nested = 0
+      was = on
+      n = split($0, part, /[;&|]+/)
+      for (i = 1; i <= n; i++) { command(bared(part[i])) }
+      # A path written across the separators above.
+      if (!seen && was && $0 ~ ros) { bare = 1 }
+      if ($0 ~ /^[ \t]*\([^(].*\)[ \t]*([;&|<>#0-9].*)?$/) { leave() }
+    }
+    BEGIN { on = 1; ros = "/opt/ros/.*setup[.]bash" }
+    {
+      bare = 0
+      if ($0 !~ /^[ \t]*#/) { line() }
+      if (mode == "detect") { if (bare) { found = 1 } ; next }
+      if (bare) {
+        print "set +u"
+        if (held != "") { print held; held = "" }
+        print
+        print "set -u"
+        on = 1
+        next
+      }
+      if (held != "") { print held; held = "" }
+      if ($0 ~ /^[ \t]*#[ \t]*shellcheck/) { held = $0; next }
+      print
+    }
+    END {
+      if (mode == "detect") { exit (found ? 0 : 1) }
+      if (held != "") { print held }
+    }
+  ' "${_entry}"
+}
+
+_migrate_nounset_source_apply() {
+  local _entry
+  _entry="$(_dfm_entrypoint_path "$1")"
+  local _tmp
+  _tmp="$(mktemp)"
+  _dfm_nounset_scan apply "$1" > "${_tmp}"
+  _dfm_install "${_entry}" "${_tmp}"
+  if _dfm_take_changed "${_entry}"; then
+    _log_info upgrade entrypoint_patched "display=  entrypoint patched: nounset-guard ROS setup.bash source (#567 m8 / #579)"
+  fi
+}
+
+# ── Migration (smoke-copy): flat .base/test/smoke/ -> per-stage dist tree ────
+#
+# Up to v0.41.0 base shipped ONE flat smoke tree, and a consumer Dockerfile
+# reached it in one of two spellings:
+#   COPY .base/test/smoke/ /smoke_test/                       wholesale
+#   COPY .base/test/smoke/test_helper.bash /smoke_test/       hand-listed
+# Both are in the wild. The shipped specs now live under
+# dist/test/bats/smoke/, split into a shared/ baseline plus one folder per
+# Dockerfile stage, so every source in both spellings is gone.
+#
+# The wholesale spelling cannot be rewritten to the shared baseline alone:
+# that would build, but would silently drop the specs the stage used to
+# run. It is replaced by the shared baseline PLUS the enclosing stage's own
+# folder, which is what the current template Dockerfile writes by hand. The
+# stage folder is emitted only when the freshly pulled subtree actually
+# ships one for that stage: a stage base has no specs for (or an unnamed
+# final stage) gets the shared baseline and nothing else, rather than a COPY
+# of a directory that does not exist.
+#
+# The hand-listed spelling names one spec, so it maps to one path -- the
+# place that spec now lives. Where that is comes from the freshly pulled
+# subtree, looked up by basename, never from a table here: the tree is what
+# moved, so the tree is what knows. A basename the subtree ships at two
+# paths, or no longer ships at all, is ambiguous or gone; the rewrite
+# declines it and warns, leaving a reference a reader can act on rather
+# than a guess that resolves somewhere wrong.
+#
+# Runs BEFORE flat_to_dist so the generic .base/script rewrite never sees
+# these lines. Idempotent: once rewritten no flat .base/test/smoke
+# reference remains, so detect is false on a second run.
+#
+# _dfm_smoke_copy_present <file>
+#   True when a COPY statement in <file> names the retired flat
+#   .base/test/smoke tree. The file is read FOLDED, so a source wrapped onto
+#   a backslash continuation counts as part of the statement it belongs to
+#   -- a ^COPY-anchored grep over raw lines cannot see one. Anchored at a
+#   path boundary (`/`, whitespace, or end of statement) so a sibling tree
+#   merely PREFIXED by the retired name -- .base/test/smoke_helpers -- is
+#   not mistaken for it.
+#
+#   The fold is captured into a variable rather than piped into grep: `grep
+#   -q` stops reading at the first match, which SIGPIPEs the writer, and
+#   under pipefail the caller would read a SUCCESSFUL match as "not found".
+#   Generalised over the retired prefix because there are two of them: the
+#   SHIPPED tree (.base/test/smoke) and the repo's OWN (test/smoke). They
+#   moved in the same reorganisation and differ only in where they are
+#   rooted, so one implementation serves both rather than two copies of
+#   this awk drifting apart (ADR-00000028).
+_dfm_regex_escape() {
+  printf '%s' "$1" | sed 's/[][^$.*+?(){}|\\]/\\&/g'
+}
+
+# _dfm_smoke_present <file> <retired_prefix>
+_dfm_smoke_present() {
+  local _file="$1"
+  local _retired="$2"
+  local _joined _re
+  _joined="$(_dfm_join_copy_statements "${_file}")"
+  _re="$(_dfm_regex_escape "${_retired}")"
+  # The retired path has to appear as a whole SOURCE TOKEN: opened at a
+  # whitespace boundary and closed at a path boundary. Both halves carry
+  # weight. Without the leading one the repo-owned prefix `test/smoke`
+  # would also match inside `.base/test/smoke`, and the two migrations
+  # would fight over one statement. Without the trailing one a sibling
+  # merely PREFIXED by the name -- test/smoke_helpers -- would be caught.
+  grep -qE "^[[:space:]]*COPY[[:space:]]([^#]*[[:space:]])?${_re}(/|[[:space:]]|\$)" \
+    <<< "${_joined}"
+}
+
+_dfm_smoke_copy_present() {
+  _dfm_smoke_present "$1" '.base/test/smoke'
+}
+
+# A COPY is a STATEMENT, not a line: a consumer wraps a long hand-listed one
+# across backslash continuations and Docker still reads it as one. Both the
+# detect and the post-apply warning ask _dfm_smoke_copy_present, which folds
+# first, so neither can miss a source on a continuation line or fire on a
+# sibling path merely prefixed by the retired name.
+_migrate_smoke_copy_detect() {
+  local _file="$1"
+  _dfm_smoke_copy_present "${_file}"
+}
+
+# _dfm_smoke_rewrite <file> <retired_prefix> <new_prefix> <tree_root> <ref>
+#   The shared body of both smoke migrations. <retired_prefix> is the path
+#   that is gone, <new_prefix> the root it is re-rooted at (trailing slash
+#   included), <tree_root> the on-disk tree consulted for which per-stage
+#   folders exist and where a hand-listed spec now lives, and <ref> the
+#   issue the message cites.
+_dfm_smoke_rewrite() {
+  local _file="$1"
+  local _retired="$2"
+  local _new="$3"
+  local _smoke_root="$4"
+  local _ref="$5"
+  local _retired_re
+  _retired_re="$(_dfm_regex_escape "${_retired}")"
+
+  # Which stage folders the subtree ships, as a ":a:b:" membership string
+  # awk can test with index().
+  local _stages=":"
+  local _dir
+  for _dir in "${_smoke_root}"/*/; do
+    [[ -d "${_dir}" ]] || continue
+    _stages+="$(basename -- "${_dir}"):"
+  done
+
+  # Every spec the subtree ships, subtree-relative, newline-separated. awk
+  # turns it into the basename -> path lookup the hand-listed spelling
+  # needs. Passed as a VALUE rather than a second input file on purpose: a
+  # subtree that ships no spec yet makes that file empty, and awk's
+  # NR == FNR idiom then treats the Dockerfile itself as the list.
+  local _specs=""
+  if [[ -d "${_smoke_root}" ]]; then
+    _specs="$( ( cd "${_smoke_root}" && find . -type f ) | sed 's#^\./##' )"
+  fi
+
+  local _tmp
+  _tmp="$(mktemp)"
+  # The awk below buffers each backslash-continued statement whole and
+  # decides once, on the folded text, then rewrites the PHYSICAL lines it
+  # buffered -- so a source on a continuation line is healed like any other
+  # and the consumer's own wrapping, flags, destination and column
+  # alignment survive. Track the enclosing build stage (`FROM ... AS
+  # <name>`) so each rewritten wholesale COPY can name its own folder.
+  # The escaped prefix travels through the environment, not `awk -v`: awk
+  # processes escape sequences in a -v value, so `\.` would arrive as a bare
+  # `.` matching any character (base#1324). ENVIRON hands it over verbatim.
+  DFM_RETIRED_RE="${_retired_re}" \
+  awk -v stages="${_stages}" -v specs="${_specs}" \
+      -v newroot="${_new}" '
+    # Exact, whitespace-delimited literal substitution. A regex would let
+    # the dots in a spec name match anything, and these are file names read
+    # off disk, not patterns.
+    function repl(s, from, to,   p, tail, pre, off) {
+      off = 0
+      while (1) {
+        p = index(substr(s, off + 1), from)
+        if (p == 0) { return s }
+        p = p + off
+        tail = substr(s, p + length(from), 1)
+        pre = (p == 1) ? " " : substr(s, p - 1, 1)
+        if ((tail == "" || tail == " " || tail == "\t") \
+            && (pre == " " || pre == "\t")) {
+          return substr(s, 1, p - 1) to substr(s, p + length(from))
+        }
+        off = p
+      }
+    }
+    # Emit the buffered statement as it stands.
+    function emit(   i) {
+      for (i = 1; i <= nb; i++) { print buf[i] }
+    }
+    # Emit the buffered statement with the FIRST wholesale smoke source
+    # re-rooted at prefix, wherever in the statement that source sits.
+    function emit_rerooted(prefix,   i, done, line) {
+      done = 0
+      for (i = 1; i <= nb; i++) {
+        line = buf[i]
+        if (!done && line ~ ("[ \t]" retired "/?([ \t\\\\]|$)")) {
+          sub(retired "/?", prefix, line)
+          done = 1
+        }
+        print line
+      }
+    }
+    function reset() {
+      nb = 0
+      joined = ""
+    }
+    function flush(   s, m, f, i, j, k, t, b, line, tok) {
+      if (nb == 0) { return }
+      s = joined
+      sub(/^[ \t]+/, "", s)
+      m = split(s, f, /[ \t]+/)
+      if (toupper(f[1]) == "FROM") {
+        stage = ""
+        for (i = 2; i < m; i++) {
+          if (toupper(f[i]) == "AS") { stage = f[i + 1] }
+        }
+        emit(); reset(); return
+      }
+      if (toupper(f[1]) != "COPY" \
+          || s !~ ("[ \t]" retired "(/|[ \t]|$)")) {
+        emit(); reset(); return
+      }
+      # Wholesale: a source ENDS at the smoke directory. The whole
+      # statement is reproduced twice -- once re-rooted at the shared
+      # baseline, once at the enclosing stage folder when the pulled
+      # subtree ships one.
+      if (s ~ ("[ \t]" retired "/?([ \t]|$)")) {
+        emit_rerooted(newroot "shared/")
+        if (stage != "" && index(stages, ":" stage ":") > 0) {
+          emit_rerooted(newroot stage "/")
+        }
+        reset(); return
+      }
+      # Hand-listed: rewrite each named spec to where it now lives. A
+      # statement may name several (one COPY, many sources) across any
+      # number of physical lines, so every token of every line is
+      # considered, not only the ones on the line that opens it.
+      for (i = 1; i <= nb; i++) {
+        line = buf[i]
+        k = split(line, tok, /[ \t]+/)
+        for (j = 1; j <= k; j++) {
+          t = tok[j]
+          if (t !~ ("^" retired "/")) { continue }
+          b = t
+          sub(/.*\//, "", b)
+          if (!(b in seen) || seen[b] == "?") { continue }
+          line = repl(line, t, newroot seen[b])
+        }
+        buf[i] = line
+      }
+      emit(); reset()
+    }
+    BEGIN {
+      nb = 0
+      joined = ""
+      retired = ENVIRON["DFM_RETIRED_RE"]
+      n = split(specs, spec, "\n")
+      for (j = 1; j <= n; j++) {
+        if (spec[j] == "") { continue }
+        b = spec[j]
+        sub(/.*\//, "", b)
+        # A basename at two paths cannot be resolved from the name alone.
+        # Two statements: in one assignment mawk and busybox create seen[b]
+        # before they evaluate `b in seen`, so every name read as a duplicate
+        # (base#2138).
+        if (b in seen) { seen[b] = "?" } else { seen[b] = spec[j] }
+      }
+    }
+    {
+      buf[++nb] = $0
+      joined = joined $0
+      if ($0 ~ /\\[ \t]*$/) {
+        sub(/\\[ \t]*$/, " ", joined)
+        next
+      }
+      flush()
+    }
+    END { flush() }
+  ' "${_file}" > "${_tmp}"
+  _dfm_install "${_file}" "${_tmp}"
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: ${_retired}/ -> per-stage smoke COPYs under ${_new} (${_ref})"
+  fi
+
+  # Anything still naming the retired tree is a spec the pulled subtree no
+  # longer ships under that name, or ships twice. Say so: the build will
+  # fail on it, and the message is the only chance to say why. Asked of the
+  # same folded view the detect uses: a half-healed statement leaves its
+  # unresolved sources on continuation lines, which is exactly where a
+  # ^COPY-anchored grep over raw lines cannot see them.
+  if _dfm_smoke_present "${_file}" "${_retired}"; then
+    _log_warn upgrade dockerfile_needs_manual_fix "display=  Dockerfile still COPYs a retired ${_retired}/ spec that is shipped at no single path — resolve it by hand (${_ref})"
+  fi
+}
+
+_migrate_smoke_copy_apply() {
+  local _root
+  _root="$(dirname -- "$1")"
+  _dfm_smoke_rewrite "$1" '.base/test/smoke' '.base/dist/test/bats/smoke/' \
+    "${_root}/.base/dist/test/bats/smoke" '#928'
+}
+
+# ── Migration (repo-smoke-copy): repo-owned test/smoke/ -> per-stage ─────────
+#
+# The sibling of smoke-copy above. That one heals the COPY that reads
+# base's SHIPPED smoke tree; this one heals the COPY that reads the repo's
+# OWN. Both trees moved in the same v0.42.0 split, only the shipped half
+# was migrated, so an upgraded Dockerfile kept the one-line
+#   COPY test/smoke/ /smoke_test/
+# spelling while a fresh bootstrap writes the per-stage pair.
+#
+# Runs AFTER smoke_copy, and the order is load-bearing in one direction:
+# `test/smoke` is a SUBSTRING of `.base/test/smoke`, so a statement still
+# naming the shipped tree must already have been rewritten before this
+# migration looks at it. The token-boundary anchoring in _dfm_smoke_present
+# makes the two disjoint even so; the ordering is the second lock, not the
+# only one.
+#
+# The repo's own tree is read from the repo, not the subtree: lib/
+# smoke_migrate.sh has just moved it into place on the same init.sh run, so
+# by the time this executes the per-stage folders it emits COPYs for exist.
+_migrate_repo_smoke_copy_detect() {
+  _dfm_smoke_present "$1" 'test/smoke'
+}
+
+_migrate_repo_smoke_copy_apply() {
+  local _root
+  _root="$(dirname -- "$1")"
+  _dfm_smoke_rewrite "$1" 'test/smoke' 'test/bats/smoke/' \
+    "${_root}/test/bats/smoke" '#1044'
+}
+
+# ── Migration (flat-to-dist): pre-dist .base/ layout -> .base/dist/ ──────────
+#
+# base's shipped tree moved under dist/. downstream_to_dist above heals the
+# `.base/downstream/` spelling, but that layout only ever shipped as a
+# prerelease: the layout every stable consumer is actually sitting on is the
+# FLAT one that v0.41.0 shipped --
+#   COPY .base/script/docker/runtime/logging.sh ...
+#   COPY .base/config "${CONFIG_DIR}"
+#   COPY .base/script/docker/lib     /lint/lib
+#   COPY .base/script/docker/wrapper /lint/wrapper
+# -- and the relocation deleted every one of those paths. Nothing migrated
+# it, so the upgrade completed cleanly onto a Dockerfile whose first COPY
+# BuildKit resolves does not exist, and the repo could not be built.
+#
+# Rewrites both prefixes wherever they appear, comments included, so the
+# commented-out runtime-stage hints a consumer later uncomments are correct
+# too. `.base/test` is deliberately NOT in this table: the smoke tree did not
+# just move, it was restructured, and smoke_copy above owns it.
+#
+# Order is load-bearing. It runs AFTER the migrations whose detect anchors on
+# the flat spelling (wrapper_copy, explicit_copy) so those still recognise it,
+# and BEFORE runtime_moved_files / runtime_dir_copy, which rewrite the runtime
+# helper COPYs -- from the flat path they would emit a source that no longer
+# exists. Idempotent: `.base/dist/...` does not match.
+_migrate_flat_to_dist_detect() {
+  local _file="$1"
+  grep -qE '\.base/(config|script)' "${_file}"
+}
+
+_migrate_flat_to_dist_apply() {
+  local _file="$1"
+  _dfm_sed "${_file}" -e 's#\.base/config#.base/dist/config#g' \
+    -e 's#\.base/script#.base/dist/script#g'
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: flat .base/{config,script} -> .base/dist/ (#915)"
+  fi
+}
+
+# ── Migration (runtime-moved-files): the two non-helpers leaving runtime/ ───
+#
+# dist/script/docker/runtime/ used to hold three kinds of file: helpers
+# baked into the image, one template init.sh seeds into a consumer repo,
+# and one runtime-test install-check helper. The directory is now COPY'd
+# whole (see runtime_dir_copy below), so the two that are not helpers moved
+# to the trees that match their destiny:
+#
+#   runtime/entrypoint.sh -> dist/dockerfile/entrypoint.sh
+#   runtime/smoke.sh      -> dist/test/bats/smoke/smoke.sh
+#
+# A consumer Dockerfile that names either source stops resolving. smoke.sh
+# is the one that reaches every repo: init.sh seeded the commented
+# runtime-test scaffold naming it, so the break is invisible until someone
+# uncomments the runtime split and gets "COPY source not found".
+#
+# Rewrites wherever they appear, comments included, for exactly that
+# reason. Runs after flat_to_dist so the pre-dist spelling is already
+# normalised; the optional prefixes are still matched so the migration does
+# not depend on that order holding. Idempotent: the new paths do not match.
+_migrate_runtime_moved_files_detect() {
+  local _file="$1"
+  grep -qE '\.base/(downstream/|dist/)?script/docker/runtime/(entrypoint|smoke)\.sh' \
+    "${_file}"
+}
+
+_migrate_runtime_moved_files_apply() {
+  local _file="$1"
+  _dfm_sed "${_file}" -E \
+    -e 's#\.base/(downstream/|dist/)?script/docker/runtime/entrypoint\.sh#.base/dist/dockerfile/entrypoint.sh#g' \
+    -e 's#\.base/(downstream/|dist/)?script/docker/runtime/smoke\.sh#.base/dist/test/bats/smoke/smoke.sh#g'
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: runtime/{entrypoint,smoke}.sh moved out of the helper dir (#971)"
+  fi
+}
+
+# ── Migration (runtime-dir-copy): per-file helper COPYs -> one dir COPY ──────
+#
+# Every consumer Dockerfile listed base's runtime helpers one COPY per file:
+#
+#   COPY --chmod=0755 .base/dist/script/docker/runtime/logging.sh   /usr/local/lib/base/logging.sh
+#   COPY --chmod=0755 .base/dist/script/docker/runtime/logrotate.sh /usr/local/lib/base/logrotate.sh
+#   COPY --chmod=0755 .base/dist/script/docker/runtime/watchdog.sh  /usr/local/lib/base/watchdog.sh
+#
+# so base adding a helper was not a change to base, it was a change to every
+# consumer repo -- and the two migrations this one replaces (logrotate_copy,
+# watchdog_copy) existed for no other reason. Collapsing to the directory
+# retires the whole class: the directory is the list, and it cannot fall out
+# of agreement with itself.
+#
+# Anchors on the SOURCE naming a helper, so any subset in any order
+# collapses and a consumer that bakes the helpers somewhere other than
+# /usr/local/lib/base/ collapses into its own destination. The consumer's
+# flags, comment prefix and spacing are preserved by rewriting the two
+# tokens in place rather than emitting a canonical line.
+#
+# Deliberately NOT deleted: the comment lines a consumer wrote above the
+# COPYs it loses. A stale comment is cosmetic; deleting text the consumer
+# may have edited is not reversible by the next upgrade.
+_DFM_RUNTIME_HELPER_SRC_RE='\.base/(downstream/|dist/)?script/docker/runtime/(logging|logrotate|watchdog)\.sh([[:space:]]|$)'
+
+_migrate_runtime_dir_copy_detect() {
+  local _file="$1"
+  # Commented COPYs count: init.sh seeded the runtime-stage scaffold into
+  # every repo, and left per-file it teaches the retired shape to whoever
+  # uncomments it later.
+  grep -qE "^[[:space:]]*#?[[:space:]]*COPY[[:space:]].*${_DFM_RUNTIME_HELPER_SRC_RE}" \
+    "${_file}"
+}
+
+_migrate_runtime_dir_copy_apply() {
+  local _file="$1"
+  local _tmp
+  _tmp="$(mktemp)"
+  # One statement per physical line is the shape every measured consumer
+  # carries. A backslash-continued one is passed through untouched rather
+  # than half-rewritten -- its per-file COPYs still resolve (base still
+  # ships all three helpers), so leaving it is safe, and the warning below
+  # says it is there.
+  awk '
+    # Trailing path component removed, keeping the separator: the
+    # destination named a file, the collapsed COPY names its directory.
+    function _dirpart(_p,   _i) {
+      _i = length(_p)
+      while (_i > 0 && substr(_p, _i, 1) != "/") { _i-- }
+      return (_i > 0) ? substr(_p, 1, _i) : _p
+    }
+    BEGIN { _stage = 0 }
+    {
+      _line = $0
+      sub(/[ \t]+$/, "", _line)
+      # Stage tracking decides the scope of the de-duplication: two stages
+      # that each COPY the helpers must each keep a COPY. A COMMENTED FROM
+      # is a boundary too -- the commented runtime scaffold is a stage.
+      if (_line ~ /^[ \t]*#?[ \t]*FROM[ \t]/) { _stage++ }
+      if (_line ~ /^[ \t]*#?[ \t]*COPY[ \t]/ &&
+          _line ~ /\.base\/(downstream\/|dist\/)?script\/docker\/runtime\/(logging|logrotate|watchdog)\.sh([ \t]|$)/ &&
+          _line !~ /\\$/ && NF >= 3) {
+        _dest = $NF
+        _quote = ""
+        if (_dest ~ /^".*"$/) {
+          _quote = "\""
+          _dest = substr(_dest, 2, length(_dest) - 2)
+        }
+        _dest = _quote _dirpart(_dest) _quote
+        # gsub, not sub: a COPY may hand-list two or three helpers as
+        # sources of one statement, and each has to become the directory.
+        gsub(/\.base\/(downstream\/|dist\/)?script\/docker\/runtime\/(logging|logrotate|watchdog)\.sh/,
+             ".base/dist/script/docker/runtime/", _line)
+        # Which leaves the directory named two or three times in a row.
+        # Squeeze the repeats; docker accepts them, a reader should not
+        # have to wonder whether they mean something.
+        while (_line ~ /\.base\/dist\/script\/docker\/runtime\/[ \t]+\.base\/dist\/script\/docker\/runtime\//) {
+          sub(/\.base\/dist\/script\/docker\/runtime\/[ \t]+\.base\/dist\/script\/docker\/runtime\//,
+              ".base/dist/script/docker/runtime/", _line)
+        }
+        _line = substr(_line, 1, length(_line) - length($NF)) _dest
+        _key = _stage SUBSEP _line
+        if (_key in _seen) { next }
+        _seen[_key] = 1
+      }
+      print _line
+    }
+  ' "${_file}" > "${_tmp}"
+  _dfm_install "${_file}" "${_tmp}"
+  if _dfm_take_changed "${_file}"; then
+    _log_info upgrade dockerfile_patched "display=  Dockerfile patched: runtime helper COPYs collapsed into one directory COPY (#971)"
+  fi
+
+  # Anything still naming a helper file is a shape the rewrite declined --
+  # a backslash-continued statement. It still builds; say so rather than
+  # reporting a collapse that did not happen to that line.
+  if grep -qE "^[[:space:]]*#?[[:space:]]*COPY[[:space:]].*${_DFM_RUNTIME_HELPER_SRC_RE}" \
+      "${_file}"; then
+    _log_warn upgrade dockerfile_needs_manual_fix "display=  Dockerfile still COPYs a runtime helper per file on a continued statement — collapse it by hand into the directory COPY (#971)"
+  fi
+}
+
+# ── Migration (entrypoint-orchestrator): a notice, never a rewrite ──────────
+#
+# base's plumbing -- the logging / watchdog source lines and the final exec
+# -- moved out of the seeded entrypoint into a base-owned ORCHESTRATOR that
+# ships inside the runtime helper directory, so it arrives with a subtree
+# pull and updates with the next one. A repo adopts it with two edits that
+# must land TOGETHER:
+#
+#   Dockerfile           ENTRYPOINT ["/usr/local/lib/base/entrypoint.sh"]
+#   script/entrypoint.sh drop base's plumbing and the exec, keep the repo's
+#                        own bringup -- the orchestrator sources this file
+#
+# Flipping the ENTRYPOINT first breaks the container: the orchestrator
+# SOURCES the bringup, so an un-removed `exec "$@"` fires mid-source and the
+# watchdog never arms. Cleaning the bringup first is merely inert. Doing
+# neither is also fine -- the repo keeps its own ENTRYPOINT and runs exactly
+# as before; it just does not get the drift fix.
+#
+# base does NOT make the edit. Only the repo owner can tell a bringup line
+# from base plumbing in a file that has been hand-edited for years, and a
+# parser guessing at that is the fragility this whole split exists to leave
+# behind. So this migration detects and WARNS and writes nothing -- the
+# apply-nothing end of the policy this file's header states for a shape it
+# recognises but must not rewrite.
+#
+# It reaches an existing repo for the same reason every other migration
+# does: init.sh calls apply_migrations from the FRESHLY PULLED subtree as
+# the upgrade's resync step, so the notice runs even under a consumer's own
+# vendored upgrade.sh from a release that predates it.
+_migrate_entrypoint_orchestrator_detect() {
+  local _file="$1"
+  grep -qE '^[[:space:]]*ENTRYPOINT[[:space:]]*\[[[:space:]]*"?/entrypoint\.sh"?' \
+    "${_file}"
+}
+
+_migrate_entrypoint_orchestrator_apply() {
+  local _file="$1"
+  _log_warn upgrade dockerfile_entrypoint_advisory "display=  Dockerfile still runs the repo's own /entrypoint.sh as the container ENTRYPOINT. base now ships an orchestrator at /usr/local/lib/base/entrypoint.sh that sources it; migrating means flipping ENTRYPOINT and cleaning script/entrypoint.sh in the SAME commit (README: Container entrypoint). Nothing was changed here."
+}
+
+# ── Migration (bringup-residue): the other half of that same notice ─────────
+#
+# Once the ENTRYPOINT is the orchestrator, the repo's file is a BRINGUP that
+# gets sourced, and two leftovers stop being harmless:
+#
+#   exec              fires mid-source and pre-empts the watchdog and the
+#                     orchestrator's own exec
+#   a helper source   sources logging.sh / watchdog.sh a SECOND time, which
+#                     opens a second per-start log file and re-tees, or arms
+#                     the watchdog twice
+#
+# Deliberately silent while the ENTRYPOINT is still the repo's own file:
+# there the exec is correct and the helper sources are the documented
+# pre-migration wiring, so warning about them would be noise on every
+# upgrade of every repo that has not migrated yet -- which is what the
+# migration above already says once.
+_DFM_BRINGUP_EXEC_RE='^[[:space:]]*exec[[:space:]]'
+_DFM_BRINGUP_PLUMBING_RE='^[[:space:]]*(\.|source)[[:space:]]+/usr/local/lib/base/(logging|watchdog)\.sh'
+
+# _dfm_bringup_on_orchestrator <dockerfile>
+#   Echo the sibling bringup path when this Dockerfile has already flipped
+#   its ENTRYPOINT to the orchestrator and that sibling exists; else fail.
+_dfm_bringup_on_orchestrator() {
+  local _file="$1"
+  grep -qE '^[[:space:]]*ENTRYPOINT[[:space:]]*\[[[:space:]]*"?/usr/local/lib/base/entrypoint\.sh"?' \
+    "${_file}" || return 1
+  local _bringup
+  _bringup="$(_dfm_entrypoint_path "${_file}")"
+  [[ -f "${_bringup}" ]] || return 1
+  printf '%s' "${_bringup}"
+}
+
+_migrate_bringup_residue_detect() {
+  local _file="$1"
+  local _bringup
+  _bringup="$(_dfm_bringup_on_orchestrator "${_file}")" || return 1
+  grep -qE "${_DFM_BRINGUP_EXEC_RE}|${_DFM_BRINGUP_PLUMBING_RE}" "${_bringup}"
+}
+
+_migrate_bringup_residue_apply() {
+  local _file="$1"
+  local _bringup
+  _bringup="$(_dfm_bringup_on_orchestrator "${_file}")" || return 0
+  if grep -qE "${_DFM_BRINGUP_EXEC_RE}" "${_bringup}"; then
+    _log_warn upgrade entrypoint_advisory "display=  script/entrypoint.sh still execs, but the ENTRYPOINT is base's orchestrator, which SOURCES it -- the exec fires mid-source and the watchdog never arms. Drop it; the orchestrator owns the final exec. Nothing was changed here."
+  fi
+  if grep -qE "${_DFM_BRINGUP_PLUMBING_RE}" "${_bringup}"; then
+    _log_warn upgrade entrypoint_advisory "display=  script/entrypoint.sh still sources a /usr/local/lib/base/ helper the orchestrator already sources, so it runs twice (a second per-start log, or a second watchdog). Drop the source line. Nothing was changed here."
+  fi
+}
+
+# Ordered migration list. Append new {detect, transform} pairs here; the
+# order is load-bearing (earlier normalisations feed later ones).
+_MIGRATIONS=(
+  downstream_to_dist
+  wrapper_copy
+  pip_helper
+  explicit_copy
+  logging_rename
+  smoke_copy
+  repo_smoke_copy
+  flat_to_dist
+  runtime_moved_files
+  runtime_dir_copy
+  hadolint
+  sc1090
+  arg_user
+  nounset_source
+  entrypoint_orchestrator
+  bringup_residue
+)

@@ -1,0 +1,187 @@
+# Dockerfile.smoke - local harness for the SHIPPED smoke specs.
+#
+# The specs under dist/test/bats/smoke/ are build-time assertions of a
+# downstream Dockerfile `-test` stage: they run during `just docker build
+# test` in a consumer repo, and nowhere else. base is the template SOURCE,
+# so it has no Dockerfile of its own and no `-test` stage to build -- which
+# left the specs it SHIPS with no way to be run at all. This file is that
+# way: `just test smoke`.
+#
+# What it stands in for, from the shipped dist/dockerfile/Dockerfile:
+#
+#   devel        installs the entrypoint at /entrypoint.sh
+#   devel-test   COPYs the wrappers + lib into /lint, flattens
+#                smoke/shared/ + smoke/<stage>/ into /smoke_test/, drops
+#                to a non-root USER, and asserts with `RUN bats`.
+#
+# Everything below mirrors those two, and
+# test/bats/unit/smoke_harness_spec.bats fails when the mirror falls behind
+# -- the stage's COPY set is walked and compared against this file, so a
+# COPY added there has to be added here.
+#
+# What it deliberately does NOT reproduce, and why that is honest rather
+# than convenient:
+#
+#   The base image. A real devel-test stage is `FROM devel`, i.e. the
+#   repo's own Ubuntu image with its apt packages. Building that here means
+#   scaffolding a whole consumer repo and a multi-minute apt build -- the
+#   acceptance CI job's work, not a local one-command loop's. So the
+#   harness is `FROM ${TEST_TOOLS_IMAGE}`, the Alpine tooling image that
+#   already carries bats + bats-support + bats-assert. The specs under test
+#   assert the SHIPPED wrapper / entrypoint / bats surface, none of which
+#   is Ubuntu-specific; what is traded away is anything that depends on the
+#   consumer's OS or its installed packages -- a repo-local
+#   test/bats/smoke/ spec asserting its own tooling, most obviously, which
+#   is why the per-repo overlay is not copied in.
+#
+#   The lint half. devel-test also runs shellcheck over the wrappers and
+#   hadolint over the Dockerfile. Those are the lint LEVEL and base runs
+#   them on its own sources through `just test lint`; duplicating them here
+#   would put the same finding behind two entry points.
+#
+# Note the FROM: the shipped `-test` stage rule ("never make a -test stage
+# FROM ${TEST_TOOLS_IMAGE}") is about a stage that must inherit the REAL
+# environment of the artifact under test. Nothing here is under test but
+# the specs themselves, and the tooling image IS the environment they need.
+
+# No default: the tag is resolved by the entry point (`just test smoke`,
+# which asks script/test/test.sh for the content-hash tag it builds), so a
+# path that reaches this build without one has left that entry point.
+ARG TEST_TOOLS_IMAGE
+# The reference this harness is built FROM, under the name the shipped
+# template gives it. The manifest below records whatever the image was
+# built from, and here that is the tooling image -- so the harness has a
+# BASE_IMAGE for the same reason a consumer does, rather than a second
+# spelling of the same idea.
+ARG BASE_IMAGE=${TEST_TOOLS_IMAGE}
+# hadolint ignore=DL3006
+FROM ${TEST_TOOLS_IMAGE} AS smoke
+
+# Who runs the specs. The real stage runs as the repo's configured
+# ${USER_NAME}; what matters is only that it is NOT root, because the COPYs
+# below land root-owned and a spec that needs to write into /lint has to
+# fail here exactly as it would there. A fixed uid well clear of the 1000
+# a host developer usually has keeps the identity from accidentally
+# matching anything on the host.
+ARG SMOKE_USER="smokeuser"
+ARG SMOKE_UID=1500
+ARG SMOKE_GID=1500
+
+RUN addgroup -g "${SMOKE_GID}" "${SMOKE_USER}" && \
+    adduser -D -u "${SMOKE_UID}" -G "${SMOKE_USER}" "${SMOKE_USER}"
+
+# ── mirrors `sys` ───────────────────────────────────────────────────────
+# The reproducibility manifest. Without it, all three specs in
+# smoke/shared/reproducibility.bats hit their own
+# `_skip_unless_manifest_adopted` guard and report `ok N # skip` -- a
+# green `just test smoke` reporting that the one assertion of #951 that
+# text cannot make (a manifest that IS written and records nothing) was
+# not made here either. That guard exists for a CONSUMER image built
+# before the manifest revision, which genuinely has no manifest and must
+# not have an upgrade turned into a broken build; base is not that
+# consumer. Two local entry points build this file -- `just test smoke`,
+# and test/bats/system/smoke_harness_spec.bats under `just test system`,
+# which builds it with --no-cache over a synthesized context -- and both
+# would have reported a green run over three skips.
+#
+# What is reproduced is the sys stage's RECORD, not its commands. The
+# bare `ARG BASE_IMAGE` re-declaration is verbatim and load-bearing for
+# the same reason it is there: the pre-FROM ARG is FROM-scope only, and
+# without this line ${BASE_IMAGE} expands to the empty string and the
+# manifest records nothing -- exactly the failure the specs below exist
+# to catch, which is worth reproducing faithfully in the file that
+# exercises them. BASE_IMAGE_DIGEST is defaulted for the same reason the
+# template defaults it, and behaves the same way: it is the only
+# expression the LABEL below and the file here can share, so a
+# reference-carried digest it does not repeat leaves both of them empty
+# and the build carries on. Nothing here stops a build over that, which
+# is the point -- test/bats/system/smoke_harness_spec.bats builds this
+# file with exactly that call and expects an image out of it.
+#
+# The package half cannot be verbatim: the tooling image is Alpine and
+# has no dpkg, so the apk database is read out in the same
+# `<name><TAB><version>` shape `dpkg-query -W` prints. The spec asserts
+# the shape of the record, and the record is what stands in.
+ARG BASE_IMAGE
+ARG BASE_IMAGE_DIGEST=""
+RUN mkdir -p /usr/local/share/base && \
+    _ref_digest=""; \
+    case "${BASE_IMAGE}" in \
+      *@sha256:*) _ref_digest="sha256:${BASE_IMAGE##*@sha256:}" ;; \
+    esac; \
+    { \
+      echo "base_image_ref=${BASE_IMAGE}"; \
+      if [ -n "${_ref_digest}" ]; then \
+        echo "base_image_pin=digest"; \
+      else \
+        echo "base_image_pin=none"; \
+      fi; \
+      echo "base_image_digest=${BASE_IMAGE_DIGEST}"; \
+      sed -n 's/^PRETTY_NAME=/base_os=/p' /etc/os-release; \
+    } > /usr/local/share/base/base-image.env && \
+    awk -F: '/^P:/ { name = $2 } /^V:/ { printf "%s\t%s\n", name, $2 }' \
+      /lib/apk/db/installed > /usr/local/share/base/packages.txt
+
+# The record's second sink, mirrored for the same reason the first one is.
+# A label is invisible to any spec running INSIDE the image, so the only
+# place the two can be compared for one image is a build plus a
+# `docker inspect` from outside -- which is what
+# test/bats/system/smoke_harness_spec.bats does with this file.
+LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}"
+
+# ── mirrors `devel` ─────────────────────────────────────────────────────
+# smoke/shared/entrypoint.bats asserts /entrypoint.sh is present and
+# executable. A consumer gets it from the devel stage, whose
+# ENTRYPOINT_FILE points at the script/entrypoint.sh that init.sh seeded
+# from this very path.
+COPY --chmod=0755 dist/dockerfile/entrypoint.sh /entrypoint.sh
+# The OTHER half. smoke/shared/entrypoint.bats also asserts the base-owned
+# orchestrator at /usr/local/lib/base/entrypoint.sh -- the file the devel
+# stage names as ENTRYPOINT, which sources the bringup above
+# (ADR-00000030). A consumer gets the whole runtime helper directory from
+# the devel stage's `COPY .base/dist/script/docker/runtime/`; here the same
+# directory is base's own dist/, since base carries no .base/ subtree.
+# That assertion is guarded on the entry-point MODEL (it skips where
+# /entrypoint.sh still execs, so an un-migrated consumer's runtime-test is
+# not failed by a spec its Dockerfile never opted into), and the guard
+# cannot weaken the gate here: the bringup COPYed above is the seeded
+# template, which carries no exec. Delete the COPY below and this stage
+# goes red, which is the point of pinning it.
+COPY --chmod=0755 dist/script/docker/runtime/ /usr/local/lib/base/
+
+# ── mirrors `devel-test` ────────────────────────────────────────────────
+# /lint: the wrappers the specs execute, plus the lib chain they source.
+# Copied root-owned and NOT --chown'd, like the stage: the ownership is
+# half of what makes a permission-sensitive spec meaningful.
+COPY script/*.sh /lint/
+COPY dist/script/docker/lib /lint/lib
+COPY dist/script/docker/wrapper /lint/wrapper
+
+# The shared test_helper does `bats_load_library bats-support` /
+# `bats-assert`; without this they are not found and every spec errors in
+# setup rather than failing an assertion.
+ENV BATS_LIB_PATH="/usr/lib/bats"
+
+# HOME is what the wrapper drivers resolve caches and dotfiles against.
+# The real stage sets it explicitly for the same reason: docker does not
+# derive it from the USER's passwd entry. Parameterised on the ARG, never
+# spelled out: a concrete username in a home path is what ADR-00000024's
+# home-literal lint exists to catch, and this file is inside its scope.
+ENV HOME="/home/${SMOKE_USER}"
+
+# /smoke_test: the per-stage selective COPY, flattened. shared/ runs on
+# every `-test` stage; devel-test/ is this stage's own. The per-repo
+# overlay (a consumer's test/bats/smoke/) has no counterpart in base --
+# base ships the specs, it does not consume them.
+COPY dist/test/bats/smoke/shared/     /smoke_test/
+COPY dist/test/bats/smoke/devel-test/ /smoke_test/
+
+USER "${SMOKE_USER}"
+
+# The assertion, at BUILD time and with no `|| true`, exactly as the stage
+# does it: a failing spec fails the build, which is what makes `just test
+# smoke` a gate rather than a report. It also means the layer cache is the
+# memo -- an unchanged spec tree over unchanged wrappers is a run that
+# already passed, and touching any of them invalidates this layer.
+RUN bats /smoke_test/

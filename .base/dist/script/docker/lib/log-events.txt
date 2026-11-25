@@ -1,0 +1,613 @@
+# log-events.txt - Registered body enum for _log_* (#423, #438).
+#
+# One event name per line. _log_* with an unregistered body is a fatal
+# error (strict enforcement, #438). Adding a new event requires a
+# same-PR addition here.
+
+# setup.sh
+env_regenerated
+env_drift_detected
+drift_grep_p_unsupported
+env_migrated_to_local
+env_local_migration_conflict
+setup_conf_migrated_to_root
+setup_conf_migration_conflict
+conf_parsed
+conf_set
+conf_added
+conf_removed
+conf_reset
+conf_invalid_value
+conf_key_not_found
+conf_section_not_found
+conf_unknown_key
+conf_subsection_registry_missing
+conf_unknown_subcmd
+conf_unknown_arg
+conf_upsert_file_missing
+conf_local_created
+conf_local_override_unusable
+apply_output_unusable
+apply_unknown_table
+apply_unknown_key
+apply_conf_value_empty
+apply_commit_failed
+apply_rollback_incomplete
+apply_repo_conf_mutated
+apply_repo_conf_unsettled
+compose_relocated_root_unusable
+conf_write_shadowed
+conf_toml_merge_failed
+conf_toml_parse_failed
+config_components_provisioned
+config_components_absent
+config_files_unprovisioned
+config_preset_selected
+config_preset_dangling
+deploy_local_override_refused
+deploy_local_override_accepted
+conf_upsert_newline_rejected
+conf_upsert_mode_failed
+conf_upsert_mv_failed
+conf_upsert_tmp_failed
+conf_write_mode_failed
+conf_write_mv_failed
+conf_write_tmp_failed
+# The commit gate in front of both TOML writers: the rewrite did not parse,
+# so nothing was written. See _conf_commit_toml.
+conf_write_declined
+# A numbered-family index with no 1-based slot: the write would land in a
+# different block. See _conf_toml_index_rejected.
+conf_write_index_rejected
+# A removal the line-oriented rewrite did not actually make: the file would
+# parse, with the value still in it. See _conf_toml_removal_applied.
+conf_write_not_applied
+# A save that would compact another mount into slot 1 of [volumes], the
+# workspace bind's only marker. See _wsc_refuse_ws_slot_move.
+conf_write_ws_slot_refused
+# `set` / `add` reporting a refusal the writer above already named.
+conf_write_failed
+stage_baseline_collision
+stage_reserved_tag
+stage_invalid_format
+stage_override_key_not_allowed
+stage_unknown_referenced
+gui_override_invalid
+ssh_x11_no_xauth
+ssh_x11_network_mismatch
+xauth_rewrite_failed
+xauth_empty_cookie
+conf_image_name_default
+conf_image_name_unknown
+conf_runtime_key_deprecated
+conf_no_repo_conf
+conf_empty_repo_conf
+conf_template_missing
+conf_reset_aborted
+conf_reset_needs_yes
+conf_mount_stale_path
+network_ports_inert
+network_name_inert
+resources_shm_size_inert
+stage_devel_reserved
+env_drift_detail
+deploy_no_dockerfile
+deploy_stage_not_deployable
+deploy_needs_yes
+deploy_aborted
+deploy_failed
+deploy_done
+deploy_manifest_malformed
+deploy_manifest_dup_basename
+deploy_manifest_no_baked_default
+deploy_mktemp_failed
+deploy_work_rm_refused
+deploy_stage_absent
+
+# build.sh
+build_started
+build_bootstrap
+build_drift_regen
+build_prune_displaced
+build_prune_skip_tagged
+build_no_env
+build_rerun_setup
+build_test_tools_version_missing
+build_verify_capture_failed
+build_verify_step_unresolved
+build_verify_no_steps
+build_verify_all_cached
+build_verify_partly_cached
+build_verify_all_ran
+build_unknown_flag
+
+# run.sh
+run_started
+run_bootstrap
+run_drift_regen
+run_already_running
+run_no_env
+run_build_image_missing
+run_build_delegating
+run_rerun_setup
+run_build_invoking
+run_detach_cmd_rejected
+
+# exec.sh
+exec_not_running
+
+# stop.sh
+stop_teardown
+stop_no_containers
+stop_prune_images
+stop_prune_networks
+
+# prune.sh
+prune_buildx
+prune_images
+prune_networks
+prune_volumes
+prune_worktree_scan
+prune_worktree_candidates
+prune_worktree_none
+prune_skip_bare
+prune_skip_other_owner
+prune_nothing_selected
+prune_aborted
+prune_volume_aborted
+prune_no_workspace
+prune_unknown_flag
+prune_reclaim_failed
+
+# lib/project_reclaim.sh - the scoped reclaim
+reclaim_artifacts_unreadable
+reclaim_containers_unreadable
+reclaim_bad_grace
+reclaim_bad_keep
+reclaim_scan
+reclaim_orphan_dry_run
+reclaim_orphan_removed
+reclaim_network_rm_failed
+reclaim_image_scan
+reclaim_image_dry_run
+reclaim_image_removed
+reclaim_image_rm_failed
+reclaim_tool_input_unparsed
+reclaim_tool_input_unreadable
+reclaim_tool_pin_unresolved
+reclaim_tool_tags_scan
+reclaim_tool_tags_dry_run
+reclaim_tool_tag_retired
+reclaim_tool_tag_rm_failed
+stop_reclaim_failed
+ci_reclaim_failed
+
+# script/test/test.sh - the previous run's residue on this project
+ci_project_bad_wait
+ci_project_wait_unreadable
+ci_project_wait
+ci_project_ready
+ci_project_wedged
+ci_suite_timeout
+ci_invalid_suite_timeout
+
+# hook.sh
+hook_not_executable
+
+# upgrade.sh
+upgrade_started
+dockerfile_migrations_reported
+upgrade_completed
+upgrade_subtree_pull_failed
+upgrade_version_bumped
+upgrade_version_mismatch
+upgrade_rollback_started
+upgrade_rollback
+upgrade_rollback_failed
+upgrade_merge_aborted
+upgrade_untracked_snapshot_failed
+upgrade_subtree_local_drift
+upgrade_subtree_local_drift_detail
+upgrade_worker_refs_left
+upgrade_version_check
+upgrade_available
+upgrade_up_to_date
+upgrade_ahead_of_latest
+upgrade_step
+upgrade_nothing_to_commit
+upgrade_config_drift
+upgrade_setup_conf_drift
+upgrade_git_identity_missing
+upgrade_git_operation_in_progress
+upgrade_not_a_git_repo
+upgrade_no_commits
+upgrade_fetch_failed
+upgrade_downgrade_refused
+upgrade_base_not_found
+upgrade_unknown_arg
+upgrade_arg_missing_value
+upgrade_subtree_root_not_found
+# lib/dockerfile_migrate.sh (emitted under the upgrade service; base#1364)
+dockerfile_migration_snapshot_failed
+dockerfile_migration_skipped
+dockerfile_patched
+entrypoint_patched
+dockerfile_unchanged
+dockerfile_needs_manual_fix
+dockerfile_entrypoint_advisory
+entrypoint_advisory
+
+# init.sh
+init_started
+init_completed
+init_missing_required_arg
+init_progress
+init_just_missing
+init_bootstrap_just
+init_failed
+init_rollback
+init_rollback_failed
+
+# ini_to_toml_migrate.sh (INI-to-TOML format migration; emitted under
+# the init service because init.sh is the only caller)
+ini_to_toml_migrated
+env_local_to_toml_migrated
+ini_to_toml_migration_declined
+ini_to_toml_index_unrepresentable
+ini_to_toml_duplicate_index
+ini_to_toml_runtime_renamed
+ini_to_toml_runtime_dropped
+
+# smoke_migrate.sh (repo-owned smoke tree layout; emitted under the init
+# service because init.sh is the only caller)
+smoke_tree_migrated
+smoke_tree_migration_conflict
+
+# version_migrate.sh (migrations bound to the release they land in; emitted
+# under the init service because the resync is the only caller). The window
+# body and the unreadable body are deliberately separate: "there was no
+# interval to cross" and "there was one and it could not be read" are
+# different situations, and only the second is one a consumer must act on.
+interval_migration_window
+interval_migration_applied
+interval_migration_unreadable
+interval_migration_declined
+# ... and the declared migrations' own bodies. The runner's `applied` line
+# says THAT one ran; this one says what it changed in the repo's own file,
+# which is the half the consumer has to be able to disagree with.
+lifecycle_restart_default_migrated
+lifecycle_init_invalid
+lifecycle_restart_invalid
+
+# gitignore.sh (managed .gitignore blocks; emitted under the init service
+# because init.sh / upgrade.sh are the only callers)
+gitignore_managed_block_invalid
+gitignore_managed_block_migrated
+gitignore_managed_block_orphans
+gitignore_prune_mode_failed
+gitignore_untrack_ls_files_failed
+gitignore_untrack_rm_failed
+
+# template_guard.sh (init/upgrade self-run guard)
+base_self_run_refused
+
+# test.sh
+ci_apt_update_failed
+ci_apt_install_failed
+ci_bats_mock_clone_failed
+ci_invalid_shard
+ci_empty_shard
+ci_no_docker_socket
+ci_no_docker_cli
+ci_unknown_option
+ci_bats_path_not_found
+ci_bats_path_system
+ci_bats_path_coverage
+ci_coverage_path_conflict
+ci_coverage_evidence_not_erased
+ci_coverage_local_conflict
+ci_jobs_without_coverage_local
+ci_paths_without_selection
+ci_invalid_coverage_jobs
+ci_shard_weights_without_shard
+ci_shard_weights_unreadable
+ci_invalid_shard_weights_blob
+ci_invalid_jobs_policy
+ci_invalid_per_test_timeout
+ci_no_fragile_files
+ci_coverage_parallel_empty_slice
+ci_coverage_slice_no_report
+ci_coverage_unexplained_skip
+ci_coverage_merge_failed
+ci_coverage_union_unevidenced
+ci_coverage_union_incomplete
+ci_coverage_clean_absent
+ci_coverage_cleaned
+ci_coverage_not_reclaimed
+ci_mixed_test_layout
+ci_issueref_in_comment
+ci_adr_numbering
+ci_adr_structure
+ci_stale_setup_conf_path
+ci_readme_sync
+ci_doc_counts
+ci_catalog_description
+ci_spec_repo_root
+ci_test_name_backtick
+ci_log_event_registry
+ci_toml_fixture
+ci_canonical_ignore_sync
+ci_home_literal
+ci_arch_literal
+ci_moving_tag
+ci_bash_source_guard
+ci_early_close_reader
+ci_errexit_bang
+ci_derived_figures
+ci_i18n_orphan
+ci_self_hosted_guard
+ci_tool_provenance
+ci_changelog_entry
+ci_changelog_entry_fix
+ci_changelog_layout
+ci_pin_coverage
+ci_action_ref_agreement
+ci_generated_workflow_actions
+ci_just_provenance
+ci_shell_metrics
+ci_nesting_depth
+ci_function_length
+ci_positional_params
+ci_lint_bad_root
+ci_no_hadolint
+ci_lint_tool_without_lint
+ci_unknown_lint_tool
+ci_bad_lint_group
+ci_host_lint_on_runner
+ci_lint_driver_failed
+ci_tooling_build_failed
+ci_lint_phase_failed
+ci_lint_errexit_suppressed
+ci_test_tools_dockerfile_missing
+ci_test_tools_inputs_unreadable
+ci_project_name_digest_failed
+ci_host_id_not_numeric
+ci_handback_failed
+ci_prev_release_progress
+ci_prev_release_unavailable
+ci_missing_prerequisite
+ci_config_gen_unprovisioned
+ci_live_tree_residue
+
+# transcript.sh (#606)
+# Only genuine setup FAILURES are emitted via the logger (to stderr,
+# pre-tee). Success meta-events (started / trace / complete / pruned) are
+# written directly into the transcript file, never the terminal, so a run
+# produces no extra on-screen output.
+transcript_dir_create_failed
+transcript_file_unwritable
+transcript_tee_missing
+transcript_env_invalid
+
+# compose.sh (project-name resolution)
+project_name_missing_from_env
+project_name_unrecorded
+project_name_reconfigured
+
+# wrapper.sh (shared wrapper runtime). Emitted under the CALLING verb's
+# tag (build / run), so the names carry no verb prefix of their own.
+service_probe_failed
+project_renamed
+project_rename_write_failed
+project_rename_deferred
+project_rename_deferred_volumes
+project_rename_probe_failed
+
+# setup_tui.sh (the interactive editor). The list editors' screen labels
+# are a table keyed by (section, prefix); a list with no complete row is
+# a defect, not a default.
+tui_list_labels_missing
+
+# toml_bridge.sh (host-side shim for the containerised TOML parser, and
+# the provisioning of the image it runs: the shim builds the bridge from
+# the shipped dockerfile/Dockerfile.toml-bridge under a content-digest
+# tag, because nothing else in the production init path ever did)
+no_such_file
+merge_no_files
+merge_layer_not_regular
+toml_bridge_building
+toml_bridge_build_failed
+toml_bridge_unprovisionable
+
+# general
+dry_run_cmd
+summary_line
+section_header
+divider
+
+# script/test/config_gen_gates.sh and config_gen_redpath.sh (the config
+# generator's Go gates, base#1462). The five gate ids are printed by the
+# Dockerfile.config-gen test stage and re-emitted by the runner.
+config_gen_gate_fmt_failed
+config_gen_gate_vet_failed
+config_gen_gate_lint_failed
+config_gen_gate_race_failed
+config_gen_gate_coverage_failed
+config_gen_build_failed
+config_gen_step_failed
+config_gen_step_reused
+config_gen_context_invalid
+config_gen_root_invalid
+config_gen_usage_invalid
+config_gen_binary_contract_failed
+config_gen_redpath_reentered
+config_gen_redpath_case_failed
+config_gen_redpath_control_failed
+config_gen_redpath_shared_failed
+config_gen_redpath_shared_reused
+config_gen_redpath_shared_ran
+config_gen_redpath_reap_lost
+config_gen_building
+config_gen_unprovisionable
+config_gen_docker_missing
+config_gen_mutation_usage_invalid
+config_gen_mutation_repo_invalid
+config_gen_mutation_context_invalid
+config_gen_mutation_base_unreachable
+config_gen_mutation_none_beside_diff
+config_gen_mutation_publish_failed
+# The admit stage's refusal of a build given no mutation context
+# (base#1465), re-emitted by config_gen_gates.sh.
+config_gen_manifest_missing
+# The admit stage's refusal of a module file changed after the baseline
+# (base#1465): the checker's stale event and the admission gate id, both
+# re-emitted by config_gen_gates.sh.
+config_gen_manifest_stale
+config_gen_gate_admission_failed
+# The 05-floors-base step's refusal to write floors.base (base#1465).
+config_gen_floors_base_failed
+# The coverage ratchet's refusals (cmd/cg-gates ratchet, base#1465),
+# re-emitted by config_gen_gates.sh.
+config_gen_coverage_fragment_invalid
+config_gen_coverage_floors_base_invalid
+config_gen_coverage_floors_dir_deleted
+config_gen_coverage_floor_duplicate
+config_gen_coverage_floor_missing
+config_gen_coverage_floor_orphan
+config_gen_coverage_floor_below
+config_gen_coverage_floor_too_low
+config_gen_coverage_floor_lowered
+config_gen_coverage_floor_stale
+config_gen_coverage_floor_none_misuse
+config_gen_coverage_floor_dropped
+
+# dockerfile/config-gen `check` (schema.Decode refusals and the command's
+# own diagnostics, base#1442). Emitted as diagnostic frames the shim
+# re-emits by event id.
+conf_unknown_table
+conf_top_level_key
+conf_value_type_refused
+conf_value_invalid
+conf_key_char_refused
+conf_value_newline_refused
+conf_value_nul_refused
+conf_entry_not_table
+conf_entry_no_gating_field
+conf_entry_unknown_field
+conf_entry_field_needs
+conf_family_two_spellings
+config_gen_check_usage
+config_gen_check_input_failed
+
+# dist/script/docker/lib/config_gen.sh _config_gen_use_native (base#1848):
+# the native config-gen on PATH is stale against the shim's digest.
+config_gen_native_stale
+
+# dockerfile/config-gen/cmd/config-gen/tables.go (`config-gen tables`,
+# base#1469): the NUL frames it writes for a non-regular input, an input it
+# cannot open, and a failed or short stdout write.
+config_gen_input_not_regular
+config_gen_input_unreadable
+config_gen_output_failed
+
+# script/test/drivers/mutation_required.sh (the required-kill roster runner,
+# base#1461) and the no-flag `just test` dispatch that runs it.
+mutation_required_usage_invalid
+mutation_required_roster_empty
+mutation_required_row_invalid
+mutation_required_jobs_invalid
+mutation_required_sandbox_failed
+mutation_required_survived
+mutation_required_probe_refused
+mutation_required_sandbox_held
+mutation_required_pinned
+mutation_required_interrupted
+mutation_required_row_timed
+mutation_required_row_dealt
+ci_mutation_required_failed
+
+# script/watch/lib.sh (the go.mod scanner of the pin registry) and
+# script/test/config_gen_steps/20-gomod-oracle.sh, which holds that scanner
+# to `go mod edit -json` (base#1463).
+go_mod_unsupported_syntax
+go_mod_indirect_requirement
+pin_file_unreadable
+go_mod_fixture_unclassified
+go_mod_oracle_mismatch
+go_mod_oracle_pin_missing
+go_mod_pin_target_not_require
+
+# script/watch/pins.sh --set and _pin_go_mod_set_line: a bump refused with
+# the file left as it was (base#1463).
+pin_set_refused
+
+# script/test/config_gen_steps/30-watch-gosum.sh: a go.mod pin bump held to
+# the go.sum Go wants, in the pinned golang image (base#1440).
+watch_gosum_mismatch
+watch_gosum_pin_missing
+
+# script/watch/lib.sh _pin_go_directive_check: a go.mod `go` directive
+# whose Go minor is not the golang pin's (base#1440).
+go_mod_go_directive_mismatch
+go_mod_golang_pin_missing
+
+# Dockerfile.config-gen mutation gate: cg-gates mutation found a package
+# under 90.0 efficacy, or one gremlins could not judge, among the packages
+# the change manifest lists a Go file of; re-emitted by config_gen_gates.sh
+# (base#1467).
+config_gen_gate_mutation_failed
+# Each package it failed, by import path (pkg=), with why (reason=below,
+# report or gremlins_failed) and, for below, the efficacy it measured
+# (measured=); re-emitted by config_gen_gates.sh (base#1467).
+config_gen_mutation_package_failed
+
+# Dockerfile.config-gen corpus sensitivity gate: cg-gates sensitivity
+# failed, and each weak pair it found, a package whose tests still passed
+# with the first byte of a golden file they were handed flipped (pkg= and
+# file=); both re-emitted by config_gen_gates.sh (base#1467).
+config_gen_gate_corpus_sensitivity_failed
+config_gen_corpus_sensitivity_weak
+# testcorpus.go holds no one top-level func Glob the gate can trace
+# (reason=glob_not_found); re-emitted by config_gen_gates.sh (base#1467).
+config_gen_corpus_sensitivity_invalid
+
+# Dockerfile.config-gen ignored-input gate: cg-gates ignored found a file
+# the producer listed in ignored.sha256 in the build context (file=); both
+# re-emitted by config_gen_gates.sh (base#1467).
+config_gen_gate_ignored_failed
+config_gen_mutation_ignored_input
+
+# Dockerfile.config-gen mutation gate, cg-gates mutation's mapping
+# (buildgate.Map) refusing the change manifest before gremlins runs: a
+# module file no mapping rule covers (file=), a manifest holding the
+# no-change marker beside a record or neither (reason=), and a listed path
+# whose package does not exist (pkg=); each re-emitted by
+# config_gen_gates.sh (base#1467).
+config_gen_mutation_unmapped
+config_gen_mutation_manifest_invalid
+config_gen_mutation_no_such_package
+
+# dist/script/docker/lib/config_gen.sh config_gen_tables (base#1470): the
+# binary's table list held a NUL byte, which a shell variable cannot carry.
+config_gen_output_nul
+
+# dist/script/docker/lib/config_gen.sh config_gen_tables (base#1470): the
+# named file's mount src (the name, or its parent's physical path) holds
+# a comma or newline, which a docker --mount value cannot carry.
+config_gen_path_unmountable
+
+# dist/script/docker/lib/config_gen.sh config_gen_tables (base#1470):
+# the docker run exited non-zero (status=) and its stderr held no
+# diagnostic frame; any unframed stderr is forwarded as
+# config_gen_stray_stderr.
+config_gen_run_failed
+
+# dist/script/docker/lib/config_gen.sh config_gen_tables (base#1470): the
+# binary's diagnostic stream held a frame that is not an 8-field D frame
+# with a registered event id (reason=tag|unregistered|truncated|count).
+config_gen_diag_malformed
+
+# dist/script/docker/lib/config_gen.sh config_gen_tables (base#1470):
+# unframed text on the run's stderr (text=), outside any diagnostic frame,
+# forwarded once beside any frame's own event.
+config_gen_stray_stderr

@@ -1,692 +1,545 @@
+<!-- sync: base 79b64b589cf1 475ab31c3292 -->
 # base
 
-[![Self Test](https://github.com/ycpss91255-docker/base/actions/workflows/self-test.yaml/badge.svg)](https://github.com/ycpss91255-docker/base/actions/workflows/self-test.yaml)
-[![codecov](https://codecov.io/gh/ycpss91255-docker/base/branch/main/graph/badge.svg)](https://codecov.io/gh/ycpss91255-docker/base)
+[![CI](https://github.com/ycpss91255-lab/base/actions/workflows/self-test.yaml/badge.svg)](https://github.com/ycpss91255-lab/base/actions/workflows/self-test.yaml)
 
-![Language](https://img.shields.io/badge/Language-Bash-blue?style=flat-square)
-![Testing](https://img.shields.io/badge/Testing-Bats-orange?style=flat-square)
+![Language](https://img.shields.io/badge/Language-Bash%20%7C%20Go-blue?style=flat-square)
+![Testing](https://img.shields.io/badge/Testing-Bats%20%7C%20go%20test-orange?style=flat-square)
 ![ShellCheck](https://img.shields.io/badge/ShellCheck-Compliant-brightgreen?style=flat-square)
-![Coverage](https://img.shields.io/badge/Coverage-Kcov-blueviolet?style=flat-square)
+![Coverage](../badge/coverage.svg)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square)](../../LICENSE)
 
-[ycpss91255-docker](https://github.com/ycpss91255-docker) 組織のすべての Docker コンテナ repo 用共有テンプレート。
+[ycpss91255-lab](https://github.com/ycpss91255-lab) 組織のすべての Docker コンテナ repo で共有されるテンプレートです。
 
 **[English](../../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
 ---
 
+<!-- sync: table-of-contents 9cc5123f8582 0aa4ab9fc803 -->
 ## 目次
 
 - [TL;DR](#tldr)
+- [前提条件](#前提条件)
 - [概要](#概要)
-- [クイックスタート](#クイックスタート)
+- [日常の使い方](#日常の使い方)
+- [repo ごとのランタイム設定](#repo-ごとのランタイム設定)
+- [アップグレード](#アップグレード)
 - [CI Reusable Workflows](#ci-reusable-workflows)
-- [ローカルテスト実行](#ローカルテスト実行)
-- [テスト](#テスト)
+- [開発とテスト](#開発とテスト)
 - [ディレクトリ構造](#ディレクトリ構造)
 
 ---
 
+<!-- sync: tldr bd7bd82eb318 9531d75ba0d2 -->
 ## TL;DR
 
 ```bash
-# ゼロからの新規 repo：init + 初回コミット + subtree + init.sh
+# ゼロからの新規 repo：初回コミット + subtree + 初回ブートストラップ
 mkdir <repo_name> && cd <repo_name>
 git init
 git commit --allow-empty -m "chore: initial commit"
 git subtree add --prefix=.base \
-    https://github.com/ycpss91255-docker/base.git v0.30.0 --squash
-./.base/init.sh
+    https://github.com/ycpss91255-lab/base.git vX.Y.Z --squash
+./.base/dist/script/base/init.sh   # 初回ブートストラップ。以降は just base init
 
-# 最新版にアップグレード
-just upgrade-check   # 確認
-just upgrade         # pull + バージョンファイル + workflow tag 更新
+# アップグレード
+just base update    # 新しい tag があるか確認
+just base upgrade   # subtree pull + resync + workflow ref（「アップグレード」参照）
 
-# CI 実行
-just test            # ShellCheck + Bats + Kcov
-just                 # 全コマンド表示
+# 使う
+just docker build   # イメージをビルド（必要なら先に setup.sh を実行）
+just docker run     # devel コンテナを起動
+just                # 全 namespace を表示
 ```
 
+`git subtree add` には `HEAD` が必要です。`git init` 直後でコミットが 1 つも
+ない repo では `ambiguous argument 'HEAD'` と `working tree has
+modifications` で失敗します。空コミットで `HEAD` を作ると subtree が
+merge できるようになります。
+
+<!-- sync: prerequisites d2be58cfe3eb eeb76083b8b3 -->
+## 前提条件
+
+コンテナ操作は Docker 上で [`just`](https://github.com/casey/just)（command
+runner）を介して実行します。`just <verb>` エントリポイントを使う前に、host へ
+両方をインストールしてください:
+
+host 側のツールは Linux のみをサポートします。macOS と Windows の host は
+サポート対象外です。
+
+- **Docker** + Docker Compose v2（`docker compose`）。
+- **just** -- 本 repo はバージョンを 1 つに固定しています。test-tools
+  イメージ、CI、`--bootstrap-just` インストーラはすべてその版を使うため、同じ
+  recipe が 3 箇所で同じ挙動になります。版は
+  `./.base/dist/script/base/just-version.sh` で表示できます（本 repo 内では
+  `./dist/script/base/just-version.sh`）。版を指定できる公式のビルド済み
+  バイナリインストーラでその版を導入してください:
+
+  ```bash
+  pin="$(./.base/dist/script/base/just-version.sh)"
+  curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+      | bash -s -- --to ~/.local/bin --tag "${pin}"
+  ```
+
+  host のパッケージマネージャ（`apt install just`、`brew install just`、
+  `cargo install just`）は**等価な選択肢ではなくフォールバック**です:
+  それぞれの registry が持つ版が入るため、固定版より何マイナーも古い場合が
+  あります。全方式は[公式インストールガイド](https://github.com/casey/just#installation)を
+  参照。`just` が使えない場合、各 recipe には raw fallback
+  （`./script/<verb>.sh`、`./.base/dist/script/base/upgrade.sh`）があります
+  -- [アップグレード](#アップグレード)参照。
+
+<!-- sync: overview f0da6f1fe447 9e6eb494da5c -->
 ## 概要
 
-本 repo は、すべての Docker コンテナ repo で共有されるスクリプト、テスト、CI workflow を一元管理しています。15 以上の repo で同一ファイルを個別管理する代わりに、各 repo が **git subtree** としてこのテンプレートを取り込み、symlink で参照します。
+本 repo は、すべての Docker コンテナ repo で共有されるスクリプト、テスト、CI workflow を一元管理しています。15 以上の repo で同一ファイルを個別管理する代わりに、各 repo が **git subtree** としてこのテンプレートを取り込み、symlink で参照します。図による解説は [doc/arch/overview.html](../arch/overview.html) にあります。
 
+<!-- sync: architecture 82511f59b040 0164c49b1c91 -->
 ### アーキテクチャ
 
 ```mermaid
 graph TB
     subgraph base["base（共有 repo）"]
-        scripts[".hadolint.yaml / Makefile.ci / compose.yaml"]
-        smoke["test/smoke/<br/>script_help.bats<br/>display_env.bats"]
-        config["config/<br/>bashrc / tmux / terminator / pip"]
-        mgmt["script/docker/wrapper/<br/>build.sh / run.sh / exec.sh / stop.sh / setup.sh"]
-        workflows["再利用可能な Workflows<br/>build-worker.yaml<br/>release-worker.yaml"]
+        scripts["dist/.hadolint.yaml<br/>dist/script/justfile（consumer entry）<br/>dist/script/docker|base|template/"]
+        smoke["dist/test/bats/smoke/{shared,devel-test,runtime-test}/"]
+        config["dist/config/<br/>bashrc / tmux / terminator"]
+        mgmt["dist/script/docker/wrapper/<br/>build.sh / run.sh / exec.sh / stop.sh / setup.sh"]
+        workflows["Reusable Workflows<br/>build-worker.yaml<br/>release-worker.yaml<br/>publish-worker.yaml（opt-in）"]
     end
 
-    subgraph consumer["Docker Repo（例: my_app）"]
-        symlinks["justfile → .base/script/docker/justfile<br/>build.sh → .base/script/docker/wrapper/build.sh<br/>run.sh / exec.sh / stop.sh / prune.sh / setup.sh / setup_tui.sh<br/>.hadolint.yaml"]
-        dockerfile["Dockerfile<br/>compose.yaml<br/>script/entrypoint.sh"]
-        repo_test["test/smoke/<br/>app_env.bats（repo 固有）"]
-        main_yaml["main.yaml<br/>→ 再利用可能な workflows を呼び出し"]
+    subgraph consumer["Docker Repo（例：ros_noetic）"]
+        symlinks["justfile → script/justfile → .base/dist/script/justfile<br/>script/docker|base|template/ → .base/dist/script/.../（per-sub symlinks）<br/>script/build.sh → .base/dist/script/docker/wrapper/build.sh<br/>run.sh / exec.sh / stop.sh / prune.sh / setup.sh / setup_tui.sh<br/>.hadolint.yaml"]
+        dockerfile["Dockerfile<br/>compose.yaml<br/>script/entrypoint.sh<br/>script/local/justfile.local（repo 固有）"]
+        repo_test["test/bats/smoke/<br/>app_env.bats（repo 固有）"]
+        main_yaml["main.yaml<br/>→ reusable workflows を呼び出し"]
     end
 
     base -- "git subtree" --> consumer
-    scripts -. "symlink" .-> symlinks
+    scripts -. "per-sub symlink" .-> symlinks
     smoke -. "Dockerfile COPY" .-> repo_test
     workflows -. "@tag 参照" .-> main_yaml
 ```
 
+<!-- sync: cicd-flow 45154f7b127c bc8e51394573 -->
 ### CI/CD フロー
 
 ```mermaid
 flowchart LR
     subgraph local["ローカル"]
-        build_test["./build.sh test"]
-        make_test["just build test"]
+        just_test["just test（test-tools をビルド）"]
+        just_build["just docker build --target devel-test"]
     end
 
-    subgraph ci_container["CI コンテナ（ghcr.io/ycpss91255-docker/test-tools:latest）"]
+    subgraph ci_container["CI コンテナ（test-tools image、TEST_TOOLS_IMAGE）"]
         shellcheck["ShellCheck"]
-        hadolint["Hadolint"]
-        bats["Bats smoke tests"]
+        hadolint["Hadolint (just test lint)"]
+        bats["Bats specs"]
     end
 
     subgraph github["GitHub Actions"]
-        build_worker["build-worker.yaml<br/>（base より）"]
-        release_worker["release-worker.yaml<br/>（base より）"]
+        build_worker["build-worker.yaml<br/>（base から）"]
+        release_worker["release-worker.yaml<br/>（base から）"]
     end
 
-    build_test --> ci_container
-    make_test -->|"script/ci/ci.sh"| ci_container
+    just_build --> ci_container
+    just_test -->|"script/test/test.sh"| ci_container
     shellcheck --> hadolint --> bats
 
     push["git push / PR"] --> build_worker
-    build_worker -->|"docker build test"| ci_container
+    build_worker -->|"docker build (devel-test stage)"| ci_container
     tag["git tag v*"] --> release_worker
     release_worker -->|"tar.gz + zip"| release["GitHub Release"]
 ```
 
+<!-- sync: whats-included a0d828952feb d90ae256767e -->
 ### 含まれるもの
 
 | ファイル | 説明 |
 |----------|------|
-| `build.sh` | コンテナビルド（`--setup` は TTY がある場合 `setup_tui.sh` を起動、無ければ `setup.sh` を実行） |
-| `run.sh` | コンテナ実行（X11/Wayland 対応；`--setup` の意味は `build.sh` と同じ） |
-| `exec.sh` | 実行中のコンテナに入る |
-| `stop.sh` | コンテナの停止・削除 |
-| `prune.sh` | コンテナ / image / build キャッシュの整理 |
-| `setup_tui.sh` | インタラクティブな setup.conf エディタ（dialog / whiptail フロントエンド） |
-| `script/docker/wrapper/setup.sh` | システムパラメータの自動検出と `.env` + `compose.yaml` 生成 |
-| `script/docker/lib/_lib.sh` | 共有 helper（`_load_env`、`_compose`、`_compose_project` など） |
-| `script/docker/lib/bootstrap.sh` | wrapper の共通初期化と引数解析 |
-| `script/docker/lib/compose.sh` | Docker Compose YAML の生成と操作 |
-| `script/docker/lib/conf.sh` | INI ファイルパーサ + section マージ |
-| `script/docker/lib/env.sh` | 環境変数のセットアップとデフォルト |
-| `script/docker/lib/gitignore.sh` | Gitignore ファイル管理 |
-| `script/docker/lib/hook.sh` | wrapper 毎の pre/post hook 呼び出し |
-| `script/docker/lib/i18n.sh` | 言語検出とローカライズ（`_detect_lang`、`_LANG`） |
-| `script/docker/lib/log.sh` | 統一されたログ / 出力ユーティリティ |
-| `script/docker/lib/config_summary.sh` | ランタイム設定のサマリ |
-| `script/docker/lib/conf_logging.sh` | ログ設定 helper |
-| `script/docker/lib/_tui_backend.sh` | `setup_tui.sh` が使用する dialog / whiptail ラッパ関数 |
-| `script/docker/lib/_tui_conf.sh` | INI バリデータ + 読み書き（`setup_tui.sh` と `setup.sh` の書き戻し用） |
-| `script/docker/runtime/logging.sh` | host 側ログ tee helper |
-| `script/docker/runtime/smoke.sh` | runtime install-check smoke |
-| `script/docker/runtime/entrypoint.sh` | テンプレート entrypoint helper |
-| `config/` | コンテナ内部のシェル設定ファイル（bashrc、tmux、terminator、pip） |
-| `setup.conf` | 単一の repo ランタイム設定（image / build / deploy / gui / network / volumes） |
-| `test/smoke/` | 共有 smoke テスト + runtime assertion helpers（下記参照） |
-| `test/unit/` | Template 自身のテスト（bats + kcov） |
-| `test/integration/` | Level-1 `init.sh` 統合テスト |
+| `script/build.sh` | コンテナをビルド（`--setup` は TTY があれば `setup_tui.sh`、なければ `setup.sh` を呼ぶ） |
+| `script/run.sh` | コンテナを起動（X11/Wayland 対応。`--setup` の意味は `build.sh` と同じ。`--build` で先に `./script/build.sh test` を実行し fresh-clone の CI と同等の検証） |
+| `script/exec.sh` | 実行中のコンテナに入る |
+| `script/stop.sh` | コンテナを停止・削除 |
+| `script/prune.sh` | この repo の dangling image / build cache を削除 |
+| `script/setup_tui.sh` | 対話式 setup.toml エディタ（dialog / whiptail フロントエンド） |
+| `dist/script/docker/wrapper/setup.sh` | システムパラメータを自動検出し `.env` / `.env.generated` + `compose.yaml` を生成 |
+| `dist/script/docker/lib/_lib.sh` | 共通 wrapper ライブラリ（`_load_env`、`_compose`、`_compose_project` など） |
+| `dist/script/docker/lib/bootstrap.sh` | wrapper 共通の初期化と引数解析 |
+| `dist/script/docker/lib/compose.sh` | `docker compose` 呼び出しラッパー + project 命名 |
+| `dist/script/docker/lib/compose_emit.sh` | `compose.yaml` のレンダラ |
+| `dist/script/docker/lib/conf.sh` | setup.toml の読み書き（TOML。移行用に旧 INI も読む） |
+| `dist/script/docker/lib/toml_bridge.sh` | TOML パーサのブリッジ（ネイティブまたはコンテナ） |
+| `dist/script/docker/lib/config_gen.sh` | Go 設定ジェネレータのシェル側（[ADR-00000039](../adr/00000039-config-generator-in-go.md)） |
+| `dist/script/docker/lib/conf_logging.sh` | logging 設定ヘルパー |
+| `dist/script/docker/lib/env.sh` | 環境変数の設定と既定値 |
+| `dist/script/docker/lib/gitignore.sh` | gitignore ファイル管理 |
+| `dist/script/docker/lib/hook.sh` | wrapper ごとの pre/post hook 呼び出し |
+| `dist/script/docker/lib/i18n.sh` | 言語検出とローカライズ（`_detect_lang`、`_LANG`） |
+| `dist/script/docker/lib/log.sh` | 統一 logging と出力ユーティリティ |
+| `dist/script/docker/lib/config_summary.sh` | ランタイム設定のサマリ |
+| `dist/script/docker/lib/_tui_backend.sh` | `setup_tui.sh` が使う dialog / whiptail ラッパー関数 |
+| `dist/script/docker/lib/_tui_conf.sh` | setup.toml の値の validator（`setup_tui.sh` と `setup.sh` で共有） |
+| `dist/script/docker/runtime/logging.sh` | host 側 log tee ヘルパー（起動ごとのファイル + 固定 symlink） |
+| `dist/script/docker/runtime/logrotate.sh` | 共通の rotate/symlink/prune プリミティブ（tee + transcript） |
+| `dist/script/docker/runtime/watchdog.sh` | 汎用の単一サービス watchdog（再起動 + 差し替え可能なヘルスチェック） |
+| `dist/script/docker/runtime/entrypoint.sh` | base の ENTRYPOINT オーケストレータ：log tee を開き、repo の bringup を source し、watchdog を起動し、workload を exec |
+| `dist/dockerfile/entrypoint.sh` | bringup テンプレート。新規 repo では `script/entrypoint.sh` として seed される（repo 側の半分、オーケストレータが source） |
+| `dist/test/bats/smoke/smoke.sh` | ランタイム install-check smoke（ldd による依存欠落スキャン） |
+| `script/test/test.sh` | base 自身のテスト dispatcher（ローカル + コンテナ内） |
+| `script/test/drivers/` | lint/test ツールごとに 1 つの driver |
+| `script/test/lint_bare_stderr.sh` | Bare stderr lint チェッカー |
+| `config/` | コンテナ内部の shell 設定（bashrc、tmux、terminator） |
+| `setup.toml` | repo ごとの単一ランタイム設定（image / build / deploy / gui / network / volumes） |
+| `dist/test/bats/smoke/` | 共有 smoke テスト + ランタイム assertion ヘルパー（[dockerfile-stages.md](../guide/dockerfile-stages.md#smoke-test-helpers-for-downstream-repos)） |
+| `test/bats/unit/` | base 自身のテスト、Unit レベル（bats + kcov） |
+| `test/bats/integration/` | base 自身のテスト、Integration レベル（init/upgrade のエンドツーエンド） |
+| `test/bats/system/` | base 自身のテスト、System レベル / Regression（runtime smoke gate、opt-in） |
+| `test/bats/acceptance/` | base 自身のテスト、Acceptance レベル（UAT/OAT。予約、S5 #785） |
 | `.hadolint.yaml` | 共有 Hadolint ルール |
-| `justfile` | Repo コマンドエントリ（`just build`、`just run`、`just stop` 等）の `just <verb>` recipe。引数は `{{args}}` でそのまま wrapper に渡されます（`just build --no-cache test`）。`just` 単独で recipe 一覧を表示。 |
-| `Makefile.ci` | Template CI コマンドエントリ（`make -f Makefile.ci test`、`make -f Makefile.ci lint` 等）。user-facing と CI-facing の分離は意図的。 |
-| `init.sh` | 初回 symlink セットアップ + 新 repo スケルトン生成 |
-| `upgrade.sh` | Subtree バージョンアップグレード |
-| `script/ci/ci.sh` | CI パイプライン（ローカル + リモート） |
-| `script/ci/lint_bare_stderr.sh` | 素の stderr 出力 lint チェッカ |
-| `script/ci/lint_mixed_test_layout.sh` | mixed-tool テストレイアウトのバリデータ |
-| `dockerfile/Dockerfile.example` | 新 repo のマルチステージ Dockerfile テンプレート |
-| `dockerfile/Dockerfile.test-tools` | プリビルド lint/test ツール image（shellcheck、hadolint、bats、bats-mock） |
-| `.github/workflows/` | 再利用可能な CI workflows（build + release） |
+| `justfile`（→ `script/justfile`） | repo のエントリ — 階層化された namespace recipe（`just docker build`、`just docker run`、`just test`、`just base upgrade` など）。サブコマンドとフラグはそのまま転送されます（`"$@"`）。例：`just docker build --no-cache --target devel`。引数なしの `just` は全 namespace を表示。 |
+| `dist/script/docker/justfile.docker` | `docker` namespace — コンテナ操作（`just docker build/run/start/exec/stop/prune/setup/setup-tui`）。 |
+| `dist/script/base/justfile.base` | `base` namespace — `.base` subtree の管理（`just base init/update/upgrade/completions`）。 |
+| `dist/script/base/init.sh` | 初回の symlink 設定 + 新規 repo の骨組み生成（bootstrap：`./.base/dist/script/base/init.sh`、以降は `just base init`）。 |
+| `dist/script/base/upgrade.sh` | Subtree バージョンアップグレード（`just base upgrade [vX.Y.Z]`）。 |
+| `script/test/justfile.test` | base 自身のテストエントリ（`just test`、`just test lint`、`just test coverage` …）。 |
+| `script/release/justfile.release` | base の `release` namespace（release / publish ツール）。 |
+| `script/watch/justfile.watch` | base の `watch` namespace — 上流リリースの監視（`just watch`、`just watch pins`、`just watch bump <name> <version>`）。 |
+| `dist/dockerfile/Dockerfile` | 新規 repo 向けマルチステージ Dockerfile テンプレート |
+| `dockerfile/Dockerfile.test-tools` | ビルド済み lint/test ツールイメージ（shellcheck、hadolint、bats、kcov） |
+| `dockerfile/Dockerfile.config-gen` | Go 設定ジェネレータ（`config-gen`）をビルド。provisioning のみで、`compose.yaml` は引き続き `compose_emit.sh` が生成 |
+| `dockerfile/config-gen/go.mod` | Go 設定ジェネレータのモジュール（[ADR-00000039](../adr/00000039-config-generator-in-go.md)） |
+| `.github/workflows/` | reusable worker + base 自身の CI |
 
-### Dockerfile ステージ（規約）
+テストは **tool-first** で配置します — spec は `test/<tool>/<category>/`
+（例：`test/bats/unit/`）、linter は `test/lint/<tool>/` — そのため
+ツールの追加は新しいフォルダの追加であり、新しいコマンド面の追加では
+ありません。分類語彙は ISTQB 準拠（Unit / Integration / System /
+Acceptance の 4 レベル + Smoke タイプ）です。
+[ADR-00000018](../adr/00000018-istqb-test-taxonomy.md) と
+[ADR-00000012](../adr/00000012-tool-first-test-layout.md)
+（category-first の ADR-00000004 を置き換え）参照。consumer は自身の
+`test/bats/smoke/` を出荷し、base は自身の
+`test/bats/{unit,integration,system,acceptance}/` を出荷します。
 
-ダウンストリーム repo は `dockerfile/Dockerfile.example` で定義される標準のマルチステージ構成に従います。
-すべてのステージは `ARG BASE_IMAGE` で指定されるベース image を共有します。
-
-| ステージ | 親ステージ | 用途 | 出荷 |
-|----------|------------|------|------|
-| `sys` | `${BASE_IMAGE}` | ユーザー/グループ、sudo、タイムゾーン、ロケール、APT mirror | 中間 |
-| `devel-base` | `sys` | 開発ツールと言語パッケージ | 中間 |
-| `devel` | `devel-base` | アプリ固有ツール + `entrypoint.sh` + config レイヤリング | **はい**（主成果物） |
-| `devel-test` | `devel` | 一時的：ShellCheck + Hadolint + Bats smoke（いずれも `test-tools:local` から） | いいえ（build 後破棄） |
-| `runtime-base`（任意） | `sys` | 最小 runtime 依存（sudo、tini） | 中間 |
-| `runtime`（任意） | `runtime-base` | install 成果物のみの軽量 runtime image（application repos で使用） | 有効時に出荷 |
-| `runtime-test`（任意） | `runtime` | 一時的：runtime install-check smoke | いいえ（build 後破棄） |
-
-補足：
-- developer image のみを出荷する repo（`env/*`）は `runtime-base` /
-  `runtime` をスキップし、該当セクションは `Dockerfile.example` 内で
-  コメントアウトしたままにします。
-- `devel-test` は常に `devel` を継承するため、`test/smoke/<repo>_env.bats` の
-  runtime assertion が確認するバイナリやファイルは、ユーザーが
-  `docker run ... <repo>:devel` で目にするものと一致します。
-- `Dockerfile.test-tools` は lint/test ツールセット（bats + shellcheck + hadolint）をビルドします。ダウンストリームの `devel-test` ステージは `ARG TEST_TOOLS_IMAGE` build arg で参照します — デフォルト `test-tools:local`（ローカル `./build.sh` フロー、`Dockerfile.test-tools` を host Docker daemon に load）。CI では `ghcr.io/ycpss91255-docker/test-tools:vX.Y.Z`（`.github/workflows/release-test-tools.yaml` がタグ push ごとに publish するマルチアーキ image）で override し、buildx が registry からアーキ対応の bats / shellcheck / hadolint binary を直接 pull します。`docker-container` buildx driver の step 間 image store 分離問題を回避。
-
-#### 追加ステージの追加（#215）
-
-baseline blocklist `{sys, devel-base, devel, devel-test,
-runtime-test}` 以外の（v0.21.x 移行期間中は旧名 `{base, test}` も受付）
-`FROM <base> AS <stage>` は、自動的に compose サービスとして
-emit されます — `extends: devel`（volumes / network / GPU / GUI /
-cap_add / additional_contexts を継承）し、`build.target` /
-`image` / `container_name` / `stdin_open` / `tty` / `profiles`
-のみを override します。典型的な用途は entrypoint バリアント、
-例えば NVIDIA Isaac Sim の `devel` 上に乗せる `headless` + `gui`
-の 2 種類の起動モード。
-
-ユーザー操作フロー：
-
-```dockerfile
-# Dockerfile に新 stage を追加（setup.conf は変更不要）
-FROM devel AS headless
-ENTRYPOINT ["/isaac-sim/runheadless.sh"]
-CMD ["-v"]
-
-FROM devel AS gui
-ENTRYPOINT ["/isaac-sim/runapp.sh"]
-```
-
-```bash
-just build                            # compose.yaml を再生成、全 stage を build
-just run -t headless                  # headless バリアントを起動
-just run -t gui                       # gui バリアントを起動
-just exec -t headless bash            # running の headless container に exec
-
-# Kit スタイルの `=` 付き引数も just ではそのまま渡せます (#469):
-just exec -t headless-stream /isaac-sim/runheadless.sh -v --/app/livestream/port=49100
-
-# 等価な直接 .sh 呼び出し:
-./build.sh
-./run.sh -t headless
-./exec.sh -t headless bash
-```
-
-制約：
-
-- Stage 名は `^[a-z][a-z0-9_-]*$` に一致する必要があり、大文字
-  / 数字始まり / ピリオドなどは拒否されます（WARN + skip、
-  他の stage は解析を続行）。
-- baseline（`sys` / `devel-base` / `devel` / `devel-test` /
-  `runtime-test`、v0.21.x 移行期間中は旧名 `base` / `test` も衝突
-  対象）と衝突する場合は `setup.sh apply` が hard error で exit 1。
-  template が管理する image tag namespace（`latest`、`v[0-9]*`）と
-  の衝突も hard error。
-- Stage の追加 / 削除は `setup.sh check-drift` をトリガーします
-  （`.env` 内の `SETUP_DOCKERFILE_HASH` 経由）。次回 wrapper 起動
-  時に自動的に `compose.yaml` を再生成します。`RUN apt-get install`
-  などの他の編集は drift をトリガー**しません**。
-
-#### Per-stage `setup.conf` overrides（#220）
-
-#215 で auto-emit された stage はデフォルトで devel の runtime 設定
-（volumes / GPU / network / GUI）を共有します。stage ごとに異なる
-runtime 設定が必要な場合 — 例えば NVIDIA Isaac Sim の `headless`
-が WebRTC livestream で `network=bridge` + port mapping + `gui=off`
-を必要とし、`devel` と `gui` は `network=host` + X11 を維持する
-場合 — repo の `setup.conf` に `[stage:<name>]` セクションを
-追加します：
-
-```ini
-[gui]
-mode = auto
-
-[network]
-mode = host
-
-[stage:headless]
-gui.mode = off
-network.mode = bridge
-network.port_1 = 8080:80
-deploy.gpu_capabilities = gpu compute utility graphics video
-```
-
-`./setup_tui.sh` でも対話的に編集できます：
-
-- **Advanced → Per-stage overrides**：直接エディタへ。このエントリ
-  は Dockerfile に少なくとも 1 つの非 baseline stage がある場合の
-  み表示されます。
-- **Features → Per-stage overrides**（#221）：常時表示の機能一覧
-  入口。条件を満たしている時はクリックで上記 Advanced と同じ
-  エディタへ、満たしていない時は有効化方法を説明する msgbox を
-  表示します。
-
-Override 可能な key (v1)：
-
-| Section | Keys |
-|---|---|
-| `[deploy]` | `gpu_mode`, `gpu_count`, `gpu_capabilities`, `runtime` |
-| `[gui]` | `mode` |
-| `[network]` | `mode`, `ipc`, `pid`, `network_name`, `port_<N>`, `port_inherit` |
-| `[security]` | `privileged`, `cap_add_<N>`, `cap_add_inherit`, `cap_drop_<N>`, `cap_drop_inherit`, `security_opt_<N>`, `security_opt_inherit` |
-| `[volumes]` | `mount_<N>`, `mount_inherit` |
-| `[environment]` | `env_<N>`, `env_inherit` |
-
-List フィールド（`mount_*` / `port_*` / `env_*` / `cap_add_*` /
-`cap_drop_*` / `security_opt_*`）は **append-default**：stage の項目が
-top-level の後に追加されます。完全に top-level を置き換える場合は
-`<list>_inherit = false` を設定します（例：
-`volumes.mount_inherit = false`、または
-`security.cap_add_inherit = false` で stage が継承した caps をクリア
-—— #526：読み取り専用の probe stage が flash stage の `SYS_ADMIN` を
-クリア）。
-
-注意事項：
-
-- `[stage:devel]` は**予約済み** (v1 no-op + WARN)。devel を
-  調整する場合は top-level セクションを直接編集してください。
-  v2 で再検討します。
-- `[stage:sys|base|test]` は **hard error**（baseline collision）。
-- `[stage:foo]` で参照される stage が Dockerfile に存在しない
-  場合 → **WARN + skip**（`setup.sh apply` の他の処理は継続）。
-- allowlist 外の override key → **WARN + key 単位で skip**。
-
-### Smoke test ヘルパー（ダウンストリーム repo 用）
-
-`test/smoke/test_helper.bash`（各 smoke spec が
-`load "${BATS_TEST_DIRNAME}/test_helper"` で読み込み）が runtime
-assertion helpers のセットを提供します。ダウンストリーム repo は
-素の `[ -f ... ]` / `command -v` より優先してこれらの helper を使用
-すべきです。失敗時は欠落している成果物を直接指し示す decorated な
-診断メッセージを出力します。
-
-| Helper | 用法 |
-|--------|------|
-| `assert_cmd_installed <cmd>` | `<cmd>` が `PATH` 上にない場合に失敗 |
-| `assert_cmd_runs <cmd> [flag]` | `<cmd> <flag>` が 0 以外で終了した場合に失敗（flag のデフォルトは `--version`） |
-| `assert_file_exists <path>` | `<path>` が通常ファイルでない場合に失敗 |
-| `assert_dir_exists <path>` | `<path>` がディレクトリでない場合に失敗 |
-| `assert_file_owned_by <user> <path>` | `<path>` の所有者が `<user>` でない場合に失敗 |
-| `assert_pip_pkg <pkg>` | `pip show <pkg>` が 0 以外で終了した場合に失敗 |
-
+<!-- sync: what-stays-in-each-repo-not-shared dc4a422e6bf1 4a287a8050d5 -->
 ### 各 repo で個別管理するファイル（共有しない）
 
 - `Dockerfile`
 - `compose.yaml`
-- `script/` — repo ローカルの **runtime helpers**（container 内で `ENTRYPOINT` / `CMD` または手動で呼ばれる）
-  - `script/entrypoint.sh`（canonical）
-  - ros / アプリ起動 helper 等
-- `script/docker/` — repo ローカルの **Dockerfile-internal build helpers**（Dockerfile `RUN` で呼び、container 起動後は使わない；サンプル + lint COPY は `dockerfile/Dockerfile.example` 参照、#275）
+- `script/` — repo ローカルの **runtime helper**（コンテナ内で `ENTRYPOINT` / `CMD` から、または手動で呼ばれる）
+  - `script/entrypoint.sh` — この repo の **bringup**。base のオーケストレータが source するもので、`ENTRYPOINT` そのものではありません（[entrypoint.md](../guide/entrypoint.md) 参照）
+  - ros / app の起動ヘルパーなど
+- `script/docker/` — repo ローカルの **Dockerfile 内部ビルドヘルパー**（Dockerfile の `RUN` から呼ばれ、起動中のコンテナでは使わない。スタブと lint COPY は `dist/dockerfile/Dockerfile` 参照、#275）
 - `doc/` と `README.md`
-- Repo 固有の smoke test
+- repo 固有の smoke テスト
 
+<!-- sync: everyday-use 2010a1303130 5030385fff40 -->
+## 日常の使い方
+
+<!-- sync: getting-help-namespace-vs-recipe 79f811f962c5 3a7d7d40222b -->
+### ヘルプの見方（namespace と recipe）
+
+`just` のヘルプは 2 段階で動きます。ダッシュ付きの `just <ns> --help` が
+使えないのは `just` の dispatch の仕様上の制約（文書化済み）で、バグでは
+ありません：
+
+| やりたいこと | 使うもの | 補足 |
+|---|---|---|
+| namespace の recipe 一覧 | `just <ns> help`（`just <ns> h`） | 例：`just docker help`、`just base help`。**ローカライズ対応**：`docker` / `base` / `template` namespace では、各 recipe の 1 行要約をあなたの言語（`$LANG`、または `--lang <en\|zh-TW\|zh-CN\|ja>`）で表示します。引数なしの `just <ns>` でも一覧は出ますが、英語のままです。 |
+| 1 つの recipe のヘルプ | `just <ns> <recipe> --help` | 例：`just docker build --help`、`just base upgrade --help`、`just base update --help` -- `--help` は裏のスクリプトにそのまま渡されます。 |
+| すべての namespace の一覧 | `just` | トップレベルの概要。`just --list`（と引数なしの `just <ns>`）は英語のままです -- just 自身の一覧表示は横取りできないため、翻訳版の入口は `just <ns> help` です。 |
+| `just <ns> --help` | （使わない） | ダッシュ付きの名前は `just` の recipe / alias にできないので横取りできません。`just` は `Did you mean 'help'?` と表示し、`just <ns> help` を案内します。 |
+
+<!-- sync: wrapper-ux-cheat-sheet-291 17e47c8d98e8 05ca92340af0 -->
+### Wrapper UX チートシート（#291）
+
+ユーザー向けの各スクリプトが受け付けるものの唯一の正式リファレンスです。
+下流 repo の README は表を複製せず、ここにリンクします。各
+`just docker <verb>` は引数を `./script/<verb>.sh` に渡します。
+
+| フラグ / 形式 | `build.sh` | `run.sh` | `exec.sh` | `stop.sh` | `setup.sh`（CLI） |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `-h` / `--help` | yes | yes | yes | yes | yes |
+| `-C` / `--chdir DIR` | yes | yes | yes | yes | — |
+| `--lang LANG` | yes | yes | yes | yes | yes |
+| `--dry-run` | yes | yes | yes | yes | — |
+| `-s` / `--setup` | yes | yes | — | — | —（`--setup` の呼び出し先） |
+| `-t` / `--target TARGET` | yes（#280、positional の alias） | yes | yes | —（Q2：project 全体のまま） | — |
+| `-q` / `--quiet` | — | — | — | — | yes（#285、変更系サブコマンドのみ） |
+| `--gui auto\|force\|off` | yes（#338） | yes（#338） | — | — | yes（apply、#338） |
+| `--no-x11-cookie` | yes（#338） | yes（#338） | — | — | yes（apply、#338） |
+| `--print-resolved` | — | — | — | — | yes（apply、#338） |
+| `--` 区切り | — | yes | yes（#289） | — | yes（サブコマンドごと） |
+| positional の意味 | TARGET | CMD | CMD | `docker compose down` への pass-through | サブコマンド名 |
+
+表の背後にある 3 つの形の決定（`build.sh` の positional と `-t` の併用、
+`stop.sh` に `-t` を持たせないこと、サブコマンド先頭の `setup.sh`）は
+[ADR-00000040](../adr/00000040-wrapper-cli-shape.md) に記録されています。
+
+<!-- sync: per-repo-runtime-configuration 75128bf3ed59 a3d53a03c049 -->
 ## repo ごとのランタイム設定
 
-各下流 repo は 1 つの `setup.conf` INI ファイルで自身のランタイム設定
+各下流 repo は 1 つの `setup.toml` で自身のランタイム設定
 （GPU 予約 / GUI env/volumes / network mode / 追加 volume mounts）を
-駆動します。`setup.sh` がこれ + システム検出結果を読み、`.env` と
-`compose.yaml` を再生成します — この 2 つの生成物をユーザが手動編集
-する必要はありません。
+駆動します。`setup.sh` がこれ + システム検出結果を読み、`.env` /
+`.env.generated` / `compose.yaml` を再生成します — これらの生成物をユーザ
+が手動編集する必要はありません。別のファイルは `.env.local` で、setup は
+最初に scaffold するだけで以後上書きせず、あなた自身の値はそこに置きます。
 
-### 単一 conf、7 つの section
+ファイルは 3 つのグループに分かれます：
+
+- **`setup.sh apply` のたびに再生成**：`compose.yaml`、`.env.generated`、
+  `.env`。手で編集しないでください。
+- **repo のもの、上書きされない**：`setup.toml` と `Dockerfile`。ツールが
+  `setup.toml` を書くのは頼まれたとき（`just docker setup set`、TUI）だけ
+  です。アップグレード時の名前付きマイグレーションは
+  [upgrade.sh が repo 内で書き換えるもの](#upgradesh-が-repo-内で書き換えるもの)
+  に一覧があります。
+- **ローカル**、gitignored、あなたのもの：`setup.local.toml` と `.env.local`。
+
+`.env.generated` がサフィックスを保つ理由は別で、compose の `${VAR}` 補間の
+ためだけに存在しコンテナには入りません — サフィックスは所有者ではなく分類を
+表します。
+
+初回の `setup.sh` 実行時（repo ごとの `setup.toml` がまだない場合）、
+テンプレートが `<repo>/setup.toml` にコピーされ、**最初の `[[volumes]]` block**
+—— `volumes.mount_1` が指す block —— にポータブルな
+`${WS_PATH}:/home/${USER_NAME}/work` workspace マウントが書き込まれます。
+検出したホストパス自体は `.env.generated` の `WS_PATH` に入るので、コミット
+されるファイルはマシンに依存しません。以降の実行は `mount_1` を正とし、空にすれば workspace の
+マウントをやめられます。`./.base/dist/script/base/init.sh --gen-conf` も同じ
+単純コピーを行い、ファイルが既にあれば拒否します（`--force` は
+`setup.toml.bak` にバックアップ）。
+
+<!-- sync: one-conf-15-sections a6f1ae3719e2 17daf2a16728 -->
+### 単一 conf、15 個の section
+
+以下の section 一覧は散文ではなく `SCHEMA_SECTIONS`
+（`dist/script/docker/lib/schema.sh`）— 「どの section が、どの順で存在
+するか」の唯一の情報源です。このブロックまたはその個数がコードとずれると
+`derived-figures` lint が失敗します。
 
 ```
-[image]    rules = prefix:docker_, suffix:_ws, @default:unknown
+[project]  name — この checkout が動く compose project（空 =
+           <DOCKER_HUB_USER>-<IMAGE_NAME> を導出）。2 つの checkout を
+           同時に動かすなら setup.local.toml に WORKTREE ごとに設定する
+[image]    rules = prefix:docker_, suffix:_ws, @basename
 [build]    apt_mirror_ubuntu、apt_mirror_debian            # Dockerfile build args
 [deploy]   gpu_mode (auto|force|off)、gpu_count、gpu_capabilities
+           dri_groups (auto|off) — GUI service への iGPU /dev/dri group_add
+[lifecycle] restart (no|always|unless-stopped|on-failure|on-failure:N)
+           既定は unless-stopped;DEPLOY スコープ — doc/guide/lifecycle.md
+           参照。init (true|false) — Docker init/PID1 reaper;既定 true。
+           watchdog_* — コンテナ内ヘルスチェック（opt-in）
 [gui]      mode (auto|force|off)
 [network]  mode (host|bridge|none)、ipc、pid (host|private)、privileged
-[volumes]  mount_1（workspace、初回 setup.sh 実行時に自動記入）
-           mount_2..mount_N（ユーザ定義の追加 host mount；/dev デバイスは path 指定）
+           port_N = host:container（bridge のときのみ publish）
+[security] privileged（false）、cap_add_N、cap_drop_N、security_opt_N
+           （対応する *_inherit トグルも;既定は最小、必要な分だけ opt-in）
+[resources] shm_size
+[environment] env_N = KEY=VALUE — set-once の既定値。生成される .env に
+           書き出され deployable stage の ENV としても bake される;
+           タスクごとに変わる変数は .env.local へ
+[tmpfs]    tmpfs_N = /path[:size=N] — RAM-backed マウントポイント
+[devices]  device_N = host:container、および cgroup rule（opt-in）
+[volumes]  mount_1（workspace、初回実行時に自動記入）
+           mount_2..mount_N（追加の host mount；デバイスは /dev path 指定）
+[additional_contexts] context_N = name=source — 追加の名前付き build context
 [logging]  driver（デフォルト json-file）、max_size、max_file、compress
            local_path（host 側 log ディレクトリ；/var/log/<repo> にバインドマウント）
+           container_log_keep (20)、container_log_days (14)（起動ごとの
+           コンテナ log 保持；keep-count と age の厳しい方が勝つ）
+           wrapper_transcript（verb の出力を log/<verb>/ に tee；既定 true）、
+           wrapper_transcript_keep (20)、wrapper_transcript_days (14)
            [logging.<svc>] で個別 service に key-level override 可能
 ```
 
-テンプレート既定値は `.base/setup.conf`；repo ごとの上書きは
-`<repo>/setup.conf`。セクションレベル **replace** 戦略：repo ファイルに
-section があれば template の section を全置換；無ければ template 既定値を継承。
+上の角括弧の名前は section の一覧であって、ファイルの構文ではありません。
+スカラー section は TOML の `[table]`、リスト形式の section は
+`[[array of tables]]` で、その N 番目の block が `<prefix>_N` が指すもの
+です —— `volumes.mount_1` は最初の `[[volumes]]` block です。
 
-初回の `setup.sh` 実行時（repo 側の setup.conf がまだ無い状態）、
-template ファイルが repo にコピーされ、検出された workspace が
-`[volumes] mount_1` に書き込まれます。以降の実行は `mount_1` を
-真のソースとして扱います — 空にすれば workspace マウントを
-オプトアウトできます。編集方法：
+テンプレート既定値は `.base/dist/setup.toml`；repo ごとの上書きは
+`<repo>/setup.toml`（`just docker setup` が管理し、手で編集する `config/` 面には
+意図的に置かない）。マージは**型を見る**方式です
+（[ADR-00000037](../adr/00000037-toml-config-format-unification.md)）：
+`[table]` 内のスカラーキーは key-level マージ —— そのキーを定義する最上位
+レイヤが勝ち、そのレイヤが触れないキーは下位から継承します —— 一方
+`[[array of tables]]` は、それを定義する最上位レイヤが配列ごと置き換え
+ます。どのレイヤも触れない section は下位に落ちます。
 
-```bash
-./setup_tui.sh                      # インタラクティブな dialog/whiptail エディタ
-./setup_tui.sh volumes              # 特定 section に直接ジャンプ
-./build.sh --setup            # TTY 下では setup_tui.sh を起動、それ以外は setup.sh を実行
-./.base/init.sh --gen-conf # .base/setup.conf を repo ルートに単純コピー
-```
+<!-- sync: three-layers-the-third-is-yours-setuplocaltoml 0140754d2189 1cf0d735b9fc -->
+#### 3 レイヤ、3 枚目はあなたのもの（`setup.local.toml`）
 
-### ホスト側へのログ出力
+| レイヤ | バージョン管理 | 誰のものか |
+|---|---|---|
+| `.base/dist/setup.toml` | subtree で出荷 | base の既定値 |
+| `<repo>/setup.toml` | commit 済み | repo のもの —— CI も他のどの checkout もこれを使う |
+| `<repo>/setup.local.toml` | **gitignored** | あなたのもの。このマシン、この worktree だけ |
 
-`[logging] local_path` を設定するとコンテナの stdout/stderr が
-ホスト側のファイルに tee 出力されます。docker daemon の json-file
-ログは並行して保持されます：
-
-```ini
-[logging]
-local_path = ./log/   # repo 相対、または /abs/、~/dir/ も可
-```
-
-任意の wrapper を再実行すると `compose.yaml` が再生成されます。
-ホスト側のファイルは `<local_path>/<svc>.log`（サービスごと）に
-出力されます。`docker logs <ct>` の動作は変わりません（json-file
-はローリング履歴を維持、ホストファイルは今回の実行分を映します）。
-
-**新規 repo**：本バージョン以降の `init.sh` で生成された
-`script/entrypoint.sh` には helper の source 行が事前に組み込まれて
-います。`[logging] local_path` を設定するだけで動作します。
-**既存 repo**：`script/entrypoint.sh` の最後の `exec` の手前に
-次の 1 行を追加して一度だけ移行してください：
+文法もマージ規則も全レイヤ共通です。3 枚目は `--local` で書きます：
 
 ```bash
-. /usr/local/lib/base/_entrypoint_logging.sh
+just docker setup set --local project.name myrepo-wt2
 ```
 
-Helper は `Dockerfile.example` の devel stage によりイメージ内の
-安定パス `/usr/local/lib/base/_entrypoint_logging.sh` にコピーされて
-います（refs #368）。そのため、この source 行は build-time / runtime
-どちらでも、どんな workspace 構成でも動作します — `$USER` 参照や
-workspace bind mount への依存はありません。
+リストは要素ごとにマージせず丸ごと置き換えます。順序付きリストを半分だけ
+上書きすると要素を削除できず、どのレイヤも書いていない組み合わせができる
+ためです。そこから次の 3 つが従い、いずれも黙って起きることはありません：
 
-トラブルシューティング：`local_path` を設定したのにホスト側
-ファイルが空のまま → `script/entrypoint.sh` に source 行が
-含まれているか確認してください
-（`grep _entrypoint_logging script/entrypoint.sh`）。
+- `setup.local.toml` が定義している section を通常の `set` で書くと、
+  section 名を挙げて**警告**します。拒否はしません —— その値は CI や他の
+  checkout が使う commit 済みの値です —— が、このマシンでは何も変わりません。
+- すべての wrapper の実行前サマリに `local override:` 行が付き、ファイルと
+  それが置き換える section を示します。
+- `just docker setup deploy` はこのファイルがある間**拒否**します
+  （[field-deploy.md](../guide/field-deploy.md) 参照）。
 
-### インタラクティブ TUI
+<!-- sync: topic-guides 8ef0959e6ba4 fcb22012ad23 -->
+### トピックガイド
 
-`./setup_tui.sh` はメインメニューを開きます。バックエンドは
-`dialog` または `whiptail`（どちらも無い場合は `sudo apt install
-dialog` のヒントを表示して終了）。Cancel / Esc で保存せず退出；
-保存後は自動的に `setup.sh` を呼び出して `.env` + `compose.yaml`
-を再生成します。
+深いトピックはそれぞれ `doc/guide/` の 1 ページにあります（英語のみ。英語
+README が正）：
 
-メインメニュー構造（#221）：
+- [Dockerfile stages](../guide/dockerfile-stages.md) -- stage 表、`/opt` に
+  bake する成果物、追加 stage、`[stage:<name>]` の上書き、smoke テストヘルパー。
+- [Container entrypoint](../guide/entrypoint.md) -- base のオーケストレータ、
+  あなたの bringup、一度きりの `ENTRYPOINT` 移行。
+- [Container lifecycle](../guide/lifecycle.md) -- 2 つの worktree の同時実行、
+  network mode、restart policy、init、watchdog。
+- [パラメータの置き場所](../guide/env-vs-workload.md) -- `setup.toml`、
+  `.env.local`、`config/<component>/` の役割分担。
+- [フィールド配備](../guide/field-deploy.md) -- `just docker setup deploy` と
+  自己完結 bundle。
+- [Logging](../guide/logging.md) -- コンテナ log の host 出力と wrapper transcript。
+- [setup.sh のワークフロー](../guide/setup-workflow.md) -- TUI、host 検出の上書き、
+  wrapper ごとの hook。
+- [命名スキーム](../guide/naming.md) -- image、project、container の名前と、
+  唯一の `container_name` の例外。
+- [publish-worker.yaml と source archive](../guide/publish-worker.md)。
 
-```
-Main
-├─ image            IMAGE_NAME 検出ルール
-├─ build            APT mirrors + Dockerfile build args
-├─ Runtime  ──→     network / deploy（GPU）/ gui / environment / logging
-├─ Mounts   ──→     volumes / devices / tmpfs
-├─ Advanced ──→     security / additional_contexts
-│                   / per_stage（条件付き）/ Reset
-├─ Features         条件付き / 上級者向け機能の一覧（per_stage の状態を含む）
-└─ Save & Exit
-```
+開発 stack は `container_name:` を emit せず、唯一の例外であるフィールド配備 bundle（`just docker setup deploy`）だけが `container_name:` を焼き込みます —— [naming.md](../guide/naming.md) 参照。
 
-`./setup_tui.sh <section>` は引き続き任意の section エディタへ
-直接ジャンプできます（例：`./setup_tui.sh volumes`）。
-
+<!-- sync: when-setupsh-runs c467aa1f8353 2f37b0271487 -->
 ### setup.sh の実行タイミング
 
-`setup.sh` は明示的にトリガーされた時のみ実行されます — build / run
-の度に再実行されることはありません：
+`setup.sh` は build / run の度に再実行されることはありませんが、名前を
+指定して頼んだ時だけ走るわけでもありません — 次がトリガーです：
 
-- **`./.base/init.sh`** がスケルトン生成後に 1 回自動実行
-- **`just upgrade` / `./.base/upgrade.sh`** が subtree pull の後に
+- **`just base init` / `./.base/dist/script/base/init.sh`** がスケルトン生成後に 1 回自動実行
+- **`just base upgrade` / `./.base/dist/script/base/upgrade.sh`** が subtree pull の後に
   init.sh 経由でもう一度実行されるため、アップグレードは常に新しい
-  baseline で `.env` / `compose.yaml` を再生成した状態で着地します
-- **`./build.sh --setup` / `./run.sh --setup`**（または `-s`）— ユーザが
-  明示的に再実行。TTY がある場合は先に `setup_tui.sh` を起動して `setup.conf`
-  を編集させ、TTY が無い場合は直接 `setup.sh` を呼び出します
-- **初回 bootstrap**：`./build.sh` / `./run.sh` は `.env` が無い初回実行
-  （CI の新規 clone 等）では、同じ TTY-aware フローを自動で通ります。
-  `--setup` 指定は不要
+  baseline で `.env` / `.env.generated` / `compose.yaml` を再生成した
+  状態で着地します
+- **`just docker build --setup` / `just docker run --setup`**（または `-s`）— 明示的に再実行
+- **初回 bootstrap**：`just docker build` / `just docker run` は
+  `.env.generated` が無い初回実行（CI の新規 clone 等）で setup.sh を自動実行
+  します。`--setup` 指定は不要
+- **Drift**：build と run は毎回まず `setup.sh check-drift` を実行します —
+  [ドリフト検出](#ドリフト検出)参照
 
 > **Fresh-clone の lint カバレッジ（#216）**：image がローカルに
-> キャッシュされていない `./run.sh` は Compose auto-build を起動
+> キャッシュされていない `just docker run` は Compose auto-build を起動
 > しますが、auto-build は **`target: devel`**（または `-t` で指定
-> された target）のみをビルドし、`target: devel-test`（pre-#243 は
-> `test`）レイヤの ShellCheck / Hadolint / Bats smoke はスキップ
-> されます。`run.sh`
-> はこの状況を検知し、`compose up` の前に `[run] INFO:` ブロック
-> を表示します（TTY 環境のみ）。CI と同じ完全な検証を 1 コマンド
-> で実行したい場合は `--build` フラグを付けてください：
+> された target）のみをビルドし、`target: devel-test` レイヤの
+> ShellCheck / Hadolint / Bats smoke はスキップされます。`run.sh` は
+> この状況を検知すると `[run] INFO:` ブロックを表示します（TTY 環境のみ）。
+> CI と同じ完全な検証を 1 コマンドで実行したい場合は `--build` フラグを
+> 付けてください：
 >
 > ```bash
-> just build test                   # 明示的に lint + smoke を実行
-> just run --build                  # lint + smoke を実行してから compose up
-> just run                          # デフォルト — 高速パス、lint/smoke はスキップ
+> just docker build test                   # 明示的に lint + smoke を実行
+> just docker run --build                  # lint + smoke を実行してから compose up
+> just docker run                          # デフォルト — 高速パス、lint/smoke はスキップ
 > ```
 
 `setup.sh apply` は毎回 `compose.yaml` をゼロから書き直しますが、
-既存 `.env` の `WS_PATH` / `APT_MIRROR_UBUNTU` / `APT_MIRROR_DEBIAN` は
-保持されるため、手動で調整した workspace パスや apt mirror はアップ
-グレードで上書きされません。
+既存 `.env.generated` の `WS_PATH` / `APT_MIRROR_UBUNTU` /
+`APT_MIRROR_DEBIAN` は保持されるため、手動で調整した workspace パスや
+apt mirror はアップグレードで上書きされません。
 
+<!-- sync: drift-detection 2ebe5e1725e2 26df6733cedc -->
 ### ドリフト検出
 
-`setup.sh` は `.env` に `SETUP_CONF_HASH` / `SETUP_GUI_DETECTED` /
-`SETUP_TIMESTAMP` を書き込みます。`./build.sh` / `./run.sh` は毎回
-エントリ時点で現行の `setup.conf` ハッシュ + システム検出値と比較し、
-以下のいずれかが変化した場合に `[WARNING]` を出力（実行は継続）：
+`setup.sh apply` は `.env.generated` に 5 つの値を記録します：
+`SETUP_CONF_HASH` / `SETUP_DOCKERFILE_HASH` / `SETUP_GUI_DETECTED` /
+`GPU_ENABLED` / `USER_UID`。`just docker build` / `just docker run` は毎回
+これらを現在の tree と host と比較し、前回の setup から変化したものごとに
+`[WARNING]` を出力します（実行は継続）：
 
-- `setup.conf` の内容（conf hash）
-- GPU / GUI の検出結果
+- `setup.toml` の内容（`SETUP_CONF_HASH`）
+- Dockerfile の stage 一覧（`SETUP_DOCKERFILE_HASH`）— `FROM ... AS <stage>`
+  の追加・削除
+- GPU 検出結果（`GPU_ENABLED`）
+- GUI 検出結果（`SETUP_GUI_DETECTED`）
 - `USER_UID`（ユーザ ID の変化）
 
-`--setup` を付けて再実行すれば `.env` + `compose.yaml` を再生成できます。
+手動で再実行する必要はありません：wrapper が `setup.sh check-drift` を実行し、
+drift が報告されたら `.env` / `.env.generated` / `compose.yaml` を自動で
+再生成します — いずれも派生物でありユーザのデータを持たないため、drift 時の
+再生成は常に安全です。`--setup` はその場で再生成を強制し、TTY では
+`setup_tui.sh` を先に開きます。
 
-### フィールド配備（`setup.sh deploy`）
+<!-- sync: setupsh-subcommands f50975a62b81 1ed7209d0be9 -->
+### setup.sh のサブコマンド
 
-`./setup.sh deploy` は同じ `setup.conf` から自己完結型のフィールドバンドルを生成します（ルーティングモデルの deploy 側）。あるステージ（既定 `runtime`）を対象に、不変イメージと生成された `deploy.sh` ランチャの 2 つだけを含む単一の `tar.xz` を出力します。
-
-```bash
-./setup.sh deploy                       # runtime バンドルを生成（先に確認）
-./setup.sh deploy --dry-run             # build plan を表示するだけで build しない
-./setup.sh deploy --stage runtime -y    # 確認プロンプトをスキップ
-./setup.sh deploy -o /tmp/robot.tar.xz  # 出力パスを指定
-```
-
-順に: (1) `[environment]` の既定値をイメージの実 `ENV` として焼き込み（S3）、`config/app/` があればイメージへ `COPY`（S4）—— フィールドイメージを自己完結化（env ファイルも config bind も持ち運ばない）; (2) `docker build --target <stage>`; (3) `deploy.sh` を生成 —— マシン依存の docker レベルフラグ（privileged / gpus / runtime / network / ipc / pid / devices / caps / shm / restart / group-add）をすべて inline した `docker run` ランチャで、当該ステージから dev の `compose.yaml` と同じ解決を行う; (4) `docker save` して `{image.tar, deploy.sh}` を `tar -cJf` でバンドル。
-
-build 前に解決済みランチャを表示し、各 inline フラグを確認してから進めます（`-y` でスキップ；`--dry-run` は plan とランチャを表示するだけで build しない；非対話シェルで `-y` なしは拒否）。フィールドマシン側:
-
-```bash
-tar -xJf <name>-runtime.tar.xz
-docker load < image.tar
-./deploy.sh                 # または: DEPLOY_IMAGE=... DEPLOY_CONTAINER_NAME=... ./deploy.sh
-```
-
-ランチャは設計上 docker レベルフラグのみを持ちます: workload の環境変数は `ENV` として焼き込み済み（実行時に `./deploy.sh` の後ろに `-e` で上書き可）、dev の workspace bind は意図的に外しています（フィールドイメージは自身のコードを同梱）。`--group-add` の GID（iGPU `/dev/dri`）は生成ホスト由来で、別のフィールドマシンでは調整が必要な場合があります。
-
-### setup.sh のサブコマンド（v0.11.0+）
-
-`setup.sh` は git スタイルのバックエンドで、明示的なサブコマンドを提供します。build / run / TUI スクリプトが内部で呼び出してくれるので、直接呼び出すのはスクリプト化 / 非対話シナリオでの利用が想定されています：
+`setup.sh` は git 風のバックエンドで、明示的なサブコマンドを持ち、
+`just docker setup <サブコマンド>` で呼べます。build / run / TUI スクリプトが
+代わりに呼ぶので、直接呼ぶのはスクリプト化や非対話の用途です：
 
 | サブコマンド | 用途 |
 |---|---|
-| `apply` | setup.conf + システム検出から `.env` + `compose.yaml` を再生成 |
-| `check-drift` | 同期なら 0、ドリフトしていれば 1（ドリフト内容は stderr） |
-| `set <section>.<key> <value>` | 単一キーを書き込む |
-| `show <section>[.<key>]` | 単一キーまたは section 全体を読み取る |
-| `list [<section>]` | INI スタイルでダンプ |
-| `add <section>.<list> <value>` | リスト型 section（`mount_*` / `env_*` / `port_*` …）に追加；空きスロット優先、無ければ `max+1` |
-| `remove <section>.<key>` / `<section>.<list> <value>` | キー指定または値マッチで削除 |
-| `reset [-y\|--yes]` | テンプレートのデフォルトに戻す；旧 `setup.conf` → `setup.conf.bak`、旧 `.env` → `.env.bak` |
-| `deploy [--stage S] [--output F] [--dry-run] [-y]` | 自己完結型のフィールドバンドル（image + 生成 `deploy.sh` の `tar.xz`）を生成。stage `S` は既定 `runtime`；build 前に解決済みランチャをプレビューして確認。[フィールド配備](#フィールド配備setupsh-deploy)参照 |
+| `apply` | setup.toml + システム検出から `.env` + `.env.generated` + `compose.yaml` を再生成（`.env.local` には触れない） |
+| `check-drift` | 同期なら 0、drift なら 1（drift の説明は stderr） |
+| `set <section>.<key> <value>` | 単一キーを書く。`--local` で commit 済みの `setup.toml` ではなく gitignored の `setup.local.toml` に書く。付けない場合、`setup.local.toml` が定義済みの section を書くと名前付きで警告 |
+| `show <section>[.<key>]` | 単一キーまたは section 全体を読む |
+| `list [<section>]` | key = value 形式のダンプ |
+| `add <section>.<list> <value>` | リスト型 section（`mount_*` / `env_*` / `port_*` …）に追加。空きスロットを優先、なければ `max+1`。`--local` 可 |
+| `remove <section>.<key>` / `<section>.<list> <value>` | キーまたは値の一致で削除。`--local` 可 |
+| `reset [-y\|--yes]` | テンプレート既定に戻す。旧 `setup.toml` → `setup.toml.bak`、旧 `.env.generated` → `.env.generated.bak`。`.env.local` には触れない |
+| `deploy [--stage S] [-y] [--dry-run] [--allow-local-override]` | フィールド配備 bundle をビルド。[field-deploy.md](../guide/field-deploy.md) 参照 |
 
-型付きキーは `_tui_conf.sh` のバリデータ（TUI と同じもの）を経由します。`set` / `add` / `remove` / `reset` は **`.env` を自動再生成しません** — 必要に応じて `apply` を続けて呼ぶか、次回 `build.sh` / `run.sh` の drift 検出で自動再生成されます。
+型付きキーは `_tui_conf.sh` の validator（TUI と同じもの）で検証されます。
+`set` / `add` / `remove` / `reset` は `.env.generated` を再生成**しません** —
+続けて `apply` するか、次の build / run が drift で再生成します。引数なしの
+`setup.sh` はヘルプを表示します：v0.11.0 で暗黙の `apply` を廃止した経緯は
+[doc/deprecations.md](../deprecations.md) にあります。
 
-#### v0.10.x からの移行（BREAKING）
-
-`setup.sh`（引数なし）と `setup.sh --base-path X --lang Y`（サブコマンドなし）は従来サイレントに `apply` にフォールスルーしていました。v0.11.0 でこのフォールスルーを廃止：
-
-| 呼び出し方 | v0.11 以前 | v0.11+ |
-|---|---|---|
-| `setup.sh` | apply 実行 | help を表示して exit 0 |
-| `setup.sh --base-path X --lang Y` | apply 実行 | exit 1「Unknown subcommand」 |
-| `setup.sh apply [...]` | apply 実行 | apply 実行（変更なし） |
-
-下流 repo にカスタムスクリプトが `setup.sh` を直接呼び出している場合、先頭に `apply` を付けてください。template 同梱の `build.sh` / `run.sh` / `init.sh` / `setup_tui.sh` はすでに更新済みです。
-
+<!-- sync: derived-artifacts-gitignored a3a31b52be28 1e630a8f6e59 -->
 ### 生成物（gitignored）
 
-- `.env` — ランタイム変数 + `SETUP_*` drift metadata
+- `.env.generated` — compose 補間用の変数（解決済みの `PROJECT_NAME` を
+  含む）+ `SETUP_*` drift metadata;コンテナには入りません
+- `.env` — コンテナに入る既定値：`[environment]` の一覧と
+  `[lifecycle] watchdog_*` ブロックを、埋まった一覧として書き出したもの
 - `compose.yaml` — baseline + 条件ブロック込みの完全な compose
 
 いつでも `compose.yaml` を開けば現在の完全なランタイム設定を確認できます。
-両ファイルは `just upgrade` のたびに再生成されます（init.sh が subtree
+3 ファイルとも `just base upgrade` のたびに再生成されます（init.sh が subtree
 pull 後に `setup.sh apply` を再実行）— 手動編集はしないでください。
-override は `setup.conf` に書きます。
+override は `setup.toml` に書きます。
 
-### Wrapper 毎の pre/post hook（#440）
+`.env.local` も gitignore されますが生成物では**ありません**。あなたのもので、
+最初の apply で一度 scaffold されたあとは上書きされません。編集しても setup の
+実行で消えることはありません。compose は `.env` の後にこれを読み込むので、
+両方にあるキーはあなたの値が使われます。
 
-各 wrapper（`run` / `build` / `exec` / `stop` / `prune` / `setup` /
-`setup_tui`）は、以下 2 つのオプショナルな repo-local script を検出します:
+> **v0.43.0 より前からのアップグレード**：`.env` は以前は手書きファイルでした。
+> `just base upgrade` は何かが再生成する前に、手書きの `.env` を `.env.local`
+> へリネームします。そのアップグレード経路を飛ばして先に `setup` を実行した
+> 場合、値が `.env.bak` に残るのはそのファイルが旧い補間キャッシュだったとき
+> だけです。それ以外は自分のバックアップから復元してください。
 
-```
-script/hooks/pre/<wrapper>.sh    # env 準備完了後、main logic 前
-script/hooks/post/<wrapper>.sh   # main logic 後（run.sh は EXIT trap 内）
-```
+`setup.local.toml` は 1 つ上のレイヤで同じ形をしています：gitignored、
+あなたのもの、ツールが書き換えることはありません。設定の*入力*であって
+生成物ではありません ——
+[3 レイヤ](#3-レイヤ3-枚目はあなたのものsetuplocaltoml)参照。
 
-`init.sh` が 14 個の executable stub を自動生成（デフォルト `exit 0`）するので、
-hook framework は箱から出してすぐに使えます。`exit 0` を host-side の処理
-（例: `multiarch/qemu-user-static` の binfmt 登録、mount ディレクトリ作成、
-hardware preflight）に置き換えてください。stub は upgrade に対して
-冪等 — pre-#440 の template でも `just upgrade` 後に scaffolding が
-補完されます。
+<!-- sync: upgrading 56de8c94ebd2 629908638ad8 -->
+## アップグレード
 
-**Contract:**
-
-| 項目 | 動作 |
-|---|---|
-| 引数 | wrapper が受け取った `"$@"` と同じ |
-| 実行位置 | ホスト（container 内では**ない**） |
-| `pre` 非ゼロ | wrapper を abort |
-| `post` 非ゼロ | wrapper exit code を override；cleanup は実行（run.sh） |
-| 非 executable | hard fail + `chmod +x` ヒント |
-| `--dry-run` | 両 hook とも silent skip |
-
-**例 — jetson_sdk_manager の binfmt 登録:**
-
-```bash
-# script/hooks/pre/run.sh
-#!/usr/bin/env bash
-if [ ! -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-  docker run --rm --privileged \
-    multiarch/qemu-user-static --reset -p yes
-fi
-```
-
-### 命名スキーム: 3 つの namespace と 2 つの user identity
-
-`setup.sh` は `.env` / `compose.yaml` に 3 つの名前を生成します。
-単一ユーザの開発機では見た目が似通っていますが、これらは**3 つの
-独立した namespace**に属し、**2 つの異なる user identity**から
-プレフィックスを取ります。共用ホスト（複数 OS user）のシナリオで
-は区別が顕在化します。個人開発機では 2 つの identity が一致する
-ことが多く、深追いする必要はありません。
-
-| 名前 | 形式 | Namespace | User プレフィックス |
-|---|---|---|---|
-| `image:` | `${DOCKER_HUB_USER:-local}/<repo>:<tag>` | **Registry**（Docker Hub） | `DOCKER_HUB_USER` |
-| `container_name:` | `${USER_NAME}-<repo>${INSTANCE_SUFFIX}` | **ローカル daemon**（同一 docker daemon 内のフラットなグローバル） | `USER_NAME`（OS user、refs #322） |
-| compose project name | `${DOCKER_HUB_USER}-<repo>${INSTANCE_SUFFIX}` | **ローカル daemon**（デフォルト network / volume label に影響） | `DOCKER_HUB_USER` |
-
-- `DOCKER_HUB_USER` — Docker Hub アカウント。registry 側で image
-  に名前空間を付けるために使います。実際に push しない場合でも、
-  image tag は `<DOCKER_HUB_USER>/<repo>:<tag>` という形で
-  この identity を含みます。
-- `USER_NAME` — ホストの OS user（`id -un`）。同じマシン上の
-  異なる OS user が daemon のフラットな container 名前空間で
-  衝突するのを防ぐために使います。
-
-2 つの identity を意図的に分けています。Image は registry 上で
-アドレス可能なオブジェクトなので Docker Hub identity を使う —
-OS user でプレフィックスを付けてしまうと buildx cache や Docker
-Hub の layer 共有が破綻します。Container name に OS identity を
-使うのは、ここで解決したい衝突（同一ホスト上の 2 user が同一 repo
-を同時実行）が daemon 側の問題であり、registry とは無関係だからです。
-
-Project name に `DOCKER_HUB_USER` を使うのは #322 以前からの
-決定で、そのまま据え置きました。個人開発機では 2 つの identity
-が重なるため `container_name` と視覚的に揃います。共用ホストでは
-`DOCKER_HUB_USER` も user ごとに異なるのが普通なので、project
-name も結果としてユーザ間衝突を回避できます。`#322` の CHANGELOG
-が言う「container レベルの命名を project レベルに揃える」とは
-「単一ユーザ機」前提での記述です — どちらも user プレフィックス
-を持つという意味では揃っていますが、複数ユーザ機ではそれぞれ別の
-変数から来るので前綴文字列は同一ではありません。
-
-**`INSTANCE_SUFFIX`** は 4 つ目の次元で、user 分離とは直交します。
-同じ OS user が同一 repo の container を複数並行起動したい場合
-（例: 2 つの branch を同時にテスト）、`INSTANCE_SUFFIX=2` を設定
-すると `alice-<repo>-2` と対応する project name が得られます。
-デフォルトは空文字列で、wrapper が対応する場面では `-n /
---instance` で指定できます。
-
-**Per-instance overlay (#465)**。`run.sh --instance NAME` は次の
-2 つの optional ファイルを compose overlay として自動検出します:
-
-```
-config/instances/<NAME>.yaml   → docker compose -f
-config/instances/<NAME>.env    → docker compose --env-file
-```
-
-どちらか一方だけの存在も可、ファイルがなければ silent skip。yaml は
-structural override（per-instance の ports、volumes、cache 等）、env は
-`compose.yaml` と共有する `${VAR}` override に使います。`NAME` は
-`^[a-z0-9][a-z0-9_-]*$` で validation され、path 安全を保証します。
-
-具体例。OS user `alice`、Docker Hub user `alice-hub`、repo
-`claude_code`、デフォルト `INSTANCE_SUFFIX` 空:
-
-```
-image:          alice-hub/claude_code:devel
-container_name: alice-claude_code
-project name:   alice-hub-claude_code
-```
-
-同一 OS user で 2 番目の instance（`INSTANCE_SUFFIX=2`）:
-
-```
-image:          alice-hub/claude_code:devel        (変わらず — 同じ image)
-container_name: alice-claude_code-2
-project name:   alice-hub-claude_code-2
-```
-
-同じホスト上の別の OS user `bob`:
-
-```
-image:          bob-hub/claude_code:devel          (registry tag が異なり cache 共有なし)
-container_name: bob-claude_code
-project name:   bob-hub-claude_code
-```
-
-`alice` と `bob` が同じ `DOCKER_HUB_USER` を共有している場合
-（例: 共用 CI サービスアカウント）、`image` は Docker Hub 上で
-衝突しますが `container_name` で区別できます — registry pull は
-キャッシュされた image を共有し、ホスト内の daemon では互いに
-分離されたままです。
-
-## クイックスタート
-
-### 新規 repo への追加
-
-```bash
-# 1. 空の repo を初期化（既存の repo でコミットが 1 つ以上ある場合はスキップ）
-mkdir <repo_name> && cd <repo_name>
-git init
-git commit --allow-empty -m "chore: initial commit"
-
-# 2. subtree 追加（特定のバージョン tag を指定）
-git subtree add --prefix=.base \
-    https://github.com/ycpss91255-docker/base.git v0.30.0 --squash
-
-# 3. symlink 初期化（ワンコマンド）
-./.base/init.sh
-```
-
-> `git subtree add` は `HEAD` の存在を前提とします。`git init` 直後でコミットが無い repo では `ambiguous argument 'HEAD'` と `working tree has modifications` で失敗します。空コミットで `HEAD` を作成しておけば subtree がマージできます。
-
-### アップグレード
+<!-- sync: updating fd94f9918e1b 3a426a8863f9 -->
+### 更新
 
 前提条件：`git config user.name` / `user.email` が設定済みで、working tree
 が merge / rebase / cherry-pick / revert 進行中ではないこと — upgrade.sh
@@ -694,70 +547,175 @@ git subtree add --prefix=.base \
 
 ```bash
 # 新バージョンの確認
-just upgrade-check
+just base update
 
 # 最新にアップグレード（subtree pull + バージョンファイル + workflow tag）
-just upgrade
+just base upgrade
 
 # バージョン指定
-just upgrade v0.3.0
+just base upgrade v0.3.0
 # 指定したバージョンが現在の local pin より古い場合（例：v0.12.0-rc1 から
 # v0.11.0 への巻き戻し）は SemVer §11 に従って暗黙の downgrade として
 # 拒否されます。意図的な rollback の場合は .base/.version を手動編集
 # してください。
 
 # just が使えない場合のフォールバック
-./.base/upgrade.sh v0.3.0
+./.base/dist/script/base/upgrade.sh v0.3.0
 ```
 
-`upgrade.sh` は一度に完結します：
+`upgrade.sh` は一度に完結します。**ただし、あなたの repo に書き込みます。
+書き換えの一部はあなた自身のファイルです** — 稼働中の field デプロイを持つ
+repo で実行する前に
+[upgrade.sh が repo 内で書き換えるもの](#upgradesh-が-repo-内で書き換えるもの)
+を読んでください。手順：
 
-1. `git subtree pull --prefix=.base ... --squash`
+1. `git subtree pull --prefix=.base ... --squash`。commit メッセージは
+   `chore: upgrade .base subtree to <version>`
 2. Post-pull 整合性チェック — subtree マーカー（`.base/.version`、
-   `.base/init.sh`、`.base/script/docker/wrapper/setup.sh`）が消えた場合は
+   `.base/dist/script/base/init.sh`、`.base/dist/script/docker/wrapper/setup.sh`）が消えた場合は
    `git reset --hard` で rollback（旧 `git-subtree.sh` の destructive FF
    対策）
-3. `./.base/init.sh` 再実行：root symlinks（`build.sh` / `run.sh`
-   / `justfile` …）の再同期、`.gitignore` を canonical entry set に
-   同期、derived artifact になった旧 tracked ファイル（`.env`、
-   `compose.yaml`、…）を `git rm --cached`、最後に `setup.sh apply` を
-   呼んで `.env` + `compose.yaml` を再生成
-4. `sed` で `.github/workflows/main.yaml` の
-   `build-worker.yaml@vX.Y.Z` / `release-worker.yaml@vX.Y.Z` を更新
-
-per-repo のファイルは上書きされません：`<repo>/setup.conf` はそのまま
-保持され、`<repo>/config/`（bashrc / tmux / terminator …）も触りません
-— 上流の `.base/config/` が前回 pull 以降変わっていれば、
-upgrade.sh が `diff -ruN .base/config config` のヒントを表示するの
-で、必要に応じて手動で reconcile してください。
+3. `./.base/dist/script/base/init.sh` 再実行：`script/*.sh` wrapper symlink と
+   ルートの `justfile` の再同期、退役したルートのリンクの削除、またいだ
+   バージョン範囲で選ばれる名前付きマイグレーションの実行、`.gitignore` を
+   canonical entry set に同期、derived artifact になった旧 tracked ファイル
+   （`.env.generated`、`compose.yaml`、…）を `git rm --cached`、最後に
+   `setup.sh apply` を呼んで `.env.generated` + `compose.yaml` を再生成
+4. `sed` で `.github/workflows/main.yaml` のうち、同じ行の `uses:` の直後に
+   ある（コメント内も含む）すべての
+   `ycpss91255-lab/base/.github/workflows/<file>@vX.Y.Z` ref を更新し、
+   手順 3 の変更と合わせて `chore: update template references to <version>`
+   として commit。それ以外の書き方の base ref はそのまま残し、コメント外で
+   旧 org または別バージョンのままのものを最後に一覧表示します
+5. `apply_migrations`（`lib/dockerfile_migrate.sh`）が、base contract の
+   変更に追随できていない **repo ルートの `Dockerfile`** と
+   **`script/entrypoint.sh`** を修復し、手順 3-4 と同じ commit に含めます
 
 手動で `git subtree pull` しないでください — 整合性チェック、init.sh
-resync、sed の手順は忘れがちです。
+resync、sed、マイグレーションの手順は忘れがちです。
 
-#### 自動バージョン更新（任意）
+**pull の後のどれか一手順でも失敗したら、アップグレード全体が巻き戻され
+ます。** pull は手順 2-5 より先に commit するため、そこで中断すると以前
+は「バージョンだけ上がって resync は一度も走っていない」リポジトリが残り
+ました — 壊れた wrapper 一式と、きれいな `git status` です。今は実行開始
+時の commit まで reset し、自分が作ったファイルも取り除くので、失敗した
+アップグレードが残すのは「何も変わっていない状態とエラー」だけです。手元
+の未 commit の作業が危険にさらされることはありません。`git subtree` は
+そもそも dirty tree では起動を拒否するため、pull 後に存在する変更はすべ
+てそのアップグレード自身が作ったものです。
 
-ダウンストリーム repo は、`base` の新しい tag が出るたびに Dependabot が PR を立てるよう設定できます。`.github/dependabot.yml` を追加します：
+> **`v0.41.0` 以前から、ファイルが移動した後のツリーへ上げる場合。**
+> アップグレードを駆動するのは自分の `.base/` に vendor されたスクリプト
+> なので、実際に走るのは旧リリースの版です。`v0.41.0` までのリリースは
+> `./.base/init.sh` を呼びますが、`dist/` 再編でその位置から移動しました。
+> 旧パスに置いた互換フォワーダがそれらを動き続けさせます。すでにこの失敗
+> を踏んでいる場合（`.base/.version` は上がっているのに `just --list` が
+> justfile を見つけられない）、壊れているものは何もありません — resync
+> が走らなかっただけです。手動で走らせて commit してください:
+>
+> ```bash
+> ./.base/dist/script/base/init.sh
+> git add -A && git commit -m "chore: resync .base wrappers"
+> ```
 
-```yaml
-version: 2
-updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+<!-- sync: pointing-base-at-a-different-upstream 301e742abfa0 c2691d8ade0c -->
+#### `.base` を別の upstream に向ける
+
+`TEMPLATE_REMOTE` は `.base` に関わるすべての操作が読む git remote です
+（新しいタグの有無を問い合わせるクエリと、working tree の `.base/` を
+書き換える `git subtree pull`）。既定は
+`https://github.com/ycpss91255-lab/base.git` — HTTPS なので、clone
+した直後の環境、CI runner、SSH 鍵を持たない初めての貢献者でもそのまま
+動きます。この既定値の定義は
+`.base/dist/script/base/upstream.sh` の 1 か所だけで、
+`TEMPLATE_REMOTE` は実行ごとの上書きです。
+
+```bash
+# HTTPS ではなく SSH（agent 認証、または SSH でしか到達できない fork）
+TEMPLATE_REMOTE=git@github.com:ycpss91255-lab/base.git just base upgrade
+
+# 自分で保守する private fork: この repo が追うのは「あなたの」base
+TEMPLATE_REMOTE=git@github.com:acme/base.git just base upgrade v1.2.0
 ```
 
-Dependabot は `main.yaml` 内の `uses: ycpss91255-docker/base/...@vX.Y.Z` ref を見て、base の最新 tag と照合して PR を出します。subtree 自体は引き続きローカルで `just upgrade vX.Y.Z` を実行する必要があります — Dependabot が扱うのは workflow ref のみです。
+**`.base/dist/` 配下はすべてこの URL から取得され、そのまま実行されます**
+— wrapper、lib、Dockerfile、entrypoint のすべてです。自分の repo と同じ
+だけ信頼できる場所にのみ向けてください。その repo を管理する人が、次の
+`just docker build` で動くものを決めることになります。conf キーではなく実行ごと
+の環境変数である理由もそこにあります。向き先の変更は実行したコマンドに
+残り、以後のアップグレードを黙って書き換えるファイルには残りません。長期
+的な fork は shell profile の export ではなく、自分のツールチェーンに明示
+的に組み込んでください。
 
+毎週のアップグレード「通知」（`check-base-version.sh`）は別の変数
+`BASE_REPO` を読みます。[CONTEXT.md](../../CONTEXT.md) の base version
+monitor を参照してください。
+
+<!-- sync: what-upgradesh-rewrites-in-your-repo a9b5fd89f4c4 79ef7c510eaf -->
+#### upgrade.sh が repo 内で書き換えるもの
+
+`.base/` は base のもの、それ以外は全部あなたのものです。それでも
+アップグレードは `.base/` の外に対して読み取り専用では**ありません**：
+subtree の内側で吸収できない base contract の変更は、あなたのファイル側で
+修復されます。しかも upgrade.sh はそれを **commit** して行うため、変更は
+あなたの名義で history に入ります。すべて stdout に出るので隠れてはいません
+が、ログは流れていくので、完全な一覧を以下に示します。
+
+| タイミング | 書き換わるもの | Commit メッセージ |
+|---|---|---|
+| 手順 1 | `.base/`（subtree pull） | `chore: upgrade .base subtree to <version>` |
+| 手順 3 | 移設前の `config/docker/setup.conf` をルートの `.setup.conf` へ移動（両方ある場合はマージ、`lib/setup_conf_migrate.sh`） | 手順 4 の commit に同梱 |
+| 手順 3 | 旧 INI 形式の `.setup.conf` を `setup.toml` に変換（`lib/ini_to_toml_migrate.sh`） | 手順 4 の commit に同梱 |
+| 手順 3 | 手書きの `.env` を `.env.local` にリネーム | 手順 4 の commit に同梱 |
+| 手順 3 | `setup.toml` の `[lifecycle] restart = "no"` → `"unless-stopped"`。またいだバージョン範囲で選択（`lib/version_migrate.sh`） | 手順 4 の commit に同梱 |
+| 手順 3 | `.gitignore` の canonical entry；derived になったファイルの `git rm --cached` | 手順 4 の commit に同梱 |
+| 手順 4 | `.github/workflows/main.yaml` の worker `@vX.Y.Z` ref | `chore: update template references to <version>` |
+| 手順 5 | repo ルートの `Dockerfile`、`script/entrypoint.sh`（`apply_migrations`） | 手順 4 の commit に同梱 |
+
+> **restart のマイグレーションは runtime の挙動を変えます。**
+> `[lifecycle] restart` は以前 devel スコープで、template の既定値が `no`
+> でした。`init.sh --gen-conf` は template を丸ごとコピーするため、ほぼ
+> すべての repo が「誰も選んでいない」`restart = no` を抱えています。この
+> key は現在 deploy スコープ（[lifecycle.md](../guide/lifecycle.md#restart-policy-is-deploy-scoped-841)
+> 参照）なので、コピーされた `no` は構造的に古い値です。だから書き換え
+> られます — **これまで host の再起動後に上がってこなかった deployable
+> stage のコンテナが、以後は自動的に起動します。** 実行されるのはバージョン
+> 範囲がこの rescope をまたぐ 1 回のアップグレードだけで、値がちょうど `no`
+> のときだけです。他の値を選んだ repo には一切触れません。`no` が望みなら
+> アップグレード後に戻してください。以後書き換えられることはありません。
+
+**実際に何が変更されたかを後から確認するには：**
+
+```bash
+git log --oneline <アップグレード前の sha>..HEAD        # アップグレードの commit を名前で列挙
+git diff <アップグレード前の sha>..HEAD -- . ':!.base'  # .base/ 以外のすべての差分
+```
+
+upgrade.sh が **触れない**もの：`setup.toml` のうち上記マイグレーション以外の
+すべてと、`<repo>/config/`（bashrc / tmux / terminator …）全体です —
+上流の `.base/dist/config/` や `.base/dist/setup.toml` が前回 pull 以降
+変わっていれば、upgrade.sh は `diff -ruN .base/dist/config config` のヒントを
+表示するだけで、あなたの代わりにマージはしません。
+
+<!-- sync: automated-version-bumps-optional 0f7ac5d7d0f0 61ca428999e4 -->
+#### 自動バージョン更新（任意）
+
+新しい base tag が出るたびに Dependabot に PR を立てさせられます：
+`github-actions` ecosystem と `directory: "/"` を指定した
+`.github/dependabot.yml` を追加してください。更新されるのは `main.yaml` の
+`uses: ycpss91255-lab/base/...@vX.Y.Z` ref だけで、subtree 自体は引き続き
+ローカルで `just base upgrade vX.Y.Z` を実行します。
+
+<!-- sync: ci-reusable-workflows 3356897db234 262cab541803 -->
 ## CI Reusable Workflows
 
-各 repo のローカル `build-worker.yaml` / `release-worker.yaml` を、本 repo の reusable workflows 呼び出しに置き換えます：
+下流 repo は `.github/workflows/main.yaml` からこれらの reusable workflow を呼び出します：
 
 ```yaml
 # .github/workflows/main.yaml
 jobs:
   call-docker-build:
-    uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v1
+    uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@vX.Y.Z
     with:
       image_name: my_app
       build_args: |
@@ -768,191 +726,102 @@ jobs:
   call-release:
     needs: call-docker-build
     if: startsWith(github.ref, 'refs/tags/')
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v1
+    permissions:
+      contents: write
+    uses: ycpss91255-lab/base/.github/workflows/release-worker.yaml@vX.Y.Z
     with:
       archive_name_prefix: my_app
 ```
 
-### build-worker.yaml パラメータ
+<!-- sync: build-workeryaml-common-inputs 22209d9818e6 2495d4e62bd2 -->
+### build-worker.yaml の主なパラメータ
 
 | パラメータ | 型 | 必須 | デフォルト | 説明 |
 |------------|------|------|------------|------|
 | `image_name` | string | はい | - | コンテナイメージ名 |
 | `build_args` | string | いいえ | `""` | 複数行 KEY=VALUE ビルド引数 |
-| `build_runtime` | boolean | いいえ | `true` | runtime stage をビルドするか |
+| `build_runtime` | boolean | いいえ | `true` | runtime ビルドのオプトアウト(`false`)。stage の有無は Dockerfile から読み取る: `runtime` / `runtime-test` を宣言していればビルドし、なければスキップするので、runtime stage を持たない repo はここを変更する必要がない |
 | `platforms` | string | いいえ | `"linux/amd64"` | カンマ区切りのターゲットプラットフォーム；各プラットフォームがネイティブ runner 上で並列実行（`linux/amd64` → ubuntu-latest、`linux/arm64` → ubuntu-24.04-arm） |
-| `test_tools_version` | string | いいえ | `"latest"` | `ghcr.io/ycpss91255-docker/test-tools:<tag>` のタグ。下流側は採用した template release にピン留めすると再現性が確保できる |
 
+全 11 個のパラメータは `.github/workflows/build-worker.yaml` の
+`on.workflow_call.inputs` を参照
+（[ADR-00000028](../adr/00000028-documentation-is-derived-not-duplicated.md)）。
+
+`devel-test` / `runtime-test` stage が FROM するツールイメージは入力では
+ない。worker が自身の ref で取得する base checkout の `.version` から導出
+され、それは `release-test-tools.yaml` がそのイメージを公開するタグでも
+ある —— つまり worker をピン留めした `@vX.Y.Z` がツールイメージもピン留め
+する。以前は `test_tools_version` 入力が担っており、デフォルトはローリング
+な `latest` だった。まだこの入力を渡している呼び出し側は、その行を削除する
+必要がある。
+
+<!-- sync: release-workeryaml-inputs 89f7de4f5d1a 1d1cefd1f85c -->
 ### release-worker.yaml パラメータ
 
 | パラメータ | 型 | 必須 | デフォルト | 説明 |
 |------------|------|------|------------|------|
 | `archive_name_prefix` | string | はい | - | アーカイブ名プレフィックス |
 | `extra_files` | string | いいえ | `""` | 追加ファイル（スペース区切り） |
+| `version` | string | いいえ | `""` | リリースするバージョン（`vX.Y.Z`）。tag 経由の経路では未設定のままにすると、push された tag から読み取られる。tag 以外の run からこの worker を直接呼ぶ場合に渡す：既定の `GITHUB_TOKEN` で作成されたイベントは新しい workflow run を開始しないため、マージ済みの変更を自動リリースする repo は tag を push しても到達できない。`vX.Y.Z[-suffix]` でない値はリリースされず拒否される |
 
-## ローカルテスト実行
+`publish-worker.yaml`（opt-in。他の repo が `FROM` する基盤イメージ repo 向け）
+は tag push 時に Dockerfile の target stage を registry へ push します。入力、
+複数バリアントの呼び出し例、base のリリースの source archive が下流のリリースと
+どう違うかは [publish-worker.md](../guide/publish-worker.md) を参照。
 
-`Makefile.ci`（template ルートから）を使用：
+<!-- sync: development-and-tests 750400f91f7b 03ee83a59fb0 -->
+## 開発とテスト
+
+base の checkout 内で（`script/test/justfile.test`）：
+
 ```bash
-make -f Makefile.ci test        # フル CI（ShellCheck + Bats + Kcov）docker compose 経由
-make -f Makefile.ci lint        # ShellCheck のみ
-make -f Makefile.ci clean       # カバレッジレポート削除
-just             # repo recipe 一覧表示
-make -f Makefile.ci help  # CI ターゲット表示
+just test               # 全 linter + Bats（no kcov）、docker compose 経由
+just test lint          # lint フェーズの全 linter
+just test lint --shellcheck   # 1 つの linter に絞る（--hadolint、--readme-sync、...）
+just test coverage      # Bats 全体を kcov 下で実行。lint フェーズなし
+just test coverage-local      # 同じ kcov 実行をローカルの in-job モードで
+just test go            # Go config-gen：build、lint、test、カバレッジ floor、mutation
+just test system        # opt-in の System レベル（host docker が必要）
+just test acceptance    # Acceptance レベル：実際に consumer を scaffold
+just test smoke         # 出荷される smoke spec
+just release coverage-badge   # coverage/ から doc/badge/coverage.svg を再生成
 ```
 
-直接実行：
-```bash
-./script/ci/ci.sh          # フル CI（docker compose 経由）
-./script/ci/ci.sh --ci     # コンテナ内で実行（compose から呼び出し）
-```
+カバレッジバッジは Bats 全体が Bash ソースに対して計測した kcov の行カバレッジ
+で、リリースごとに 1 回計測します。Go パッケージはパッケージごとの floor で
+ゲートされます（`just test go`）。計測方法は
+[ADR-00000008](../adr/00000008-coverage-sharded-pr-gate.md)、テスト索引は
+[TEST.md](../test/TEST.md)（カテゴリ別一覧：[unit](../test/unit.md) /
+[integration](../test/integration.md) / [system](../test/system.md) /
+[acceptance](../test/acceptance.md) / [smoke](../test/smoke.md)）、全 recipe は
+`script/test/justfile.test` を参照。
 
-## テスト
-
-詳細は [TEST.md](../test/TEST.md) を参照。
-
+<!-- sync: directory-structure ab00213e0736 418ed8cb85d5 -->
 ## ディレクトリ構造
 
 ```
-.base/
-├── init.sh                           # Initialize repo (new or existing)
-├── upgrade.sh                        # Upgrade template subtree version
-├── script/
-│   ├── docker/                       # Docker operation scripts
-│   │   ├── wrapper/                  # User-facing wrapper scripts
-│   │   │   ├── build.sh
-│   │   │   ├── run.sh
-│   │   │   ├── exec.sh
-│   │   │   ├── stop.sh
-│   │   │   ├── prune.sh
-│   │   │   ├── setup.sh              # .env generator
-│   │   │   └── setup_tui.sh          # Interactive setup editor
-│   │   ├── lib/                      # Shared helper modules
-│   │   │   ├── _lib.sh               # Core wrappers library
-│   │   │   ├── bootstrap.sh          # Wrapper initialization
-│   │   │   ├── compose.sh            # Compose generation
-│   │   │   ├── conf.sh               # INI parser
-│   │   │   ├── conf_logging.sh       # Logging config
-│   │   │   ├── env.sh                # Environment setup
-│   │   │   ├── gitignore.sh          # Gitignore management
-│   │   │   ├── hook.sh               # Per-wrapper hooks
-│   │   │   ├── i18n.sh               # Language detection
-│   │   │   ├── log.sh                # Logging utilities
-│   │   │   ├── config_summary.sh     # Config summary
-│   │   │   ├── _tui_backend.sh       # TUI dialog/whiptail wrapper
-│   │   │   ├── _tui_conf.sh          # TUI INI validators
-│   │   │   ├── log-events.txt        # Log event catalog
-│   │   │   └── log.lnav-format.json  # Lnav format definition
-│   │   ├── runtime/                  # Runtime in-container scripts
-│   │   │   ├── entrypoint.sh         # Template entrypoint helper
-│   │   │   ├── logging.sh            # Host-side log tee helper
-│   │   │   └── smoke.sh              # Runtime install-check smoke
-│   │   ├── justfile                  # Docker operations entry (just)
-│   │   └── setup.conf                # Template runtime config defaults
-│   └── ci/                           # CI pipeline scripts
-│       ├── ci.sh                     # CI orchestration (local + remote)
-│       ├── lint_bare_stderr.sh       # Bare stderr lint checker
-│       └── lint_mixed_test_layout.sh # Mixed-tool test layout validator
-├── dockerfile/
-│   ├── Dockerfile.example            # Multi-stage template (sys / devel-base / devel / devel-test / [runtime-base / runtime / runtime-test])
-│   └── Dockerfile.test-tools         # Pre-built lint/test tools image
-├── config/                           # Container-internal shell/tool configs
-│   ├── docker/
-│   │   └── setup.conf                # Runtime config (per-repo override mirror: <repo>/config/docker/setup.conf)
-│   └── shell/
-│       ├── bashrc
-│       ├── bashrc.d/                 # Interactive shell bootstrap drop-ins
-│       │   └── .gitkeep
-│       ├── terminator/
-│       │   ├── setup.sh
-│       │   └── config
-│       └── tmux/
-│           ├── setup.sh
-│           ├── README.adoc
-│           └── tmux.conf
-├── test/
-│   ├── smoke/                        # Shared smoke tests + runtime assertion helpers
-│   │   ├── test_helper.bash          # assert_cmd_installed / _runs / file / dir / owned_by / pip_pkg
-│   │   ├── script_help.bats
-│   │   └── display_env.bats
-│   ├── unit/                         # Template self-tests (bats + kcov)
-│   │   ├── test_helper.bash
-│   │   ├── bashrc_spec.bats
-│   │   ├── build_sh_spec.bats
-│   │   ├── build_sh_prune_spec.bats
-│   │   ├── build_worker_yaml_spec.bats
-│   │   ├── ci_spec.bats
-│   │   ├── compose_gen_spec.bats
-│   │   ├── compose_logging_spec.bats
-│   │   ├── compose_overlay_spec.bats
-│   │   ├── conf_logging_spec.bats
-│   │   ├── deploy_spec.bats
-│   │   ├── entrypoint_logging_spec.bats
-│   │   ├── exec_sh_spec.bats
-│   │   ├── gitignore_spec.bats
-│   │   ├── hook_spec.bats
-│   │   ├── init_spec.bats
-│   │   ├── lib_spec.bats
-│   │   ├── lint_mixed_test_layout_spec.bats
-│   │   ├── log_spec.bats
-│   │   ├── makefile_user_spec.bats
-│   │   ├── multi_distro_build_worker_yaml_spec.bats
-│   │   ├── prune_sh_spec.bats
-│   │   ├── release_test_tools_yaml_spec.bats
-│   │   ├── run_sh_spec.bats
-│   │   ├── runtime_smoke_spec.bats
-│   │   ├── self_test_yaml_spec.bats
-│   │   ├── setup_spec.bats
-│   │   ├── smoke_helper_spec.bats
-│   │   ├── stop_sh_spec.bats
-│   │   ├── template_spec.bats
-│   │   ├── terminator_config_spec.bats
-│   │   ├── terminator_setup_spec.bats
-│   │   ├── tmux_conf_spec.bats
-│   │   ├── tmux_setup_spec.bats
-│   │   ├── tui_backend_spec.bats
-│   │   ├── tui_flow.bats
-│   │   ├── tui_mount_assembler_spec.bats
-│   │   ├── tui_spec.bats
-│   │   ├── upgrade_spec.bats
-│   │   └── wrapper_lib_lookup_spec.bats
-│   ├── integration/                  # Level-1 init.sh end-to-end tests
-│   │   ├── init_new_repo_spec.bats
-│   │   ├── upgrade_spec.bats
-│   │   ├── fresh_clone_portability_spec.bats
-│   │   ├── gitignore_sync_spec.bats
-│   │   └── wrapper_compose_dispatch_spec.bats
-│   └── behavioural/                  # Runtime integration tests
-│       └── runtime_test_smoke_spec.bats
-├── Makefile.ci                       # Template CI entry (make test/lint/...)
-├── compose.yaml                      # Docker CI runner
-├── .hadolint.yaml                    # Shared Hadolint rules
-├── .dockerignore
-├── codecov.yml
-├── .github/workflows/
-│   ├── self-test.yaml                # Template CI
-│   ├── build-worker.yaml             # Reusable build + smoke-test workflow
-│   ├── release-worker.yaml           # Reusable release (source archive) workflow
-│   ├── publish-worker.yaml           # Reusable image publish workflow (opt-in)
-│   ├── multi-distro-build-worker.yaml # Multi-distro build workflow
-│   └── release-test-tools.yaml       # Template's own test-tools image release
+.base/                                  # consumer の <repo>/.base/ に固定される subtree
+├── .version                            # 固定された base リリース tag
+├── justfile                            # base 自身のエントリ（mods test / release / watch）
+├── compose.yaml                        # base CI runner（test-tools サービス）
+├── dist/                               # 出荷物：setup.toml、env.toml、.hadolint.yaml、
+│                                       #   config/、dockerfile/、script/{docker,base,template}/、
+│                                       #   deploy/（cd-guard + bundle README）、test/bats/smoke/
+├── script/                             # base 自身のツール：test/、release/、watch/、ci/
+├── dockerfile/                         # Dockerfile.test-tools / .config-gen / .smoke /
+│                                       #   .toml-bridge、config-gen/ Go モジュール、kcov パッチ
+├── test/                               # base 自身の spec：bats/{unit,integration,system,acceptance}/
+├── .github/                            # reusable worker + base CI workflow、dependabot.yml
 ├── doc/
-│   ├── readme/                       # README translations
-│   │   ├── README.zh-TW.md
-│   │   ├── README.zh-CN.md
-│   │   └── README.ja.md
-│   ├── adr/                          # Architecture Decision Records
-│   │   ├── 00000001-setup-conf-vs-compose.md
-│   │   ├── 00000002-no-latest-tag.md
-│   │   ├── 00000003-env-vs-workload-param-boundary.md
-│   │   └── 00000004-test-category-tool-subdir-layout.md
-│   ├── test/
-│   │   └── TEST.md                   # Test catalog and spec tables
-│   ├── changelog/
-│   │   └── CHANGELOG.md              # Release notes
+│   ├── badge/                          # 生成されるリリースカバレッジバッジ（リリース時に hand-run、bump 呼び出し元は未接続：docker_harness#289）
+│   ├── guide/                          # README からリンクされるトピックガイド
+│   ├── readme/                         # README の翻訳（zh-TW / zh-CN / ja）
+│   ├── adr/                            # Architecture Decision Records
+│   ├── arch/                           # アーキテクチャ図（自己完結 HTML）
+│   ├── test/                           # テスト索引 + レベル別 spec 一覧
+│   ├── changelog/                      # 生成される索引の下に 0.Y シリーズごと 1 ファイル
 │   └── deprecations.md
-├── .gitignore
+├── CONTEXT.md
 ├── LICENSE
 └── README.md
 ```
-
