@@ -27,3 +27,14 @@ config/host.yaml
 # interpreter, which this repo does not do: every test runs in a container.
 __pycache__/
 *.py[cod]
+.env.local
+.env.local.toml
+.env.local.bak
+env.local.toml
+.setup.conf.bak
+setup.toml.bak
+.setup.conf.local
+.setup.conf.local.bak
+setup.local.toml
+log/
+/deploy/
