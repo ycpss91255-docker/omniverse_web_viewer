@@ -63,10 +63,6 @@ on:
         required: false
         type: boolean
         default: true
-      test_tools_version:
-        required: false
-        type: string
-        default: "latest"
       platforms:
         required: false
         type: string
@@ -87,6 +83,19 @@ on:
 jobs:
   resolve-matrix:
     runs-on: ubuntu-latest
+    # Every job of a worker bounds itself: GitHub's default is six hours,
+    # and it applies per matrix shard. `call-build` carries none because
+    # `timeout-minutes` is not accepted on a job that `uses:` another
+    # workflow -- its bound lives on build-worker's own jobs, which is
+    # where the work is.
+    timeout-minutes: 5
+    # This is a REUSABLE workflow: a job with no `permissions:` runs on
+    # the CALLING repo's whole grant. The job picks one of two inputs and
+    # writes it to GITHUB_OUTPUT -- it does not even check out -- so it
+    # declares the read-only block rather than inheriting a caller's
+    # `contents: write` (#957).
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.r.outputs.matrix }}
     steps:
@@ -100,16 +109,36 @@ jobs:
         # tag_matrix full matrix. Tag pushes specifically benefit
         # from full validation since they cut releases; main pushes
         # benefit because the same code path is what tag-cut will see.
+        #
+        # GITHUB_OUTPUT's `name=value` form holds one line, and a caller may
+        # write its matrix as a block scalar: written as given, the second
+        # line fails the step (base#2160). So the value is read as JSON and
+        # written compact. Anything but one strict JSON array is refused here,
+        # by the input's name; `fromJSON` alone is laxer (a trailing comma, a
+        # comment) and would name neither.
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            echo "matrix=${PR_MATRIX}" >> "${GITHUB_OUTPUT}"
+            input=pr_matrix value="${PR_MATRIX}"
           else
-            echo "matrix=${TAG_MATRIX}" >> "${GITHUB_OUTPUT}"
+            input=tag_matrix value="${TAG_MATRIX}"
           fi
+          one_array='if length == 1 and (.[0] | type) == "array" then .[0] else error("expected one array") end'
+          if ! matrix="$(jq -cs "${one_array}" <<< "${value}")"; then
+            echo "::error::${input} is not one JSON array of matrix entries."
+            exit 1
+          fi
+          printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT}"
 
   call-build:
     needs: resolve-matrix
+    # Job-level permissions on a `uses:` job are the CEILING every job of
+    # the called workflow runs under. build-worker.yaml's five jobs each
+    # declare `contents: read` and nothing else, so this is the narrowest
+    # ceiling that satisfies all of them -- and it stops a caller's
+    # `packages: write` reaching them through this hop (#957).
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -126,7 +155,6 @@ jobs:
       # docker/build-push-action.
       build_args: ${{ matrix.build_args }}
       build_runtime: ${{ inputs.build_runtime }}
-      test_tools_version: ${{ inputs.test_tools_version }}
       platforms: ${{ inputs.platforms }}
       context_path: ${{ inputs.context_path }}
       dockerfile_path: ${{ inputs.dockerfile_path }}
@@ -140,6 +168,11 @@ jobs:
     needs: call-build
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads `needs.call-build.result` and exits. `contents: read` rather
+    # than `{}` keeps the block uniform with its siblings (#957).
+    permissions:
+      contents: read
     steps:
       - name: Aggregate matrix results
         env:

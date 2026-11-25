@@ -1,0 +1,920 @@
+# Dockerfile.example - Template for new Docker container repos
+#
+# Copy this file to your repo root as "Dockerfile" and customize.
+# The test-tools image (ShellCheck, Hadolint, Bats) is consumed via the
+# TEST_TOOLS_IMAGE build arg, always passed explicitly (no bare-tag
+# default). The local `just docker build` flow builds Dockerfile.test-tools into
+# the host Docker daemon and passes a version-scoped
+# `test-tools:<base-version>` (mirroring the CI tag minus the registry
+# prefix, so two base versions never collide on one host). CI passes
+# `ghcr.io/ycpss91255-lab/test-tools:vX.Y.Z` so buildx can pull the
+# arch-correct pre-built image without the cross-step image-store
+# isolation that broke the old test-tools:local CI pattern.
+#
+# Stages:
+#   sys           - User/group, locale, timezone
+#   devel-base    - Development tools and packages
+#   builder       - Compile/build stage (optional; opt-in for runtime split, keeps source)
+#   devel         - Application-specific tools + entrypoint
+#   devel-test    - Lint + bats smoke test (ephemeral, discarded after build)
+#   runtime-base  - Minimal runtime base (sudo + tini + ldd-driven libs), optional
+#   runtime       - Minimal runtime image (COPY --from=builder install trees), optional
+#   runtime-test  - Runtime install-check + bats smoke (ephemeral, optional)
+#
+# The generalized `-test` stage rule: EVERY `-test` stage is
+#   `FROM <the real stage it tests>` (devel-test FROM devel,
+#   runtime-test FROM runtime) and brings the shared toolchain in via
+#   `COPY --from=test-tools-stage` -- ShellCheck / Hadolint / Bats from
+#   the pre-built, version-pinned, multi-arch test-tools image. Do NOT
+#   make any `-test` stage `FROM ${TEST_TOOLS_IMAGE}`: a `-test` stage
+#   must inherit the REAL environment of the artifact under test, then
+#   layer the tools on top. The inverse (real artifacts copied onto the
+#   fat tools base) silently masks the very bugs `-test` exists to catch
+#   -- runtime-test's `ldd` scan would resolve missing `.so`s against
+#   the tools base and report a false green while the shipped runtime is
+#   still broken (ros1_bridge#123). See the runtime-test block below.
+#
+#   Flavour-specific test tooling (e.g. ROS: colcon test / ament_* /
+#   launch_testing) is the CONSUMER's responsibility, installed in its
+#   own `-test` stage on top of the COPYed common toolchain -- base
+#   ships only the common toolchain, no flavoured test image.
+#
+#   `-test` stages may be heavier than the stages they test; that is
+#   fine because they are ephemeral and never reach users (they exist
+#   only inside the build/test graph).
+#
+# Adding extra stages: any `FROM <base> AS <stage>` outside the
+# baseline blocklist {sys, devel-base, devel, devel-test, runtime-test}
+# is auto-emitted as a compose service that extends `devel` (inherits
+# volumes / network / GPU / GUI / cap_add / additional_contexts) and
+# overrides only build.target / image / stdin_open / tty / profiles.
+# No service carries a name of its own: compose derives
+# `<project>-<stage>-<n>`, which is what lets two stacks of one repo
+# coexist on a host. Stage names must match `^[a-z][a-z0-9_-]*$` and must
+# not collide with `latest` / `v[0-9]*` (reserved release tag
+# namespace). Use case: entrypoint variants like `headless` + `gui`
+# for the same baseline. No setup.toml change needed; run any wrapper
+# to regenerate compose.yaml, then `just docker run -t <stage>`.
+#
+# Backward-compat: the legacy stage names `base` and `test` are still
+# accepted by the blocklist during the v0.21.x transition (downstream
+# Dockerfiles renamed to `devel-base` / `devel-test` over a coordinated
+# rollout). They will be removed from the blocklist in a future major.
+
+# BASE_IMAGE defaults to a MOVING tag: `ubuntu:24.04` re-resolves on every
+# Ubuntu point release and every security respin, and the apt packages
+# installed on top of it (here and in devel-base) carry no versions. Two
+# builds of the same template version a month apart are therefore not the
+# same image. That is a deliberate trade, not an oversight:
+#
+#   - The default is only a default. Consumers routinely override
+#     BASE_IMAGE from their own Dockerfile or CI matrix (ros:humble,
+#     nvidia/cuda, python:3.11-slim, ...), so a digest baked in here would
+#     govern almost nothing -- while making every upstream security respin
+#     a template release fanned out across every repo under the org.
+#   - These are DEVELOPMENT images. One that cannot pick up a security
+#     update without a template release is worse for its audience than one
+#     that drifts.
+#
+# What compensates is that the drift is RECORDED rather than silent. Every
+# image built from this file carries, from the image alone:
+#
+#   /usr/local/share/base/base-image.env  the base reference as given,
+#                                         whether that reference is
+#                                         digest-pinned, the digest the
+#                                         build was told to record, and
+#                                         the base OS identity
+#   /usr/local/share/base/packages.txt    every installed package and its
+#                                         exact version, rewritten after
+#                                         each apt layer
+#
+# plus the OCI `org.opencontainers.image.base.name` /
+# `org.opencontainers.image.base.digest` labels, so `docker inspect`
+# answers without unpacking. Two consumer images that behave differently
+# can be diffed down to the package version that changed. This is also
+# what the DL3008 ignore in .hadolint.yaml names as its compensating
+# control.
+#
+# WHAT THE SHIPPED DEFAULT STILL DOES NOT ANSWER, stated plainly rather
+# than left for a reader to discover: built as shipped -- `ubuntu:24.04`,
+# no build args -- the manifest records
+#
+#   base_image_ref=ubuntu:24.04
+#   base_image_pin=none
+#   base_image_digest=
+#
+# i.e. it does NOT record which digest that tag resolved to, because
+# nothing INSIDE a build can ask the daemon what it pulled. Pinning the
+# reference to a digest does not fill the field on its own either -- the
+# pinning paragraph below says why, and what it costs to fill. Filling it
+# costs one build arg, from whoever runs the build and can ask:
+#
+#   BASE_IMAGE_DIGEST="$(docker image inspect \
+#     --format '{{index .RepoDigests 0}}' ubuntu:24.04)"
+#   BASE_IMAGE_DIGEST="${BASE_IMAGE_DIGEST##*@}"
+#
+# The second line is not tidiness. `.RepoDigests` holds REFERENCES
+# (`ubuntu@sha256:<hex>`), and this value is recorded verbatim as
+# `base_image_digest` and as the OCI
+# `org.opencontainers.image.base.digest` annotation, where OCI defines a
+# digest and not a reference. Unstripped it puts a reference in both
+# sinks at once, and every reader of the field expects a digest -- the
+# annotation by the OCI spec, and the shipped smoke spec, which asserts
+# `base_image_digest` is empty or `sha256:` plus 64 hex and fails the
+# `-test` stage when it is neither.
+#
+# The value reaches the build alongside BASE_IMAGE, by one of three
+# routes, in the order to reach for them:
+#
+#   1. LOCAL, and the one this repo actually drives builds through: add
+#      it to the `[[build.args]]` list in the repo-root `setup.toml`, next
+#      to the APT_MIRROR_* / TZ args already there --
+#
+#        [[build.args]]
+#        key = "BASE_IMAGE_DIGEST"
+#        value = "sha256:<digest>"
+#
+#      -- then `just docker setup apply` (which emits it into compose.yaml's
+#      build `args:` and into `.env`) and `just docker build`. The value
+#      is versioned with the repo instead of living in one shell's
+#      history, and no template-owned line is edited. `setup.local.toml`
+#      takes the same entry for a machine-local value, but a layer that
+#      defines any `[[build.args]]` replaces the whole list -- restate the
+#      other args in it or lose them.
+#   2. CI: the `build_args:` input of base's reusable build-worker
+#      workflow, which forwards it to every build step.
+#   3. `--build-arg`, for a throwaway one-off. Every container operation
+#      here goes through `just`, so this is the route that leaves nothing
+#      behind and repeats nothing; prefer (1) unless that is the point.
+#
+# It is a RECORD, not a pin: the build still resolves the tag, and the
+# digest lands in base-image.env and in the OCI base.digest label.
+#
+# Need bit-for-bit reproducibility instead? Give BASE_IMAGE an immutable
+# reference:
+#
+#   BASE_IMAGE=ubuntu@sha256:<digest>
+#
+# That builds, and it is enough on its own: the manifest records
+# `base_image_pin=digest` and a `base_image_ref` that carries the digest.
+# What it does not do is fill `base_image_digest` / the OCI
+# `base.digest` annotation. The reason is narrow and worth stating
+# exactly, because a wider version of it once stopped this build: a LABEL
+# CAN read a digest out of a reference -- `${BASE_IMAGE##*@}` in a LABEL
+# resolves to `sha256:<hex>` for `ubuntu@sha256:<hex>`, which base
+# verifies by building its smoke harness with a probe label and reading
+# it back with `docker inspect`. What a LABEL cannot do is BRANCH. The
+# same expression resolves to `ubuntu:24.04` for an unpinned reference,
+# i.e. a tag in the field OCI reserves for a digest, which the shipped
+# smoke spec rejects; and pattern expansion inside a LABEL is
+# builder-dependent besides (this template pins no `syntax=` directive).
+# One expression cannot be right for both, so the annotation carries the
+# build arg and nothing else -- and the file records that same arg, which
+# is what keeps the two sinks from ever disagreeing.
+#
+# So pass both if you want the field filled:
+#
+#   BASE_IMAGE=ubuntu@sha256:<digest>
+#   BASE_IMAGE_DIGEST=sha256:<digest>
+#
+# The build does NOT refuse the reference-only form. An empty
+# `base_image_digest` beside `base_image_pin=digest` is a truthful
+# "pinned, digest not separately recorded", identical in both sinks, and
+# refusing it would break a configuration this note recommends. What is
+# rejected is DISAGREEMENT: state both halves naming different digests
+# and the shipped smoke spec fails the `-test` stage, because a record
+# that answers one field two ways is false however it is read.
+#
+# The pair travels the same three routes. Under `[build]` that is
+# `arg_5 = BASE_IMAGE=ubuntu@sha256:<digest>` beside the
+# `arg_4 = BASE_IMAGE_DIGEST=sha256:<digest>` above -- the route that
+# costs no hand-edit of this file and survives the next `just base upgrade`,
+# whereas changing the `ARG BASE_IMAGE=` default below edits a
+# template-owned line a later migration may rewrite.
+# Pinning is a per-repo call because the bump maintenance it costs is the
+# repo's to carry -- and one repo pinning does not conscript every other
+# repo under the org.
+#
+# tool-pin: unpinned base-image -- a MOVING tag, and what to do about it
+# is the consumer-facing decision the block above states in full. Declared
+# so the watch NAMES it on every run rather than letting two builds of one
+# template tag differ in silence; there is no version here to compare.
+ARG BASE_IMAGE="ubuntu:24.04"
+# No bare-tag default (was `test-tools:local`): build.sh (local) passes a
+# version-scoped `test-tools:<base-version>` and CI passes
+# `ghcr.io/ycpss91255-lab/test-tools:<version>`, both explicitly. An
+# unset value resolves an empty base image and fails the build loudly
+# rather than silently reusing a stale, wrong-version local image.
+ARG TEST_TOOLS_IMAGE
+
+############################## sys ##############################
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE} AS sys
+
+ARG USER_NAME="user"
+ARG USER_GID=1000
+ARG USER_UID=1000
+ARG USER_GROUP="user"
+ARG TZ="Asia/Taipei"
+ARG APT_MIRROR_UBUNTU="tw.archive.ubuntu.com"
+ARG DEBIAN_FRONTEND=noninteractive
+# Re-declared bare so the RUN below can record it: the pre-FROM ARG is
+# FROM-scope only, and without this line ${BASE_IMAGE} expands to the
+# empty string inside the stage and the manifest records nothing.
+ARG BASE_IMAGE
+# The digest BASE_IMAGE resolved to, as the caller supplies it (see the
+# note above `ARG BASE_IMAGE`). This is the ONLY expression both sinks of
+# the record can read -- the file below and the OCI annotation further
+# down -- so a reference that carries its own digest does not fill it by
+# a second route, and unsupplied it leaves both sinks equally empty. That
+# is a record with a blank field, not a broken one, and the build says so
+# by continuing. Defaulted rather than left bare: this stage's SHELL runs
+# with `-u`, and an unsupplied bare ARG is what turns a missing optional
+# record into a failed build.
+ARG BASE_IMAGE_DIGEST=""
+
+SHELL ["/bin/bash", "-x", "-euo", "pipefail", "-c"]
+
+# Every apt layer of this file installs through this helper: each attempt
+# runs a fresh `apt-get update` before the install, so one failed fetch
+# from a skewed mirror is retried rather than final; after the last
+# attempt the layer still fails, base#1602. Stages built FROM sys inherit
+# it; a stage built from a fresh ${BASE_IMAGE} copies it again. The apt
+# config sets `Acquire::Retries "3";` so one transient fetch error is
+# retried inside an attempt.
+COPY --chmod=0755 .base/dist/script/docker/build/apt-retry.sh /usr/local/libexec/base/apt-retry.sh
+COPY .base/dist/script/docker/build/80-base-retries /etc/apt/apt.conf.d/80-base-retries
+
+# tool-pin: unpinned sys-apt-packages -- an apt package names no version
+# here, and the base image it resolves against is itself a moving tag, so
+# there is no bound at all. Recorded so the watch says so every run.
+RUN sed -i "s@archive.ubuntu.com@${APT_MIRROR_UBUNTU}@g" /etc/apt/sources.list || true; \
+    /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+        tzdata \
+        locales \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && \
+    locale-gen && \
+    update-locale LANG="en_US.UTF-8" && \
+    ln -snf /usr/share/zoneinfo/"${TZ}" /etc/localtime && echo "${TZ}" > /etc/timezone && \
+    mkdir -p /usr/local/share/base && \
+    _ref_digest=""; \
+    case "${BASE_IMAGE}" in \
+      *@sha256:*) _ref_digest="sha256:${BASE_IMAGE##*@sha256:}" ;; \
+    esac; \
+    { \
+      echo "base_image_ref=${BASE_IMAGE}"; \
+      if [ -n "${_ref_digest}" ]; then \
+        echo "base_image_pin=digest"; \
+      else \
+        echo "base_image_pin=none"; \
+      fi; \
+      echo "base_image_digest=${BASE_IMAGE_DIGEST}"; \
+      sed -n 's/^PRETTY_NAME=/base_os=/p' /etc/os-release; \
+    } > /usr/local/share/base/base-image.env && \
+    dpkg-query -W > /usr/local/share/base/packages.txt
+
+# The reference this image was built FROM, readable via `docker inspect`
+# without unpacking the image. Inherited by every stage below. The digest
+# is `${BASE_IMAGE_DIGEST}` and nothing else -- the same expression the
+# file above records. Not because a LABEL is unable to read a digest out
+# of a reference: it is able to, and a probe label proves it. Because a
+# LABEL cannot BRANCH, so the expression that strips a digest returns the
+# whole reference when there is none to strip, which would put a tag in
+# the field OCI reserves for a digest. One expression, one answer, both
+# sinks. Empty is a truthful "not recorded", which is what a consumer
+# needs to know before trusting the ref as reproducible.
+LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}"
+
+ENV LC_ALL="en_US.UTF-8"
+ENV LANG="en_US.UTF-8"
+ENV LANGUAGE="en_US:en"
+ENV TZ="${TZ}"
+
+# Create user (handle UID/GID conflicts)
+RUN if getent group "${USER_GID}" >/dev/null; then \
+        groupmod -n "${USER_GROUP}" "$(getent group "${USER_GID}" | cut -d: -f1)"; \
+    else \
+        groupadd -g "${USER_GID}" "${USER_GROUP}"; \
+    fi && \
+    if getent passwd "${USER_UID}" >/dev/null; then \
+        usermod -l "${USER_NAME}" -d "/home/${USER_NAME}" -m \
+            "$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
+    else \
+        useradd -m -l -s /bin/bash -u "${USER_UID}" -g "${USER_GID}" "${USER_NAME}"; \
+    fi && \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+############################## devel-base ##############################
+FROM sys AS devel-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# tool-pin: unpinned devel-apt-packages -- same as the sys stage above:
+# unversioned apt packages on a moving base image.
+RUN /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        sudo \
+        ca-certificates \
+        git \
+        vim \
+        tmux \
+        terminator \
+        curl \
+        wget \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    dpkg-query -W > /usr/local/share/base/packages.txt
+
+############################## devel ##############################
+FROM devel-base AS devel
+
+ARG USER="${USER_NAME}"
+ARG GROUP="${USER_GROUP}"
+ARG ENTRYPOINT_FILE="script/entrypoint.sh"
+ARG CONFIG_DIR="/tmp/config"
+# Layered config/ override (template#254): two sequential COPYs into
+# /tmp/config/. The first brings .base/dist/config/ defaults; the
+# second overlays <repo>/config/ on top. File-level merge -- files in
+# <repo>/config/ replace same-path files in /tmp/config/; files only
+# in .base/dist/config/ stay; files only in <repo>/config/ are added.
+# Mental model is the same as setup.toml section-replace, just at
+# file granularity. <repo>/config/ becomes opt-in (init.sh seeds an
+# empty .gitkeep for new repos, not the full tree); existing repos
+# with a full <repo>/config/ snapshot from earlier seed continue to
+# work (their copy overrides every template default, identical to
+# pre-v0.22.0 behaviour). Trim <repo>/config/ files that match
+# template default to start receiving template-side improvements.
+ARG CONFIG_SRC="config"
+
+# Add your application-specific packages here. Keep the trailing
+# dpkg-query: it rewrites the reproducibility manifest so YOUR packages
+# and their versions are recorded too (see the BASE_IMAGE note at the top).
+# RUN /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+#         your-package \
+#         && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     dpkg-query -W > /usr/local/share/base/packages.txt
+
+# The repo's BRINGUP -- not the container ENTRYPOINT. base's orchestrator
+# (below) is, and it SOURCES this file, so it holds only the repo's own
+# bringup: env for the workload, an overlay to source, a directory to
+# create. No `exec`, and none of base's plumbing; the file's own header
+# says so. Everything base needs is already wired by the orchestrator, so
+# a repo opting into [logging] local_path or [lifecycle] watchdog_check
+# adds nothing here.
+COPY --chmod=0755 "./${ENTRYPOINT_FILE}" "/entrypoint.sh"
+# base's container-side runtime helpers AND the orchestrator that sources
+# them, in one directory:
+#
+#   entrypoint.sh   the container ENTRYPOINT (see the bottom of this stage)
+#   logging.sh      host-side log tee            ([logging] local_path)
+#   watchdog.sh     single-service watchdog      ([lifecycle] watchdog_check)
+#   logrotate.sh    shared rotate/prune primitives
+#
+# Each feature is a no-op until its knob is set, so the whole set is safe
+# to carry unconditionally -- a repo that has opted into neither is
+# unaffected. The in-image path (vs the bind-mounted .base) avoids two
+# failure modes: build-time smoke crashes when $USER is unset, and
+# multi-repo workspaces where WS_PATH is the workspace parent rather than
+# the repo root.
+#
+# The DIRECTORY, not a file list. The files depend on each other (logging
+# and watchdog both source logrotate.sh from this same in-image dir, and
+# the orchestrator sources both), and a hand-written list is one more
+# thing that can fall out of agreement with what base ships -- which it
+# did twice, each time costing every consumer repo a Dockerfile edit. The
+# directory holds only files that belong here, and base asserts that from
+# the directory itself rather than from a list of names. It is also what
+# makes the orchestrator arrive on a subtree pull with no Dockerfile edit
+# at all.
+COPY --chmod=0755 .base/dist/script/docker/runtime/ /usr/local/lib/base/
+# Layer 1: .base/dist/config/ defaults (subtree-managed, updates with
+# .base/dist/script/base/upgrade.sh).
+COPY --chown="${USER}":"${GROUP}" --chmod=0755 .base/dist/config "${CONFIG_DIR}"
+# Layer 2: <repo>/config/ overrides (per-repo, survives subtree
+# pull). Files here overlay matching paths from layer 1.
+COPY --chown="${USER}":"${GROUP}" --chmod=0755 "${CONFIG_SRC}" "${CONFIG_DIR}"
+
+USER "${USER}"
+
+# WORKDIR is a Docker directive: it interpolates build-time ARG / ENV
+# only, not shell-time $HOME. Without this explicit ENV, the
+# `WORKDIR "${HOME}/work"` below silently collapses to /work (BuildKit
+# emits `WARN: UndefinedVar`) and `docker inspect` reports the wrong
+# WorkingDir.
+ENV HOME="/home/${USER_NAME}"
+
+# Setup shell, terminator, tmux. The bashrc append picks up the
+# bashrc.d bootstrap loop (template#254) which sources any *.sh
+# drop-ins under ~/.bashrc.d/ at interactive shell start.
+RUN cat "${CONFIG_DIR}"/shell/bashrc >> "${HOME}/.bashrc" && \
+    chown "${USER}":"${GROUP}" "${HOME}/.bashrc" && \
+    mkdir -p "${HOME}/.bashrc.d" && \
+    cp -n "${CONFIG_DIR}"/shell/bashrc.d/*.sh "${HOME}/.bashrc.d/" 2>/dev/null || true && \
+    chown -R "${USER}":"${GROUP}" "${HOME}/.bashrc.d" && \
+    "${CONFIG_DIR}"/shell/terminator/setup.sh && \
+    "${CONFIG_DIR}"/shell/tmux/setup.sh && \
+    sudo rm -rf "${CONFIG_DIR}"
+
+# CONVENTION: bake self-built artifacts at an ABSOLUTE /opt/... path,
+# never under $HOME.
+#
+# The `ENV HOME=` line above resolves at BUILD time, so anything this
+# image bakes under $HOME is coupled to the build-time USER_NAME. `just
+# build` injects the local host's user; CI / release bakes `user` (UID
+# 1000). Run a prebuilt / GHCR / `docker save`+`load` image under a
+# different USER_NAME -- or just rebuild with one -- and every $HOME path
+# points at a different, EMPTY home tree: the baked workspace is invisible
+# and the entrypoint's `source` fails. Content at an absolute /opt path is
+# immune, because there is no $HOME indirection to resolve.
+#
+# Three rules:
+#
+# 1. Install self-built artifacts (colcon workspaces, SDKs, compiled
+#    tools) at absolute /opt/<name>. Reserve $HOME for dotfiles and
+#    convenience symlinks.
+# 2. Have the entrypoint / bashrc source the ABSOLUTE path, never `~` or
+#    $HOME. A `~/<name> -> /opt/<name>` convenience symlink created in the
+#    per-user RUN block is fine for interactive discoverability -- it is
+#    the only user-coupled bit and is cheap to recreate -- but nothing may
+#    SOURCE it.
+# 3. Never spell a concrete username into a path. Use ${HOME} /
+#    ${USER_NAME} where a home path is genuinely needed. A shipped
+#    Dockerfile / entrypoint carrying a literal one fails base's
+#    `home-literal` lint, which base runs over this template in its own CI
+#    (a consumer repo has no recipe that runs it).
+#
+# Rule 3 is mechanical and gated; rules 1-2 are a judgement call the lint
+# cannot make for you. Rationale: ADR-00000024.
+#
+# Example (uncomment and adapt):
+#RUN mkdir -p /opt/some_ws && \
+#    <build into /opt/some_ws> && \
+#    sudo chown -R "${USER}":"${GROUP}" /opt/some_ws
+#RUN ln -snf /opt/some_ws "${HOME}/some_ws"
+# then in script/entrypoint.sh:
+#   . /opt/some_ws/install/setup.bash --
+
+# CONVENTION: architecture comes from TARGETARCH, never from a literal.
+#
+# buildx builds THIS ONE file once per `--platform`, and injects TARGETARCH
+# into any stage that declares `ARG TARGETARCH`. A stage that instead writes
+# the architecture into a string builds the SAME artifact for every platform:
+# the wrong binary lands inside every other platform's image variant and says
+# nothing until someone runs it (`Exec format error`). Separate
+# per-architecture Dockerfiles were considered and rejected -- they trade
+# "one place forgotten" for "two files 90% identical, silently drifting".
+#
+# Two rules:
+#
+# 1. Declare `ARG TARGETARCH` in the stage that needs it, with NO default
+#    value. A default SHADOWS BuildKit's auto-injection (moby/buildkit#3403),
+#    which pins every platform to that default -- the failure is invisible
+#    until the wrong-arch image is run. A stage that needs the value declares
+#    its own ARG: it is not inherited across `FROM`.
+# 2. Upstream release assets rarely spell the architecture the way Docker
+#    does, so map TARGETARCH onto the upstream spelling in one `case`, and
+#    let an unknown value FAIL loudly rather than guess.
+#
+# That mapping is the one place a bare architecture literal is legitimate, so
+# it opts out of base's `arch-literal` lint -- run over this template in
+# base's own CI, not by any consumer recipe -- which otherwise refuses one
+# anywhere in a shipped Dockerfile. The region markers sit OUTSIDE the
+# instruction, so a multi-line RUN needs no comments between its
+# continuations, and the reason after `--` is required -- an opt-out without
+# one is an off switch.
+#
+# Example (uncomment and adapt):
+# arch-literal-lint: allow-begin -- a worked example of rule 2 has to show both
+# spellings or it teaches nothing: TARGETARCH says amd64 / arm64, while
+# shellcheck publishes linux.x86_64 / linux.aarch64 and hadolint publishes
+# Linux-x86_64 / Linux-arm64.
+#ARG TARGETARCH
+#RUN case "${TARGETARCH}" in \
+#      amd64) tool_arch="x86_64"  ;; \
+#      arm64) tool_arch="aarch64" ;; \
+#      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+#    esac && \
+#    curl -fsSL "https://example.com/tool/v1.0.0/tool.linux.${tool_arch}.tar.gz" \
+#      | tar -xz -C /opt/tool
+# arch-literal-lint: allow-end
+#
+# A single line that genuinely needs a literal opts out on its own instead,
+# with the reason on the line:
+#   ARG SC_ARCH="x86_64"  # arch-literal-lint: allow -- <why>
+#
+# Rule 1 is mechanical and gated; deciding WHICH platforms a repo should build
+# is not, and this lint does not pretend to.
+
+# (Optional) Repo-local Dockerfile-internal build helpers. Put any
+# shell helpers that should run during `docker build` under
+# <repo>/script/docker/<name>.sh, then COPY them into a build-time
+# scratch location and RUN them. Cleanup keeps the final image lean.
+# Runtime helpers (entrypoint, ros bringup, ...) stay under
+# <repo>/script/ as before; the two classes are deliberately split.
+#
+# Example (uncomment and adapt):
+#COPY --chmod=0755 script/docker/build_helper.sh /tmp/build_helper.sh
+#RUN /tmp/build_helper.sh && rm /tmp/build_helper.sh
+
+WORKDIR "${HOME}/work"
+
+EXPOSE 22
+
+# base's orchestrator, not the repo's file. It opens the host log tee,
+# SOURCES the repo bringup at /entrypoint.sh, arms the watchdog and execs
+# the CMD. Naming a /usr/local/lib/base/ path here is also the record: the
+# entry point is base's, visible in `docker inspect`, and it updates with
+# the subtree rather than being frozen in a copy this repo owns.
+ENTRYPOINT ["/usr/local/lib/base/entrypoint.sh"]
+CMD ["bash"]
+
+############################## devel-test ##############################
+# Resolves to test-tools:<base-version> (local build.sh) or ghcr.io/.../test-tools:vX.Y.Z (CI).
+# hadolint ignore=DL3006
+FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
+
+FROM devel AS devel-test
+
+# DL3066 ("non-numeric user-id may not be resolvable by host system", new
+# in hadolint 2.13) asks for a numeric uid so a host / orchestrator can
+# resolve the identity a container RUNS as. Neither half applies to this
+# line. `root` is the one name every image resolves by definition, and this
+# is a BUILD-time hop inside a discarded `-test` stage -- it exists so the
+# COPYs below can write into /usr/local/bin and /lint, and the stage drops
+# back to the unprivileged user before it runs anything. The identity this
+# image actually ships with is `USER "${USER}"` at the end of devel and of
+# devel-test, and DL3066 still guards both. Silenced HERE rather than in
+# dist/.hadolint.yaml on purpose: an entry in the config would switch the
+# rule off for every downstream repo's real runtime USER too, which is the
+# case it is worth having. The pragma sits directly above the instruction
+# because hadolint binds it to the NEXT line, not the next instruction.
+# hadolint ignore=DL3066
+USER root
+
+# Lint tools (from pre-built test-tools image; see TEST_TOOLS_IMAGE at top)
+COPY --from=test-tools-stage /usr/local/bin/shellcheck /usr/local/bin/shellcheck
+COPY --from=test-tools-stage /usr/local/bin/hadolint /usr/local/bin/hadolint
+
+# Lint: ShellCheck (.sh) + Hadolint (Dockerfile)
+COPY .hadolint.yaml /lint/.hadolint.yaml
+COPY Dockerfile /lint/Dockerfile
+# the seven user-facing wrappers live under <repo>/script/;
+# pull them in via that directory (BuildKit follows the ../.base/...
+# symlinks since the target sits inside the build context).
+COPY script/*.sh /lint/
+# Helpers sourced by the wrappers. Must sit next to them so
+# build.sh / run.sh / exec.sh / stop.sh / setup.sh can source _lib.sh
+# (which in turn sources i18n.sh); setup.sh also sources _tui_conf.sh.
+# removing these used to be compensated by inline
+# `_detect_lang` fallbacks in every script — now the canonical
+# definition lives once in i18n.sh.
+# all libs (including _lib.sh, i18n.sh, _tui_conf.sh) now live
+# under lib/. Single COPY preserves the directory structure.
+COPY .base/dist/script/docker/lib /lint/lib
+COPY .base/dist/script/docker/wrapper /lint/wrapper
+RUN shellcheck -S warning /lint/wrapper/*.sh /lint/lib/*.sh
+WORKDIR /lint
+RUN hadolint Dockerfile
+
+# Bats (from pre-built test-tools image; see TEST_TOOLS_IMAGE at top)
+COPY --from=test-tools-stage /opt/bats /opt/bats
+COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats
+RUN ln -sf /opt/bats/bin/bats /usr/local/bin/bats
+
+ENV BATS_LIB_PATH="/usr/lib/bats"
+
+# Smoke test (build-verification type). Per-stage selective COPY: only
+# the shared baseline + THIS stage's own specs, from both the template
+# (.base/dist/test/bats/smoke/) and the repo (test/bats/smoke/). No
+# whole-tree COPY, so the ephemeral -test image stays small and picks up
+# exactly the specs that apply to devel-test. Adding a stage = a folder
+# under smoke/<stage>/ + an analogous COPY block (see runtime-test).
+COPY .base/dist/test/bats/smoke/shared/     /smoke_test/
+COPY .base/dist/test/bats/smoke/devel-test/ /smoke_test/
+COPY test/bats/smoke/shared/                /smoke_test/
+COPY test/bats/smoke/devel-test/            /smoke_test/
+
+ARG USER
+USER "${USER}"
+
+RUN bats /smoke_test/
+
+############################## builder + runtime split (optional) ##############################
+# Three concrete stages for repos that need a separate runtime image
+# (compiled binaries / generated artifacts to ship without dev deps).
+# Lessons lifted from ycpss91255-lab/ros1_bridge#60 PR -- empirically
+# saved ~1.1 GB/arch on that repo's runtime image.
+#
+# Three rules, all of which the previous commented-out hint was silent on:
+#
+# 1. `runtime` MUST NOT be `FROM devel`. ros1_bridge had
+#    `FROM devel AS runtime` which forced devel to delete its source
+#    trees in the same RUN that built them (otherwise runtime carried
+#    the bloat). Result: devel was unusable for the standard
+#    "edit source, rebuild, retest" workflow. The fix is the
+#    conventional split: builder keeps source, devel inherits builder,
+#    runtime starts from a fresh base and only `COPY --from=builder`
+#    the install trees.
+#
+# 2. Runtime apt: install only the libs `ldd` proves are missing.
+#    Don't bulk-install builder deps "to be safe" -- that defeats the
+#    point. Identify the gap empirically:
+#      docker run --rm -it <builder-image> bash
+#      ldd /opt/<framework>/lib/*.so | grep "not found"
+#      dpkg -S <missing.so>     # map back to apt package name
+#    For ros1_bridge the gap was a small set:
+#    libboost-{chrono,filesystem,program_options,thread}, libpoco-foundation,
+#    libgpgme. Note the cross-distro suffix split: noble adds `t64`
+#    (time_t-64bit) on some packages, jammy does not -- handle with a
+#    `case "${BASE_IMAGE}"` or `case "${UBUNTU_CODENAME}"` branch.
+#
+# 3. `source FILE` in entrypoints needs a trailing `--`. Bash's
+#    `source FILE` (without explicit args) propagates the calling
+#    script's positional parameters to the sourced file. Frameworks
+#    that re-forward them (ROS 1's catkin/_setup_util.py is the
+#    canonical case) then see CMD's `--flag` as their own argparse
+#    input, print usage to stdout, and the wrapper sources that usage
+#    as shell -- container dies with `setup.sh.<rand>: line 1:
+#    usage:: command not found`, exit 127. Pass `--` explicitly:
+#      source /opt/<framework>/setup.bash --
+#    Document this in script/entrypoint.sh; add a smoke test that runs
+#    the runtime image with `--help` as CMD and asserts a sensible
+#    exit, not 127.
+#
+# To enable: uncomment the three blocks below and change `devel` above
+# from `FROM devel-base AS devel` to `FROM builder AS devel` so devel
+# inherits builder's build artifacts (without re-installing build
+# deps). That is the whole action -- main.yaml needs no edit. The CI
+# worker reads THIS file to decide whether to build the runtime pair,
+# so the stages you declare here are the ones it builds, and there is
+# no second declaration that can disagree with them. Uncomment both
+# runtime and runtime-test or neither: half a pair fails the build
+# with a message naming the missing stage.
+
+############################## builder (optional) ##############################
+# FROM devel-base AS builder
+#
+# ARG DEBIAN_FRONTEND=noninteractive
+# # ARG is not inherited across FROM: a builder that downloads a
+# # per-architecture toolchain declares its own `ARG TARGETARCH` (no default)
+# # and maps it, per the TARGETARCH convention in the devel stage above.
+#
+# # Build-time deps. KEEP source / build intermediates -- devel
+# # inherits this stage for the dev workflow, and runtime
+# # COPY --from=builder only the install trees (not the source).
+# RUN /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+#         build-essential \
+#         cmake \
+#         pkg-config \
+#         python3-dev \
+#         && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     dpkg-query -W > /usr/local/share/base/packages.txt
+#
+# # Fetch + build (example: a colcon workspace).
+# WORKDIR /build_ws
+# COPY src/ /build_ws/src/
+# RUN /usr/local/libexec/base/apt-retry.sh 4 15 -- rosdep install --from-paths ./src --ignore-src -y && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     dpkg-query -W > /usr/local/share/base/packages.txt
+# RUN colcon build --install-base /build_ws/install
+# # IMPORTANT: do NOT rm -rf source/build trees here. devel needs them
+# # for the rebuild workflow; runtime only pulls /build_ws/install via
+# # COPY --from=builder, so the source weight never lands in runtime.
+
+############################## runtime-base + runtime (optional) ##############################
+# FROM ${BASE_IMAGE} AS runtime-base
+#
+# ARG DEBIAN_FRONTEND=noninteractive
+# # runtime-base is a FRESH ${BASE_IMAGE}: it inherits nothing the sys
+# # stage wrote, so the reproducibility manifest and the OCI base labels
+# # have to be re-emitted here or the runtime image -- the one image of
+# # this graph that actually ships -- becomes the only one that cannot say
+# # what it was built from. Same bare re-declaration, same reason (the
+# # pre-FROM ARG is FROM-scope only). Note this block runs under /bin/sh,
+# # not the bash SHELL sys sets, so keep it POSIX -- which `${VAR##...}`
+# # is. Bare here, unlike sys: /bin/sh carries no `-u`.
+# ARG BASE_IMAGE
+# ARG BASE_IMAGE_DIGEST
+#
+# # The same fresh FROM drops `ARG TARGETARCH` too. A runtime stage that
+# # fetches a per-architecture artifact declares and maps it here again,
+# # per the TARGETARCH convention in the devel stage above.
+#
+# # Minimal runtime apt: sudo (entrypoint usually needs it), tini
+# # (PID 1 signal-handler), plus the ldd-identified shared libs that
+# # the install trees need. Keep this list short -- bloat here
+# # defeats the purpose of the builder/runtime split. A fresh
+# # ${BASE_IMAGE} lacks the apt retry helper and config sys copies in,
+# # base#1602.
+# COPY --chmod=0755 .base/dist/script/docker/build/apt-retry.sh /usr/local/libexec/base/apt-retry.sh
+# COPY .base/dist/script/docker/build/80-base-retries /etc/apt/apt.conf.d/80-base-retries
+# RUN /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+#         sudo \
+#         tini \
+#         # libboost-chrono1.74.0 \
+#         # libboost-filesystem1.74.0 \
+#         # libpoco-foundation70 \
+#         # libgpgme11 \
+#         && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     mkdir -p /usr/local/share/base && \
+#     _ref_digest=""; \
+#     case "${BASE_IMAGE}" in \
+#       *@sha256:*) _ref_digest="sha256:${BASE_IMAGE##*@sha256:}" ;; \
+#     esac; \
+#     { \
+#       echo "base_image_ref=${BASE_IMAGE}"; \
+#       if [ -n "${_ref_digest}" ]; then \
+#         echo "base_image_pin=digest"; \
+#       else \
+#         echo "base_image_pin=none"; \
+#       fi; \
+#       echo "base_image_digest=${BASE_IMAGE_DIGEST}"; \
+#       sed -n 's/^PRETTY_NAME=/base_os=/p' /etc/os-release; \
+#     } > /usr/local/share/base/base-image.env && \
+#     dpkg-query -W > /usr/local/share/base/packages.txt
+#
+# LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+#       org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}"
+#
+# FROM runtime-base AS runtime
+#
+# ARG USER="${USER_NAME}"
+# ARG GROUP="${USER_GROUP}"
+#
+# # Pull only the install artifacts out of builder. Source / build
+# # intermediates stay in builder (and devel, transitively); runtime
+# # carries only what the binary needs to execute.
+# COPY --from=builder /build_ws/install /opt/app/install
+#
+# COPY --chmod=0755 script/entrypoint.sh /entrypoint.sh
+# # base's runtime helpers AND the orchestrator. Runtime starts from a
+# # fresh BASE_IMAGE so the devel stage's COPY is NOT inherited: this
+# # one is required, not optional, because the ENTRYPOINT below is the
+# # orchestrator and it lives in this directory. It also carries the
+# # [logging] local_path tee and the [lifecycle] watchdog into the
+# # runtime image, both still no-ops until their knob is set.
+# COPY --chmod=0755 .base/dist/script/docker/runtime/ /usr/local/lib/base/
+#
+# # (Optional) Interactive-shell env source for `docker exec`.
+# #
+# # The repo env (e.g. ROS `ros2`) has to reach THREE kinds of process
+# # via THREE complementary mechanisms -- this is not a base bug, just
+# # how the runtime stage is minimal:
+# #   1. PID 1 / the app (`ros2 launch`, exec'd directly, non-interactive):
+# #      only the ENTRYPOINT can source it. A directly-exec'd
+# #      non-interactive process never reads bashrc, so the entrypoint is
+# #      necessary and cannot be replaced by bashrc.
+# #   2. Interactive shells (`just docker exec -t runtime bash`, i.e.
+# #      `docker exec -it`): bashrc / ~/.bashrc.d/. devel wires this up;
+# #      the minimal runtime does NOT -- this is the gap closes.
+# #   3. Non-interactive ad-hoc exec (`docker exec ... ros2 ...`):
+# #      neither the entrypoint (exec bypasses it) nor bashrc
+# #      (non-interactive) applies. This case inherently needs an
+# #      explicit `source` or a `bash -ic` wrapper; do NOT bake env into
+# #      Dockerfile `ENV` (arch- and python-version-dependent
+# #      LD_LIBRARY_PATH / PYTHONPATH -- fragile; sourcing is canonical,
+# #      as upstream `ros:` images do).
+# #
+# # To give interactive `docker exec` shells the env WITHOUT dragging the
+# # full config/ COPY + bashrc.d machinery into the minimal runtime, drop
+# # one source line into the system-wide /etc/bash.bashrc (read by every
+# # interactive bash). base is ROS-agnostic, so the consumer supplies the
+# # ROS-specific line, e.g.:
+# #   RUN echo 'source /opt/ros/$ROS_DISTRO/setup.bash' >> /etc/bash.bashrc
+# # Heavier alternative: replicate devel's ~/.bashrc + ~/.bashrc.d/ wiring
+# # (COPY config/ + the bashrc append loop from the devel stage) so the
+# # SAME per-repo drop-ins (config/shell/bashrc.d/*.sh) apply in runtime
+# # too. Prefer the single-line /etc/bash.bashrc form to keep runtime
+# # minimal. Either way, this is interactive-only: PID 1 and
+# # non-interactive exec are unchanged.
+# USER "${USER}"
+# # WORKDIR interpolates only build-time ARG / ENV (not shell $HOME);
+# # for why the explicit ENV is required.
+# ENV HOME="/home/${USER_NAME}"
+# WORKDIR "${HOME}/work"
+# ENTRYPOINT ["/usr/local/lib/base/entrypoint.sh"]
+# CMD ["bash"]
+
+############################## runtime-test (optional) ##############################
+# Install-check + bats smoke for the runtime image. Mirrors `FROM devel
+# AS devel-test` -- the generalized `-test` rule: stay
+# `FROM runtime` (the REAL minimal runtime under test) and `COPY
+# --from=test-tools-stage` the shared toolchain in. Ephemeral,
+# build-only, never pushed. CI builds this target after `target:
+# runtime`; build failure surfaces a smoke failure visibly in the GHA
+# log.
+#
+# Two smoke styles, both supported (use either or both):
+#   (a) ldd-based install-check via RUNTIME_SMOKE_CMD -- the bare,
+#       dependency-free default; proves the real runtime resolves every
+#       shared library its binaries need (the ros1_bridge#123
+#       false-green trap in the header).
+#   (b) Bats smoke against the real runtime -- COPY Bats in from
+#       test-tools-stage (exactly as devel-test does) and run a
+#       runtime-specific .bats suite. Lets the runtime image assert real
+#       behaviour (entrypoint, installed CLIs, library resolution) with
+#       the same harness devel-test uses, while still running INSIDE the
+#       genuine minimal runtime.
+#
+# Flavour-specific runtime test tooling (e.g. ROS colcon test / ament_*
+# / launch_testing) is the consumer's own job: `apt-get install` it in
+# THIS stage on top of the COPYed common toolchain. base ships only the
+# common toolchain, not a ROS-flavoured test image (scope).
+#
+# NOTE (build-worker prerequisite,): the moment runtime-test does
+# `COPY --from=test-tools-stage`, the test-tools image enters
+# runtime-test's build graph, so its build must receive the pinned
+# `TEST_TOOLS_IMAGE` build-arg too (not just devel-test). build-worker's
+# "Build runtime-test stage" step forwards it; a local `just docker build`
+# forwards its version-scoped `test-tools:<base-version>` tag.
+#
+# Default smoke command is generic install-check (USER set + bash on
+# PATH). Override per repo via `build_args: RUNTIME_SMOKE_CMD=<command>`
+# to test domain binaries.
+#
+# Constraint: command must be CLI-only -- no GUI tools that init
+# QApplication / OGRE on `--version` / `--help` (rqt, rviz2,
+# gazebo-classic). Prefer `<binary> --help`, `command -v <binary>`,
+# package manager queries (`ros2 pkg list | grep ...`, `rospack
+# find ...`) over invoking the GUI binary itself.
+#
+# `bash -c` wrapper required: `RUN ${ARG}` does word-splitting on the
+# substituted value and treats shell operators (&&, ||, etc.) as
+# literal arguments to the first word. Wrapping with
+# `bash -c "${RUNTIME_SMOKE_CMD}"` passes the value as a single string
+# for bash to parse, preserving operators, nested quotes, AND bash-only
+# constructs commonly used in install-checks: `source <bash-script>`
+# (and `. <bash-script>` against bash-syntax files like
+# `/opt/ros/$DISTRO/setup.bash`), `${var:-default}` style parameter
+# expansion, etc. An earlier `sh -c` wrapper (v0.21.1 through v0.23.0)
+# broke any override that sourced bash-syntax files because /bin/sh on
+# Debian/Ubuntu is dash, which has neither `source` nor bash parameter
+# expansion. bash is present in every Ubuntu/Debian-based runtime image
+# the template targets, so the bash dependency is safe.
+#
+# Only enable when the runtime stage above is also enabled.
+# build-worker.yaml resolves its runtime gate FROM this file, so the
+# two cannot disagree: leave both runtime and runtime-test commented
+# out and the worker skips both build steps on its own, with no
+# main.yaml edit. Declaring exactly one of the pair is drift and fails
+# the resolve step naming the missing stage.
+#
+# FROM runtime AS runtime-test
+#
+# # Style (a) -- ldd-based install-check (default, no toolchain needed).
+# #default smoke check includes an ldd-based missing-dep scan
+# # via the shipped smoke.sh (catches missing .so installs that the old
+# # 'whoami && bash --version' default silently passed -- e.g.
+# # libboost_regex.so absent in ros1_bridge#123).
+# COPY .base/dist/test/bats/smoke/smoke.sh /usr/local/lib/base/smoke.sh
+# ARG RUNTIME_SMOKE_CMD='whoami && bash --version && bash /usr/local/lib/base/smoke.sh'
+# # Inherit USER from runtime (non-root). install-check doesn't need
+# # privilege; if downstream override needs root, prefix with sudo.
+# RUN bash -c "${RUNTIME_SMOKE_CMD}"
+#
+# # Style (b) -- Bats smoke against the real runtime (opt-in). Same
+# # generalized pattern as devel-test: COPY Bats in from the pre-built
+# # test-tools image (NO re-download / re-install -- the cached
+# # multi-arch image devel-test already uses), then run a
+# # runtime-specific suite INSIDE the genuine minimal runtime. Requires
+# # the TEST_TOOLS_IMAGE build-arg to reach this stage's build (see the
+# # build-worker prerequisite note above).
+# #
+# # Stay non-root (inherit from runtime, so hadolint DL3002 is happy and
+# # the smoke runs as the real user). `COPY --from` already runs as root
+# # regardless of the current USER; the few writes into system paths use
+# # the runtime image's passwordless sudo rather than a `USER root`
+# # switch (which would have to be undone before the final RUN).
+# COPY --from=test-tools-stage /opt/bats /opt/bats
+# COPY --from=test-tools-stage /usr/lib/bats /usr/lib/bats
+# RUN sudo ln -sf /opt/bats/bin/bats /usr/local/bin/bats
+# ENV BATS_LIB_PATH="/usr/lib/bats"
+# # Runtime-specific bats suite (e.g. assert installed CLIs resolve,
+# # entrypoint exits 0 on --help, ldd clean). Keep it CLI-only -- no GUI
+# # binaries that init QApplication / OGRE. Same per-stage selective COPY
+# # as devel-test: only shared/ + this stage's runtime-test/, from both
+# # the template and the repo.
+# COPY .base/dist/test/bats/smoke/shared/       /smoke_test/
+# COPY .base/dist/test/bats/smoke/runtime-test/ /smoke_test/
+# COPY test/bats/smoke/shared/                  /smoke_test/
+# COPY test/bats/smoke/runtime-test/            /smoke_test/
+# # Flavour-specific runtime test deps are the consumer's job -- install
+# # them HERE on top of the common toolchain, e.g. for ROS:
+# #   RUN sudo /usr/local/libexec/base/apt-retry.sh 4 15 -- apt-get install -y --no-install-recommends \
+# #           python3-colcon-common-extensions \
+# #           && \
+# #       sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*
+# RUN bats /smoke_test/

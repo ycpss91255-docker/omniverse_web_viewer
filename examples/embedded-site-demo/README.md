@@ -47,7 +47,7 @@ The entrypoint substitutes `__OWV_SERVER__` / `__OWV_PORT__` /
 `__OWV_MEDIA_PORT__` from `SIGNALING_SERVER` / `SIGNALING_PORT` / `MEDIA_PORT`
 (env) or `/etc/host.yaml` (`network.public_ip`) into the built bundle on every
 boot. `just run` reads those from the generated `.env` -- set them in
-`setup.conf` `[environment]` and re-run `./script/setup.sh apply`.
+`setup.toml` `[environment]` and re-run `./script/setup.sh apply`.
 
 To point the container somewhere for a single run without touching either,
 start it directly instead (`just run` does not forward `-e` in detached mode):

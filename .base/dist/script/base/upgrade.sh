@@ -1,0 +1,1282 @@
+#!/usr/bin/env bash
+# upgrade.sh - Upgrade template subtree to the latest version
+#
+# Run from the repo root:
+#   ./.base/dist/script/base/upgrade.sh              # latest tag
+#   ./.base/dist/script/base/upgrade.sh v0.3.0       # specific version
+#   ./.base/dist/script/base/upgrade.sh --check      # check only
+#
+# Steady-state users call `just base upgrade [vX.Y.Z]`; the raw path above
+# is only for environments without `just`.
+#
+# Exit codes (base#1370):
+#   --check       0 up to date, or local is ahead of the latest tag
+#                 1 an update is available
+#                 2 the check itself failed -- any fatal error, e.g. the
+#                   remote could not be fetched, a sourced helper is
+#                   missing, WRAPPER_TRANSCRIPT was refused; a code above 2
+#                   from a failing command passes through unchanged.
+#                   `just base update` exits with this code
+#   normal run    0 upgraded (or nothing to do); non-zero on failure
+
+set -euo pipefail
+
+# --check exit status (base#1370). --check reserves 1 for "update
+# available", which _check records in _UPGRADE_UPDATE_AVAILABLE just before
+# it returns 1. Every other exit 1 of a --check run -- _error, a sourced
+# helper that is missing, the transcript setup refusing WRAPPER_TRANSCRIPT,
+# a command stopping the script under set -e -- is the check failing, and
+# leaves as 2 so a caller that tolerates 1 (the `just base update` recipe)
+# still sees it. Codes above 1 pass through. A normal run is not remapped.
+# The remap is installed before anything else can fail: as a plain EXIT
+# trap here, then as an _atexit callback once transcript.sh (which owns
+# the EXIT trap from then on) is loaded.
+_UPGRADE_CHECK_MODE=""
+for _upgrade_arg in "$@"; do
+  [[ "${_upgrade_arg}" == "--check" ]] && _UPGRADE_CHECK_MODE=1
+done
+unset _upgrade_arg
+readonly _UPGRADE_CHECK_MODE
+_UPGRADE_UPDATE_AVAILABLE=""
+
+# _upgrade_check_status <rc>
+#   Print the status a --check run leaves with when it is exiting with <rc>.
+_upgrade_check_status() {
+  if [[ "$1" == 1 && -z "${_UPGRADE_UPDATE_AVAILABLE}" ]]; then
+    printf '2'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# _upgrade_check_exit_early
+#   EXIT trap until transcript.sh takes the trap over (see above).
+_upgrade_check_exit_early() {
+  local _rc=$?
+  exit "$(_upgrade_check_status "${_rc}")"
+}
+
+# _upgrade_check_exit_atexit
+#   The same remap as an _atexit callback, which reads the exiting status
+#   from _ATEXIT_STATUS and may only change it via _atexit_set_exit_code.
+_upgrade_check_exit_atexit() {
+  local _rc
+  _rc="$(_upgrade_check_status "${_ATEXIT_STATUS}")"
+  if [[ "${_rc}" != "${_ATEXIT_STATUS}" ]]; then
+    _atexit_set_exit_code "${_rc}"
+  fi
+}
+
+if [[ -n "${_UPGRADE_CHECK_MODE}" ]]; then
+  trap '_upgrade_check_exit_early' EXIT
+fi
+
+# upgrade.sh lives deep in the subtree (.base/dist/script/base/upgrade.sh,
+# relocated in  ADR-00000011 §8 / ADR-00000006). Walk up from the
+# script's own directory to the subtree root -- the directory carrying the
+# subtree markers `.version` + `dist/` -- so SUBTREE_ROOT is the
+# subtree root regardless of how deep the script is nested. The subtree
+# prefix is its basename, used DIRECTLY as the subtree-pull --prefix= flag
+# and every filesystem reference, so a downstream rename still works
+# without code changes.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+readonly SCRIPT_DIR
+SUBTREE_ROOT="${SCRIPT_DIR}"
+while [[ "${SUBTREE_ROOT}" != "/" ]]; do
+  [[ -f "${SUBTREE_ROOT}/.version" && -d "${SUBTREE_ROOT}/dist" ]] && break
+  SUBTREE_ROOT="$(cd -- "${SUBTREE_ROOT}/.." && pwd -P)"
+done
+# This failure comes before _lib.sh is sourced, so it reaches for log.sh
+# beside the script (dist/script/docker/lib/) to log the registered event.
+# A lone copy has no log.sh either; it then writes a minimal fallback record
+# by hand -- JSON unless LOG_FORMAT=text or stderr is a terminal -- so a
+# LOG_FORMAT=json reader still gets one it can parse (base#1382). That
+# record carries timestamp, severity, body, service.name, service.lang and
+# display only: no code.filepath, code.lineno, thread.id or trace context,
+# and the text form has no color and ignores log.sh's cached TTY state.
+[[ -f "${SUBTREE_ROOT}/.version" ]] || {
+  _upgrade_no_root_msg="upgrade.sh: cannot locate subtree root above ${SCRIPT_DIR}"
+  if [[ -f "${SCRIPT_DIR}/../docker/lib/log.sh" ]]; then
+    # shellcheck source=dist/script/docker/lib/log.sh
+    source "${SCRIPT_DIR}/../docker/lib/log.sh"
+    _log_err upgrade upgrade_subtree_root_not_found \
+      "display=${_upgrade_no_root_msg}"
+  else
+    # Mirrors log.sh's LOG_FORMAT dispatch (text, json, auto = text on a TTY).
+    _upgrade_no_root_fmt="${LOG_FORMAT:-auto}"
+    _upgrade_no_root_ts="$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')"
+    if [[ "${_upgrade_no_root_fmt}" == "text" ]] \
+       || { [[ "${_upgrade_no_root_fmt}" != "json" ]] && [[ -t 2 ]]; }; then
+      printf '%s [upgrade] ERROR: %s\n' \
+        "${_upgrade_no_root_ts}" "${_upgrade_no_root_msg}" >&2
+    else
+      _upgrade_no_root_msg="${_upgrade_no_root_msg//\\/\\\\}"
+      _upgrade_no_root_msg="${_upgrade_no_root_msg//\"/\\\"}"
+      _upgrade_no_root_msg="${_upgrade_no_root_msg//$'\n'/\\n}"
+      _upgrade_no_root_msg="${_upgrade_no_root_msg//$'\t'/\\t}"
+      _upgrade_no_root_msg="${_upgrade_no_root_msg//$'\r'/\\r}"
+      printf '{"timestamp":"%s","severity_text":"ERROR","severity_number":17,"body":"upgrade_subtree_root_not_found","attributes":{"service.name":"upgrade","service.lang":"bash","display":"%s"}}\n' \
+        "${_upgrade_no_root_ts}" "${_upgrade_no_root_msg}" >&2
+    fi
+  fi
+  exit 1
+}
+readonly SUBTREE_ROOT
+REPO_ROOT="$(cd -- "${SUBTREE_ROOT}/.." && pwd -P)"
+readonly REPO_ROOT
+TEMPLATE_REL="$(basename "${SUBTREE_ROOT}")"
+readonly TEMPLATE_REL
+# Where .base/ is pulled from. The default is the one shared upstream
+# constant (upstream.sh), not a literal repeated per script. Export
+# TEMPLATE_REMOTE=git@github.com:... to opt into SSH (needed for private
+# forks, or when the user prefers agent-based auth) -- see README
+# "Pointing .base at a different upstream". Everything this URL delivers
+# is executed in the consumer's tree, so it is worth knowing which one it
+# is.
+# shellcheck source=dist/script/base/upstream.sh
+source "${SCRIPT_DIR}/upstream.sh"
+TEMPLATE_REMOTE="${TEMPLATE_REMOTE:-${BASE_UPSTREAM_REMOTE}}"
+readonly TEMPLATE_REMOTE
+VERSION_FILE="${REPO_ROOT}/${TEMPLATE_REL}/.version"
+readonly VERSION_FILE
+
+# upgrade.sh sources _lib.sh directly (not via _bootstrap), so set
+# the verb here for transcript.sh's classification before the source.
+export _WRAPPER_VERB=upgrade
+# shellcheck disable=SC1091
+source "${SUBTREE_ROOT}/dist/script/docker/lib/_lib.sh"
+# _lib.sh does NOT pull in template_guard.sh, so source it explicitly
+# (mirroring init.sh) for the self-run guard _assert_not_template_source.
+# shellcheck disable=SC1091
+source "${SUBTREE_ROOT}/dist/script/docker/lib/template_guard.sh"
+
+# Hand the --check exit remap to transcript.sh's EXIT trap (base#1370).
+# _atexit installs that trap now, replacing the early one above, so the
+# remap also covers the transcript setup refusing WRAPPER_TRANSCRIPT.
+if [[ -n "${_UPGRADE_CHECK_MODE}" ]]; then
+  _atexit _upgrade_check_exit_atexit
+fi
+
+cd "${REPO_ROOT}"
+
+# _log <event> <message...>
+#   INFO line under the upgrade service; <event> is the registered body
+#   (log-events.txt) naming what the line reports (base#1364).
+_log() { local _ev="$1"; shift; _log_info upgrade "${_ev}" "display=$*"; }
+# _error <event> <message...>
+#   Fatal: ERROR line under the upgrade service, then exit 1. <event> is
+#   the registered body naming what failed; only a path that has already
+#   restored the repo passes upgrade_rollback (base#1369).
+_error() { local _ev="$1"; shift; _log_err upgrade "${_ev}" "display=$*"; exit 1; }
+
+# Rollback state. Both are set just before the subtree pull and cleared
+# once the upgrade is past everything that can fail; a non-empty
+# _UPGRADE_PRE_HEAD is what tells the exit rollback there is a pull to undo.
+# Deliberately NOT readonly -- clearing them is how the rollback is disarmed.
+_UPGRADE_PRE_HEAD=""
+_UPGRADE_UNTRACKED_SNAPSHOT=()
+
+# Vendored-drift findings, collected the moment the pull has landed and
+# reported after the upgrade has finished. Each entry is "<status>\t<path>".
+# Declared here so `set -u` tolerates the empty case, which is the normal
+# one.
+_UPGRADE_DRIFT=()
+_UPGRADE_DRIFT_SPLIT=""
+# Why the comparison could not be made, when it could not. Empty means it ran.
+# A check that cannot run reports the same zero findings as a clean tree, so
+# the absence is never left to read as agreement.
+_UPGRADE_DRIFT_UNVERIFIED=""
+
+# The base worker refs Step 4 could not bring to the target, as
+# `<line>: <ref>`; reported with the advisory findings.
+_UPGRADE_LEFT_REFS=()
+
+# ── Safety guards ────────────────────────────────────────────────────────────
+#
+# git-subtree pull is known to misbehave on some versions (reports of
+# destructive fast-forward have been seen on Jetson L4T shipping older
+# git-subtree.sh). These helpers keep `upgrade.sh` safe regardless: fail
+# fast if the repo is not in a state where subtree pull can succeed
+# cleanly, and roll back if the pull ran but left `.base/` in a shape
+# that doesn't match a subtree (e.g. markers missing, working tree
+# contains template-repo root files at <repo>/ root).
+
+# _require_git_identity
+#   git-subtree internally calls `git commit-tree`, which needs
+#   user.name + user.email. Missing identity on Jetson was observed to
+#   leave git in a partial state that the next run then fast-forwarded
+#   destructively. Fail fast with an actionable message instead.
+_require_git_identity() {
+  local _name _email
+  _name="$(git config user.name 2>/dev/null || true)"
+  _email="$(git config user.email 2>/dev/null || true)"
+  if [[ -z "${_name}" || -z "${_email}" ]]; then
+    _error upgrade_git_identity_missing "git identity not configured. Set it before upgrading:
+  git config --global user.name \"Your Name\"
+  git config --global user.email \"you@example.com\""
+  fi
+}
+
+# _require_clean_merge_state
+#   Refuse to start if a merge / rebase / cherry-pick / revert is in
+#   progress; our subtree merge would be conflated with the user's
+#   in-flight operation. Also the first git call that needs a repository,
+#   so a tree with no .git is refused here by name rather than dying
+#   under set -e with only git's stderr (base#1369). A repo with no
+#   commits yet (unborn HEAD) is refused here too, before the later
+#   `git rev-parse HEAD` dies the same way (base#1385).
+_require_clean_merge_state() {
+  local _git_dir _state
+  if ! _git_dir="$(git rev-parse --git-dir 2>/dev/null)"; then
+    _error upgrade_not_a_git_repo "$(pwd -P) is not inside a git repository; run the upgrade from the root of the repo's git checkout."
+  fi
+  if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+    _error upgrade_no_commits "$(pwd -P) is in a git repository with no commits yet; commit the repo once before upgrading."
+  fi
+  for _state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "${_git_dir}/${_state}" ]]; then
+      _error upgrade_git_operation_in_progress "${_state} present in ${_git_dir} — resolve or abort it before upgrading."
+    fi
+  done
+}
+
+# _verify_subtree_intact <pre_head_sha>
+#   Post-pull sanity check: `${TEMPLATE_REL}/` must still contain the
+#   subtree markers. A known failure mode (older git-subtree) is to
+#   fast-forward the synthetic squash commit, replacing <repo> root with
+#   the upstream tree (moves `${TEMPLATE_REL}/*` to `<repo>/*` and
+#   deletes repo-specific files). Detect that by checking subtree
+#   markers, and hard-reset back to <pre_head_sha> if integrity is lost.
+_verify_subtree_intact() {
+  local _pre_head="$1"
+  local _target_ver="${2:-}"
+
+  # R1+ structural invariant: instead of asserting specific
+  # files exist at hard-coded paths (which broke on the v0.39.0
+  # `script/docker/setup.sh` -> `wrapper/setup.sh` reorg), check that
+  # the subtree directory exists, is non-empty, and carries a
+  # well-formed `.version`. Then verify the pulled version matches
+  # the target the caller asked for (catches wrong-tag / wrong-remote
+  # cases that pass the structural check but deliver the wrong thing).
+  # Sibling path-coupling regions in upgrade.sh are intentionally not
+  # covered here -- tracked in
+  if [[ ! -d "${TEMPLATE_REL}" ]]; then
+    _log_err upgrade upgrade_subtree_pull_failed "display=post-pull integrity check failed -- '${TEMPLATE_REL}/' subtree dir missing." "marker=${TEMPLATE_REL}"
+    _rollback_subtree_pull "${_pre_head}"
+  fi
+  if [[ -z "$(ls -A "${TEMPLATE_REL}" 2>/dev/null)" ]]; then
+    _log_err upgrade upgrade_subtree_pull_failed "display=post-pull integrity check failed -- '${TEMPLATE_REL}/' subtree dir is empty." "marker=${TEMPLATE_REL}"
+    _rollback_subtree_pull "${_pre_head}"
+  fi
+  if [[ ! -f "${TEMPLATE_REL}/.version" ]]; then
+    _log_err upgrade upgrade_subtree_pull_failed "display=post-pull integrity check failed -- '${TEMPLATE_REL}/.version' missing." "marker=${TEMPLATE_REL}/.version"
+    _rollback_subtree_pull "${_pre_head}"
+  fi
+
+  local _pulled_ver
+  _pulled_ver="$(tr -d '[:space:]' < "${TEMPLATE_REL}/.version")"
+  if [[ ! "${_pulled_ver}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+    _log_err upgrade upgrade_subtree_pull_failed "display=post-pull integrity check failed -- '${TEMPLATE_REL}/.version' content is not semver: '${_pulled_ver}'." "pulled=${_pulled_ver}"
+    _rollback_subtree_pull "${_pre_head}"
+  fi
+
+  if [[ -n "${_target_ver}" ]] && [[ "${_pulled_ver#v}" != "${_target_ver#v}" ]]; then
+    _log_err upgrade upgrade_version_mismatch "display=pulled ${_pulled_ver}, expected ${_target_ver}" "pulled=${_pulled_ver}" "expected=${_target_ver}"
+    _rollback_subtree_pull "${_pre_head}"
+  fi
+}
+
+_rollback_subtree_pull() {
+  local _pre_head="$1"
+  # upgrade_rollback_started, not upgrade_rollback: the restore has not
+  # run yet, and may fail (base#1369).
+  _log_err upgrade upgrade_rollback_started "display=Likely cause: git-subtree fast-forwarded destructively or pulled wrong tag."
+  _restore_pre_upgrade_state "${_pre_head}" || exit 1
+  _error upgrade_rollback "upgrade aborted; repo restored to pre-upgrade state"
+}
+
+# _restore_pre_upgrade_state <pre_head_sha>
+#   Put the repo back the way the upgrade found it: hard-reset to the
+#   pre-upgrade commit, then remove the files the aborted run created.
+#
+#   The sweep is not optional. `git reset --hard` restores TRACKED content
+#   and says nothing about anything new, so without it a rollback leaves
+#   the aborted upgrade's fresh symlinks and seeded files sitting in the
+#   tree -- "restored" that is not restored. Only paths that were not
+#   already untracked before the upgrade are removed, so a file the user
+#   had lying around is never collateral.
+#
+#   Disarms the exit rollback on the way in by clearing _UPGRADE_PRE_HEAD:
+#   this IS the rollback, and the caller's subsequent _error must not
+#   re-enter it. It never touches the EXIT trap itself -- that trap is
+#   transcript.sh's, and clearing it skips the transcript finalize
+#   (base#1371).
+#
+#   Returns 1 when the rescue reset fails or any upgrade-created file
+#   cannot be removed, logging upgrade_rollback_failed, and each caller turns
+#   that into a non-zero exit. Do NOT swallow it with `|| true`: this runs
+#   when the tree is already damaged, and the user must hear the truth --
+#   a still-broken tree -- rather than a reassuring 'restored' message they
+#   might push on top of. It returns rather than exits because the exit
+#   rollback runs it from inside an _atexit callback, where `exit` would
+#   skip the transcript finalize.
+_restore_pre_upgrade_state() {
+  local _pre_head="${1:?"${FUNCNAME[0]}: missing pre_head"}"
+  _UPGRADE_PRE_HEAD=""
+
+  _log_info upgrade upgrade_rollback_started "display=Rolling back to ${_pre_head:0:12} ..." "commit=${_pre_head:0:12}"
+  if ! git reset --hard "${_pre_head}" >/dev/null 2>&1; then
+    _log_err upgrade upgrade_rollback_failed "display=rollback FAILED -- could not reset to ${_pre_head:0:12}; manual recovery required (working tree is NOT restored)." "commit=${_pre_head:0:12}"
+    return 1
+  fi
+  if ! _remove_untracked_since_snapshot; then
+    _log_err upgrade upgrade_rollback_failed "display=rollback INCOMPLETE -- reset to ${_pre_head:0:12}, but some files the upgrade created could not be removed; run 'git status' and delete the untracked files it lists that you did not create (working tree is NOT fully restored)." "commit=${_pre_head:0:12}"
+    return 1
+  fi
+}
+
+# _remove_untracked_since_snapshot
+#   Delete every currently-untracked path that was not untracked before the
+#   upgrade started. Run AFTER the reset, so `--exclude-standard` reads the
+#   restored .gitignore rather than the one the aborted upgrade wrote.
+#
+#   Keeps sweeping past a removal that fails, so as much as possible is
+#   cleaned, and returns 1 if ANY removal failed: a later success must not
+#   hide an earlier failure, or the caller reports a restore that left
+#   files behind (base#1369).
+#
+#   A listing that cannot be taken fails the sweep: enumerating nothing,
+#   removing nothing and returning success would report a clean restore
+#   (base#1369).
+_remove_untracked_since_snapshot() {
+  local _path
+  local _failed=0
+  local -a _paths=()
+  if ! _list_untracked_paths _paths; then
+    return 1
+  fi
+  for _path in "${_paths[@]}"; do
+    if [[ -z "${_path}" ]]; then
+      continue
+    fi
+    if _was_untracked_before_upgrade "${_path}"; then
+      continue
+    fi
+    # `:?` rather than a bare expansion: an unset root would make this
+    # `rm -f /<path>`, and a sweep is not a place to guess.
+    if ! rm -f -- "${REPO_ROOT:?}/${_path}"; then
+      _failed=1
+    fi
+  done
+  return "${_failed}"
+}
+
+# _list_untracked_paths <array_name>
+#   Fill the named array with every untracked, non-ignored path, each
+#   exactly as it is on disk. Returns 1, leaving the array empty, when the
+#   listing cannot be taken. Both the pre-upgrade snapshot and the
+#   rollback sweep read through here, so the two always agree on a path's
+#   spelling.
+#
+#   NUL-delimited (`-z`): line-oriented output C-quotes any name holding a
+#   tab, a newline, a quote, a backslash or a non-ASCII byte, and that
+#   quoted form names no file on disk (base#1381). NUL bytes cannot pass
+#   through `$(...)`, so the listing goes to a temp file -- and not
+#   through a process substitution, whose exit status bash discards: a
+#   failed `git ls-files` would otherwise read as "nothing untracked"
+#   (base#1369, base#1384).
+_list_untracked_paths() {
+  local -n _list_untracked_out="${1:?"${FUNCNAME[0]}: missing array name"}"
+  local _listing_file
+  _list_untracked_out=()
+  if ! _listing_file="$(mktemp)"; then
+    return 1
+  fi
+  if ! git ls-files -z --others --exclude-standard > "${_listing_file}"; then
+    rm -f -- "${_listing_file}"
+    return 1
+  fi
+  mapfile -d '' -t _list_untracked_out < "${_listing_file}"
+  rm -f -- "${_listing_file}"
+}
+
+# _was_untracked_before_upgrade <path>
+#   Membership test against the pre-upgrade snapshot. In-shell rather than
+#   `grep -q` over a printf: a reader that stops at its first match strands
+#   the writer with SIGPIPE, and under `pipefail` that 141 becomes the
+#   pipeline's status -- a successful match reported as "not found", which
+#   here would delete a file the user owns.
+_was_untracked_before_upgrade() {
+  local _path="${1:?"${FUNCNAME[0]}: missing path"}"
+  local _known
+  for _known in "${_UPGRADE_UNTRACKED_SNAPSHOT[@]}"; do
+    if [[ "${_known}" == "${_path}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# _abort_failed_subtree_pull <rc> <target_ver>
+#   Clean up after a `git subtree pull` that did not complete, then abort.
+#
+#   This is the pre-arm sibling of _restore_pre_upgrade_state, and it is
+#   deliberately narrower. The exit rollback undoes a pull that COMMITTED;
+#   there is no commit to undo here, so the only state to clear is an
+#   in-progress merge -- which `git merge --abort` restores exactly, HEAD,
+#   index and working tree together.
+#
+#   Aborting is safe for the same reason the exit rollback is: git-subtree
+#   refuses to run against a dirty tree, so every change the merge left is
+#   one this run made. A failure with no merge in progress (a bad tag, an
+#   unreachable remote) has nothing to clean and falls straight through.
+#
+#   A rescue that itself fails is reported, never swallowed: the user is
+#   holding a mid-merge tree either way, and must hear which one it is.
+#   Neither outcome logs upgrade_rollback: nothing was committed, so there
+#   is no upgrade to roll back, and the abort is reported only once it has
+#   succeeded (base#1369).
+_abort_failed_subtree_pull() {
+  local _rc="${1:?"${FUNCNAME[0]}: missing rc"}"
+  local _target="${2:?"${FUNCNAME[0]}: missing target_ver"}"
+  local _git_dir
+  _git_dir="$(git rev-parse --git-dir)"
+
+  if [[ -e "${_git_dir}/MERGE_HEAD" ]]; then
+    if ! git merge --abort >/dev/null 2>&1; then
+      _log_err upgrade upgrade_rollback_failed "display=subtree pull left a conflicted merge in progress and it could not be aborted; the tree is still mid-merge — resolve it or run 'git merge --abort' by hand before retrying." "status=${_rc}"
+      exit 1
+    fi
+    _log_warn upgrade upgrade_merge_aborted "display=subtree pull left a conflicted merge in progress; aborted it so the repo is not left mid-merge." "status=${_rc}"
+  fi
+
+  _error upgrade_subtree_pull_failed "git subtree pull failed (exit ${_rc}); nothing was committed and the repo is unchanged. A conflict here means ${TEMPLATE_REL}/ carries local edits that clash with ${_target} — the subtree is upstream-managed, so move those edits out of it and retry."
+}
+
+# _upgrade_dfm_ran_file_cleanup
+#   An _atexit callback removing the file the Step 3 init.sh writes to
+#   record that it ran the Dockerfile migration dispatcher (base#1372).
+_upgrade_dfm_ran_file_cleanup() {
+  [[ -n "${_UPGRADE_DFM_RAN_FILE:-}" ]] && rm -f -- "${_UPGRADE_DFM_RAN_FILE}"
+  return 0
+}
+
+# _upgrade_exit_rollback
+#   An _atexit callback (transcript.sh owns the single EXIT trap, so this
+#   never installs or clears one -- base#1371). Armed the moment the
+#   subtree pull has COMMITTED, disarmed once the upgrade has finished
+#   everything that can fail. In between, the repo is mid-flight: the new
+#   subtree is already in the history, but the resync that makes it usable
+#   has not run.
+#
+#   Leaving that state behind is what turned a missing file into a repo
+#   that claimed a version it never reached -- .version bumped, commit
+#   landed, `git status` clean, and every wrapper the user types dangling.
+#   `set -euo pipefail` guarantees a failed step aborts; this guarantees it
+#   aborts to the state the user started in.
+#
+#   Rolling back is safe precisely BECAUSE it is armed after the pull:
+#   git-subtree refuses to run against a dirty tree, so nothing the user
+#   had in flight can exist at this point -- every change present is one
+#   this run made.
+#
+#   Disarmed by state, not by trap: the callback stays registered and does
+#   nothing once _UPGRADE_PRE_HEAD is empty. The exit status comes from
+#   _ATEXIT_STATUS, and a failed rescue asks for its code through
+#   _atexit_set_exit_code -- never `exit`, which would skip the transcript
+#   finalize that runs after the callbacks.
+_upgrade_exit_rollback() {
+  local _status="${_ATEXIT_STATUS:-0}"
+  if (( _status == 0 )) || [[ -z "${_UPGRADE_PRE_HEAD}" ]]; then
+    return 0
+  fi
+  _log_err upgrade upgrade_rollback_started "display=upgrade failed after the subtree pull had committed (exit ${_status}); undoing it so the repo is not left claiming a version it never reached." "status=${_status}"
+  if _restore_pre_upgrade_state "${_UPGRADE_PRE_HEAD}"; then
+    _log_err upgrade upgrade_rollback "display=upgrade aborted; repo restored to pre-upgrade state"
+  else
+    _atexit_set_exit_code 1
+  fi
+}
+
+# ── Get versions ─────────────────────────────────────────────────────────────
+
+_get_local_version() {
+  if [[ -f "${VERSION_FILE}" ]]; then
+    tr -d '[:space:]' < "${VERSION_FILE}"
+  else
+    echo "unknown"
+  fi
+}
+
+_get_latest_version() {
+  # Newest STABLE tag on the upstream remote, or "" when the remote cannot
+  # be reached or carries no vX.Y.Z tag. `--sort=-v:refname` puts the
+  # newest first, so the first match wins; rc / pre-release tags do not
+  # match the pattern and are skipped.
+  #
+  # The scan is in-shell on purpose. It used to be
+  # `git ls-remote ... | grep -oP ... | head -1 | sed ...`: `head -1`
+  # closes the pipe after one line, the `grep -oP` still writing takes
+  # SIGPIPE and exits 141, `pipefail` promotes that to the pipeline's
+  # status, and under the caller's `set -e` the bare assignment killed the
+  # script before _check's `_log` lines ran. `|| true` stopped the abort,
+  # but by discarding the status -- including a genuine `git` failure --
+  # and left the quieter defect in place: an EMPTY answer that reads as
+  # "no newer release" when there is one.
+  #
+  # Nothing below can be killed by a reader that stopped reading, because
+  # there is no reader: no pipe, no early exit, no status that depends on
+  # how two processes were scheduled. An unreachable remote still yields
+  # "", which _check reports as `Could not fetch ...` with the remote
+  # named -- the one loud error this path has always had. Parsing the ref
+  # in-shell also drops the `grep -oP` PCRE dependency, which does not
+  # exist on a BSD / macOS host.
+  local _line _ref _result=""
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    if [[ -n "${_result}" ]]; then
+      continue
+    fi
+    # `git ls-remote` prints "<sha><TAB><ref>". Strip through the last run
+    # of whitespace rather than a literal tab: the replaced `grep -oP`
+    # matched the ref anywhere on the line, so anything that separates the
+    # two fields has to keep working. A peeled `refs/tags/vX.Y.Z^{}` line
+    # fails the anchored match and is skipped, as it was before.
+    _ref="${_line##*[[:space:]]}"
+    if [[ "${_ref}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      _result="${_ref#refs/tags/}"
+    fi
+  done < <(git ls-remote --tags --sort=-v:refname "${TEMPLATE_REMOTE}")
+  printf '%s' "${_result}"
+}
+
+# ── Semver comparison ────────────────────────────────────────────────────────
+#
+# SemVer §11 says a pre-release version has LOWER precedence than the
+# associated normal version (rc1 < final). GNU `sort -V` orders them
+# the OTHER way (final < rc1, treats `-` as "less than empty"), so we
+# can't just delegate. The wrong ordering causedonce
+# v0.12.0 was published, downstreams still pinned to v0.12.0-rc1
+# would have been told they were "ahead" of stable, hiding the upgrade.
+#
+# This comparator handles the only semver shape we ship —
+# v<MAJOR>.<MINOR>.<PATCH>[-<PRERELEASE>] — and applies §11 explicitly:
+#   - core compared via `sort -V` (purely numeric, no `-` involved)
+#   - same-core final beats same-core pre-release
+#   - same-core pre-releases compared lexicographically (rc1 < rc2 etc.)
+#
+# Returns: 0 = equal, 1 = a < b, 2 = a > b.
+_semver_cmp() {
+  local _a="${1#v}"
+  local _b="${2#v}"
+  local _a_core="${_a%%-*}"
+  local _b_core="${_b%%-*}"
+  local _a_pre=""
+  local _b_pre=""
+  [[ "${_a}" == *"-"* ]] && _a_pre="${_a#*-}"
+  [[ "${_b}" == *"-"* ]] && _b_pre="${_b#*-}"
+
+  if [[ "${_a_core}" != "${_b_core}" ]]; then
+    local _newer
+    _newer="$(printf '%s\n%s\n' "${_a_core}" "${_b_core}" | sort -V | tail -1)"
+    [[ "${_newer}" == "${_a_core}" ]] && return 2 || return 1
+  fi
+
+  if [[ -z "${_a_pre}" && -z "${_b_pre}" ]]; then return 0; fi
+  [[ -z "${_a_pre}" ]] && return 2
+  [[ -z "${_b_pre}" ]] && return 1
+
+  if [[ "${_a_pre}" < "${_b_pre}" ]]; then return 1; fi
+  if [[ "${_a_pre}" > "${_b_pre}" ]]; then return 2; fi
+  return 0
+}
+
+# ── Check mode ───────────────────────────────────────────────────────────────
+
+_check() {
+  local local_ver latest_ver
+  local_ver="$(_get_local_version)"
+  latest_ver="$(_get_latest_version)"
+
+  if [[ -z "${latest_ver}" ]]; then
+    _error upgrade_fetch_failed "Could not fetch latest version from ${TEMPLATE_REMOTE}"
+  fi
+
+  _log upgrade_version_check "Local:  ${local_ver}"
+  _log upgrade_version_check "Latest: ${latest_ver}"
+
+  if [[ "${local_ver}" == "unknown" ]]; then
+    _log upgrade_available "Update available: ${local_ver} →${latest_ver}"
+    _UPGRADE_UPDATE_AVAILABLE=1
+    return 1
+  fi
+
+  local _cmp=0
+  _semver_cmp "${local_ver}" "${latest_ver}" || _cmp=$?
+  case "${_cmp}" in
+    0) _log upgrade_up_to_date "Already up to date."; return 0 ;;
+    1) _log upgrade_available "Update available: ${local_ver} →${latest_ver}"
+       _UPGRADE_UPDATE_AVAILABLE=1
+       return 1 ;;
+    2) _log upgrade_ahead_of_latest "Local is ahead of latest stable (prerelease or local-only tag)."; return 0 ;;
+  esac
+}
+
+# _base_worker_uses <text>
+#   Every `uses:` of a base worker in <text> that Step 4 can rewrite, under
+#   the current or the retired slug, one `uses: <slug>/<path>@<ref>` per line
+#   in file order.
+_base_worker_uses() {
+  local _slugs="(${BASE_UPSTREAM_RETIRED_RE}|${BASE_UPSTREAM_SLUG//./\\.})"
+  printf '%s\n' "${1}" \
+    | grep -oE "(^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?${_slugs}/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@[^][:space:]\"',}]*" \
+    || true
+}
+
+# _workers_with_changed_ref <before> <after>
+#   The worker file names whose `uses:` differs between two texts Step 4 made
+#   one from the other, sorted and space-separated on one line; nothing when
+#   none does. The rewrite adds and removes no `uses:`, so the two lists pair
+#   up by position: not `diff`, whose output format is not a contract (GNU
+#   defaults to `> new`, busybox to `+new`), not a set of lines, which loses a
+#   line rewritten into text another job already has, and not the whole line,
+#   where a comment or a second ref can stand in for the one that changed.
+_workers_with_changed_ref() {
+  local -a _old _new
+  local _i _ref _names
+  mapfile -t _old < <(_base_worker_uses "${1}")
+  mapfile -t _new < <(_base_worker_uses "${2}")
+  _names="$(for _i in "${!_new[@]}"; do
+    [[ "${_old[_i]-}" != "${_new[_i]}" ]] || continue
+    _ref="${_new[_i]%%@*}"
+    printf '%s\n' "${_ref##*/}"
+  done | sort -u | tr '\n' ' ')"
+  printf '%s' "${_names% }"
+}
+
+# _collect_left_worker_refs <main.yaml> <target version>
+#   Record in _UPGRADE_LEFT_REFS the base worker refs that are still under
+#   the retired slug, or at another release, after Step 4. The rewrite needs
+#   the ref directly behind its `uses:`; YAML also allows it on the next
+#   line, in a block scalar, or behind an anchor or a tag, and those are left
+#   to the user rather than guessed at. Read as text: whatever follows a
+#   blank and a `#` counts as a comment, even inside a quoted value, and a
+#   ref in a value that is not a `uses:` is recorded too.
+_collect_left_worker_refs() {
+  local _file="${1}" _target="${2}" _line _ref
+  local _slugs="(${BASE_UPSTREAM_RETIRED_RE}|${BASE_UPSTREAM_SLUG//./\\.})"
+  _UPGRADE_LEFT_REFS=()
+  while IFS=: read -r _line _ref; do
+    # `grep -o` carries the one character that bounded the match on the left.
+    [[ "${_ref}" == [A-Za-z0-9]* ]] || _ref="${_ref:1}"
+    case "${_ref}" in
+      "${BASE_UPSTREAM_SLUG}"/*@"${_target}") continue ;;
+      "${BASE_UPSTREAM_SLUG}"/*@v[0-9]*.[0-9]*.[0-9]*) ;;
+      "${BASE_UPSTREAM_SLUG}"/*) continue ;;
+    esac
+    _UPGRADE_LEFT_REFS+=("${_line}: ${_ref}")
+  done < <(sed -E 's/(^|[[:space:]])#.*$//' "${_file}" \
+    | grep -noE "(^|[^A-Za-z0-9_.-])${_slugs}/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@[^][:space:]\"',}]*" \
+    || true)
+}
+
+# _warn_left_worker_refs <target version>
+#   Name every ref _collect_left_worker_refs recorded; silent when none.
+_warn_left_worker_refs() {
+  (( ${#_UPGRADE_LEFT_REFS[@]} > 0 )) || return 0
+  _log_warn upgrade upgrade_worker_refs_left \
+    "display=WARNING: ${#_UPGRADE_LEFT_REFS[@]} base worker ref(s) in .github/workflows/main.yaml are not at ${1} after the rewrite. If a job calls one, set it to ${BASE_UPSTREAM_SLUG}/...@${1} by hand, or the job keeps calling what it names now." \
+    "count=${#_UPGRADE_LEFT_REFS[@]}"
+  local _entry
+  for _entry in "${_UPGRADE_LEFT_REFS[@]}"; do
+    _log_warn upgrade upgrade_worker_refs_left \
+      "display=           .github/workflows/main.yaml:${_entry}" \
+      "ref=${_entry#*: }" "line=${_entry%%:*}"
+  done
+}
+
+# ── Upgrade ──────────────────────────────────────────────────────────────────
+
+_upgrade() {
+  local target_ver="$1"
+  local local_ver
+  local_ver="$(_get_local_version)"
+
+  if [[ "${local_ver}" == "${target_ver}" ]]; then
+    _log upgrade_up_to_date "Already at ${target_ver}. Nothing to do."
+    return 0
+  fi
+
+  # Refuse implicit downgrade. Without this guard the user can ratchet
+  # back from v0.12.0-rc1 to an older v0.11.0 without realising it,
+  # which silently undoes prerelease testing and re-introduces fixed
+  # bugs. _semver_cmp returns 2 when local > target per SemVer §11.
+  if [[ "${local_ver}" != "unknown" ]]; then
+    local _cmp=0
+    _semver_cmp "${local_ver}" "${target_ver}" || _cmp=$?
+    if (( _cmp == 2 )); then
+      _error upgrade_downgrade_refused "Refusing implicit downgrade from ${local_ver} to ${target_ver}.
+  If this is intentional (rolling back a bad release), edit
+  ${TEMPLATE_REL}/.version manually and re-run the upgrade."
+    fi
+  fi
+
+  # Pre-flight safety checks. Any failure exits non-zero without
+  # touching the working tree.
+  _require_git_identity
+  _require_clean_merge_state
+
+  # NOTE: retiring the stale devel-scoped `[lifecycle] restart = no` is NOT
+  # called from here. It used to be, and that is base#1110: the migration
+  # gated on the VENDORED template under `${TEMPLATE_REL}/` -- the tree this
+  # pull is about to replace -- still reading `restart = no`, while the
+  # function itself arrived in the same release that changed that template.
+  # Every published tag carrying the function therefore carries a template
+  # saying `unless-stopped`, so the gate closed on all of them and the
+  # migration returned 0 having done nothing, on every consumer, forever.
+  # No path under `${TEMPLATE_REL}/` can be a precondition for work done out
+  # here: the driver running is the consumer's own vendored copy, so a gate
+  # on the pre-pull tree and the code that reads it can never be in the same
+  # repo at the same time. It lives in lib/version_migrate.sh's declared set
+  # instead, selected on the version interval the upgrade crosses, and run
+  # from the init.sh resync at Step 3 below.
+
+  # NOTE: the `.env` -> `.env.local` rename is NOT called from here. It has
+  # to fire on the upgrade that CROSSES the naming change, and that upgrade
+  # is driven by the consumer's own vendored copy of this file, which
+  # predates the rename -- so a call added here would first run one release
+  # too late. It lives in init.sh instead, which Step 3 below re-runs from
+  # the freshly pulled subtree, and it gates on the file's CONTENT rather
+  # than on a version marker so it is inert everywhere else.
+
+  # NOTE: the relocation of a legacy per-repo `setup.toml` from under
+  # `config/` to the repo root is not called
+  # from here either, for the same reason. It used to be, and that is
+  # base#1086: a repo still carrying the old path is exactly a repo on
+  # v0.41.0 or earlier, whose vendored driver has never heard of the
+  # migration -- so the call fired one release too late, against a tree
+  # whose configuration the missed hop had already replaced with the
+  # template defaults. It lives in lib/setup_conf_migrate.sh, called from
+  # the Step 3 resync below.
+
+  # Snapshot HEAD so the post-pull integrity check can roll back if
+  # git-subtree corrupts the tree. Captured AFTER the pre-pull migration
+  # commits, so a rollback preserves what they rewrote.
+  local _pre_head
+  _pre_head="$(git rev-parse HEAD)"
+
+  _log upgrade_started "Upgrading: ${local_ver} → ${target_ver}"
+
+  # Snapshot the pre-pull tree hash of ${TEMPLATE_REL}/dist/config so we can
+  # tell the user if their seeded <repo>/config is now out of sync with
+  # the upstream baseline. Git tree hashes are stable and cheap (no blob
+  # compare); if HEAD has no ${TEMPLATE_REL}/dist/config yet (initial setup),
+  # leave _pre_config_hash empty.
+  local _pre_config_hash=""
+  # --verify: print the resolved hash on success, print nothing on
+  # failure. Without it, git's default mode echoes the unresolved ref
+  # back to stdout for unknown paths, which would be mistaken for a
+  # hash later by _warn_config_drift.
+  _pre_config_hash="$(git rev-parse --verify "HEAD:${TEMPLATE_REL}/dist/config" 2>/dev/null || true)"
+
+  # Snapshot pre-pull setup.toml hash too. Path is the location
+  # ${TEMPLATE_REL}/dist/setup.toml. If the upstream baseline
+  # changed, the user may want to copy new sections / keys into their
+  # per-repo setup.toml override ('s 2-file model makes this a
+  # manual merge — we never overwrite the user's file).
+  local _pre_setup_conf_hash=""
+  _pre_setup_conf_hash="$(git rev-parse --verify "HEAD:${TEMPLATE_REL}/dist/setup.toml" 2>/dev/null || true)"
+
+  # What is untracked BEFORE anything moves, so a rollback can tell the
+  # user's own stray files (leave them) from the ones an aborted upgrade
+  # created (remove them).
+  #
+  # A snapshot that cannot be taken stops the upgrade here, before
+  # anything is pulled: an empty snapshot would let a later rollback sweep
+  # the user's own untracked files (base#1384).
+  if ! _list_untracked_paths _UPGRADE_UNTRACKED_SNAPSHOT; then
+    _error upgrade_untracked_snapshot_failed \
+      "Could not list untracked files before the upgrade; nothing was changed"
+  fi
+
+  # Step 1: subtree pull
+  _log upgrade_step "Step 1/5: git subtree pull"
+  # Guarded rather than left to `set -e`: the pull is the ONE step that can
+  # fail while the exit rollback below is still unarmed, and its
+  # characteristic failure (a conflict against a hand-edited .base/) leaves
+  # a merge in progress. Aborting under `set -e` there would hand the user
+  # a tree mid-merge that nothing in this run put back -- discovered one run
+  # later by _require_clean_merge_state, on a state they never chose.
+  local _pull_rc=0
+  git subtree pull --prefix="${TEMPLATE_REL}" \
+    "${TEMPLATE_REMOTE}" "${target_ver}" --squash \
+    -m "chore: upgrade ${TEMPLATE_REL} subtree to ${target_ver}" || _pull_rc=$?
+  if (( _pull_rc != 0 )); then
+    _abort_failed_subtree_pull "${_pull_rc}" "${target_ver}"
+  fi
+
+  # The pull has landed a COMMIT. Everything from here is recoverable only
+  # by undoing it, so arm the rollback now -- see _upgrade_exit_rollback for
+  # why doing so is safe exactly at this point and not before.
+  _UPGRADE_PRE_HEAD="${_pre_head}"
+  _atexit _upgrade_exit_rollback
+
+  # Step 2: post-pull integrity check (rolls back on corruption)
+  _log upgrade_step "Step 2/5: verify ${TEMPLATE_REL}/ subtree integrity"
+  _verify_subtree_intact "${_pre_head}" "${target_ver}"
+
+  # Record how far the vendored tree diverges from the release that was just
+  # pulled, while the tree is still exactly what the pull produced. Reported
+  # at the end with the other advisory findings, not here, so it is not
+  # scrolled off by Steps 3-5.
+  _collect_subtree_local_drift "${_pre_head}"
+
+  # Step 3: re-run init.sh to sync symlinks (in case template structure changed)
+  _log upgrade_step "Step 3/5: re-run init.sh to sync symlinks"
+  # when upgrading from <v0.30.0, init.sh's stale-removal loop
+  # migrates the seven root *.sh symlinks into the script/ subfolder.
+  _log upgrade_step "  (init.sh migrates root *.sh -> script/*.sh on upgrades from pre-v0.30.0)"
+  # The pulled init.sh runs the Dockerfile migration dispatcher itself
+  # (its _migrate_dockerfile) and records that it did in this file, so
+  # Step 5 does not run the same dispatcher a second time and print every
+  # notice twice (base#1372).
+  _UPGRADE_DFM_RAN_FILE="$(mktemp)"
+  _atexit _upgrade_dfm_ran_file_cleanup
+  _BASE_DFM_RAN_FILE="${_UPGRADE_DFM_RAN_FILE}" \
+    "./${TEMPLATE_REL}/dist/script/base/init.sh"
+
+  # Step 4: update main.yaml @tag references
+  _log upgrade_step "Step 4/5: update workflow @tag references"
+  local main_yaml="${REPO_ROOT}/.github/workflows/main.yaml"
+  local _ref_note="not present, so there was no workflow @ref to update"
+  if [[ -f "${main_yaml}" ]]; then
+    # Replace @vX.Y.Z(-prerelease)? with the new version in every ref into
+    # one of base's OWN reusable workflows, matched by SHAPE and never by
+    # worker name.
+    #
+    # Naming the workers was a roster, and a roster omits. base ships four
+    # workflows a downstream main.yaml can call; this named two, so
+    # publish-worker's ref in a consumer was advanced by nothing at all --
+    # the consumer's copy never moved, no later upgrade repaired it, and the
+    # commit message below claimed it had. `build-worker.yaml` is also a
+    # SUBSTRING of `multi-distro-build-worker.yaml`, so the fourth worker was
+    # carried along by an accident of spelling rather than by the rule.
+    #
+    # Anchored on the upstream slug, because name-independent must not become
+    # owner-independent: a downstream main.yaml may call somebody else's
+    # reusable workflow, whose tags have nothing to do with the base version
+    # being installed, and the unanchored pattern rewrote those too. The
+    # slug's dots are escaped so the anchor is a literal rather than a
+    # wildcard.
+    #
+    # The `-E` regex anchors on a full semver shape (optional pre-release per
+    # §9) — the prior `[0-9.]*` stopped at the first `-`, so upgrading from an
+    # RC tag (e.g. v0.10.0-rc1 → -rc2) left the old suffix in place and
+    # produced `@v0.10.0-rc2-rc1`.
+    #
+    # The whole pattern sits ON the sed line rather than in variables above
+    # it: template_spec.bats exercises the production substitution by
+    # extracting this line out of this file, so a pattern assembled from
+    # names that line does not carry would be exercised empty.
+    #
+    # THE @tag IS THE ONLY VERSION THIS WRITES, and a second one must not be
+    # added beside it. The tooling image a worker builds from used to be a
+    # `test_tools_version` input a caller set next to this ref, which made the
+    # tooling version a thing an upgrade had to keep in step with the ref by
+    # rewriting both. It is derived from the `.version` of the base checkout
+    # the worker takes at the ref this line moves (base#1122), so moving the
+    # ref moves it: a version written into main.yaml here would be a second
+    # source of it again. A spec holds the workers to declaring no such input.
+    #
+    # A ref still under the slug base was published from before the org was
+    # renamed (BASE_UPSTREAM_RETIRED_RE) is moved to the current slug first,
+    # path and ref untouched, so the line below then bumps it like any other.
+    #
+    # Both lines are bounded on the LEFT by a `uses` key (quoted or not) and
+    # an optional quote, with nothing between that and the slug. Without it an
+    # owner whose name merely ends in the slug matched, and the line that
+    # moves the org turned that stranger's owner into one that does not
+    # exist. It also leaves a comment that records a ref without a `uses:` as
+    # it was written; a `uses:` inside a comment is still rewritten, so a job
+    # that is commented out can be re-enabled as it stands.
+    local _before _relocated
+    _before="$(cat "${main_yaml}")"
+    sed -i -E "s#((^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?)${BASE_UPSTREAM_RETIRED_RE}(/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@)#\1${BASE_UPSTREAM_SLUG}\3#g" "${main_yaml}"
+    _relocated="$(cat "${main_yaml}")"
+    sed -i -E "s#((^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?${BASE_UPSTREAM_SLUG//./\\.}/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?#\1@${target_ver}#g" "${main_yaml}"
+    # What the commit message says is read off what CHANGED, not restated
+    # from the rule above. The old message asserted "workflow @tag updated to
+    # <ver>" unconditionally, which was false on exactly the repos whose
+    # unnamed worker ref it had just left behind -- and a line that cannot be
+    # wrong reports nothing.
+    #
+    # Two things can change a ref, and only one of them is a bump: a ref that
+    # is not a release tag (`@main`) moves off the retired org and keeps its
+    # ref, so it is listed as moved and not as updated. One that moves and is
+    # bumped is in both lists (base#2118).
+    local _bumped _moved
+    _bumped="$(_workers_with_changed_ref "${_relocated}" "$(cat "${main_yaml}")")"
+    _moved="$(_workers_with_changed_ref "${_before}" "${_relocated}")"
+    _ref_note="no base workflow @ref was updated"
+    [[ -n "${_bumped}" ]] && _ref_note="@ref updated to ${target_ver} for ${_bumped}"
+    [[ -n "${_moved}" ]] \
+      && _ref_note+=$'\n'"- main.yaml: moved to ${BASE_UPSTREAM_SLUG}: ${_moved}"
+    _collect_left_worker_refs "${main_yaml}" "${target_ver}"
+    git add "${main_yaml}"
+  fi
+
+  # Step 5: heal downstream Dockerfile / entrypoint drift via the declarative
+  # migration list (folds facet B). Each base contract change used
+  # to grow another one-off sed here (the lib-copy split, the
+  # wrapper-copy move); they have all moved into lib/dockerfile_migrate.sh as
+  # an ordered, data-driven {detect, transform} table. upgrade.sh now just
+  # sources the lib and calls the dispatcher: each migration auto-applies
+  # (idempotently) where its shape is detected and SKIPs (warn, never
+  # force-rewrite) where structure is missing or ambiguous. Adding the next
+  # fanout breakage is a new {detect, transform} pair in the lib, not another
+  # branch here.
+  #
+  # The dispatcher runs here only when the Step 3 init.sh did not already
+  # run it. The patches are idempotent, but the warnings, the ENTRYPOINT
+  # advisory and the summary line are not: a second pass printed each of
+  # them again (base#1372). An init.sh that predates the record, or one
+  # with no _migrate_dockerfile, leaves the file empty and this pass runs.
+  _log upgrade_step "Step 5/5: apply Dockerfile/entrypoint migrations (#567 / #579)"
+  local _dockerfile="${REPO_ROOT}/Dockerfile"
+  if [[ -s "${_UPGRADE_DFM_RAN_FILE}" ]]; then
+    _log upgrade_step "  (already applied by the Step 3 init.sh run)"
+  else
+    # shellcheck disable=SC1091
+    source "${SUBTREE_ROOT}/dist/script/docker/lib/dockerfile_migrate.sh"
+    apply_migrations "${_dockerfile}"
+  fi
+  # Stage any files the migrations rewrote (Dockerfile + the sibling
+  # entrypoint, when present) so they land in the same commit below.
+  [[ -f "${_dockerfile}" ]] && git add "${_dockerfile}"
+  [[ -f "${REPO_ROOT}/script/entrypoint.sh" ]] && git add "${REPO_ROOT}/script/entrypoint.sh"
+
+  # Step 3 ran init.sh which (re-)synced .gitignore via lib/gitignore.sh
+  # and `git rm --cached`-ed any tracked-but-now-derived artifacts
+  # The .gitignore mutation is unstaged; the rm is index-staged.
+  # Stage .gitignore so both land in the same commit.
+  if [[ -f "${REPO_ROOT}/.gitignore" ]]; then
+    git add "${REPO_ROOT}/.gitignore"
+  fi
+
+  # Commit workflow + .gitignore + index removals together
+  git commit -m "$(cat <<COMMIT
+chore: update template references to ${target_ver}
+
+- main.yaml: ${_ref_note}
+- .gitignore: synced canonical entries (template lib/gitignore.sh)
+- untracked any derived artifacts now covered by .gitignore
+COMMIT
+)" || _log upgrade_nothing_to_commit "No additional changes to commit"
+
+  # Every step that can fail has succeeded; the upgrade is done. Disarm
+  # BEFORE the drift warnings below -- they are advisory, and an upgrade
+  # that landed must not be undone because a warning tripped.
+  _UPGRADE_PRE_HEAD=""
+
+  # Post-pull: warn when the upstream config baseline moved so the
+  # user can reconcile <repo>/config/ (seeded by init.sh, user-owned
+  # afterwards) against the new .base/dist/config/. Silent when the
+  # baseline didn't change or there was no prior baseline.
+  _warn_config_drift "${_pre_config_hash}"
+
+  # Same pattern for .base/dist/setup.toml: the user's per-repo
+  # setup.toml is the override file (committed, never overwritten by
+  # template upgrades). When the upstream .base/dist/setup.toml adds new
+  # sections / keys / changes defaults, point the user at the diff so
+  # they can opt in.
+  _warn_setup_conf_drift "${_pre_setup_conf_hash}"
+
+  # Last, because these two name repo paths the user has to act on rather
+  # than a diff they may want to read.
+  _warn_subtree_local_drift
+  _warn_left_worker_refs "${target_ver}"
+
+  _log upgrade_completed "Done! Upgraded to ${target_ver}"
+  _log upgrade_completed ""
+  _log upgrade_completed "Next steps:"
+  _log upgrade_completed "  1. Run just docker build test to verify"
+  _log upgrade_completed "  2. git push"
+}
+
+# ── Vendored-tree drift against the release that was pulled ──────────────────
+#
+# `git subtree pull --squash` raises a conflict only where BOTH sides changed
+# the same path. For a path base shipped identically across the interval the
+# merge sees a change on the local side and none upstream, so it keeps the
+# local version with no conflict and no message -- and the run's output is
+# then indistinguishable from one that landed a byte-exact tree. A byte-exact
+# census of every vendored tree in the org found one such edit, which had
+# already ridden through an upgrade; what it could not find was any run,
+# check or output that would have reported it. Silence is what PRD invariant
+# 2 forbids, so the upgrade now names every vendored path that does not match
+# the release it just pulled.
+#
+# It REPORTS and never rewrites. The consumer's edit is the only copy of
+# whatever it carries, so losing it is the worse of the two failures; the
+# upgrade has also already committed by the time this runs, and an advisory
+# finding must not undo a pull that succeeded. Deciding where a FAILING gate
+# over this same comparison belongs -- a downstream CI job, the per-repo
+# version monitor, a verb the consumer runs -- is a separate decision, and is
+# deliberately not made here.
+
+# _subtree_split_of <commit>
+#   The upstream commit a squash commit for THIS subtree prefix was built
+#   from, read off git-subtree's own recorded trailers. Returns 1 when
+#   <commit> is not such a squash commit.
+#
+#   `git-subtree-dir:` / `git-subtree-split:` are git-subtree's own metadata
+#   -- it writes them on every squash and parses them back on the next pull
+#   to find where the last one stopped -- so they are a contract rather than
+#   a rendering. Deliberately not `FETCH_HEAD`, which is a side effect of how
+#   git-subtree happens to fetch today, and deliberately not a second network
+#   call: every object needed here is already local, because the pull that
+#   just ran fetched it.
+_subtree_split_of() {
+  local _commit="${1:?"${FUNCNAME[0]}: missing commit"}"
+  local _line _dir_seen=0 _split=""
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    [[ "${_line}" == "git-subtree-dir: ${TEMPLATE_REL}" ]] && _dir_seen=1
+    [[ "${_line}" == "git-subtree-split: "* ]] && _split="${_line#git-subtree-split: }"
+  done < <(git log -1 --format=%B "${_commit}" 2>/dev/null)
+  (( _dir_seen )) || return 1
+  [[ -n "${_split}" ]] || return 1
+  printf '%s' "${_split}"
+}
+
+# _subtree_split_sha <rev_range>
+#   The newest subtree squash in <rev_range>, as the upstream commit it
+#   recorded. Returns 1 when the range holds no squash for this prefix.
+_subtree_split_sha() {
+  local _range="${1:?"${FUNCNAME[0]}: missing rev range"}"
+  local _commit _split
+  while IFS= read -r _commit || [[ -n "${_commit}" ]]; do
+    _split="$(_subtree_split_of "${_commit}")" || continue
+    printf '%s' "${_split}"
+    return 0
+  done < <(git rev-list "${_range}" 2>/dev/null)
+  return 1
+}
+
+# _collect_subtree_local_drift <pre_pull_head>
+#   Compare the vendored tree the pull produced against the upstream root
+#   tree it was pulled from, and record every path that differs into
+#   _UPGRADE_DRIFT. Called the moment the pull has landed, BEFORE the resync
+#   steps run, so nothing this upgrade does afterwards can be mistaken for
+#   the consumer's own divergence.
+#
+#   `git diff-tree` rather than `diff(1)`: the comparison is between two git
+#   trees, so it is blob SHA plus mode and nothing is parsed out of a
+#   rendered diff -- `/usr/bin/diff` in a consumer may be busybox, whose
+#   default output format is not GNU's.
+_collect_subtree_local_drift() {
+  local _pre_head="${1:?"${FUNCNAME[0]}: missing pre-pull HEAD"}"
+  _UPGRADE_DRIFT=()
+  _UPGRADE_DRIFT_SPLIT=""
+  _UPGRADE_DRIFT_UNVERIFIED=""
+  local _split
+  _split="$(_subtree_split_sha "${_pre_head}..HEAD")" || {
+    _UPGRADE_DRIFT_UNVERIFIED="no ${TEMPLATE_REL} subtree squash commit in ${_pre_head:0:12}..HEAD"
+    return 0
+  }
+  _UPGRADE_DRIFT_SPLIT="${_split}"
+  # The recorded upstream commit is reachable here only because the pull just
+  # fetched it. Resolve it explicitly rather than letting an unresolvable
+  # revision read as an empty diff, which is the clean-tree answer.
+  if ! git rev-parse --verify --quiet "${_split}^{tree}" >/dev/null 2>&1; then
+    _UPGRADE_DRIFT_UNVERIFIED="upstream commit ${_split:0:12} is not in this repo's object store"
+    return 0
+  fi
+  local _status _path
+  while IFS= read -r -d '' _status && IFS= read -r -d '' _path; do
+    _UPGRADE_DRIFT+=("${_status}"$'\t'"${_path}")
+  done < <(git diff-tree -r --name-status -z \
+    "${_split}^{tree}" "HEAD:${TEMPLATE_REL}" 2>/dev/null)
+}
+
+# _warn_subtree_local_drift
+#   Name every finding _collect_subtree_local_drift recorded. Silent when
+#   the pull landed byte-exact, which is the normal case.
+_warn_subtree_local_drift() {
+  if [[ -n "${_UPGRADE_DRIFT_UNVERIFIED}" ]]; then
+    _log_warn upgrade upgrade_subtree_local_drift \
+      "display=WARNING: whether ${TEMPLATE_REL}/ still matches what base shipped could not be checked: ${_UPGRADE_DRIFT_UNVERIFIED}." \
+      "reason=${_UPGRADE_DRIFT_UNVERIFIED}"
+  fi
+  (( ${#_UPGRADE_DRIFT[@]} > 0 )) || return 0
+  _log_warn upgrade upgrade_subtree_local_drift \
+    "display=WARNING: ${#_UPGRADE_DRIFT[@]} path(s) under ${TEMPLATE_REL}/ do not match what base shipped at the release just pulled." \
+    "count=${#_UPGRADE_DRIFT[@]}"
+  _log_warn upgrade upgrade_subtree_local_drift \
+    "display=         ${TEMPLATE_REL}/ is upstream-managed, and a squashed subtree pull reports a local edit only where upstream changed the same path -- so these were kept with no conflict and no message. Move anything you mean to keep OUT of ${TEMPLATE_REL}/."
+  local _entry _status _path _what
+  for _entry in "${_UPGRADE_DRIFT[@]}"; do
+    _status="${_entry%%$'\t'*}"
+    _path="${_entry#*$'\t'}"
+    case "${_status:0:1}" in
+      A) _what="only in this repo" ;;
+      D) _what="missing from this repo" ;;
+      *) _what="differs from upstream" ;;
+    esac
+    # Printed repo-relative, which is what the user has to type at the
+    # prompt; the comparison itself is subtree-relative.
+    _log_warn upgrade upgrade_subtree_local_drift_detail \
+      "display=           ${TEMPLATE_REL}/${_path} (${_what})" \
+      "path=${TEMPLATE_REL}/${_path}" "state=${_what}"
+  done
+  _log_warn upgrade upgrade_subtree_local_drift \
+    "display=         Review the whole divergence with:  git diff ${_UPGRADE_DRIFT_SPLIT:0:12} HEAD:${TEMPLATE_REL}"
+}
+
+# _warn_config_drift <pre_pull_tree_hash>
+#
+# When the upstream ${TEMPLATE_REL}/dist/config/ tree changed during this
+# pull, print a WARNING pointing the user at the diff so they can merge
+# into their <repo>/config/ manually. Never fails the upgrade (config is
+# user-owned — we only report, not force).
+_warn_config_drift() {
+  local _pre="${1:-}"
+  local _post
+  _post="$(git rev-parse --verify "HEAD:${TEMPLATE_REL}/dist/config" 2>/dev/null || true)"
+  [[ -z "${_post}" ]] && return 0         # no config in new subtree
+  [[ "${_pre}" == "${_post}" ]] && return 0   # unchanged
+  _log upgrade_config_drift ""
+  _log upgrade_config_drift "WARNING: ${TEMPLATE_REL}/dist/config/ changed upstream since the last pull."
+  _log upgrade_config_drift "         Your <repo>/config/ is user-owned and was NOT updated."
+  _log upgrade_config_drift "         Review the diff and port any upstream changes you want:"
+  _log upgrade_config_drift ""
+  _log upgrade_config_drift "           diff -ruN ${TEMPLATE_REL}/dist/config config"
+  if [[ -n "${_pre}" ]]; then
+    _log upgrade_config_drift ""
+    _log upgrade_config_drift "         Upstream-only diff (what moved in ${TEMPLATE_REL}/dist/config/):"
+    _log upgrade_config_drift "           git diff ${_pre:0:12}..${_post:0:12} -- ${TEMPLATE_REL}/dist/config"
+  fi
+}
+
+# _warn_setup_conf_drift <pre_pull_blob_hash>
+#
+# sibling of _warn_config_drift. <repo>/setup.toml
+# (path) is the user-owned override file; this script never
+# rewrites it. When the upstream template-side setup.toml changes (new
+# sections, new keys, default tweaks), surface a pointer to the diff so
+# the user can hand-merge any upstream additions they want into their
+# override. Silent on no change.
+_warn_setup_conf_drift() {
+  local _pre="${1:-}"
+  local _post
+  _post="$(git rev-parse --verify "HEAD:${TEMPLATE_REL}/dist/setup.toml" 2>/dev/null || true)"
+  [[ -z "${_post}" ]] && return 0
+  [[ "${_pre}" == "${_post}" ]] && return 0
+  _log upgrade_setup_conf_drift ""
+  _log upgrade_setup_conf_drift "WARNING: ${TEMPLATE_REL}/dist/setup.toml changed upstream since the last pull."
+  _log upgrade_setup_conf_drift "         Your setup.toml is the user override and was NOT updated."
+  _log upgrade_setup_conf_drift "         Review the diff and copy any new sections / keys you want:"
+  _log upgrade_setup_conf_drift ""
+  _log upgrade_setup_conf_drift "           diff -u ${TEMPLATE_REL}/dist/setup.toml setup.toml"
+  if [[ -n "${_pre}" ]]; then
+    _log upgrade_setup_conf_drift ""
+    _log upgrade_setup_conf_drift "         Upstream-only diff (what moved in ${TEMPLATE_REL}/dist/setup.toml):"
+    _log upgrade_setup_conf_drift "           git diff ${_pre:0:12}..${_post:0:12} -- ${TEMPLATE_REL}/dist/setup.toml"
+  fi
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+_usage() {
+  cat >&2 <<EOF
+Usage: ./${TEMPLATE_REL}/dist/script/base/upgrade.sh [VERSION|--check|--gen-conf]
+       (or, preferred: just base upgrade [VERSION])
+
+Upgrade ${TEMPLATE_REL} subtree to the latest (or specified) version.
+
+Arguments:
+  VERSION       Target version (e.g. v0.5.0). Defaults to latest tag.
+  --check       Check if an update is available (no changes made)
+  --gen-conf    Copy ${TEMPLATE_REL}/dist/setup.toml to
+                <repo>/setup.toml for per-repo overrides
+                (delegates to init.sh --gen-conf)
+  --lang LANG   Message language (en|zh-TW|zh-CN|ja; default: auto-detect
+                from SETUP_LANG / \$LANG)
+  -h, --help    Show this help
+
+Exit codes:
+  --check       0 up to date (or local is ahead of the latest tag),
+                1 update available, 2 the check failed (any fatal error,
+                e.g. a fetch error); a code above 2 passes through
+  normal run    0 upgraded or nothing to do, non-zero on failure
+  just base update exits 0 for the first two --check results and with the
+  check's own code when the check fails.
+
+Examples:
+  just base upgrade                                          # upgrade to latest
+  just base upgrade v0.5.0                                   # specific version
+  just base update                                           # check only
+  ./${TEMPLATE_REL}/dist/script/base/upgrade.sh        # raw: latest
+EOF
+  exit 0
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  _transcript_begin  # capture this run's output (no-op if disabled)
+
+  # upgrade.sh is a human-facing `base` namespace recipe, so it
+  # accepts --lang and honors SETUP_LANG/$LANG via i18n.sh (sourced by
+  # _lib.sh). Its own messages are English-only pending the localized pass
+  # --lang is validated here so the flag is accepted, not an error,
+  # uniformly with the docker wrappers. Strip --lang <code> from argv
+  # before the positional dispatch below.
+  local _LANG
+  _resolve_lang _LANG
+  local -a _args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lang)
+        if [[ -z "${2:-}" ]]; then
+          _error upgrade_arg_missing_value "--lang requires a value (en|zh-TW|zh-CN|ja)"
+        fi
+        _LANG="$2"
+        _sanitize_lang _LANG "upgrade"
+        shift 2
+        ;;
+      *) _args+=("$1"); shift ;;
+    esac
+  done
+  set -- "${_args[@]+"${_args[@]}"}"
+
+  case "${1:-}" in
+    -h|--help) _usage ;;
+  esac
+
+  # Refuse to run inside the base template source itself (ADR-00000011
+  # sec.8). A vendored `.base/` subtree never carries `.git`; the base
+  # checkout/worktree does, so `.git` at the resolved subtree root means
+  # "this is the template source, not a consumer" -- proceeding would
+  # subtree-pull into base's PARENT dir. After --help (which must work
+  # anywhere), before any mutation. Same helper init.sh uses.
+  _assert_not_template_source "${SUBTREE_ROOT}" upgrade || exit 1
+
+  [[ ! -d "${TEMPLATE_REL}" ]] && \
+    _error upgrade_base_not_found "${TEMPLATE_REL}/ not found. Run from repo root."
+
+  case "${1:-}" in
+    --check) _check ;;
+    --gen-conf) "./${TEMPLATE_REL}/dist/script/base/init.sh" --gen-conf ;;
+    v*)
+      _upgrade "$1"
+      ;;
+    "")
+      local latest
+      latest="$(_get_latest_version)"
+      [[ -z "${latest}" ]] && _error upgrade_fetch_failed "Could not fetch latest version"
+      _upgrade "${latest}"
+      ;;
+    *) _error upgrade_unknown_arg "Unknown argument: $1" ;;
+  esac
+}
+
+main "$@"

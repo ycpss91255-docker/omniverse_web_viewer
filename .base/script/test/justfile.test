@@ -1,0 +1,736 @@
+# Base / template self-test gate (just). Invoked as `just test` (bare =
+# run the whole self-test) and `just test <recipe>` for sub-actions
+# (`lint` / `coverage` / `system` / ...), via base's own root
+# `justfile`, which `mod?`s this file as the `test` namespace. `just` does
+# not auto-discover this file, so it never collides with the auto-discovered
+# container-ops `justfile` (dist/script/justfile, symlinked into
+# downstream roots).
+#
+# ADR-00000005: `just` is the single runner. ADR-00000010/00000011: base's
+# own dev/CI entry is the `test` namespace (was `ci`); this file lives under
+# script/test/, the base-own tooling tree, distinct from the shipped
+# dist/ tree. Per the min->max principle (ADR-00000011 §3) bare
+# `just test` runs everything; options/sub-recipes narrow.
+
+# Recipes run from the repo root (relative `./script`, `docker compose`
+# reading the root compose.yaml, etc.), regardless of whether they are
+# reached via the `test` module or a direct `just -f` (both default cwd to
+# this file's dir otherwise). `../..` is relative to this file's location
+# (script/test), i.e. the repo root.
+set working-directory := '../..'
+
+# Arguments reach a recipe body as "$@", not as an unquoted {{args}}
+# interpolation. `mutation-probe` takes a shell command as one argument, and
+# `{{args}}` hands the recipe's own shell a command to re-split: a mutation
+# carrying a space becomes several arguments and the probe refuses it, while
+# one carrying a `>` or a `;` is EXECUTED by the recipe shell -- outside the
+# record-and-restore loop, writing a file the probe never recorded and so can
+# never put back. base#1284 made the rule uniform: EVERY forwarding recipe in
+# this file passes "$@", because the same re-split reached `coverage-path`'s
+# `--filter` as well, and a per-recipe exception is what let it survive.
+# No recipe here reads $0 / $1 / $@ for anything but forwarding.
+set positional-arguments := true
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test -> run the whole self-test: every linter of the _LINT_TOOLS
+# table (ShellCheck and Hadolint among them) and then Bats, no kcov.
+default:
+    ./script/test/test.sh
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test lint -> all linters (ShellCheck + Hadolint + issue-ref comment
+# lint + ADR-numbering lint + stale setup.conf path lint + localized README
+# sync lint + doc/test count drift gate + hardcoded home path lint +
+# derived-figure lint + tool-pin coverage lint) via the test-tools container (hadolint has no host binary; the alpine ci image
+# bakes it in).
+# Narrow with
+# `just test lint --shellcheck` / `just test lint --hadolint`
+# / `just test lint --issueref` / `just test lint --adr-numbering`
+# / `just test lint --adr-structure`
+# / `just test lint --stale-setup-conf` / `just test lint --readme-sync`
+# / `just test lint --doc-counts` / `just test lint --home-literal`
+# / `just test lint --arch-literal`
+# / `just test lint --errexit-bang`
+# / `just test lint --derived-figures` / `just test lint --changelog-entry`
+# / `just test lint --changelog-layout`
+# / `just test lint --pin-coverage`
+# / `just test lint --action-ref-agreement`
+# / `just test lint --just-provenance`
+# / `just test lint --catalog-description`
+# / `just test lint --spec-repo-root`
+# / `just test lint --test-name-backtick`
+# / `just test lint --toml-fixture`
+# / `just test lint --canonical-ignore-sync`
+# / `just test lint --log-event-registry` -- NOT in _LINT_TOOLS, so this
+#   one does not narrow the phase, it ADDS to it: the bare `lint` does not
+#   run the log event registry scan and no CI job does. base#1226 shipped
+#   it dispatchable and gating nothing; the driver header names the single
+#   condition for promoting it into the table.
+# (ADR-00000011 sec.3 min->max). Every narrowing flag runs in-container, so
+# a flag the table carries behaves exactly as it does under the bare
+# `lint`, and the GHA lint jobs (shellcheck, doc-counts, hadolint and the
+# lint-static matrix) run this same in-container `--lint` path (base#1412).
+# script/test/test.sh's _LINT_TOOLS table is the list of tools this phase
+# runs, and self_test_yaml_spec asserts every entry of it has a CI job.
+# ci_spec's "every flag the justfile advertises is backed by the tree"
+# holds this list to the table and to the dispatcher, so a flag advertised
+# here that nothing answers for is a red test rather than a comment.
+lint *args:
+    ./script/test/test.sh --lint "$@"
+
+# lifecycle: CREATES NOTHING. It is the one recipe here that runs
+# host-direct -- pure bash over the checkout, no compose, no container --
+# so there is no project to reclaim and no previous run to wait for.
+#
+# just test metrics -> the three implementation-standard shell metrics
+# (base#994): nesting depth <= 3, function length <= 50 body code lines,
+# positional parameters <= 5, measured over every tracked shell file by
+# ONE reader in ONE pass (script/test/drivers/shell_metrics.sh).
+#
+# Each metric FAILS only above its adoption ceiling -- the count of
+# functions phase 3 has not flattened yet -- so the census figures are
+# printed by the run and are deliberately not written down here; a
+# number in this comment would be a second place to keep them true
+# (ADR-00000028). The ceilings, and the argument that a ceiling is not
+# the baseline ADR-00000029 rejected, live in the driver's header.
+#
+# It is still NOT part of the default `just test` gate and not part of
+# `just test lint`, and the reason is no longer the unflattened tree:
+# that phase runs INSIDE the ci container, and this population comes
+# from the git index (see the host-direct note below). Joining it is
+# base#994 phase 4's.
+# This recipe exists because phase 3 works from its output -- every
+# violation is printed, one per line, `file:line: name -- metric N`.
+#
+# `metric` narrows to one of the three, for a slice that is working on
+# just that number:
+#
+#   just test metrics                     # all three
+#   just test metrics nesting-depth
+#   just test metrics function-length
+#   just test metrics positional-params
+#
+# It runs on the HOST rather than through the ci container, unlike every
+# recipe above. The population is derived from the git index, and a
+# `git worktree` checkout's `.git` is a FILE naming a path outside the
+# container's bind mount -- inside the container the lint would refuse
+# rather than measure. The driver is pure bash over the checkout. No
+# workflow step reaches these arms, which
+# test/bats/unit/self_test_yaml_spec.bats checks by running every step
+# that names test.sh (base#1412).
+#
+# just test metrics [nesting-depth|function-length|positional-params]
+metrics metric='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case '{{metric}}' in
+      '')                 ./script/test/test.sh --shell-metrics-only ;;
+      nesting-depth)      ./script/test/test.sh --nesting-depth-only ;;
+      function-length)    ./script/test/test.sh --function-length-only ;;
+      positional-params)  ./script/test/test.sh --positional-params-only ;;
+      *)
+        echo "just test metrics: unknown metric '{{metric}}' (expected nesting-depth | function-length | positional-params | empty)" >&2
+        exit 2
+        ;;
+    esac
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test coverage -> full Kcov coverage (slow; local / release check).
+# just test coverage 1/4 -> kcov one matrix shard only; handy to prove the
+# sharded path locally without the full ~8-12min serial kcov run. With no
+# <weights> it partitions by `@test` count -- the partition CI's cache-miss
+# shards run -- never by a checkout's test/bats/.shard-weights.
+# just test coverage 1/4 <weights> -> the shard CI ran as 1/4: <weights> is
+# the file CI partitioned by (`gh run download <run-id> -n shard-weights
+# -D <dir>` fetches it), forwarded as --shard-weights. A shard runs as
+# COVERAGE_JOBS kcov slices, default the hosted runner's 4, so the same
+# weights and the same N/T run the same specs in the same slices here and
+# on CI (base#1410).
+#
+# Both write into the same coverage/ tree, so the run stamps
+# coverage/.head-sha with the sha it measured AND its scope (`full`, or
+# `partial <m>/<n> specs`). `just release coverage-badge` publishes only a
+# `full` one -- a shard's rate is a partition's, not the project's, and
+# without the scope the badge would publish it as the release figure.
+#
+# The scope is DERIVED from coverage/timings.tsv, the manifest naming
+# every spec the run actually walked, not from the argument above: an
+# invocation cannot be trusted to describe a run that anything else --
+# an inherited COVERAGE_SHARD or COVERAGE_PATH, say -- has narrowed.
+coverage shard='' weights='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n '{{shard}}' && -n '{{weights}}' ]]; then
+      ./script/test/test.sh --coverage-shard '{{shard}}' --shard-weights '{{weights}}'
+    elif [[ -n '{{shard}}' ]]; then
+      ./script/test/test.sh --coverage-shard '{{shard}}'
+    else
+      ./script/test/test.sh --coverage
+    fi
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test coverage-local -> the SAME full-suite coverage `just test
+# coverage` produces, run as N concurrent kcov processes instead of one.
+# `just test coverage-local 8` sets N; bare uses nproc.
+#
+# It measures the same specs and writes the same coverage/ tree, so it
+# stamps `scope=full` and `just release coverage-badge` accepts it. What
+# differs is only how many cores it uses: kcov's bash engine is
+# single-threaded per traced process and `kcov` over `bats --jobs` is
+# unreliable for accuracy (ADR-00000008), so the parallelism is N
+# INDEPENDENT kcov processes over the shared time-balanced partition,
+# merged with `kcov --merge`.
+#
+# Prefer it over `just test coverage` on a machine with cores to spare --
+# the release path needs a full-scope run, and the serial one is on the
+# critical path of every release. `just test coverage <n>/<total>
+# <weights>` remains the way to run ONE matrix slice locally -- the one CI
+# ran under that name, given CI's weights (base#1410).
+coverage-local jobs='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n '{{jobs}}' ]]; then
+      ./script/test/test.sh --coverage-local --jobs '{{jobs}}'
+    else
+      ./script/test/test.sh --coverage-local
+    fi
+
+# just test coverage-gate -> the coverage verdict over the last
+# `just test coverage` / `just test coverage-local` run (base#1411).
+#
+# A coverage run decides nothing until its verdict runs, and the verdict
+# is two checks: the floor (COVERAGE_MIN, default 80) over the merged
+# report, and the run-manifest union check, which names every spec the
+# run did not walk -- a spec that ran nowhere cannot move a ratio, so the
+# floor alone cannot see it. The line that runs it is the SAME line the
+# hosted coverage-gate job runs, the body below is the self-hosted
+# coverage-local workflow's verdict step verbatim, and the manifest is the
+# one test.sh's coverage run writes; coverage_gate_spec.bats fails if any
+# of that drifts. COVERAGE_MIN is the driver's own default here as in
+# both workflows. A
+# `just test coverage <n>/<total>` slice fails the union check by design:
+# a slice is not the suite.
+#
+# It reads coverage/ and starts no container, so it runs on the host.
+coverage-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    manifest=coverage/timings.tsv
+    run_dirs=(coverage/)
+    bash ./script/test/drivers/coverage_gate.sh --verdict "${manifest}" "${run_dirs[@]}"
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test coverage-path <spec> -> run ONE spec under kcov instrumentation.
+#
+# The inner loop for the failure class whose entire evidence is "this spec is
+# red under kcov and green without it". `just test coverage` and
+# `just test coverage <n>/<total>` are the only other instrumented entries and
+# both cost 8-12 minutes, so every red-green iteration on such a bug used to
+# cost a full suite -- which is why the last four diagnoses of that class
+# reached past `just` to a hand-rolled `docker run` + kcov.
+#
+# It reports NO coverage figure and writes nothing into coverage/. That is
+# deliberate: one spec's covered lines over the whole tree's denominator is not
+# a project rate, and the report the coverage-gate merges must never be handed
+# one. The kcov report goes to a throwaway directory inside the container and
+# is deleted; what you get back is the RUN.
+#
+# The spec you name is the spec that runs -- no shard partition is consulted,
+# so neither the weights nor the shard count can change it. (A shard is
+# reproduced with `just test coverage <n>/<total> <weights>`, given the
+# weights CI partitioned by, base#1410.)
+#
+# The argument is REQUIRED (contrast `coverage shard=''`): a bare invocation
+# must name the missing spec, not silently kcov the whole suite.
+#
+# The spec and the extra flags both pass through as "$@", not as an
+# interpolated {{spec}} / {{args}}, for the reason `set positional-arguments`
+# is set at the top of this file: a `--filter` regex is ONE argument, and
+# {{args}} hands the recipe's own shell the expression to re-split. Until
+# base#1284 `--filter 'one two'` arrived as two arguments and
+# `--filter 'foo|bar'` became a shell pipeline -- `bar: not found`, status
+# 127, from the recipe's own shell, which reads as nothing an operator can
+# connect to quoting.
+#
+#   just test coverage-path test/bats/unit/lib_spec.bats
+#   just test coverage-path test/bats/unit/lib_spec.bats --filter 'nounset'
+coverage-path spec *args:
+    ./script/test/test.sh --coverage-path "$@"
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms, pass
+# or fail, and asks whether the previous run has let go of this project
+# before it starts. This recipe adds no second sweep, for the same reason
+# `coverage-path` above does not: the runner is also what CI invokes
+# directly, so a copy here would cover the `just` path only.
+#
+# just test bats-path <spec> -> run ONE spec FILE or DIRECTORY, uninstrumented.
+#
+# The TDD inner loop. The alternatives are the whole suite (bare `just test`,
+# minutes) or `coverage-path`, which instruments the run; this one skips the
+# static-lint table and the instrumentation both, so a red-green iteration on
+# a single spec costs a container start and the spec itself. `--filter <regex>`
+# narrows further, to one `@test` within the file.
+#
+# The argument is REQUIRED (contrast `coverage shard=''`): a bare invocation
+# must name the missing spec, not silently run the whole suite -- which is the
+# very thing this recipe exists to avoid paying for.
+#
+# Extra flags pass through as "$@", not as an interpolated {{args}}, for the
+# reason `set positional-arguments` is set at the top of this file: a
+# `--filter` regex is ONE argument, and {{args}} hands the recipe's own shell
+# the expression to re-split. `--filter 'one two'` becomes two arguments the
+# runner rejects by name, and `--filter 'foo|bar'` becomes a shell pipeline.
+#
+#   just test bats-path test/bats/unit/justfile_spec.bats
+#   just test bats-path test/bats/unit/schema_spec.bats --filter 'gpu_count'
+#   just test bats-path test/bats/integration/
+bats-path spec *args:
+    ./script/test/test.sh --bats-path "$@"
+
+# lifecycle: RECLAIMED BY THE RUNNER. The probe drives the suite through
+# script/test/test.sh, which installs its own EXIT-trap sweep on every
+# dispatch it arms, so this recipe adds no second one.
+#
+# just test mutation-probe -> break a behaviour once and find out whether
+# anything was pinning it. A green suite says every assertion ran; it does
+# not say any of them would notice a WRONG answer, and removing the
+# production code cannot tell those apart -- a guard that only greps for a
+# string turns red when the file carrying it is deleted. So this puts the
+# code back and breaks the behaviour in place.
+#
+# It runs the scope UNMUTATED first -- without that baseline a red cannot be
+# attributed to the mutation, and a tree that is already red would have every
+# mutation report PINNED. Then it records each declared subject, applies the
+# mutation, runs, restores from the record and PROVES the restoration before
+# reporting, so there is no path that leaves the tree mutated. A mutation that
+# touched a file it did not declare is refused before the run, because only
+# declared subjects were recorded. Two runs per probe, not one.
+#
+# A red names the assertion that was pinning the behaviour, which is the line
+# to quote. A green is qualified by how much ran: narrowing to one spec can
+# only report INCONCLUSIVE, never that the behaviour is unpinned. See
+# doc/test/TEST.md, "Breaking the behaviour on purpose".
+#
+#   just test mutation-probe --subject script/test/drivers/thing.sh \
+#     --mutate 'sed -i "/^_run_thing() {/a   return 0" script/test/drivers/thing.sh'
+mutation-probe *args:
+    ./script/test/mutation-probe.sh "$@"
+
+# The required-kill roster (base#1461): every row of
+# script/test/mutation_required/*.tsv names a shell refusal guard and the
+# mutation that disables it. All rows are validated before any baseline,
+# each is probed by mutation-probe.sh in a private sandbox copy under its
+# own compose project, and the recipe exits 0 only when every row is
+# PINNED. MUTATION_REQUIRED_JOBS (default 4) rows run at once. The no-flag
+# `just test` runs it between the lint phase and bats; the hosted
+# lint-static legs and the self-hosted config-gen job run this recipe.
+#
+#   just test mutation-required            # probe every row
+#   just test mutation-required --check    # validate the roster only
+mutation-required *args:
+    ./script/test/drivers/mutation_required.sh "$@"
+
+# Both `system` and `smoke` drive compose directly rather than through
+# test.sh's dispatcher, so neither is covered by test.sh's own end-of-run
+# reclaim -- each carries its own line. It is an EXIT trap, not a trailing
+# command, because `set -e` means a failed run never reaches a trailing
+# command, and litter from a failed run is still litter. `|| true` keeps a
+# refused reclaim from changing the recipe's verdict; bash preserves the
+# pending exit status across an EXIT trap that does not itself exit.
+#
+# `--orphan-projects`, not `--reclaim`: the project half removes only what
+# the artifact itself proves is dead, while the tooling-tag half is a cache
+# policy no artifact can justify (see script/test/test.sh's
+# _test_exit_reclaim). A recipe may collect its own litter unasked; it may
+# not retire an image a sibling checkout might still want.
+
+# Each also carries its own `--await-project` line, for the same reason it
+# carries its own reclaim line: neither goes through test.sh's dispatcher,
+# so neither inherits the question the dispatcher asks before it hands
+# compose a project name -- has the previous run let go of this project's
+# network? It is a query that mints nothing, and it is what turns the
+# daemon's raw "has active endpoints" text into either a bounded wait or a
+# refusal naming the container and `just test stop`.
+
+# just test system -> system runtime-test specs (opt-in; host docker.sock)
+# Builds the test-tools image through the docker namespace base self-uses
+# (ADR-00000011 sec.5) rather than a raw `docker build -f` one-liner.
+#
+# The local tooling tag is a content hash of dockerfile/Dockerfile.test-tools
+# (test.sh --test-tools-image), not the fixed literal it used to be: a
+# sibling checkout building different tooling inputs writes a DIFFERENT tag
+# instead of displacing the image this run is about to use, while identical
+# inputs resolve to the same tag and hit the build cache. Resolving it once
+# and exporting it is what keeps the build-only `test-tools` service and the
+# `ci-system` consumer on the same image. A caller-pinned TEST_TOOLS_IMAGE
+# (CI) still wins.
+#
+# The compose project is named explicitly for the same reason test.sh names
+# it: with neither `-p` nor COMPOSE_PROJECT_NAME, compose falls back to the
+# checkout directory's BASENAME, so two checkouts named alike share one set
+# of containers and one network. Exporting the name here is what reaches the
+# bare `docker compose run` below.
+#
+# HOST_UID / HOST_GID are exported for the same reason: this recipe is the
+# one `just test` path that drives compose directly instead of through
+# test.sh's _run_via_compose, and the ci-system service takes the ids with
+# no default (they decide who owns what the suite writes into the mounted
+# checkout). Both compose calls below need them -- `just docker build`
+# parses the whole file too.
+system:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap './script/prune.sh --orphan-projects || true' EXIT
+    TEST_TOOLS_IMAGE="${TEST_TOOLS_IMAGE:-$(./script/test/test.sh --test-tools-image)}"
+    export TEST_TOOLS_IMAGE
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(./script/test/test.sh --compose-project-name)}"
+    export COMPOSE_PROJECT_NAME
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    export HOST_UID HOST_GID
+    ./script/test/test.sh --await-project
+    just docker build --target test-tools
+    docker compose run --rm ci-system
+
+# lifecycle: RECLAIMS ITS OWN RUN. Like `system` it drives compose
+# directly (the tooling build) and so carries its own --orphan-projects
+# sweep and its own --await-project question; and it also reclaims every
+# artifact its run key names, below.
+#
+# just test acceptance -> the acceptance job's steps, on this host's arch
+# (base#1409): scaffold a synthesized downstream repo from this checkout
+# with init.sh and drive its `just` verbs from the consumer's chair. It runs
+# script/ci/acceptance.sh, the SAME script self-test.yaml's `acceptance`
+# job runs, so a green here and a green there are one claim. What the job
+# gets from its runner, this recipe provides: the tooling image (built
+# exactly as `system` builds it, and for the same reasons), and a run key.
+#
+# CI_RUN_KEY is minted per invocation as `<epoch>-<pid>`, the
+# `<digits>-<digits>` shape the workflow's key takes, because every name the
+# script creates -- scaffold directory, image, container, network, prune
+# probe -- embeds `ci-<key>`, and that is what script/ci/reclaim.sh --run
+# proves ownership by. The EXIT trap hands this run's artifacts back pass or
+# fail, and touches nothing another run owns: `--run` only, never the
+# age-based `--stale` sweep, which is a CI host's policy and not a recipe's.
+#
+# The arm64 leg of the CI matrix has no local counterpart unless the host
+# IS arm64; this recipe runs the host's arch. Needs network (`just base
+# update` checks the published tags) and the host docker daemon.
+acceptance:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CI_RUN_KEY="${CI_RUN_KEY:-$(date +%s)-$$}"
+    export CI_RUN_KEY
+    trap './script/ci/reclaim.sh --run "${CI_RUN_KEY}" || true; ./script/prune.sh --orphan-projects || true' EXIT
+    TEST_TOOLS_IMAGE="${TEST_TOOLS_IMAGE:-$(./script/test/test.sh --test-tools-image)}"
+    export TEST_TOOLS_IMAGE
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(./script/test/test.sh --compose-project-name)}"
+    export COMPOSE_PROJECT_NAME
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    export HOST_UID HOST_GID
+    ./script/test/test.sh --await-project
+    just docker build --target test-tools
+    ./script/ci/acceptance.sh
+
+# lifecycle: CREATES NO PROJECT. It runs plain `docker build` / `docker
+# run --rm` and no compose, so there is no compose project to reclaim; the
+# images it builds are build-cache layers plus one untagged final image.
+#
+# just test go -> the config generator's Go gates (ADR-00000039,
+# base#1462): fmt, vet, lint, race and coverage in
+# dockerfile/Dockerfile.config-gen's test stage, then the binary's usage
+# contract, through script/test/config_gen_gates.sh (go-gates); then
+# script/test/config_gen_redpath.sh (go-redpath, unsharded), which plants
+# one defect per gate in a scratch copy and requires each to go red on its
+# own gate. The SAME command runs in the self-hosted coverage-local
+# `config-gen` job and the pre-PR mirror; the hosted self-test workflow
+# runs its two recipes as the `config-gen-gates` job and the
+# `config-gen-redpath` shard matrix, so each job ends inside its bound
+# (base#1547). The two recipes run in order and a red runner stops this
+# one: a redpath over gates that are already red proves nothing. The
+# runner writes its steps verdict to a scratch file the redpath then
+# reuses in place of its shared pass, so steps 20 and 30 run once here
+# (base#1547). The redpath runs every case: a CONFIG_GEN_REDPATH_ONLY or
+# CONFIG_GEN_REDPATH_SHARD in the caller's environment is dropped. Needs
+# the host docker daemon.
+go:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+    CONFIG_GEN_STEPS_VERDICT_OUT="${tmp}/steps.verdict" just test go-gates
+    CONFIG_GEN_STEPS_VERDICT="${tmp}/steps.verdict" just test go-redpath
+
+# just test go-gates -> the runner alone: the Go gates and the binary's
+# usage contract (base#1547). The hosted `config-gen-gates` job.
+go-gates:
+    ./script/test/config_gen_gates.sh
+
+# just test go-redpath [<n>/<N>] -> the redpath alone (base#1547): with a
+# shard, the cases config_gen_redpath_shards.tsv puts on shard n of N, the
+# hosted `config-gen-redpath` matrix job; without one, every case. A
+# CONFIG_GEN_REDPATH_ONLY or CONFIG_GEN_REDPATH_SHARD in the caller's
+# environment is dropped, so the argument alone picks the cases.
+#
+#   just test go-redpath 2/5
+go-redpath shard='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unset CONFIG_GEN_REDPATH_ONLY CONFIG_GEN_REDPATH_SHARD
+    [[ -z "${1:-}" ]] || export CONFIG_GEN_REDPATH_SHARD="${1}"
+    exec ./script/test/config_gen_redpath.sh
+
+# just test smoke -> run the SHIPPED smoke specs (dist/test/bats/smoke/)
+# the way a downstream Dockerfile `-test` stage runs them: root-owned
+# COPYs into /lint + /smoke_test, a non-root user, and `RUN bats` at build
+# time. Forwards flags to the build (`just test smoke --no-cache`).
+#
+# Why there is a recipe at all: those specs are build-time assertions of a
+# stage base itself has no Dockerfile for, so verifying one used to mean
+# hand-reproducing the stage with raw docker -- which interrupts for a
+# permission decision on every invocation and leaves nothing reusable.
+#
+# Why BUILDING is the whole test: dockerfile/Dockerfile.smoke ends in
+# `RUN bats /smoke_test/`, exactly as the stage does. There is no
+# `compose run` step, so a failing spec fails a build rather than being
+# reported by something that could stop reporting.
+#
+# Scope: the devel-test spec set (smoke/shared/ + smoke/devel-test/), which
+# is every shipped smoke spec today. No stage argument: runtime-test ships
+# none, and its real base is the MINIMAL runtime image, so running the
+# shared baseline against this devel-shaped harness and labelling the
+# result `runtime-test` would be a false green. The unit spec fails the day
+# runtime-test gains a spec, which is when that decision is due.
+#
+# NOT part of the default `just test`. That gate is the fast self-test --
+# no daemon, no image build -- and these are a different level (a stage's
+# build-time assertions, excluded from the self-test grand total in
+# doc/test/TEST.md for the same reason). Their CI coverage is the
+# acceptance job, which builds a real consumer's `-test` stage.
+#
+# The tooling tag and the compose project are resolved exactly as `system`
+# resolves them, and for the same reasons (see its comment above): a
+# content-hash tag so a sibling checkout cannot displace this run's image,
+# an explicit project name so two checkouts do not share one, and
+# HOST_UID / HOST_GID because compose interpolates the whole file whatever
+# service is named.
+#
+# PROJECT_NAME is seeded from the SAME resolved value, and it is not
+# redundant with COMPOSE_PROJECT_NAME: the build goes through the wrapper,
+# which passes `docker compose -p "${PROJECT_NAME}"` explicitly, so
+# COMPOSE_PROJECT_NAME never reaches it. That `-p` is what compose names
+# the built image after, and with nothing set the wrapper derives it from
+# the checkout DIRECTORY BASENAME -- two same-named checkouts (or two CI
+# runs) then write one image tag. Setting it takes the documented
+# already-resolved path through _compute_project_name rather than letting
+# it fall back.
+#
+# BUILDKIT_PROGRESS=plain because the bats output IS the result here --
+# the collapsed default progress hides a passing run's output entirely.
+smoke *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap './script/prune.sh --orphan-projects || true' EXIT
+    TEST_TOOLS_IMAGE="${TEST_TOOLS_IMAGE:-$(./script/test/test.sh --test-tools-image)}"
+    export TEST_TOOLS_IMAGE
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(./script/test/test.sh --compose-project-name)}"
+    export COMPOSE_PROJECT_NAME
+    PROJECT_NAME="${COMPOSE_PROJECT_NAME}"
+    export PROJECT_NAME
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    export HOST_UID HOST_GID
+    export BUILDKIT_PROGRESS=plain
+    ./script/test/test.sh --await-project
+    just docker build --target test-tools
+    just docker build "$@" --target smoke
+
+# The gap it closes: base runs two compose projects out of one checkout.
+# `just docker build` / `run` mint `local-<dir>`, which the shipped
+# wrapper owns and `just docker stop` ends. `just test` mints
+# `base-<sha256(checkout path)[0:12]>` -- keyed to the PATH so two
+# worktrees cannot share one set of containers -- and nothing ended that
+# one. `just docker stop` resolves the other name, and `just docker prune`
+# says in its own help that it does not touch running containers, so the
+# only way to clear an interrupted run's container was raw `docker`. A
+# thing `just` cannot do is a gap in the control surface, not a licence to
+# reach past it.
+#
+# The name is not derived here. `test.sh --compose-project-name` is the
+# one producer (it delegates to lib/project_reclaim.sh's
+# _reclaim_project_for_path, which the collector shares), and handing its
+# answer over as PROJECT_NAME is what stops a second derivation existing
+# that agrees today and drifts tomorrow. stop.sh takes an ambient
+# PROJECT_NAME in preference to computing one, and needs no
+# `.env.generated` to do it -- that file is a configured consumer's
+# interpolation cache, and generating one just to stop a container would
+# write into the tree under test.
+#
+# TEST_TOOLS_IMAGE and HOST_UID / HOST_GID are resolved here for the
+# reason `system` and `smoke` resolve them: compose interpolates the WHOLE
+# file whatever command it is given -- `down` included -- so every
+# `${VAR:?}` in compose.yaml has to have a value or compose refuses to
+# read the file at all. A stop that supplied only the project name died
+# naming four services and tore nothing down, and `--dry-run` could not
+# show it because dry-run never calls compose. The ids are also what a
+# direct `just -f` needs, which the root entry's exports do not reach.
+#
+# just test stop -> stop and remove the containers of THIS checkout's self-test project
+stop *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PROJECT_NAME="$(./script/test/test.sh --compose-project-name)"
+    export PROJECT_NAME
+    TEST_TOOLS_IMAGE="${TEST_TOOLS_IMAGE:-$(./script/test/test.sh --test-tools-image)}"
+    export TEST_TOOLS_IMAGE
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    export HOST_UID HOST_GID
+    ./script/stop.sh "$@"
+
+# lifecycle: RECLAIMED BY THE RUNNER. This recipe starts a container of
+# its own, so it mints a compose project; script/test/test.sh arms the
+# same EXIT sweep it arms for every other dispatch.
+#
+# just test clean -> remove this checkout's coverage/ reports
+#
+# It used to be `rm -rf coverage/` run here, on the host, as you -- and
+# that is the one thing this cannot be. The reports are written by a
+# container running as root over the bind-mounted checkout, unlinking a
+# file needs write permission on the DIRECTORY holding it, and after a
+# failed or an interrupted run that directory is root's. The host `rm`
+# then fails, `trash-put` fails the same way, and the next `just test
+# coverage` correctly refuses to start over evidence it could not erase:
+# the checkout can never run coverage again without sudo or raw docker,
+# neither of which is a thing this project asks of anyone (base#1032).
+#
+# So the removal happens where root is -- the same service, over the same
+# mount, that wrote the reports. The runner then checks on THIS side that
+# the directory is gone and fails loudly, naming the path, if it is not: a
+# clean that half-works puts the tree straight back into the state it was
+# run to fix. Nothing to clean is a success and starts no container.
+clean:
+    ./script/test/test.sh --clean-coverage
+
+# lifecycle: NOTHING TO RECLAIM, and reclaimed anyway. The repair is
+# host-direct -- pure bash over the checkout, short-circuited before any mode
+# dispatch -- so it starts no container and mints no compose project. The
+# runner's EXIT trap still sweeps on the way out, because the repair `exit`s
+# through it like every other dispatch.
+#
+# just test changelog-fix -> fold a repeated '### <category>' heading in
+# doc/changelog's '## [Unreleased]' into that category's first occurrence.
+# The verb the changelog-entry lint's refusal names, because the moment
+# somebody meets that refusal is the moment they need the repair.
+#
+# A REPAIR, not a validator: it writes and it never judges, so CI goes on
+# refusing the duplicate. The series files carry `merge=union`
+# (.gitattributes), so two branches whose category blocks landed at
+# different anchors both survive with nothing for a reviewer to resolve.
+# Each category is emitted once in roster order with its entry text
+# byte-for-byte; a section with nothing to fold is not rewritten at all, so
+# running this twice changes nothing and running it on a clean file changes
+# nothing. Review the diff and commit it.
+changelog-fix:
+    ./script/test/test.sh --changelog-entry-fix
+
+# Base-management recipes (init / upgrade / upgrade-check) were removed:
+# ADR-00000011 §8 relocated init.sh / upgrade.sh to dist/script/base/ and
+# the `base` namespace supersedes them -- use `just base init`,
+# `just base upgrade [vX.Y.Z]`, `just base update` (the apt-style check).
+
+# just test sync-docs -> regenerate doc/test/*.md from the specs: the count
+# figures (grep -c '^@test') AND the catalogue sections, whose blurbs and
+# per-test descriptions are read out of the spec files' own `# why:` marker
+# blocks. One-directional -- nothing is read back out of the catalogue, so a
+# row deleted there is restored byte-for-byte and a renamed test carries its
+# description with it. Idempotent; check_test_md_drift.sh remains the
+# validator, and it runs THIS generator against a throwaway copy.
+sync-docs:
+    ./script/test/sync-doc-counts.sh
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test sync-docs-check -> validate doc/test/*.md counts WITHOUT writing
+# (the read-only twin of sync-docs, and the same gate the default `just test`
+# lint phase runs). Non-zero exit on drift, printing the unified diff of what
+# regeneration would change. Three entry points share this one rule: this
+# recipe (on demand), the lint phase (blocking, local + CI), and the harness
+# repo's advisory PostToolUse hook (fast interactive signal, never blocks).
+sync-docs-check:
+    ./script/test/test.sh --lint --doc-counts
+
+# just test resolve-docs -> resolve a doc/test/*.md MERGE CONFLICT in one
+# command: collapse the markers, regenerate from the merged spec tree,
+# verify, and stage. It refuses (loudly, staging nothing) rather than pick a
+# side whenever the two collapses still differ after regeneration -- which
+# now means only hand-written prose OUTSIDE the generated region, since
+# everything inside it is derived from the specs both sides already merged.
+resolve-docs:
+    ./script/test/resolve-doc-counts.sh
+
+# just test sync-readme -> re-stamp each doc/readme/README.*.md section with
+# the hash of the README.md section it was translated against AND of the
+# translated section itself. Run this AFTER updating a translation; never
+# hand-edit a hash. Idempotent; it also reports the English sections a
+# translation still accounts for neither way (no `<!-- sync: <id> -->`
+# marker, no `<!-- sync-skip: <id> -- <why> -->`).
+#
+# It is NOT a way to make the lint stop complaining: a section whose English
+# hash moved while its translation stood still is refused, by name, and the
+# run exits non-zero. `just test sync-readme --accept <id>[,<id>...]` is the
+# explicit "I read the English change and the translation is still correct"
+# -- the case an English typo fix creates, kept to one command.
+sync-readme *args:
+    ./script/test/sync-readme-hashes.sh "$@"
+
+# lifecycle: RECLAIMED BY THE RUNNER. script/test/test.sh installs an EXIT
+# trap that sweeps orphaned compose projects on every dispatch it arms,
+# pass or fail, and asks whether the previous run has let go of this
+# project before it starts. The recipe does not repeat either, because the
+# runner is also what CI invokes directly -- a copy here would cover the
+# `just` path only.
+#
+# just test sync-readme-check -> validate the translation markers WITHOUT
+# writing (the read-only twin of sync-readme, and the same lint the default
+# `just test` lint phase runs). Non-zero exit naming the FILE and the SECTION
+# that drifted.
+sync-readme-check:
+    ./script/test/test.sh --lint --readme-sync

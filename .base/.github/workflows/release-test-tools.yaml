@@ -1,126 +1,532 @@
 name: Release test-tools image to GHCR
 
 # Multi-arch (linux/amd64 + linux/arm64) build of
-# .base/dockerfile/Dockerfile.test-tools, pushed to
-# ghcr.io/ycpss91255-docker/test-tools tagged with the release version
-# and :latest. Downstream repo Dockerfiles consume this via
-# `ARG TEST_TOOLS_IMAGE=ghcr.io/ycpss91255-docker/test-tools:<ver>`,
+# dockerfile/Dockerfile.test-tools, pushed to
+# ghcr.io/ycpss91255-lab/test-tools tagged with the release version
+# (and :latest, for a finished release). Downstream repo Dockerfiles
+# consume this via
+# `ARG TEST_TOOLS_IMAGE=ghcr.io/ycpss91255-lab/test-tools:<ver>`,
 # avoiding the cross-step image-store isolation that sank the previous
 # `test-tools:local` approach (v0.9.11 pre-D migration).
 #
 # Triggers:
-#   push of a vX.Y.Z tag -> pushes :<tag> and :latest
-#   push to main (Dockerfile.test-tools or this workflow changed)
+#   push of a vX.Y.Z tag -> pushes :<tag>, plus :latest when the tag is
+#                           NOT a prerelease. That question has one
+#                           answer in this repo -- script/ci/release-ref.sh
+#                           -- and release-worker.yaml asks the same one.
+#   push to main (an input of the tooling image, or this workflow, changed)
 #                        -> pushes :main rolling tag (#317 P2)
-#   workflow_dispatch    -> manual bootstrap; pushes only :latest
+#   workflow_dispatch    -> resolves by the ref it was dispatched FROM:
+#                           main takes the :main arm, a v* tag takes the
+#                           tag arm. Any other ref is refused rather
+#                           than published -- see the tag resolver step
+#                           in the merge job.
 #
-# Why the paths filter on main push: every non-doc PR merge triggers
-# a push to main, but most don't touch Dockerfile.test-tools. Without
-# the filter, every merge would burn ~3-5 min of multi-arch buildx
-# republishing the same image content under a new manifest digest.
-# Restrict the main trigger to commits that actually change the
-# test-tools recipe; tag-push trigger stays unfiltered because tag
-# pushes are explicit publish intents.
+# Why the paths filter on main push: every non-doc PR merge triggers a push
+# to main, and most change nothing the tooling image is built from. Without
+# the filter, every merge would burn build minutes pushing the same image
+# content under a new manifest digest. The tag-push trigger stays unfiltered
+# because tag pushes are explicit publish intents.
+#
+# WHAT THE FILTER HAS TO LIST, and why it is not just the Dockerfile. It
+# named the Dockerfile and this file, on the premise that the Dockerfile is
+# the image's only input -- true while every tool it installs was pinned by a
+# literal inside its own text, and false from the moment a stage arrived that
+# COPYs a file straight out of the build context. That file's CONTENT is
+# baked in while the Dockerfile does not move, so a merge touching only it
+# did not start this workflow at all, and `:main` went on describing the tree
+# from before it.
+#
+# GitHub evaluates `paths:` as static YAML before any job runs, so this list
+# cannot DERIVE the input set. It is instead HELD to it:
+# release_test_tools_yaml_spec.bats reads script/ci/testtools_paths.sh --
+# which derives the set from the Dockerfile's own COPY lines, the same
+# derivation the local content-hash tag uses -- and fails, naming the path,
+# when an entry is missing. So the list is still a list, and the pull request
+# that adds a context COPY without extending it is red before it can merge.
+#
+# WHY THE GATE IS THIS FILTER AND NOT A FIRST JOB THAT DECIDES. A job could
+# derive the set instead of being checked against it, with the filter widened
+# to `'**'` so the workflow always starts. It would also put runs that
+# publish NOTHING into the concurrency group below, and GitHub keeps only one
+# PENDING run per group: while a publish is in progress, a doc-only merge
+# queued behind it evicts a queued publish, then decides -- correctly, for
+# its own push -- to publish nothing, and the evicted change never reaches
+# `:main`. Every run this trigger starts has a reason to publish, and the
+# publish is unconditional, so a run that supersedes another always carries
+# at least what the superseded one would have pushed.
+#
+# Multi-arch build model (#587): each architecture builds on its NATIVE
+# runner (linux/amd64 -> ubuntu-latest, linux/arm64 -> ubuntu-24.04-arm),
+# consistent with build-worker / publish-worker. Because the
+# arches build on separate runners, each shard pushes its single-arch
+# image BY DIGEST (no tag), then a `merge` job assembles the tagged
+# multi-arch manifest list from the digests via
+# `docker buildx imagetools create`. This is deliberate: having each
+# shard push the SAME tag would leave a last-shard-wins single-arch tag
+# (the latent failure mode), which would break the downstream
+# `FROM ${TEST_TOOLS_IMAGE}` consumers on the losing arch.
 #
 # Needs packages: write to push to GHCR under the org namespace.
 
 on:
   push:
     branches: [main]
+    # Every path that can change what the tooling image CONTAINS, plus this
+    # workflow. NOT maintained by hand: a spec reads
+    # script/ci/testtools_paths.sh and fails, naming the path, when this list
+    # does not cover what the Dockerfile COPYs -- see the header.
     paths:
       - 'dockerfile/Dockerfile.test-tools'
+      - 'dockerfile/toml_bridge.py'
+      - 'dockerfile/verify-extract.sh'
+      - 'dockerfile/apk-retry.sh'
+      - 'dockerfile/kcov-76bf685.patch'
+      - 'dockerfile/kcov-bash53-ansi-c.patch'
+      - 'dockerfile/kcov-marker-resync.patch'
+      - 'dockerfile/bats-timeout-killer.patch'
+      - 'dockerfile/config-gen/**'
       - '.github/workflows/release-test-tools.yaml'
     tags:
       - 'v*'
   workflow_dispatch:
 
+# ── Ordering: the rolling tag has one writer at a time ────────────────
+#
+# The `merge` job's `imagetools create` is last-writer-wins on a tag, and
+# without a group the winner is decided by arm64 queue time rather than by
+# commit order: two main merges that both touch Dockerfile.test-tools can
+# finish out of order and leave `:main` pointing at the OLDER recipe --
+# which every self-test job then pulls and, until the probe rebuilds,
+# runs inside.
+#
+# `cancel-in-progress: false`, deliberately, and this is the workflow where
+# it matters most: a cancelled run between the per-arch digest pushes and
+# the manifest assembly leaves the tag naming whatever was there before,
+# with a set of orphan digests behind it. Serialise; never interrupt.
+concurrency:
+  group: release-test-tools-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
 
-jobs:
-  release-test-tools:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+env:
+  IMAGE: ghcr.io/ycpss91255-lab/test-tools
 
-      - name: Resolve tags
-        id: tags
-        shell: bash
-        # Three publish modes, three tag sets. `smoke` is the single tag
-        # the post-publish smoke step pulls so we always exercise the
-        # image we just pushed (rather than statically pulling :latest
-        # and missing :main bootstrapping bugs).
+jobs:
+  # Parse the target platforms into a native-runner matrix, mirroring
+  # build-worker.yaml / publish-worker.yaml's compute-matrix convention.
+  # The platform list is fixed here (this is a fixed multi-arch
+  # publisher with no `platforms` input); factoring the parser into a
+  # single source shared across all three workflows is a follow-up.
+  compute-matrix:
+    runs-on: ubuntu-latest
+    # Every job in the tree bounds itself; GitHub's default is six hours
+    # and applies per matrix shard. This one only writes an output.
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          PLATFORMS: "linux/amd64,linux/arm64"
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            ver="${GITHUB_REF##refs/tags/}"
-            tags="ghcr.io/ycpss91255-docker/test-tools:${ver},ghcr.io/ycpss91255-docker/test-tools:latest"
-            smoke="ghcr.io/ycpss91255-docker/test-tools:${ver}"
-          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
-            tags="ghcr.io/ycpss91255-docker/test-tools:main"
-            smoke="ghcr.io/ycpss91255-docker/test-tools:main"
-          else
-            tags="ghcr.io/ycpss91255-docker/test-tools:latest"
-            smoke="ghcr.io/ycpss91255-docker/test-tools:latest"
+          items=""
+          IFS=',' read -ra plats <<< "${PLATFORMS}"
+          for p in "${plats[@]}"; do
+            p="${p//[[:space:]]/}"
+            case "${p}" in
+              linux/amd64)
+                items+='{"platform":"linux/amd64","runner":"ubuntu-latest","hardware":"amd64"},'
+                ;;
+              linux/arm64)
+                items+='{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","hardware":"arm64"},'
+                ;;
+              "")
+                continue
+                ;;
+              *)
+                echo "::error::Unsupported platform '${p}'. Supported: linux/amd64, linux/arm64"
+                exit 1
+                ;;
+            esac
+          done
+          if [ -z "${items}" ]; then
+            echo "::error::No valid platforms found in '${PLATFORMS}'"
+            exit 1
           fi
-          printf 'tags=%s\n' "${tags}" >> "${GITHUB_OUTPUT}"
-          printf 'smoke=%s\n' "${smoke}" >> "${GITHUB_OUTPUT}"
+          echo "matrix={\"include\":[${items%,}]}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up QEMU
-        # Needed for the arm64 leg; amd64 alone could skip it, but the
-        # QEMU setup is a no-op on native arch so we keep the workflow
-        # simple with a single builder.
-        uses: docker/setup-qemu-action@v4
+  # Per-platform build on the native runner. Each shard pushes its
+  # single-arch image BY DIGEST (no tag); the merge job assembles the
+  # tagged manifest list from the digests.
+  build:
+    needs: compute-matrix
+    # Same-repository guard (see build-worker.yaml's `build` job for the
+    # full rationale). `runs-on` is a runtime-computed matrix label, so the
+    # job is self-hosted-eligible by the static rule and must carry it.
+    # Operationally inert today: this workflow has no `pull_request`
+    # trigger at all, so the first disjunct is always true. It is here so
+    # that adding one later cannot open the hole silently. Enforced by the
+    # self-hosted-guard lint.
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event_name != 'merge_group' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    # A per-arch image build, including a kcov compile, on a runner that
+    # may be self-hosted. Far above the measured run, far below the
+    # six-hour default a hung buildx would otherwise burn per arch.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Compute config-gen digest
+        id: config_gen_digest
+        run: |
+          _d="$(script/ci/config_gen_digest.sh)"
+          echo "config_gen_digest=${_d}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch test-tools image
+      - name: Build and push by digest (${{ matrix.platform }})
+        id: build
         # This workflow runs inside the template repo, not a downstream
         # consumer, so the Dockerfile lives at `dockerfile/...`, not
         # `.base/dockerfile/...` (the latter is only the subtree path
-        # downstream repos see and is what build-worker.yaml uses since
-        # that workflow executes in the downstream's checkout).
+        # downstream repos see).
         uses: docker/build-push-action@v7
         with:
           context: .
           file: dockerfile/Dockerfile.test-tools
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.tags }}
-          push: true
+          platforms: ${{ matrix.platform }}
+          build-args: CONFIG_GEN_DIGEST=${{ steps.config_gen_digest.outputs.config_gen_digest }}
+          # Push by digest only (no tag); the merge job applies the tags
+          # to a manifest list assembled from every arch's digest.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          # The file is NAMED by the digest, which is what the manifest
+          # create reads, and it now CARRIES the platform it was built for.
+          # The merge job verifies the image before it lets any tag name it,
+          # and the only way to verify an image is to RUN it -- which a
+          # runner can do for its own architecture and no other. So that job
+          # has to tell which of the downloaded digests it can execute, and
+          # this file is the only place the answer survives:
+          # `merge-multiple: true` flattens the per-arch artifact NAMES away
+          # before the merge job ever sees them.
+          printf '%s\n' '${{ matrix.platform }}' \
+            > "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.hardware }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Verify the per-arch digests the build shards pushed, and only then
+  # assemble the tagged multi-arch manifest that makes them reachable by
+  # name.
+  #
+  # THAT ORDER IS THE WHOLE POINT, and it is the one thing here a reader
+  # must not "tidy". The smoke step is the only check this image has: no
+  # job of this workflow needs self-test.yaml, and no tag push waits for
+  # one. It used to run AFTER `imagetools create`, so `:latest` -- the tag
+  # 15 of the 19 org repos that call a worker take by default -- already
+  # named the new content by the time anything had run it, and there is no
+  # `failure()` arm, no rollback and no `imagetools rm` anywhere in this
+  # file to put it back. On the measured v0.42.0 tag it moved 5m58s before
+  # that commit had a test verdict of any kind.
+  #
+  # The repair is this job's order, not a cross-workflow `needs:`: a
+  # digest-only push is reachable by content and by nothing else, so the
+  # window between "pushed" and "verified" belongs to no consumer. The tag
+  # is what consumers read, and it is attached last.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # This job needs the tree, where it previously needed none, because
+      # three things below are read out of the checkout rather than written
+      # here. Every `ARG <NAME>_VERSION=` in dockerfile/Dockerfile.test-tools
+      # is read through script/ci/test-tools-pins.sh; shellcheck and hadolint
+      # are pinned by literal release URL, a shape no ARG roster can see, so
+      # they are read from those URLs; and the tag resolver asks
+      # script/ci/release-ref.sh whether the tag is a prerelease.
+      #
+      # Deriving all of them from the declaration is the whole point: a
+      # version literal in this workflow would be a second place to forget,
+      # and two literals that agree with each other prove only that someone
+      # edited both.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        shell: bash
+        # Two tag sets and a refusal. A finished `v*` tag and a push to
+        # main each resolve a tag set; every other ref -- which is the
+        # only thing `workflow_dispatch` can add, since it carries the
+        # ref it was dispatched FROM -- resolves nothing and fails.
+        # `smoke` is the single tag the post-publish smoke step pulls so
+        # we always exercise the image we just pushed (rather than
+        # statically pulling :latest and missing :main bootstrapping
+        # bugs).
+        #
+        # `:latest` is the rolling convenience tag -- a human's `docker
+        # pull`, never a worker's build. NO WORKER CONSUMES IT ANY MORE:
+        # build-worker.yaml and publish-worker.yaml derive the image they
+        # build from out of `.version` in the base checkout they take at
+        # their own ref (#1122), which is `:<ver>` below. Both rules here
+        # still hold, because `:latest` is published from this step and a
+        # tag published wrong is wrong for whoever pulls it.
+        #
+        # A PRERELEASE tag publishes `:<ver>` and stops there. The `v*`
+        # trigger matches `v0.42.0-rc4` as readily as `v0.42.0`, and rc1
+        # through rc4 each moved `:latest` -- so for the length of an RC
+        # window the org was building against a release candidate.
+        #
+        # Prerelease is the same question release-worker.yaml asks before
+        # it marks a GitHub Release, so it is ASKED rather than restated:
+        # script/ci/release-ref.sh owns the rule. Its answer is captured
+        # into a variable rather than tested inline as `[[ "$(...)" == ]]`,
+        # because a command substitution that FAILS inside `[[ ]]` does
+        # not trip errexit -- the refusal would read as "not a
+        # prerelease", which is the arm that moves `:latest`.
+        #
+        # A ref this resolver does not recognise publishes NOTHING.
+        # `workflow_dispatch` is unrestricted by ref, so that arm is
+        # reachable from any feature branch; resolving it to `:latest`
+        # made the unrecognised input the most destructive one. Same
+        # direction as ghcr-cleanup.yaml's dry-run resolver, which routes
+        # an input it cannot parse to the safe branch rather than the
+        # default one.
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF##refs/tags/}"
+            tags="${IMAGE}:${ver}"
+            pre="$(./script/ci/release-ref.sh prerelease "${ver}")"
+            if [[ "${pre}" == 'true' ]]; then
+              echo "::notice::${ver} is a prerelease tag: publishing" \
+                "${IMAGE}:${ver} only and leaving :latest where it is."
+            else
+              tags="${tags},${IMAGE}:latest"
+            fi
+            smoke="${IMAGE}:${ver}"
+          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            tags="${IMAGE}:main"
+            smoke="${IMAGE}:main"
+          else
+            echo "::error::${GITHUB_REF} is neither a v* tag nor main," \
+              "so this workflow has no tag to publish for it. Dispatch" \
+              "from main, or push a v* tag." >&2
+            exit 1
+          fi
+          printf 'tags=%s\n' "${tags}" >> "${GITHUB_OUTPUT}"
+          printf 'smoke=%s\n' "${smoke}" >> "${GITHUB_OUTPUT}"
+          echo "Computed tags: ${tags}"
+
+      - name: Select the digest to verify
+        id: verify
+        working-directory: /tmp/digests
+        shell: bash
+        # The smoke step below RUNS the image, and a runner can only run its
+        # own architecture. Each build shard wrote the platform it built into
+        # its digest file (the build job's Export digest step), so the arch
+        # is read out of the artifact rather than assumed from `runs-on:` --
+        # move this job to an arm64 runner and the selection follows it.
+        #
+        # A digest this runner cannot execute is not skipped, it is a hard
+        # failure: an empty selection would leave the smoke step with nothing
+        # to pull and the manifest create with nothing in front of it, which
+        # is precisely the state the step order here exists to remove. The
+        # read of each file is assigned rather than tested inline, because a
+        # command substitution that FAILS inside `[[ ]]` does not trip
+        # errexit -- an unreadable file would read as "not this arch".
+        run: |
+          set -euo pipefail
+          host="linux/$(docker version --format '{{.Server.Arch}}')"
+          ref=''
+          for _d in *; do
+            built="$(cat "${_d}")"
+            if [[ "${built}" == "${host}" ]]; then
+              ref="${IMAGE}@sha256:${_d}"
+              break
+            fi
+          done
+          if [[ -z "${ref}" ]]; then
+            echo "::error::none of the digests this run pushed was built" \
+              "for ${host}, so this runner can execute none of them. The" \
+              "build matrix and this job's runner have diverged; refusing" \
+              "to tag an image nothing verified." >&2
+            exit 1
+          fi
+          printf 'ref=%s\n' "${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Verifying ${ref} before any tag names it"
 
       - name: Smoke test pushed image
         # Regression guard for the v0.12.1 publish (issue #165): the alpine
         # final stage shipped without bash and without /usr/local/bin/bats,
         # so the image had bats-* files on disk but `bats` was unrunnable.
-        # Pull the just-pushed amd64 leg and exercise each tool end-to-end
-        # so a similar break never reaches downstream consumers silently.
-        # The smoke target tracks `steps.tags.outputs.smoke` so we always
-        # verify the image the current trigger produced (incl. :main on
-        # main push, not the stale :latest left from the previous tag).
+        # Pull the just-pushed image and exercise each tool end-to-end so a
+        # similar break never reaches downstream consumers silently.
+        #
+        # THE TARGET IS A DIGEST, and no tag exists for this content yet.
+        # That is what makes this step a gate rather than a report: it reads
+        # `steps.verify.outputs.ref`, the digest a shard pushed, and the
+        # manifest create below attaches the tags to those same digests
+        # afterwards. Reading a TAG here, as this step used to, required the
+        # create to have run first -- so the check that could fail ran after
+        # the publish it was supposed to authorise, and a red smoke left the
+        # moved tag exactly where it was.
         shell: bash
         run: |
           set -euo pipefail
-          image="${{ steps.tags.outputs.smoke }}"
+          image="${{ steps.verify.outputs.ref }}"
           docker pull "${image}"
-          docker run --rm "${image}" bats --version
-          docker run --rm "${image}" shellcheck --version
-          docker run --rm "${image}" hadolint --version
+          # bats and kcov are NOT probed here: both are pinned by an ARG,
+          # so the roster loop below asserts them by version, which is
+          # strictly more than the exit status a probe here would read.
+          #
+          # The static-analysis pair IS on that roster now -- the pins moved
+          # onto ARG lines so a `tool-pin:` marker had a line to attach to,
+          # and the roster reads every ARG. The explicit comparison below
+          # therefore re-asserts what the roster loop already asserts. It is
+          # kept rather than deleted because it is the check that caught a
+          # 3.8-year-stale hadolint pin and it names the two tools every PR
+          # in this repo is gated by; the cost is one duplicated assertion,
+          # not a gap.
+          #
+          # (This line does not open with the tool's name on purpose: a
+          # comment beginning `# shellcheck ...` inside a run: block is
+          # parsed as a shellcheck DIRECTIVE, and actionlint fails the
+          # workflow with SC1072/SC1073 rather than reading prose.)
+          # The two lint gates every PR in this repo must pass are the
+          # static-analysis pair pinned in dockerfile/Dockerfile.test-tools
+          # -- a shape dependabot cannot see. `<tool> --version` asserting
+          # exit 0, which is what stood here, catches a tool that vanished
+          # from the image and nothing else: a hadolint pin went 3.8 years
+          # stale behind this very check. So read the pin and compare it
+          # with what the image actually shipped.
+          #
+          # The expectations are GREPPED from the Dockerfile rather than
+          # written here. An empty grep result is a hard failure, never an
+          # empty-string comparison that agrees with itself: that is the
+          # state a renamed ARG or a renamed file produces, and it is
+          # exactly when a silent pass is worst.
+          #
+          # The read is of the `ARG <TOOL>_VERSION=` declaration, not of
+          # the release URL below it. Both versions live on ARG lines now
+          # because a version inside a line-continued RUN has no line of
+          # its own for a `tool-pin:` marker to attach to; the URLs
+          # interpolate them, so there is no literal there left to grep.
+          # The leading v is stripped by the substitution, as before.
+          df="dockerfile/Dockerfile.test-tools"
+          expected_sc="$(sed -n 's|^ARG[[:space:]]\{1,\}SHELLCHECK_VERSION=v\{0,1\}\([0-9][0-9.]*\)[[:space:]]*$|\1|p' "${df}" | head -n1)"
+          expected_hd="$(sed -n 's|^ARG[[:space:]]\{1,\}HADOLINT_VERSION=v\{0,1\}\([0-9][0-9.]*\)[[:space:]]*$|\1|p' "${df}" | head -n1)"
+          if [[ -z "${expected_sc}" || -z "${expected_hd}" ]]; then
+            echo "could not read the shellcheck / hadolint pins from ${df} (shellcheck='${expected_sc}' hadolint='${expected_hd}'). The ARG declaration moved, or the file did. Refusing to report agreement between two empty strings." >&2
+            exit 1
+          fi
+
+          # Both tools print their version as a bare number; the pins are
+          # tags, hence the stripped leading v above. The dots are escaped
+          # and the number is bounded on both sides, so 0.11.0 matches the
+          # version it is and not 0.11.01, nor a digit sequence that merely
+          # contains it.
+          re_sc="${expected_sc//./\\.}"
+          re_hd="${expected_hd//./\\.}"
+          actual_sc="$(docker run --rm "${image}" shellcheck --version)"
+          if ! grep -qE "(^|[^0-9.])${re_sc}([^0-9.]|$)" <<< "${actual_sc}"; then
+            echo "shellcheck version mismatch: ${df} pins v${expected_sc}, image reports:" >&2
+            echo "${actual_sc}" >&2
+            exit 1
+          fi
+          echo "shellcheck: pinned v${expected_sc}, image agrees"
+
+          actual_hd="$(docker run --rm "${image}" hadolint --version)"
+          if ! grep -qE "(^|[^0-9.])${re_hd}([^0-9.]|$)" <<< "${actual_hd}"; then
+            echo "hadolint version mismatch: ${df} pins v${expected_hd}, image reports:" >&2
+            echo "${actual_hd}" >&2
+            exit 1
+          fi
+          echo "hadolint: pinned v${expected_hd}, image agrees"
           docker run --rm "${image}" parallel --version
           docker run --rm "${image}" git --version
-          docker run --rm "${image}" make --version
-          # just (#546): the justfile entry point replaces the Makefile;
-          # downstream + CI run `just <verb>`, so the image must carry it.
-          docker run --rm "${image}" just --version
+          # Every probe above asserts an exit status and nothing else,
+          # which catches a tool's REMOVAL and never its staleness -- that
+          # is how this image sat 37 minors behind the `just` CI and
+          # developer hosts ran, green throughout. The tools the
+          # Dockerfile PINS are therefore compared to their declaration,
+          # and the list of them is the declaration's, not one kept here:
+          # script/ci/test-tools-pins.sh reads every `ARG <NAME>_VERSION=`
+          # in dockerfile/Dockerfile.test-tools and refuses to answer
+          # while any of them has no probe. So a tool pinned tomorrow is
+          # asserted tomorrow, rather than joining the three (bats, kcov,
+          # alpine) that were pinned and compared to nothing.
+          #
+          # The roster is captured into a variable BEFORE the loop rather
+          # than piped into it: a loop fed by a command that failed simply
+          # gets no input and passes, which for a step whose whole
+          # assertion is "the versions were checked" is the fail-open
+          # direction. An assignment from a failing command substitution
+          # trips errexit, and emptiness is refused by name below.
+          roster="$(./script/ci/test-tools-pins.sh roster)"
+          if [ -z "${roster}" ]; then
+            echo "::error::the pin roster came back empty, so no version" \
+              "was checked at all. Read script/ci/test-tools-pins.sh." >&2
+            exit 1
+          fi
+          while IFS="$(printf '\t')" read -r pin_arg pin_ver pin_probe; do
+            observed="$(docker run --rm "${image}" sh -c "${pin_probe}" 2>&1)"
+            if ! ./script/ci/test-tools-pins.sh check "${pin_arg}" "${observed}"; then
+              echo "::error::${image} answers '${observed}' for" \
+                "${pin_probe}, but dockerfile/Dockerfile.test-tools" \
+                "declares ARG ${pin_arg}=${pin_ver}" >&2
+              exit 1
+            fi
+            echo "${pin_arg}=${pin_ver} confirmed in ${image} (${observed})"
+          done <<< "${roster}"
           # `git subtree --help` would invoke `man git-subtree`, but alpine
           # ships no man viewer in the test-tools image (and we don't want
           # to install one just for this smoke check). Confirm the binary
@@ -128,9 +534,187 @@ jobs:
           # value, no man dependency.
           docker run --rm "${image}" sh -c 'test -f "$(git --exec-path)/git-subtree"'
           # docker-cli + docker-cli-buildx (#249): consumed by the
-          # behavioural test suite (test/behavioural/*.bats) when run
-          # via the ci-behavioural compose service. Smoke-check both
+          # system test suite (test/bats/system/*.bats) when run
+          # via the ci-system compose service. Smoke-check both
           # by version. buildx is exposed as `docker buildx version`,
           # not a standalone binary.
           docker run --rm "${image}" docker --version
           docker run --rm "${image}" docker buildx version
+          # docker-cli-compose + xz: the field-deploy system test runs the
+          # generated deploy.sh (real `docker compose up -d`) and unxz's the
+          # bundled image.tar.xz; the generator xz-compresses the saved image.
+          docker run --rm "${image}" docker compose version
+          docker run --rm "${image}" xz --version
+          # mawk + gawk (#576): added alongside busybox awk so the issueref
+          # awk program's portability unit test exercises all three engines
+          # in the alpine `just test` loop (closes the kcov debian/mawk
+          # blind spot). mawk reports its version on stderr and exits non-
+          # zero for -W version, so probe presence via the binary path.
+          docker run --rm "${image}" sh -c 'command -v mawk'
+          docker run --rm "${image}" gawk --version
+          # yq (#957): the spec suite's YAML derivations query a parser
+          # rather than matching indentation with awk, so a job or a
+          # permission entry written in a shape the regex did not model
+          # can no longer go missing. Alpine ships it as `yq-go`; the
+          # binary on PATH is `yq`, which is what this probe pins.
+          docker run --rm "${image}" yq --version
+          # toml-bridge (#1222): the ADR-37 TOML parser this image bundles
+          # so a downstream repo inherits it through the test-tools-stage
+          # pattern without building the standalone image. It shipped for
+          # four published tags as a `#!/usr/bin/env python3` script in a
+          # stage that installed no python3 -- an inert file -- and this
+          # step probed every other bundled tool and not that one.
+          #
+          # It reads the PARSE and not the exit status, which is the same
+          # distinction the roster above draws for a version: a missing
+          # interpreter and a successful parse both end the process, and
+          # only what was printed says which happened. The failure is
+          # captured rather than left to errexit so the message can quote
+          # what the image actually answered.
+          bridge_out="$(printf '[gui]\nmode = "wayland"\n' \
+            | docker run --rm -i "${image}" /usr/local/bin/toml-bridge 2>&1 \
+            || true)"
+          if [ "${bridge_out}" != '{"gui": {"mode": "wayland"}}' ]; then
+            echo "::error::the bundled toml-bridge in ${image} answered" \
+              "'${bridge_out}' where the parsed JSON was expected." \
+              "dockerfile/Dockerfile.test-tools COPYs the parser in; a" \
+              "final stage without its interpreter makes that copy inert." >&2
+            exit 1
+          fi
+          echo "toml-bridge: the bundled parser answers with parsed JSON"
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        shell: bash
+        # Build `-t <tag>` flags from the comma-separated tag list and
+        # source refs from each per-arch digest filename, then create the
+        # manifest list. This is what makes the published tag a true
+        # multi-arch image instead of a last-shard-wins single arch.
+        #
+        # LAST, after the smoke step above, and not for tidiness: every tag
+        # this attaches is reachable by name the instant it exists, nothing
+        # in this file can detach one again, and `:latest` is what the
+        # unpinned majority of the org builds its lint stage from. The
+        # content it names has already been run.
+        run: |
+          set -euo pipefail
+          tag_args=()
+          IFS=',' read -ra _tags <<< "${{ steps.tags.outputs.tags }}"
+          for _t in "${_tags[@]}"; do
+            tag_args+=("-t" "${_t}")
+          done
+          src=()
+          for _d in *; do
+            src+=("${IMAGE}@sha256:${_d}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${src[@]}"
+
+      - name: Confirm the published tag names the verified content
+        working-directory: /tmp/digests
+        shell: bash
+        # The one thing that cannot be checked before the tag exists: that
+        # the tag RESOLVES, and resolves to this run's content. The smoke
+        # step above answers "does the image work"; this answers "did the
+        # create attach the tags to it", which is the only failure mode the
+        # reordering leaves on this side of the publish.
+        #
+        # The two references arrive through `env:` rather than inline, so the
+        # body is shell a spec can RUN with the environment supplied --
+        # release_test_tools_yaml_spec.bats drives it over one registry
+        # state per case, with `docker` stubbed. IMAGE_TAG is the single tag the
+        # current trigger treats as primary (`:<ver>` for a tag push, `:main`
+        # for a main push), so this reads the tag this run produced and never
+        # a stale one left by the previous publish.
+        env:
+          IMAGE_TAG: ${{ steps.tags.outputs.smoke }}
+          VERIFIED_REF: ${{ steps.verify.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Bash runs a command substitution with errexit OFF unless told
+          # otherwise, so a registry read that printed a usable body and then
+          # failed would be taken as an answer. inherit_errexit carries -e
+          # into every `$(...)` below; the reads that matter also check their
+          # own status (base#1510).
+          shopt -s inherit_errexit
+          # Resolve the tag ONCE, to the immutable digest of the index it
+          # names, and read every answer below from that digest, so the tag
+          # cannot move between the reads.
+          tag_digest="$(docker buildx imagetools inspect "${IMAGE_TAG}" \
+            --format '{{.Manifest.Digest}}')"
+          if [[ ! "${tag_digest}" =~ ^sha256:[0-9a-f]+$ ]]; then
+            echo "::error::${IMAGE_TAG} did not resolve to a digest" \
+              "(answered '${tag_digest}')." >&2
+            exit 1
+          fi
+          pinned="${IMAGE}@${tag_digest}"
+          # The tag resolves, and the manifest under it carries every platform
+          # this run built. The expected platform list is the digest
+          # artifacts' own, so an arch added to the build matrix is checked
+          # without this step being edited. The shape read is buildx's own
+          # `Platform:  <os>/<arch>` listing, which the spec's stub derives
+          # from the same raw index the comparison below reads.
+          listing="$(docker buildx imagetools inspect "${pinned}")"
+          for _d in *; do
+            built="$(cat "${_d}")"
+            if ! grep -qE "Platform:[[:space:]]+${built}[[:space:]]*$" \
+                <<< "${listing}"; then
+              echo "::error::${IMAGE_TAG} carries no manifest for ${built}," \
+                "which this run built. The tag is not the multi-arch list" \
+                "this job assembled." >&2
+              exit 1
+            fi
+            echo "${IMAGE_TAG} carries a manifest for ${built}"
+          done
+          # And for THIS runner's platform the tag names the very image the
+          # smoke step ran. Neither index digest can be compared: provenance
+          # is on by default in docker/build-push-action, so each shard's
+          # `outputs.digest` names an INDEX carrying the platform image plus
+          # its attestation, and `imagetools create` FLATTENS those indexes
+          # into the published one -- the verified ref and the tag are always
+          # two different indexes. `docker image inspect .Id` is no way out
+          # either: it depends on the local image store, the config digest on
+          # the classic graphdriver store but the pulled INDEX digest on the
+          # containerd store (base#1510), where it failed every publish after
+          # the tags had moved. What both indexes must share is the image
+          # manifest for this platform, read from the registry, so the answer
+          # does not depend on the store; its digest pins config and layers.
+          # The platform is the one the verify step matched to this host: the
+          # artifact file named by the verified digest.
+          platform="$(cat "${VERIFIED_REF##*sha256:}")"
+          IFS='/' read -r p_os p_arch p_variant <<< "${platform}"
+          # _child <ref>: the digest of the single non-attestation descriptor
+          # in <ref>'s index whose os, architecture and (when the artifact
+          # names one) variant are this platform's; none or several refuse.
+          # Both sides go through it, so each is held to exactly one.
+          _child() {
+            local _ref="${1}" _found _n
+            _found="$(docker buildx imagetools inspect --raw "${_ref}" \
+              | jq -r --arg os "${p_os}" --arg arch "${p_arch}" \
+                  --arg variant "${p_variant:-}" '
+                (.manifests // [])[]
+                | select((.annotations // {})["vnd.docker.reference.type"]
+                    != "attestation-manifest")
+                | select(.platform.os == $os
+                    and .platform.architecture == $arch
+                    and ($variant == "" or .platform.variant == $variant))
+                | .digest')" || {
+              echo "::error::could not read the index ${_ref} names." >&2
+              return 1
+            }
+            _n="$(grep -c . <<< "${_found}" || true)"
+            if [[ "${_n}" -ne 1 ]]; then
+              echo "::error::${_ref} carries ${_n} image manifests for" \
+                "${platform}; exactly one is required." >&2
+              return 1
+            fi
+            printf '%s\n' "${_found}"
+          }
+          want="$(_child "${VERIFIED_REF}")" || exit 1
+          got="$(_child "${pinned}")" || exit 1
+          if [[ "${want}" != "${got}" ]]; then
+            echo "::error::${IMAGE_TAG} names ${got} for ${platform}, but" \
+              "the image this job verified is ${want}. The tags were" \
+              "attached to content the smoke step never ran." >&2
+            exit 1
+          fi
+          echo "${IMAGE_TAG} names the verified ${platform} image (${got})"

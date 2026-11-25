@@ -1,0 +1,6100 @@
+#!/usr/bin/env bats
+#
+# Unit tests for script/test/test.sh helper functions.
+# Only helpers that can be exercised without a full CI run are covered here.
+#
+# NOTE: these tests confine PATH to MOCK_DIR *after* sourcing test.sh so
+# the mocked binaries resolve instead of the real ones.
+
+setup() {
+  export LOG_FORMAT=text
+  # A caller's exported work dir is not this test's (base#1420).
+  unset COVERAGE_LOCAL_WORKDIR
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  create_mock_dir
+  local _cmd
+  # sha256sum + cut back the name derivations (_compute_test_tools_hash /
+  # _compute_compose_project_name); without them a PATH-confined test would
+  # exercise their fail-loud guard instead of the behaviour under test.
+  # timeout wraps the compose run of the suite (base#1413), so a test that
+  # reaches that call needs the real one beside the mocked docker.
+  for _cmd in grep date cat printf sha256sum cut timeout; do
+    local _path
+    _path="$(command -v "${_cmd}" 2>/dev/null)" && ln -sf "${_path}" "${MOCK_DIR}/${_cmd}"
+  done
+}
+
+teardown() {
+  cleanup_mock_dir
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _run_shellcheck
+#
+# Regression guard: if someone adds a new shell script under script/ or
+# config/ but forgets to wire it into _run_shellcheck, the list drifts
+# out of sync with reality. These tests pin the expected invocations so
+# that drift surfaces as a test failure.
+# ════════════════════════════════════════════════════════════════════
+
+# why: Wired-file regression guard
+@test "_run_shellcheck: invokes shellcheck against every expected script" {
+  # Log each invocation to a capture file so we can inspect the set.
+  local _log="${BATS_TEST_TMPDIR}/shellcheck.log"
+  mock_cmd "shellcheck" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  # xargs needs a mock too — the real one would forward to the real
+  # shellcheck binary (which lives in MOCK_DIR), so this is just a
+  # belt-and-braces ensure PATH is honored.
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_success
+
+  assert [ -f "${_log}" ]
+  run cat "${_log}"
+  assert_output --partial "script/test/test.sh"
+  assert_output --partial "sync-doc-counts.sh"
+  assert_output --partial "init.sh"
+  assert_output --partial "upgrade.sh"
+  assert_output --partial "config/shell/terminator/setup.sh"
+  assert_output --partial "config/shell/tmux/setup.sh"
+  # the base namespace scripts (completions.sh) are shellchecked too.
+  assert_output --partial "dist/script/base"
+}
+
+# why: `find` covers new scripts
+@test "_run_shellcheck: picks up every .sh file in script/docker/" {
+  local _log="${BATS_TEST_TMPDIR}/shellcheck.log"
+  mock_cmd "shellcheck" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_success
+
+  # Every .sh under dist/script/docker/wrapper/ and lib/ must appear.
+  for _f in /source/dist/script/docker/wrapper/*.sh /source/dist/script/docker/lib/*.sh; do
+    run grep -F "${_f}" "${_log}"
+    assert_success
+  done
+}
+
+@test "_run_shellcheck: picks up every .sh file in script/test/ (#876)" {
+  # The driver used to name script/test/*.sh one by one, so
+  # check_test_md_drift.sh, lint_bare_stderr.sh and the 333-line
+  # sync-readme-hashes.sh generator went unlinted -- and the same batch
+  # that added resolve-doc-counts.sh to the list forgot them. A find
+  # sweep makes a new gate script linted the moment it exists.
+  local _log="${BATS_TEST_TMPDIR}/shellcheck.log"
+  mock_cmd "shellcheck" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_success
+
+  local _f _missing=""
+  while IFS= read -r _f; do
+    grep -qF "${_f}" "${_log}" || _missing+=" ${_f}"
+  done < <(find /source/script/test -name '*.sh' -type f | sort)
+  [ -z "${_missing}" ] || { echo "script/test scripts never linted:${_missing}"; false; }
+}
+
+# why: base#1113 the dist/ half named its find roots, and the tree grew two
+# scripts outside every one of them
+@test "_run_shellcheck: lints every *.sh the dist/ tree ships (base#1113)" {
+  # The script/ half has asked the tree since base#876; the dist/ half kept
+  # a list of roots, and a list of roots cannot say which root is missing.
+  # dist/deploy/cd-guard.sh (downstream CD runs it before a deploy) and
+  # dist/config/shell/bashrc.d/30-name-host-groups.sh (the Dockerfile copies
+  # it into ~/.bashrc.d and every interactive shell sources it) sat outside
+  # all of them: an SC2086 added to both left --shellcheck-only printing
+  # "--- Running ShellCheck ---" and exiting 0, while the same line in
+  # dist/script/docker/lib/hook.sh failed the run. The population is the
+  # shipped tree, so the driver asks the shipped tree.
+  local _log="${BATS_TEST_TMPDIR}/shellcheck.log"
+  mock_cmd "shellcheck" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_success
+  assert [ -f "${_log}" ]
+
+  local -a _shipped=()
+  mapfile -t _shipped < <(find /source/dist -name '*.sh' -type f | sort)
+  # Refuse the no-evidence state. A find that matched nothing makes every
+  # comparison below a comparison against an empty population, so the guard
+  # would report clean having read no files at all.
+  [ "${#_shipped[@]}" -ge 50 ] \
+    || fail "find over dist/ yielded ${#_shipped[@]} scripts; the population did not parse"
+
+  local _f _missing=""
+  for _f in "${_shipped[@]}"; do
+    grep -qF "${_f}" "${_log}" || _missing+=" ${_f}"
+  done
+  [ -z "${_missing}" ] \
+    || fail "shipped dist/ scripts in no ShellCheck pass:${_missing} -- a shipped script no pass names is a script whose next edit is unchecked"
+}
+
+# why: Strict-mode propagation
+@test "_run_shellcheck: exits non-zero when shellcheck fails on any script" {
+  # Simulate a lint violation on init.sh specifically.
+  mock_cmd "shellcheck" '
+    for _arg in "$@"; do
+      if [[ "${_arg}" == *"/init.sh" ]]; then
+        printf "SC0001: fake violation\n" >&2
+        exit 1
+      fi
+    done
+    exit 0'
+  # Enable -e to mirror real CI invocation (test.sh sets it when run
+  # directly; when sourced, the caller owns strict mode).
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _run_lint_tool: an abort the driver cannot explain
+#
+# A lint driver that dies at a command reporting nothing -- a signal
+# above all, SIGPIPE from a pipeline whose reader closed early -- used to
+# surface as a bare exit code from `just`, reading like a lint finding
+# rather than a broken driver. The dispatcher names the tool, the status
+# and the command that stopped it, through the registered event id.
+# ════════════════════════════════════════════════════════════════════
+
+# why: 141 reported as tool + command + SIGPIPE
+@test "_run_lint_tool: names the tool and the signal when a driver dies of SIGPIPE (#898)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() {
+      local _v
+      # A writer whose reader is already gone: SIGPIPE -> 141, which
+      # pipefail promotes to the pipeline status, exactly as a
+      # `... | sort | head -n1` losing the race would.
+      _v="$( { sleep 0.2; printf "x\n"; } | true )"
+    }
+    _run_lint_tool adr-numbering
+  '
+  assert_failure
+  assert_output --partial "ci_lint_driver_failed"
+  assert_output --partial "adr-numbering"
+  assert_output --partial "141"
+  assert_output --partial "SIGPIPE"
+}
+
+# why: Plain non-zero abort still names the tool
+@test "_run_lint_tool: names the tool when a driver fails without a signal (#898)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; }
+    _run_lint_tool adr-numbering
+  '
+  assert_failure
+  assert_output --partial "ci_lint_driver_failed"
+  assert_output --partial "adr-numbering"
+  assert_output --partial "false"
+}
+
+# why: Silent on success, trap disarmed after
+@test "_run_lint_tool: a clean driver reports nothing and leaves no ERR trap armed (#898)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { echo "driver ok"; }
+    _run_lint_tool adr-numbering
+    trap -p ERR
+    echo "trap-listing-ends"
+  '
+  assert_success
+  assert_output --partial "driver ok"
+  refute_output --partial "ci_lint_driver_failed"
+  refute_output --partial "_lint_driver_failed"
+}
+
+# why: The single dispatch has the same call-site precondition the phase
+# has, and it is reachable on its own -- `main --ci` calls it directly for
+# LINT_ONLY with one named tool. Under a suppressing caller its ERR trap
+# never fires (bash suppresses the trap for the same commands it suppresses
+# errexit for), the driver runs on past its first failing command, and the
+# dispatch returns the zero of its own last statement. Guarding only the
+# plural would leave the narrower entry point reporting clean.
+@test "_run_lint_tool: an errexit-suppressing caller is refused, not trusted (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; echo "SAILED PAST the first failure"; }
+    if _run_lint_tool adr-numbering; then echo "DISPATCH SAID CLEAN"; fi
+  '
+  assert_failure
+  refute_output --partial "SAILED PAST"
+  refute_output --partial "DISPATCH SAID CLEAN"
+  assert_output --partial "ci_lint_errexit_suppressed"
+}
+
+# why: The refusal asks about the CALL, not about the option. `set +e` is
+# a caller that has turned errexit off, which is harmless here -- the
+# driver subshell arms its own -- while an `if` condition is a caller that
+# has taken it away in a way no `set -e` can give back. A probe that
+# confused the two would either refuse the whole gate or protect nothing.
+@test "_refuse_suppressed_errexit: reads the call shape, not the errexit option (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    set +e
+    _refuse_suppressed_errexit "the option-off call"
+    echo "option off, plain statement: allowed"
+    set -e
+    if _refuse_suppressed_errexit "the suppressed call"; then
+      echo "SUPPRESSED CALL ALLOWED"
+    fi
+  '
+  assert_failure
+  assert_output --partial "option off, plain statement: allowed"
+  refute_output --partial "SUPPRESSED CALL ALLOWED"
+  assert_output --partial "ci_lint_errexit_suppressed"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _run_lint_tools: the phase enumerates, the driver still stops
+#
+# The lint phase used to be a bare loop under the file's `set -e`, so the
+# first failing driver ended the run and every driver behind it went
+# unreported. A tree with three violations therefore cost three full gate
+# cycles, and after each one nobody knew how many remained.
+#
+# The drivers are independent -- a `case` dispatch, each reading its own
+# file set, none consuming another's output -- so the phase can run them
+# all and report the failures together. What must NOT come with that is a
+# driver that keeps going past its own first failing command: that is a
+# different scope, and the one _run_lint_tool's header argues for.
+# ════════════════════════════════════════════════════════════════════
+
+# why: Three independent violations must be enumerated by ONE run. This is
+# the defect measured in base#1059: a lint phase that ran 17 drivers, died
+# on changelog-entry and never reached any of the entries behind it --
+# changelog-layout through catalog-description -- so each cycle returned
+# one bit, "this one is broken, and something unknown may be behind it".
+@test "_run_lint_tools: three failing drivers are all run and all named in one pass (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_issueref()            { echo "reached issueref"; false; }
+    _run_adr_numbering()       { echo "reached adr-numbering"; }
+    _run_changelog_entry()     { echo "reached changelog-entry"; false; }
+    _run_pin_coverage()        { echo "reached pin-coverage"; }
+    _run_catalog_description() { echo "reached catalog-description"; false; }
+    _run_lint_tools issueref adr-numbering changelog-entry pin-coverage \
+      catalog-description
+  '
+  assert_failure
+  # Every tool was reached, including the two behind the first failure.
+  assert_output --partial "reached issueref"
+  assert_output --partial "reached adr-numbering"
+  assert_output --partial "reached changelog-entry"
+  assert_output --partial "reached pin-coverage"
+  assert_output --partial "reached catalog-description"
+  # And the phase names all three failures together, in phase order, so
+  # the operator learns the whole list from this one run.
+  assert_output --partial "ci_lint_phase_failed"
+  assert_output --partial "issueref changelog-entry catalog-description"
+}
+
+# why: The collection must not be bought with the driver's own errexit.
+# `( _run_lint_tool "${_tool}" ) || _failed+=(...)` reads as the obvious
+# shape and is wrong: bash suppresses errexit for the whole of a `||`
+# command, inside the subshell too, and a `set -e` in the subshell body
+# does not bring it back. That is the exact failure _run_lint_tool's
+# header refuses -- a driver sailing past its first failing command.
+@test "_run_lint_tools: a failing driver still stops at its FIRST failing command (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; echo "SAILED PAST the first failure"; }
+    _run_lint_tools adr-numbering
+  '
+  assert_failure
+  refute_output --partial "SAILED PAST"
+  assert_output --partial "ci_lint_driver_failed"
+  assert_output --partial "adr-numbering"
+}
+
+# why: The subshell's guarantee is a CALL-SITE precondition, and an
+# unenforced precondition defaults to pass. bash suppresses errexit for
+# every command of an `if` condition, a `&&` / `||` list or a `!`, and the
+# suppression reaches through this function into the standalone subshell
+# too, so a caller who writes `if _run_lint_tools ...` gets back the exact
+# defect the shape was chosen to refuse -- the driver sails past its first
+# failing command, the subshell exits zero, and the phase reports a clean
+# tree. No spelling of the subshell repairs it from the inside, so the
+# phase probes for the suppression and refuses instead of measuring
+# something it cannot measure.
+@test "_run_lint_tools: an errexit-suppressing caller is refused, not trusted (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; echo "SAILED PAST the first failure"; }
+    if _run_lint_tools adr-numbering; then echo "PHASE SAID CLEAN"; fi
+  '
+  assert_failure
+  refute_output --partial "PHASE SAID CLEAN"
+  refute_output --partial "SAILED PAST"
+  assert_output --partial "ci_lint_errexit_suppressed"
+}
+
+# why: The sibling call shape, and the one a `_run_all_lint_tools || x`
+# reads as harmless. Same suppression, same refusal -- pinned separately
+# because a probe that only covered the `if` condition would leave the
+# list operators reporting clean.
+@test "_run_lint_tools: an errexit-suppressing list operator is refused too (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; echo "SAILED PAST the first failure"; }
+    _run_lint_tools adr-numbering || echo "CALLER HANDLED IT"
+  '
+  assert_failure
+  refute_output --partial "CALLER HANDLED IT"
+  refute_output --partial "SAILED PAST"
+  assert_output --partial "ci_lint_errexit_suppressed"
+}
+
+# why: The probe measures a COMMAND-SUBSTITUTION subshell, which is
+# narrower than "a subshell of this call", and the two come apart under
+# `eval`: measured on bash 5.1, `if eval f` leaves the substitution
+# reporting errexit ARMED while a plain `( set -e; false )` subshell of
+# the same call still sails. So an `if eval _run_lint_tools ...` is NOT
+# refused -- and what stops the driver there is the OTHER mechanism, the
+# `set -E` and ERR trap inside _run_lint_tool, which `eval` does not
+# disarm. That is the mechanism the refusal's narrowed header now leans
+# on for the shapes its probe cannot see, so it is pinned here rather
+# than assumed: under the shape that escapes the probe, the driver must
+# still die at its first failing command and be named.
+# bash 5.3 moved the boundary (measured on 5.3.3, base#1030): under
+# `if eval f` the substitution now reports "suppressed" AND the ERR trap
+# no longer fires, so with the refusal stubbed out the driver sails and the
+# phase reports clean. There the probe is the mechanism that holds, and the
+# phase refuses before any driver runs. The contract -- the run fails, the
+# driver never sails, the phase never says clean -- is the same on both
+# sides; which guard speaks is pinned per bash version, so either one
+# regressing on the bash it holds on turns this red.
+@test "_run_lint_tools: an eval'd caller escapes the probe, the driver still cannot sail (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { false; echo "SAILED PAST the first failure"; }
+    if eval _run_lint_tools adr-numbering; then echo "PHASE SAID CLEAN"; fi
+  '
+  assert_failure
+  refute_output --partial "SAILED PAST"
+  refute_output --partial "PHASE SAID CLEAN"
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    # bash >= 5.3: the probe reads the eval'd caller; the phase refuses.
+    assert_output --partial "ci_lint_errexit_suppressed"
+    assert_output --partial "the lint phase was called"
+    refute_output --partial "ci_lint_driver_failed"
+    return 0
+  fi
+  # bash < 5.3: not the refusal -- the probe cannot see this shape -- but
+  # the driver's own ERR trap, naming the driver that died.
+  assert_output --partial "ci_lint_driver_failed"
+  assert_output --partial "adr-numbering"
+}
+
+# why: The phase's OWN refusal, pinned by something only it can answer.
+# Both guards above are satisfied by `_run_lint_tool`'s copy of the
+# refusal, which fires inside the driver subshell and emits the same
+# event, so deleting the phase's line leaves them green -- a precondition
+# with two enforcers and assertions that cannot tell which one spoke. This
+# one names the phase in the refusal it demands and refuses to see a
+# dispatch at all: the phase must stop the run BEFORE the first driver is
+# reached, not collect one refusal per table entry and report "23 of 23
+# lint tools failed", which is a different sentence about a different
+# thing.
+@test "_run_lint_tools: the refusal is the phase's own, before any dispatch (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { echo "reached adr-numbering"; }
+    _run_arch_literal()  { echo "reached arch-literal"; }
+    if _run_lint_tools adr-numbering arch-literal; then echo "PHASE SAID CLEAN"; fi
+  '
+  assert_failure
+  assert_output --partial "ci_lint_errexit_suppressed"
+  assert_output --partial "the lint phase was called from a context"
+  # No driver was dispatched, so no dispatch refused on the phase's
+  # behalf and no driver ran.
+  refute_output --partial "the lint dispatch for"
+  refute_output --partial "reached adr-numbering"
+  refute_output --partial "reached arch-literal"
+  # And the run ended in a refusal, not in a phase report counting the
+  # drivers that refused.
+  refute_output --partial "ci_lint_phase_failed"
+  refute_output --partial "PHASE SAID CLEAN"
+}
+
+# why: The empty set is the input no driver can answer for. The phase
+# takes `"$@"`, so the list it is handed is the caller's; with nothing in
+# it the loop runs zero times, and a phase leaning on its drivers to
+# enforce the call-site precondition would answer a suppressed caller with
+# a clean tree -- the exact defect the refusal exists for, reached by
+# passing an empty list rather than a failing one. Today the only caller
+# passes the whole table, which is why this is a guard on the function's
+# contract and not on a reachable path: a filtered list is what the next
+# caller passes, and an empty result is what a filter returns.
+@test "_run_lint_tools: an empty set is refused too, by the phase itself (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    if _run_lint_tools; then echo "PHASE SAID CLEAN"; fi
+  '
+  assert_failure
+  assert_output --partial "ci_lint_errexit_suppressed"
+  assert_output --partial "the lint phase was called from a context"
+  refute_output --partial "PHASE SAID CLEAN"
+}
+
+# why: The other half of the contract. A clean set must exit zero and say
+# nothing, and the loop must hand the caller back the errexit it borrowed
+# -- the collection is implemented by clearing it, so a phase that forgot
+# to restore it would disarm every `set -e` check after the lint phase.
+@test "_run_lint_tools: a clean set exits zero and returns the caller's errexit (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_adr_numbering() { echo "adr ok"; }
+    _run_arch_literal()  { echo "arch ok"; }
+    _run_lint_tools adr-numbering arch-literal
+    case "$-" in *e*) echo "errexit still armed" ;; *) echo "ERREXIT LOST" ;; esac
+  '
+  assert_success
+  assert_output --partial "adr ok"
+  assert_output --partial "arch ok"
+  assert_output --partial "errexit still armed"
+  refute_output --partial "ci_lint_phase_failed"
+}
+
+# why: The population is the whole _LINT_TOOLS table, read out of the tree
+# rather than restated here, so a tool added to the table is covered by
+# this guard the day it lands. A failure at the FIRST entry must not hide
+# the twenty-two behind it.
+@test "_run_all_lint_tools: an early failure does not hide the tools behind it (#1059)" {
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_lint_tool() { echo "dispatched ${1}"; [[ "${1}" != "shellcheck" ]]; }
+    _run_all_lint_tools
+  '
+  assert_failure
+  local _dispatched="${output}"
+  local -a _tools=()
+  mapfile -t _tools < <(awk '
+    /^readonly _LINT_TOOLS=\(/ { inside = 1; next }
+    inside && /^\)/            { inside = 0 }
+    inside                     { gsub(/[[:space:]]/, "", $0); if ($0 != "") print }
+  ' /source/script/test/test.sh)
+  [ "${#_tools[@]}" -gt 20 ] \
+    || fail "_LINT_TOOLS yielded ${#_tools[@]} entries; the table did not parse"
+  local _tool
+  for _tool in "${_tools[@]}"; do
+    [[ "${_dispatched}" == *"dispatched ${_tool}"* ]] \
+      || fail "the phase never reached '${_tool}' after an earlier tool failed"
+  done
+}
+
+# why: The full gate keeps its fail-fast where fail-fast is worth having.
+# Collecting happens WITHIN the lint phase; a phase that failed still ends
+# the run before bats, so a tree that does not lint never spends the
+# suite's minutes to be told so.
+@test "main --ci: a lint phase that collected failures never reaches bats (#1059)" {
+  # The suite itself runs INSIDE a `--ci` dispatch, so BATS_ONLY / BATS_FILE
+  # / BATS_FILTER are already exported into this process. Left alone, the
+  # `main --ci` under test would take the branch that dispatches bats over
+  # BATS_FILE -- bats inside bats, recursively, which hangs rather than
+  # fails. Clear the whole ambient dispatch so this exercises the full-gate
+  # branch (lint, then the suite) the test is named for.
+  run env LOG_FORMAT=json BATS_ONLY=0 BATS_FILE= BATS_FILTER= \
+    BATS_UNIT_SHARD= BATS_FRAGILE=0 BATS_INTEGRATION=0 \
+    COVERAGE=0 COVERAGE_PATH= COVERAGE_SHARD= LINT_ONLY=0 bash -c '
+    source /source/script/test/test.sh
+    set -eo pipefail
+    _run_lint_tool()     { echo "dispatched ${1}"; [[ "${1}" != "changelog-entry" ]]; }
+    _run_tests()         { echo "BATS PHASE RAN"; }
+    _fix_permissions()   { :; }
+    # Routing is under test, not the bare-run prerequisites (base#1423).
+    _check_suite_prerequisites() { :; }
+    main --ci
+  '
+  assert_failure
+  # catalog-description is the last table entry, behind changelog-entry.
+  assert_output --partial "dispatched catalog-description"
+  refute_output --partial "BATS PHASE RAN"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The lint-order rationale: an argument, with no wall-clock figure in it
+#
+# The ordering question the enumeration raises -- cheap drivers first, so
+# the common case still fails fast -- is answered above _LINT_TOOLS,
+# because a run that enumerates ends when its LAST driver ends whatever
+# the order. That argument has to stay readable: without it the next
+# reader re-litigates the order from the same intuition.
+#
+# What it must not carry is a measurement: how long a driver took, or how
+# far repeat timings of the table spread. Nothing here re-derives such a
+# figure -- no lint, no test, no generator -- so it is a hand-maintained
+# number about a moving tree measured on a moving host, which is exactly
+# ADR-00000028's invariant-2 case: it goes stale silently while still
+# reading as authoritative. Repeat runs of the same table on one machine
+# do not agree either, which is the argument for measuring on demand and
+# not for writing the spread down. So the block below is pinned to hold
+# the reasoning and not the numbers.
+# ════════════════════════════════════════════════════════════════════
+
+# The ordering rationale, one line per comment line: the block between
+# its opening sentence and its closing one, read out of the tree rather
+# than restated here, so both guards below see the block the file
+# actually has.
+#
+# BOTH bounds are named, and that is the point. A block ended at "the
+# first line that is not a comment" is delimited by whatever the file
+# happens to do next: one blank line inside the argument truncates it,
+# and both guards then read a shorter block while the present-to-be-read
+# guard still passes on it. A block whose closing sentence is missing is
+# a block this reader cannot delimit, so it returns NOTHING -- which
+# fails the guard below by name, rather than handing the figure guard a
+# population that runs to the end of the file.
+#
+# Takes the file to read so its own behaviour is testable on a fixture;
+# the default is the tree the guards lint.
+_lint_order_rationale() {
+  local _file="${1:-/source/script/test/test.sh}"
+  awk '
+    /^# ORDER IS NOT A FAIL-FAST LEVER/       { inside = 1 }
+    inside                                    { block = block $0 "\n" }
+    inside && /^# END OF THE ORDER RATIONALE/ { printf "%s", block; exit }
+  ' "${_file}"
+}
+
+# The lines of a comment block that STORE a measurement, read on stdin
+# and printed back. Four shapes, because a stale number arrives in more
+# than one: a duration ("40 seconds"), a percentage ("12%"), a spread
+# stated as a fraction ("more than a tenth") -- which the rationale itself
+# carried while the guard looked only for units -- and a quantity spelled
+# in words ("thirty seconds", "half a minute").
+#
+# The digit is not the thing being refused. The first three shapes all
+# began with `[0-9]`, which made the guard a lint against notation rather
+# than against a stored figure: the same claim written out in words went
+# straight through, and words are what a writer reaches for when the
+# number is approximate -- which is precisely when nothing re-derives it.
+# The word list is cardinals and fraction words only, so an ordinal ("the
+# second driver") stays prose: it names a position, not a magnitude.
+#
+# Matched case-insensitively. bash `=~` is case-sensitive, and the block
+# this reads writes its emphasis in upper case, so a lower-case-only
+# matcher would miss the spelling most likely to be written next to it.
+_stored_measurements() {
+  local _line _lower
+  local _words='one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|ninety|hundred|dozen|couple|few|several|half|quarter|third'
+  local -a _stored=()
+  while IFS= read -r _line; do
+    _lower="${_line,,}"
+    if [[ "${_lower}" =~ [0-9]+(\.[0-9]+)?[[:space:]]*(seconds|second|secs|sec|minutes|minute|mins|min|hours|hour|hrs|hr|ms|s|m|h)([^a-z0-9]|$) ]] \
+      || [[ "${_lower}" =~ [0-9]+(\.[0-9]+)?[[:space:]]*(%|percent) ]] \
+      || [[ "${_lower}" =~ (more|less|fewer|greater)[[:space:]]+than[[:space:]]+(a|one|two|three|half|[0-9]+)[[:space:]]*(tenth|quarter|third|half|fifth|percent) ]] \
+      || [[ "${_lower}" =~ (^|[^a-z])(${_words})([[:space:]]+of)?([[:space:]]+(a|an))?[[:space:]]+(seconds|second|minutes|minute|hours|hour|milliseconds|millisecond)([^a-z]|$) ]]; then
+      _stored+=( "${_line}" )
+    fi
+  done
+  (( ${#_stored[@]} == 0 )) || printf '%s\n' "${_stored[@]}"
+}
+
+# why: The anchor, and the reason it is a test of its own. The figure
+# guard below reads the same block, so a comment that was deleted or
+# reworded past its opening sentence would leave that guard scanning an
+# empty set and passing -- a lint that has quietly stopped linting. This
+# one fails loudly instead, naming the sentence it looks for.
+@test "_LINT_TOOLS: the ordering rationale is present to be read (#1059)" {
+  local -a _block=()
+  mapfile -t _block < <(_lint_order_rationale)
+  [ "${#_block[@]}" -gt 0 ] || fail \
+    "no block bounded by '# ORDER IS NOT A FAIL-FAST LEVER' and '# END OF THE ORDER RATIONALE' above _LINT_TOOLS: either the ordering decision is unrecorded or its closing sentence is gone, and the figure guard reads the same block, so it would otherwise scan an empty set and pass"
+}
+
+# why: A measurement written into a permanent comment is a claim nothing
+# re-derives. The tree moves it, the host moves it, and repeat runs of the
+# same table move it, so it is wrong soon after it is typed and nothing
+# says when. The rationale needs none of them -- "the phase ends when its
+# last driver ends" holds at any timing -- so the numbers are refused
+# here, and measured when the question is actually asked.
+@test "_LINT_TOOLS: the ordering rationale stores no measured figure (#1059)" {
+  local -a _block=()
+  mapfile -t _block < <(_lint_order_rationale)
+  [ "${#_block[@]}" -gt 0 ] || fail \
+    "no ordering rationale to check -- see the guard above; this one must not pass on an empty set"
+
+  local -a _stored=()
+  mapfile -t _stored < <(printf '%s\n' "${_block[@]}" | _stored_measurements)
+  [ "${#_stored[@]}" -eq 0 ] || fail \
+    "the ordering rationale states a measured figure, which nothing re-derives: ${_stored[*]} -- drop it and measure when the question is asked (./script/test/test.sh --<tool>-only times one driver)"
+}
+
+# why: The population is read out of the tree, so the reader must hold
+# BOTH bounds of it. "From the opening sentence to the first line that is
+# not a comment" holds only one: a blank line dropped into the rationale
+# silently shrinks what both guards scan, and the present-to-be-read guard
+# above still passes, because a truncated block is not an empty one --
+# cannot-determine-the-block resolving to pass. The same single bound
+# over-runs the other way, swallowing the neighbouring paragraph a bare
+# `#` line joins to the rationale.
+@test "_lint_order_rationale: the block is bounded at both ends, blank line or not (#1059)" {
+  local _fixture="${BATS_TEST_TMPDIR}/bounded.sh"
+  printf '%s\n' \
+    '# A paragraph above the rationale.' \
+    '# ORDER IS NOT A FAIL-FAST LEVER. The argument opens here.' \
+    '# The second line of the argument.' \
+    '' \
+    '# Still the argument, one blank line later.' \
+    '# END OF THE ORDER RATIONALE. The argument closes here.' \
+    '#' \
+    '# A neighbouring paragraph that is not the rationale.' \
+    'readonly _SOMETHING=1' > "${_fixture}"
+
+  run _lint_order_rationale "${_fixture}"
+  assert_success
+  assert_output --partial "The argument opens here"
+  assert_output --partial "Still the argument, one blank line later"
+  assert_output --partial "The argument closes here"
+  refute_output --partial "A paragraph above the rationale"
+  refute_output --partial "A neighbouring paragraph"
+}
+
+# why: The refusal side of the same reader. A block whose closing sentence
+# is gone cannot be delimited, and a reader that answers such a question
+# by returning everything to the end of the file would hand the figure
+# guard a population nobody chose. Returning nothing instead lands on the
+# present-to-be-read guard, which fails loudly and names the sentence.
+@test "_lint_order_rationale: a block it cannot bound is no block at all (#1059)" {
+  local _fixture="${BATS_TEST_TMPDIR}/unbounded.sh"
+  printf '%s\n' \
+    '# ORDER IS NOT A FAIL-FAST LEVER. The argument opens here.' \
+    '# and is never closed.' \
+    'readonly _SOMETHING=1' > "${_fixture}"
+
+  run _lint_order_rationale "${_fixture}"
+  assert_output ""
+}
+
+# why: bash `=~` is case-sensitive, and this file's own house style writes
+# emphasis in upper case (ORDER IS NOT A FAIL-FAST LEVER, THE SUBSHELL
+# SHAPE IS LOAD-BEARING), so a lower-case-only match is a guard that does
+# not see the shape most likely to be written next to it. Prose carrying
+# no figure must still come back clean, or the guard would refuse the
+# argument it exists to protect.
+@test "_stored_measurements: a unit in upper case is still a stored figure (#1059)" {
+  run _stored_measurements <<< '# shellcheck takes about 40 SECONDS of the phase'
+  assert_success
+  assert_output --partial "40 SECONDS"
+
+  run _stored_measurements <<< '# the phase ends when its LAST driver ends'
+  assert_success
+  assert_output ""
+}
+
+# why: A duration is not the only measurement a comment can store. The
+# claim that repeat runs "spread by more than a tenth" is the same kind of
+# number -- hand-measured, un-derived, silently stale -- and it sat inside
+# this very rationale until this guard was widened, so a matcher that
+# looked only for unit tokens refused the seconds while carrying the
+# spread.
+@test "_stored_measurements: a spread stated as a fraction is a stored figure (#1059)" {
+  run _stored_measurements <<< '# three timing rounds already spread by more than a tenth'
+  assert_success
+  assert_output --partial "more than a tenth"
+
+  run _stored_measurements <<< '# the drivers disagree by 12% between runs'
+  assert_success
+  assert_output --partial "12%"
+}
+
+# why: A stored figure does not have to arrive as a digit. "about thirty
+# seconds per driver" is the same hand-measured, un-derived, silently
+# stale claim as "40 SECONDS", and every branch of this matcher required
+# `[0-9]`, so the guard refused the spelling with digits and passed the
+# spelling in words -- the shape a writer reaches for when the number is
+# approximate, which is exactly when it is a claim nothing re-derives.
+# Second widening of the same guard for the same reason: the first was a
+# spread stated as a fraction, which the block itself was carrying.
+# The prose the block does need must still come back clean, or the guard
+# refuses the argument it exists to protect.
+@test "_stored_measurements: a quantity spelled in words is a stored figure (#1059)" {
+  run _stored_measurements <<< '# shellcheck takes about thirty seconds per driver'
+  assert_success
+  assert_output --partial "thirty seconds"
+
+  run _stored_measurements <<< '# the phase costs roughly half a minute per driver'
+  assert_success
+  assert_output --partial "half a minute"
+
+  # The rationale's own line about repeat runs: a comparison, not a
+  # magnitude, and it must survive the widening.
+  run _stored_measurements <<< '# repeat runs of the same table on one machine do not agree'
+  assert_success
+  assert_output ""
+
+  # An ordinal is not a quantity: "the second driver" names a position.
+  run _stored_measurements <<< '# the second driver in the table is hadolint'
+  assert_success
+  assert_output ""
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The lint-static CI partition: derived from the table, never rostered
+#
+# CI runs the static lints as a handful of GROUPED jobs rather than one
+# job per driver (base#1071). The grouping is the thing under test here,
+# and what makes it worth testing is the failure it replaces: a written
+# table of "which driver goes in which group" is a roster, and a roster
+# is wrong on the day a driver is added, with nothing to say so -- the
+# lint would simply stop running in CI while every job stayed green.
+#
+# So the partition is computed from `_LINT_TOOLS`, and these tests assert
+# the property that makes the computation trustworthy: every lint of the
+# table is either run by its own dedicated job or lands in EXACTLY ONE
+# group, at any group count, including a lint the table does not carry
+# today.
+# ════════════════════════════════════════════════════════════════════
+
+# The entries of a `readonly <name>=( ... )` table, read out of the tree.
+# Parsed, never sourced, for the reason self_test_yaml_spec's sibling
+# guard states: sourcing test.sh drags in the whole lib chain, which reads
+# BASH_SOURCE unguarded, and under the kcov-instrumented bash of a
+# coverage shard that source aborts and its stderr is read as data.
+#
+# Takes the file so the reader is exercisable on a fixture; the default is
+# the tree the guards read.
+_declared_array() {
+  local _name="${1}" _file="${2:-/source/script/test/test.sh}"
+  awk -v name="${_name}" '
+    $0 == "readonly " name "=(" { inside = 1; next }
+    inside && /^\)/             { inside = 0 }
+    inside {
+      sub(/#.*/, "")
+      gsub(/[[:space:]]+/, "")
+      if ($0 != "") print
+    }
+  ' "${_file}"
+}
+
+# The lints the grouped jobs are responsible for: the table minus the ones
+# that carry a dedicated CI job of their own. Derived from the two tables,
+# so it moves when they move.
+_grouped_lints() {
+  local _file="${1:-/source/script/test/test.sh}"
+  local -a _table=() _own=()
+  mapfile -t _table < <(_declared_array _LINT_TOOLS "${_file}")
+  mapfile -t _own   < <(_declared_array _LINT_TOOLS_OWN_CI_JOB "${_file}")
+  local _t _o _skip
+  for _t in "${_table[@]}"; do
+    _skip=0
+    for _o in "${_own[@]}"; do
+      [[ "${_t}" != "${_o}" ]] || _skip=1
+    done
+    (( _skip == 1 )) || printf '%s\n' "${_t}"
+  done
+}
+
+# Every group of a partition of TOTAL, concatenated, one name per line.
+_all_group_members() {
+  local _total="${1}" _script="${2:-/source/script/test/test.sh}"
+  local _i
+  for (( _i = 1; _i <= _total; _i++ )); do
+    "${_script}" --lint-group-members "${_i}/${_total}" || return 1
+  done
+}
+
+# why: The property the whole shape rests on. A grouped CI job is only as
+# trustworthy as "every lint is in exactly one group": a lint in no group
+# runs nowhere and gates nothing while CI stays green, and a lint in two
+# groups pays for itself twice. It is asserted at SEVERAL totals, not at
+# the one the workflow happens to use, because the partition is arithmetic
+# over the table's positions -- a total that divides the table evenly and
+# one that does not are different cases, and the workflow's count is free
+# to change.
+@test "lint groups: every grouped lint lands in exactly one group, at any group count (base#1071)" {
+  local -a _expected=()
+  mapfile -t _expected < <(_grouped_lints)
+  # Non-vacuity: an unparsed table would make every comparison below a
+  # comparison of two empty sets, which is the failure this guard exists
+  # to catch.
+  [ "${#_expected[@]}" -ge 13 ] \
+    || fail "the lint tables yielded ${#_expected[@]} grouped lints; they did not parse"
+
+  local _total
+  for _total in 1 2 3 4 5 7 13; do
+    local -a _seen=()
+    mapfile -t _seen < <(_all_group_members "${_total}")
+    [ "${#_seen[@]}" -eq "${#_expected[@]}" ] \
+      || fail "at ${_total} groups the partition yielded ${#_seen[@]} names for ${#_expected[@]} grouped lints -- a lint is in no group or in two"
+    local _diff
+    _diff="$(comm -3 \
+      <(printf '%s\n' "${_expected[@]}" | sort) \
+      <(printf '%s\n' "${_seen[@]}" | sort))"
+    [ -z "${_diff}" ] \
+      || fail "at ${_total} groups the partition does not cover the table: ${_diff}"
+  done
+}
+
+# why: The half a test over today's table cannot reach. The roster this
+# replaces was not wrong when it was written -- it was wrong on the day
+# the NEXT driver was added, and the tree at that moment is not the tree
+# this suite reads. So the addition is performed: a driver the table does
+# not carry is appended to a copy of it, and the partition of that copy
+# must place it, with no workflow and no group list edited. A partition
+# that could only place the names it already knew would pass every other
+# test in this file.
+@test "lint groups: a lint added to the table lands in a group with nothing else edited (base#1071)" {
+  local _tree="${BATS_TEST_TMPDIR}/tree"
+  mkdir -p "${_tree}/dist/script"
+  cp -r /source/script "${_tree}/script"
+  cp -r /source/dist/script/docker "${_tree}/dist/script/"
+  local _script="${_tree}/script/test/test.sh"
+
+  # The tomorrow this test is about: one more driver in the table, added
+  # the way the next one will be.
+  local _added="zz-a-lint-nobody-has-written-yet"
+  run awk -v add="  ${_added}" '
+    /^readonly _LINT_TOOLS=\(/ { inside = 1 }
+    inside && /^\)/            { print add; inside = 0 }
+    { print }
+  ' "${_script}"
+  assert_success
+  printf '%s\n' "${output}" > "${_script}.new"
+  mv "${_script}.new" "${_script}"
+  chmod +x "${_script}"
+
+  run "${_script}" --lint-group-members 1/1
+  assert_success
+  assert_output --partial "${_added}"
+
+  local -a _seen=()
+  mapfile -t _seen < <(_all_group_members 4 "${_script}")
+  local _hits
+  _hits="$(printf '%s\n' "${_seen[@]}" | grep -cx -- "${_added}" || true)"
+  [ "${_hits}" -eq 1 ] \
+    || fail "the new driver appears in ${_hits} of 4 groups -- adding a lint to the table must place it in exactly one, or it silently stops running in CI"
+}
+
+# why: The exclusion list is the one hand-written thing left, so it is
+# held to the only rule that matters: a name is excluded from the groups
+# BECAUSE it has a job of its own. A name in it that the table does not
+# carry excludes nothing and is a typo that reads as a decision -- and the
+# lint it meant to name keeps running in a group, so nothing else notices.
+@test "lint groups: every lint excluded from the groups is a lint of the table (base#1071)" {
+  local -a _table=() _own=()
+  mapfile -t _table < <(_declared_array _LINT_TOOLS)
+  mapfile -t _own   < <(_declared_array _LINT_TOOLS_OWN_CI_JOB)
+  [ "${#_own[@]}" -ge 1 ] \
+    || fail "_LINT_TOOLS_OWN_CI_JOB yielded no entries; the table did not parse"
+
+  local _o
+  for _o in "${_own[@]}"; do
+    printf '%s\n' "${_table[@]}" | grep -qx -- "${_o}" \
+      || fail "'${_o}' is excluded from the lint groups but is not in _LINT_TOOLS -- it excludes nothing"
+  done
+}
+
+# A refusal-only case is satisfied by the feature's ABSENCE, which is the
+# defect base#1090 is about: with the `--lint-group-members` arm deleted
+# from the option parser, every spec below -- good and bad alike -- fell
+# to `Unknown option` and this case still reported `ok 1` of 1, measured
+# on 1c9ccb2. So the refusals are framed by two positives: an in-range
+# spec is ACCEPTED and lists the whole table, and no refusal below is
+# allowed to be the parser's. Together those say the option is present,
+# reads a spec, and refuses only the specs it should.
+
+# why: A group spec the dispatcher cannot read must not resolve to an
+# empty group. Every refusal here is a way a CI job could run zero
+# drivers and report success, which is the same green-while-gating-nothing
+# failure the grouping itself is built to avoid -- so the spec is
+# validated rather than trusted, an index outside its own total is refused
+# with the malformed ones, and each refusal is framed by the positive that
+# keeps it from being satisfied by the option not existing.
+@test "lint groups: a group spec that is not <n>/<total> in range is refused (base#1071)" {
+  # Present and behaving. The accepted spec and the expected listing are
+  # both derived from the lint tables, so this half moves with them: at
+  # one group the partition IS the table, and one group is also the only
+  # total that is in range whatever the table's size.
+  local -a _expected=()
+  mapfile -t _expected < <(_grouped_lints)
+  [ "${#_expected[@]}" -ge 13 ] \
+    || fail "the lint tables yielded ${#_expected[@]} grouped lints; they did not parse"
+
+  run /source/script/test/test.sh --lint-group-members 1/1
+  assert_success
+  local _listed
+  _listed="$(printf '%s\n' "${_expected[@]}")"
+  [ "${output}" = "${_listed}" ] \
+    || fail "--lint-group-members 1/1 listed '${output}' where the table's ${#_expected[@]} grouped lints are '${_listed}'; an in-range spec has to be ACCEPTED, or the refusals below are satisfied by the option not existing"
+
+  # And the last index of a partition as wide as the table: in range by
+  # derivation rather than by a number written here.
+  run /source/script/test/test.sh --lint-group-members "${#_expected[@]}/${#_expected[@]}"
+  assert_success
+
+  local _spec
+  for _spec in "" "4" "0/4" "5/4" "1/0" "one/four" "1/4/4" "-1/4"; do
+    run /source/script/test/test.sh --lint-group-members "${_spec}"
+    assert_failure
+    # The refusal has to be the spec validator's, not the option parser
+    # having never heard of the flag. Both refuse; only one of them means
+    # what this case claims.
+    refute_output --partial "Unknown option"
+  done
+}
+
+# why: The other empty group, and the one arithmetic produces on its own:
+# more groups than there are lints leaves the tail groups with nothing to
+# run. Listing nothing is a fair answer to a question about membership;
+# RUNNING nothing and exiting 0 is a job that gates nothing while its
+# check goes green, so the runner refuses what the lister may print.
+@test "lint groups: running a group with no lints in it is refused (base#1071)" {
+  local -a _expected=()
+  mapfile -t _expected < <(_grouped_lints)
+  local _total=$(( ${#_expected[@]} + 1 ))
+
+  run /source/script/test/test.sh --lint-group-members "${_total}/${_total}"
+  assert_success
+  assert_output ""
+
+  run /source/script/test/test.sh --lint-group "${_total}/${_total}"
+  assert_failure
+}
+
+# why: A refusal has to name what it refused for, and this one did not.
+# `--lint-group` reads the membership through a process substitution, so a
+# `_die` inside the lister kills the SUBSHELL only: the runner saw an empty
+# list and blamed the empty group, reporting "contains no lint" for a spec
+# that never parsed. The wrong reason is the visible half. The invisible
+# half is worse -- the runner was treating the lister's OUTPUT as its
+# verdict, so a lister that ever printed one member before dying would hand
+# back a truncated group and run it to a green exit. So the runner
+# validates the spec in its OWN shell, and the lister's refusal is a
+# backstop it no longer depends on.
+@test "lint groups: a malformed spec is refused for BEING malformed, not for being empty (base#1071)" {
+  local _spec
+  for _spec in "abc" "9/4" "1/0"; do
+    run /source/script/test/test.sh --lint-group "${_spec}"
+    assert_failure
+    assert_output --partial "lint group '${_spec}'"
+    refute_output --partial "contains no lint"
+  done
+}
+
+# why: The one shape the digits-only regex accepts and bash arithmetic
+# rejects. `1/08` is a well-formed spec by every rule stated above and an
+# INVALID OCTAL CONSTANT to `(( ))`, so the range checks printed a raw
+# "value too great for base" from the shell itself and then refused for a
+# reason that was not the reason -- a padded index reported as "outside its
+# own total", a padded total as "asks for 08 groups". A spec is read in the
+# base it is written in, and a padded one names the same group as its bare
+# twin.
+@test "lint groups: a zero-padded spec is read as decimal, not as octal (base#1071)" {
+  run /source/script/test/test.sh --lint-group-members 1/08
+  assert_success
+  refute_output --partial "value too great for base"
+  local _padded="${output}"
+
+  run /source/script/test/test.sh --lint-group-members 1/8
+  assert_success
+  [ "${output}" = "${_padded}" ] \
+    || fail "group 1/08 lists '${_padded}' while group 1/8 lists '${output}'; a zero-padded spec must name the same group as its bare twin"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _run_via_compose / main routing
+#
+# Regression guards: default `test.sh` (no flag) must hit the alpine
+# `ci` service; `--coverage` must hit the `coverage` service (which now
+# shares the same test-tools image). Mock `docker` so the test captures
+# the chosen service name + COVERAGE env without actually running
+# compose.
+# ════════════════════════════════════════════════════════════════════
+
+# why: Service routing — fast path
+@test "_run_via_compose: routes default mode to the ci service with COVERAGE=0" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_via_compose ci 0
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "compose"
+  assert_output --partial "COVERAGE=0"
+  assert_output --partial " ci"
+  refute_output --partial "COVERAGE=1"
+}
+
+# why: Service routing — coverage path
+@test "_run_via_compose: routes coverage mode to the coverage service with COVERAGE=1" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_via_compose coverage 1
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "compose"
+  assert_output --partial "COVERAGE=1"
+  assert_output --partial " coverage"
+}
+
+# why: End-to-end default dispatch. The required-kill roster the no-flag run
+# calls between its lint and bats compose runs (base#1461) is stubbed: it
+# builds real sandboxes, and pre_pr_mirror_parity_spec holds its order.
+@test "main: dispatches no-flag default to the ci service" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_mutation_required() { :; }
+    export PATH="'"${MOCK_DIR}"'"
+    main
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " ci"
+  assert_output --partial "COVERAGE=0"
+}
+
+# why: Parallel-present branch, and the count it is handed is FLOORED
+# rather than equal to the core count -- `_run_tests` is one of the
+# runners with no kcov in the loop, so there is no line set to move and
+# nothing to hold it at the machine's size (base#1068). The assertion is
+# `> the mocked cores`, not a number: it says WHICH SIDE of the policy
+# this runner is on, which is the part a re-tune must not silently flip.
+@test "_run_tests: passes --jobs N when parallel is on PATH" {
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 8'
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_tests
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  local _jobs
+  _jobs="$(printf '%s\n' "${output}" | sed -n 's/.*jobs \([0-9][0-9]*\).*/\1/p' | head -n1)"
+  assert [ -n "${_jobs}" ]
+  assert [ "${_jobs}" -gt 8 ]
+}
+
+# why: Parallel-missing branch
+@test "_run_tests: omits --jobs when parallel is absent (graceful fallback)" {
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  # Intentionally NOT mocking `parallel` so command -v misses.
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_tests
+  '
+  assert_success
+  assert_output --partial "serial"
+  assert_output --partial "parallel not in PATH"
+
+  run cat "${_log}"
+  assert_success
+  refute_output --partial "--jobs"
+}
+
+# why: End-to-end --coverage dispatch
+@test "main: dispatches --coverage to the coverage service" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    # The provenance pair is STUBBED, not exercised: it reads and writes
+    # ${REPO_ROOT}/coverage, which here is the mounted checkout, so running
+    # it for real erases the certificate and the run manifest of whatever
+    # `just test coverage` is in flight (bats runs 32 jobs). This test is
+    # about the compose call.
+    _invalidate_coverage_head() { :; }
+    _stamp_coverage_head() { :; }
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " coverage"
+  assert_output --partial "COVERAGE=1"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --coverage-shard: sharded kcov matrix (ADR-00000008, weight-balanced)
+#
+# Coverage is the primary unit gate. _shard_unit_files is the partition
+# primitive: greedy weight-balanced bin-packing by per-spec _spec_weight
+# (recorded runtime in seconds, or the @test-count fallback -- heaviest
+# first into the lightest shard) so the slowest shard's load approaches
+# max(heaviest spec, total/N), the floor no partition beats. Unit and
+# integration specs are ONE pool -- integration is NOT appended whole to the
+# last shard, a rule since superseded -- so _run_coverage <n>/<total> kcov's
+# exactly the slice it is handed. main --coverage-shard plumbs
+# COVERAGE_SHARD into the coverage service.
+# ════════════════════════════════════════════════════════════════════
+
+# why: #615 coverage shard returns spec paths
+@test "_shard_unit_files: a single shard returns real unit spec paths (#615)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _shard_unit_files 1/4
+  '
+  assert_success
+  assert_output --partial "test/bats/unit/"
+  assert_output --partial "_spec.bats"
+}
+
+# why: #615 partition invariant (each slice runs once)
+@test "_shard_unit_files: partition is exhaustive + disjoint across all shards of T (#615, #724)" {
+  # Union of every shard of 4 must equal the full sorted spec list (unit +
+  # integration, folded into one pool), with no file in two shards (the
+  # invariant the coverage-gate merge relies on: every spec runs exactly
+  # once across the matrix).
+  run bash -c '
+    source /source/script/test/test.sh
+    all=$(find "${REPO_ROOT}/test/bats/unit" "${REPO_ROOT}/test/bats/integration" \
+            -name "*_spec.bats" | sort)
+    union=$( { _shard_unit_files 1/4; _shard_unit_files 2/4; \
+               _shard_unit_files 3/4; _shard_unit_files 4/4; } | sort )
+    [[ "${all}" == "${union}" ]] || { echo "MISMATCH"; exit 1; }
+    # disjoint: total line count equals the full list count (no dupes)
+    n_all=$(printf "%s\n" "${all}" | wc -l)
+    n_union=$( { _shard_unit_files 1/4; _shard_unit_files 2/4; \
+                 _shard_unit_files 3/4; _shard_unit_files 4/4; } | wc -l)
+    [[ "${n_all}" -eq "${n_union}" ]] || { echo "DUPES"; exit 1; }
+    echo OK
+  '
+  assert_success
+  assert_output --partial "OK"
+}
+
+# _balance_rule
+#   Echo the shell program that DEFINES the balance rule -- the bound a
+#   partition is judged against, and the verdict on a given makespan --
+#   and measures nothing. Every case below runs this one copy -- the live
+#   probe, the fixture-driven partitions, and the replay of the coverage
+#   loads recorded on base#936 -- so none of them restates the rule the
+#   others apply.
+_balance_rule() {
+  cat <<'RULE'
+# _balance_lb <total_weight> <shards> <heaviest_weight>
+#   The floor no partition finishes below, greedy or optimal: a spec cannot
+#   be split across shards, so the makespan is at least the heaviest single
+#   spec, and at least the perfectly even split. Judging against a flat
+#   multiple of the AVERAGE alone would indict the partitioner the moment
+#   one spec runs longer than that -- a property of the input, not of the
+#   algorithm.
+_balance_lb() {
+  local _total="${1}" _n="${2}" _heaviest="${3}"
+  # Ceil, not truncation: a truncated average understates the bound.
+  local _avg=$(( (_total + _n - 1) / _n ))
+  if (( _heaviest > _avg )); then
+    printf '%s\n' "${_heaviest}"
+  else
+    printf '%s\n' "${_avg}"
+  fi
+}
+
+# _balance_verdict <lower_bound> <max_shard_load>
+#   BALANCED while the heaviest shard stays within 1.5x the bound. 1.5x is
+#   a QUALITY POLICY, deliberately TIGHTER than anything greedy LPT can be
+#   proven to deliver against this bound: the tight worst case is 2N/(N+1)
+#   -- 1.6x at four shards, 1.78x at eight -- attained by N+1 equally
+#   dominating specs, which no partition can beat either. Widening the
+#   ceiling to that guarantee would make the rule unfalsifiable by
+#   construction. It is held FLAT across N on purpose: it judges the
+#   partitions this repo actually presents, not the algorithm's proof, and
+#   a ceiling that grows with N would license the eight-way matrix to be
+#   the sloppiest one.
+_balance_verdict() {
+  local _lb="${1}" _max="${2}"
+  if (( _max * 2 > _lb * 3 )); then
+    printf 'IMBALANCED\n'
+  else
+    printf 'BALANCED\n'
+  fi
+}
+RULE
+}
+
+# _weights_fixture_prelude
+#   Echo the shell program that writes a synthesised SHARD_WEIGHTS_FILE over
+#   the REAL spec pool, so a deliberately skewed runtime distribution can be
+#   driven through the partitioner on a bare checkout -- where no weights
+#   file exists and every weight would otherwise collapse onto the `@test`
+#   fallback. FIXTURE_HEAVY specs carry FIXTURE_WEIGHT seconds and every
+#   other spec carries 1; FIXTURE_ORDER picks the heavy set by `@test` count
+#   (`n` = the fewest, `nr` = the most).
+_weights_fixture_prelude() {
+  cat <<'FIXTURE'
+_wf="${BATS_TEST_TMPDIR}/shard-weights"
+shopt -s globstar
+_lines=""
+for _f in /source/test/bats/unit/**/*_spec.bats \
+          /source/test/bats/integration/**/*_spec.bats; do
+  [[ -e "${_f}" ]] || continue
+  _lines+="$(grep -cE '^@test' "${_f}" 2>/dev/null || true) ${_f#/source/}"$'\n'
+done
+# _spec_weight keys on the repo-relative PATH (base#1410), so every spec,
+# a shared basename included, can be given a runtime of its own.
+_heavy="$(printf '%s' "${_lines}" \
+  | sort -k1,1"${FIXTURE_ORDER}" -k2,2 \
+  | awk -v k="${FIXTURE_HEAVY}" 'NR <= k { print $2 }')"
+# Heavy lines first: _spec_weight takes the FIRST match for a path.
+{
+  printf '%s\n' "${_heavy}" | sed "s/^/${FIXTURE_WEIGHT} /"
+  printf '%s' "${_lines}" | awk '{ print 1, $2 }'
+} > "${_wf}"
+export SHARD_WEIGHTS_FILE="${_wf}"
+FIXTURE
+}
+
+# _shard_balance_probe
+#   Echo the shell program that measures how evenly _shard_unit_files
+#   spreads the spec pool over PROBE_SHARDS shards, and exits non-zero when
+#   the heaviest shard breaks the bound. Every shard is reported on BOTH
+#   axes -- the partition weight (summed through _spec_weight, the same
+#   function the partitioner sorts by, so it follows whichever weight source
+#   is in force) and the `@test` count -- so a divergence between the two is
+#   visible in the log. Any SHARD_WEIGHTS_FILE the caller set is picked up by
+#   _spec_weight, which drives the partition and the measurement together.
+_shard_balance_probe() {
+  _balance_rule
+  cat <<'PROBE'
+source /source/script/test/test.sh
+shopt -s globstar
+declare -A _weight=() _count=()
+_wtotal=0
+_ctotal=0
+_heaviest=0
+for _f in "${REPO_ROOT}"/test/bats/unit/**/*_spec.bats \
+          "${REPO_ROOT}"/test/bats/integration/**/*_spec.bats; do
+  [[ -e "${_f}" ]] || continue
+  _w="$(_spec_weight "${_f}")"
+  _c="$(grep -cE '^@test' "${_f}" 2>/dev/null || true)"
+  _weight["${_f}"]="${_w:-0}"
+  _count["${_f}"]="${_c:-0}"
+  _wtotal=$(( _wtotal + ${_w:-0} ))
+  _ctotal=$(( _ctotal + ${_c:-0} ))
+  if (( ${_w:-0} > _heaviest )); then _heaviest="${_w:-0}"; fi
+done
+_n="${PROBE_SHARDS:?BUG: _shard_balance_probe expects PROBE_SHARDS}"
+_wavg=$(( (_wtotal + _n - 1) / _n ))
+_cavg=$(( (_ctotal + _n - 1) / _n ))
+_wmax=0
+_cmax=0
+for (( _s = 1; _s <= _n; _s++ )); do
+  _wload=0
+  _cload=0
+  while IFS= read -r _f; do
+    [[ -n "${_f}" ]] || continue
+    _wload=$(( _wload + ${_weight["${_f}"]:-0} ))
+    _cload=$(( _cload + ${_count["${_f}"]:-0} ))
+  done < <(_shard_unit_files "${_s}/${_n}")
+  printf 'shard %d/%d weight=%d tests=%d\n' "${_s}" "${_n}" "${_wload}" "${_cload}"
+  if (( _wload > _wmax )); then _wmax="${_wload}"; fi
+  if (( _cload > _cmax )); then _cmax="${_cload}"; fi
+done
+_lb="$(_balance_lb "${_wtotal}" "${_n}" "${_heaviest}")"
+_wverdict="$(_balance_verdict "${_lb}" "${_wmax}")"
+# The count axis is diagnostic, so it is judged against its average alone
+# and reported in its own vocabulary -- EVEN / LOPSIDED never reads as the
+# gating verdict.
+_cverdict=EVEN
+if [[ "$(_balance_verdict "${_cavg}" "${_cmax}")" != BALANCED ]]; then
+  _cverdict=LOPSIDED
+fi
+printf 'weight avg=%d heaviest=%d lb=%d max=%d verdict=%s\n' \
+  "${_wavg}" "${_heaviest}" "${_lb}" "${_wmax}" "${_wverdict}"
+printf 'count avg=%d max=%d verdict=%s\n' "${_cavg}" "${_cmax}" "${_cverdict}"
+# The weight axis gates; the count axis is reported for contrast only.
+[[ "${_wverdict}" == BALANCED ]] || exit 1
+PROBE
+}
+
+# _pool_denominator_audit
+#   Echo the shell program that asks the live probe WHICH POOL its total
+#   was summed over -- the defect behind the coverage-shard failure this
+#   guard was written for was a total taken over `test/bats/unit/` alone
+#   while the loads were summed over the pool `_shard_unit_files` actually
+#   partitions, which inflated max/avg and condemned a healthy partition.
+#   The caller must have defined `_probe` as a SUBSHELL wrapper around
+#   _shard_balance_probe: the audit reads the `weight avg=` the probe
+#   printed and matches it against the two candidate denominators computed
+#   here independently, through the same _spec_weight the probe uses, so
+#   it follows whichever weight source is in force. Wrapping in a subshell
+#   keeps the probe's own BALANCED/IMBALANCED gate from ending this
+#   program -- the denominator is a separate question from the verdict.
+_pool_denominator_audit() {
+  cat <<'AUDIT'
+_n="${PROBE_SHARDS:?BUG: _pool_denominator_audit expects PROBE_SHARDS}"
+# The probe runs FIRST, and this program sources test.sh only afterwards:
+# test.sh marks SCRIPT_DIR readonly, so a shell that has already sourced it
+# kills the second source -- including the one inside the probe subshell,
+# which would leave the probe silent and this audit reporting `neither`.
+_out="$(_probe)" || true
+printf '%s\n' "${_out}"
+source /source/script/test/test.sh
+shopt -s globstar
+_avg="$(printf '%s\n' "${_out}" | sed -n 's/^weight avg=\([0-9][0-9]*\) .*/\1/p')"
+_unit=0
+for _f in "${REPO_ROOT}"/test/bats/unit/**/*_spec.bats; do
+  [[ -e "${_f}" ]] || continue
+  _w="$(_spec_weight "${_f}")"
+  _unit=$(( _unit + ${_w:-0} ))
+done
+_pool="${_unit}"
+for _f in "${REPO_ROOT}"/test/bats/integration/**/*_spec.bats; do
+  [[ -e "${_f}" ]] || continue
+  _w="$(_spec_weight "${_f}")"
+  _pool=$(( _pool + ${_w:-0} ))
+done
+# Compared as AVERAGES because that is what the probe prints; ceil'd the
+# same way, so the comparison is exact rather than a tolerance.
+_pavg=$(( (_pool + _n - 1) / _n ))
+_uavg=$(( (_unit + _n - 1) / _n ))
+if (( _pavg == _uavg )); then
+  # No integration weight to be short BY -- the audit cannot tell the two
+  # denominators apart, so it must not report a pass.
+  _dv=indistinguishable
+elif [[ "${_avg}" == "${_pavg}" ]]; then
+  _dv=pool
+elif [[ "${_avg}" == "${_uavg}" ]]; then
+  _dv=unit-only
+else
+  _dv=neither
+fi
+printf 'denominator=%s probe-avg=%s pool-avg=%d unit-only-avg=%d\n' \
+  "${_dv}" "${_avg:-none}" "${_pavg}" "${_uavg}"
+AUDIT
+}
+
+# why: #677 live-tree probe through `_spec_weight`, at the eight shards CI
+# runs
+@test "_shard_unit_files: greedy weight-balance keeps every shard within 1.5x the partition bound (#677, #940)" {
+  # The round-robin floor dumped the heaviest specs into one shard (~2x the
+  # others). Greedy LPT must hold every shard within 1.5x of the bound NO
+  # partition can beat -- max(heaviest spec, total/N) -- measured on whatever
+  # weight source is in force: recorded seconds where CI restored a weights
+  # file, the `@test` fallback on a bare checkout. Either way it is the axis
+  # the partitioner itself sorted by.
+  #
+  # EIGHT shards, not four. The coverage matrix takes its total from the
+  # `CI_SHARDS` repo variable (default 8, clamped to [1,12]), so four was a
+  # partition CI never executes. That variable is a GitHub setting this
+  # container cannot read, so the case pins the DEFAULT rather than
+  # pretending to track it; the totals either side of the default are
+  # covered by the fixture cases below, which can discriminate between them.
+  #
+  # What it measures depends on WHERE it runs, and the two are different
+  # gates:
+  #
+  #   - Bare checkout / local `just test` (and a CI weights-cache MISS):
+  #     no `test/bats/.shard-weights` exists, so every spec collapses onto
+  #     its `@test` count. The heaviest spec is a fraction of total/8, the
+  #     partition lands at ratio ~1.00, and no spec set this repo can
+  #     present locally turns it red. Here it proves only that the probe
+  #     runs against the real pool and that the pool is not pathological.
+  #   - The coverage matrix: the workflow restores the cached weights file
+  #     into the repo the container mounts BEFORE the shard runs, so
+  #     `_spec_weight` returns recorded kcov seconds and this case gates
+  #     the REAL timing distribution. It can go red there, and that is the
+  #     point -- a red verdict means the timings skewed past the bound (or
+  #     the partitioner regressed), not that the harness is broken. Read
+  #     the per-shard `weight=` lines in the log to see which.
+  #
+  # So the fixture-driven cases below are not the only ones that CAN fail;
+  # they are the ones that fail DETERMINISTICALLY, by synthesising the
+  # distribution instead of reading whichever one is in force.
+  run bash -c "PROBE_SHARDS=8
+$(_shard_balance_probe)"
+  assert_success
+  assert_output --partial "verdict=BALANCED"
+}
+
+# why: #940 skewed `SHARD_WEIGHTS_FILE`: the guard follows seconds, not
+# `@test` count
+@test "_shard_unit_files: one slow low-@test spec balances by weight though the count axis calls it lopsided (#940)" {
+  # The wrong-axis mismatch, isolated. This shape has never turned a CI run
+  # red -- the run that prompted this work failed on a short denominator,
+  # not on the axis (see the pool case below) -- but the mismatch is real
+  # and latent, so it gets a fixture that exhibits it on demand rather than
+  # waiting for a distribution that does.
+  #
+  # A spec with FEW tests but a dominating runtime: greedy LPT isolates it
+  # on its own shard, which is exactly right by seconds and looks
+  # catastrophic by `@test` count, since the other shard then carries every
+  # remaining spec. The weight axis must call this BALANCED while the count
+  # axis calls it LOPSIDED; asserting both pins the guard to the axis the
+  # partitioner optimises. Two shards make the count skew maximal.
+  run bash -c "FIXTURE_HEAVY=1 FIXTURE_ORDER=n FIXTURE_WEIGHT=100000 PROBE_SHARDS=2
+$(_weights_fixture_prelude)
+$(_shard_balance_probe)"
+  assert_success
+  assert_output --partial "verdict=BALANCED"
+  assert_output --partial "verdict=LOPSIDED"
+}
+
+# why: #940 non-vacuity: N+1 equal heavy specs over eight shards must FAIL
+# the guard
+@test "_shard_unit_files: a distribution no partition can balance is reported IMBALANCED (#940)" {
+  # The inverse, and the proof the guard is not vacuous, driven at the eight
+  # shards CI runs: N+1 specs of equal dominating runtime over N shards
+  # forces one shard to carry two of them, so the best achievable makespan
+  # is 2w against a bound of (N+1)w/N -- 1.78x at N=8, past the 1.5x ceiling
+  # for ANY partition, greedy or optimal. The heavy set is drawn from the
+  # specs with the MOST tests, which leaves the residual `@test`
+  # distribution even: a count-axis guard would pass this partition, so the
+  # fixture discriminates the two axes rather than tripping whichever one is
+  # in force.
+  run bash -c "FIXTURE_HEAVY=9 FIXTURE_ORDER=nr FIXTURE_WEIGHT=10000 PROBE_SHARDS=8
+$(_weights_fixture_prelude)
+$(_shard_balance_probe)"
+  assert_failure
+  assert_output --partial "verdict=IMBALANCED"
+}
+
+# why: #940 the probe's shard total is load-bearing: N=4 passes what N=8
+# catches
+@test "_shard_unit_files: the same partition a four-shard probe calls balanced fails at eight (#940)" {
+  # Why the probe's shard total is load-bearing, shown on the SAME
+  # distribution the case above condemns. Nine equally dominating specs over
+  # four shards pack 3+2+2+2: a makespan of 3w against a bound of 9w/4, ratio
+  # 1.33, comfortably inside the ceiling. Over eight they pack 2 and seven
+  # 1s: 2w against 9w/8, ratio 1.78. So a distribution that genuinely breaks
+  # the matrix CI executes reads as healthy at a total CI never selects --
+  # which is what the guard asserted before, and the reason the live probe
+  # above moved to eight.
+  run bash -c "FIXTURE_HEAVY=9 FIXTURE_ORDER=nr FIXTURE_WEIGHT=10000 PROBE_SHARDS=4
+$(_weights_fixture_prelude)
+$(_shard_balance_probe)"
+  assert_success
+  assert_output --partial "verdict=BALANCED"
+}
+
+# why: #936 regression guard: a probe totalling `test/bats/unit/` alone is
+# caught on the live tree
+@test "_shard_unit_files: the live probe's total spans the partition pool, not test/bats/unit alone (#936, #940)" {
+  # The regression guard proper, aimed at the LIVE probe rather than at a
+  # replay of constants: the coverage-shard failure this work came from was
+  # a total summed over `test/bats/unit/` while the per-shard loads were
+  # summed over the pool the partitioner walks, so the average was short by
+  # every integration spec and a healthy partition read as IMBALANCED.
+  #
+  # Reintroduce that short total in the probe -- restrict its total loop to
+  # unit specs -- and this case goes red on `denominator=unit-only`, at the
+  # eight shards CI runs. It asserts the identity of the denominator, not
+  # its value, so it stands under either weight source: `@test` counts on a
+  # bare checkout, recorded seconds under the coverage matrix.
+  #
+  # The probe's verdict is deliberately NOT asserted here. The balance
+  # gate is the live-probe case above; wrapping the probe in a subshell
+  # keeps a skewed timing distribution from also turning this case red and
+  # sending the reader after the wrong cause.
+  run bash -c "PROBE_SHARDS=8
+_probe() (
+$(_shard_balance_probe)
+)
+$(_pool_denominator_audit)"
+  assert_success
+  assert_line --partial "denominator=pool"
+}
+
+# why: #936 arithmetic: the recorded loads clear the ceil'd bound once the
+# total is pooled
+@test "_shard_unit_files: the loads that failed CI clear the bound once the total spans the whole pool (#936, #940)" {
+  # The arithmetic of the rule, replayed on the numbers the failing run
+  # recorded. This case pins `_balance_lb`'s ceil and `_balance_verdict`'s
+  # 1.5x against real loads; the case ABOVE pins the probe's denominator.
+  # Neither substitutes for the other -- constants cannot detect a probe
+  # that walks the wrong pool, and the denominator audit says nothing
+  # about where the ceiling sits.
+  #
+  # The defect was the DENOMINATOR, not the axis. base#936's
+  # `coverage (6/8)` reported shard loads of
+  # 576 / 699 / 688 / 1134 against "avg=737", and all five of those numbers
+  # are `@test` COUNTS: the old assertion measured every load with
+  # `grep -cE "^@test"`, and the arithmetic pins the rest. The loads sum to
+  # 3097, which is that tree's unit pool (2949) PLUS its integration pool
+  # (148); avg=737 is 2949/4 truncated. So the loads were summed over the
+  # pool _shard_unit_files partitions while the total was summed over
+  # `test/bats/unit/` alone -- the denominator was short by every
+  # integration spec, which inflated max/avg and condemned a partition that
+  # was fine.
+  #
+  # Scope the total to the same pool and the IDENTICAL numbers pass, on the
+  # count axis they were always on: lb = ceil(3097/4) = 775, and 1134 is
+  # 1.46x of it. The heaviest spec on that tree was template_spec.bats at
+  # 155, far under the average, so it does not move the bound. Both totals
+  # go through the same rule the live probe runs, never a second copy.
+  #
+  # The wrong-axis mismatch the fixture cases above cover is real, latent,
+  # and worth having fixed -- but it is NOT what turned this run red, and
+  # nothing asserted here rests on it.
+  run bash -c "$(_balance_rule)"'
+    _short=$(_balance_lb 2949 4 155)
+    _pool=$(_balance_lb 3097 4 155)
+    printf "short lb=%s verdict=%s\n" \
+      "${_short}" "$(_balance_verdict "${_short}" 1134)"
+    printf "pool lb=%s verdict=%s\n" \
+      "${_pool}" "$(_balance_verdict "${_pool}" 1134)"
+  '
+  assert_success
+  assert_line "short lb=738 verdict=IMBALANCED"
+  assert_line "pool lb=775 verdict=BALANCED"
+}
+
+# why: #615 shard-spec validation (asserts message)
+@test "_shard_unit_files: rejects an out-of-range shard spec (#615, #692)" {
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _shard_unit_files 5/4
+  '
+  assert_failure
+  assert_output --partial "Need 1<=n<=total"
+}
+
+# why: #692 missing-slash format guard
+@test "_shard_unit_files: rejects a no-slash shard spec (#692)" {
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _shard_unit_files abc
+  '
+  assert_failure
+  assert_output --partial "Expected <n>/<total>"
+}
+
+# why: #692 non-numeric guard
+@test "_shard_unit_files: rejects a non-numeric shard spec (#692)" {
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _shard_unit_files a/b
+  '
+  assert_failure
+  assert_output --partial "Need 1<=n<=total"
+}
+
+# why: #692 empty-slice guard
+@test "_shard_unit_files: dies ci_empty_shard when a valid shard matches no files (#692)" {
+  # Greedy-LPT leaves the tail shards empty whenever total exceeds the spec
+  # count. Driven over a fixture REPO_ROOT holding exactly two specs so the
+  # Greedy-LPT fills one shard per spec before reusing any, so asking for
+  # (spec count + 1) shards leaves the last one empty by construction. The
+  # total is DERIVED from the tree rather than hardcoded: an earlier version
+  # asked for shard 100/100 on the assumption that the repo would stay under
+  # 100 specs, and started passing for the wrong reason once it grew past
+  # that. REPO_ROOT is readonly in test.sh, so the count is taken from the
+  # same globs the function itself walks.
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    shopt -s globstar
+    _n=0
+    for _f in "${REPO_ROOT}"/test/bats/unit/**/*_spec.bats \
+              "${REPO_ROOT}"/test/bats/integration/**/*_spec.bats; do
+      [[ -e "${_f}" ]] && _n=$(( _n + 1 ))
+    done
+    _shard_unit_files "$(( _n + 1 ))/$(( _n + 1 ))"
+  '
+  assert_failure
+  assert_output --partial "No spec files matched"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _spec_weight: time-weighted shard partition (ADR-00000008 amend)
+#
+# The shard partition (greedy LPT in _shard_unit_files) weights each spec
+# by RUNTIME, not `@test` count: equal-count specs of unequal duration
+# imbalance the shards otherwise. Weight source is a timings file (seconds
+# per repo-relative spec path, base#1410) populated automatically from prior CI runs; a spec
+# absent from it (new spec / no data yet) falls back to its `@test` count.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_spec_weight: returns the recorded seconds from SHARD_WEIGHTS_FILE (#724)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    wf="${BATS_TEST_TMPDIR}/w.tsv"
+    printf "%s\n" "12 test/bats/unit/foo_spec.bats" "3 test/bats/unit/bar_spec.bats" > "${wf}"
+    SHARD_WEIGHTS_FILE="${wf}" _spec_weight "${REPO_ROOT}/test/bats/unit/foo_spec.bats"
+  '
+  assert_success
+  assert_output "12"
+}
+
+@test "_spec_weight: falls back to @test count when the spec has no recorded time (#724)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    wf="${BATS_TEST_TMPDIR}/w.tsv"
+    printf "%s\n" "12 other_spec.bats" > "${wf}"
+    spec="${BATS_TEST_TMPDIR}/new_spec.bats"
+    printf "@test \"a\" {\n:\n}\n@test \"b\" {\n:\n}\n" > "${spec}"
+    SHARD_WEIGHTS_FILE="${wf}" _spec_weight "${spec}"
+  '
+  assert_success
+  assert_output "2"
+}
+
+@test "_spec_weight: falls back to @test count when no SHARD_WEIGHTS_FILE is set (#724)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    spec="${BATS_TEST_TMPDIR}/c_spec.bats"
+    printf "@test \"a\" {\n:\n}\n@test \"b\" {\n:\n}\n@test \"c\" {\n:\n}\n" > "${spec}"
+    unset SHARD_WEIGHTS_FILE
+    _spec_weight "${spec}"
+  '
+  assert_success
+  assert_output "3"
+}
+
+@test "_spec_weight: reads the default repo weights file when SHARD_WEIGHTS_FILE is unset (#733)" {
+  # CI restores the cached weights to ${REPO_ROOT}/test/bats/.shard-weights
+  # (the mounted /source tree), so the in-container coverage run picks them up
+  # WITHOUT any -e plumbing. Source only the driver so REPO_ROOT (readonly in
+  # test.sh) can point at a tmpdir holding a controlled default weights file.
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats"
+    printf "%s\n" "42 test/bats/unit/foo_spec.bats" > "${REPO_ROOT}/test/bats/.shard-weights"
+    source /source/script/test/drivers/bats.sh
+    unset SHARD_WEIGHTS_FILE
+    _spec_weight "${REPO_ROOT}/test/bats/unit/foo_spec.bats"
+  '
+  assert_success
+  assert_output "42"
+}
+
+@test "_shard_unit_files: partitions by recorded time when SHARD_WEIGHTS_FILE is set (#724)" {
+  # Give ONE real spec a dominating runtime and everything else ~0; with 2
+  # shards, greedy-LPT-by-time must isolate the heavy spec on its own shard.
+  # Count-based weighting (which ignores SHARD_WEIGHTS_FILE) would not.
+  run bash -c '
+    source /source/script/test/test.sh
+    specs=$(find "${REPO_ROOT}/test/bats/unit" -name "*_spec.bats" | sort)
+    heavy=$(printf "%s\n" "${specs}" | head -1)
+    heavy="${heavy#"${REPO_ROOT}/"}"
+    wf="${BATS_TEST_TMPDIR}/w.tsv"
+    : > "${wf}"
+    while IFS= read -r p; do
+      [[ -n "${p}" ]] || continue
+      b="${p#"${REPO_ROOT}/"}"
+      if [[ "${b}" == "${heavy}" ]]; then echo "100000 ${b}"; else echo "1 ${b}"; fi
+    done <<< "${specs}" >> "${wf}"
+    s1=$(SHARD_WEIGHTS_FILE="${wf}" _shard_unit_files 1/2 | grep -c .)
+    s2=$(SHARD_WEIGHTS_FILE="${wf}" _shard_unit_files 2/2 | grep -c .)
+    echo "s1=${s1} s2=${s2}"
+    { [[ "${s1}" -eq 1 ]] || [[ "${s2}" -eq 1 ]]; } || { echo FAIL; exit 1; }
+    echo OK
+  '
+  assert_success
+  assert_output --partial "OK"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _junit_to_timings: capture real per-spec-file kcov-mode runtime
+#
+# A coverage shard runs `kcov ... bats --report-formatter junit`, which
+# emits one <testsuite name=<spec> time=<sec>> per FILE. _junit_to_timings
+# turns that report into the `<seconds> <repo-relative path>` lines
+# _spec_weight reads (base#1410), so the NEXT run's partition weights by real runtime instead of
+# the @test-count fallback. Seconds round to the nearest whole, floored at
+# 1 so a sub-second spec still carries a non-zero LPT weight.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_junit_to_timings: emits <seconds> <repo-relative path> per testsuite, rounded and floored at 1 (#733, base#1410)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    xml="${BATS_TEST_TMPDIR}/report.xml"
+    cat > "${xml}" <<EOF
+<?xml version="1.0"?>
+<testsuites time="3.6">
+  <testsuite name="foo_spec.bats" tests="2" time="2.4">
+    <testcase classname="x" name="a" time="1.2"/>
+  </testsuite>
+  <testsuite name="${REPO_ROOT}/test/bats/integration/bar_spec.bats" tests="1" time="0.3">
+    <testcase classname="x" name="b" time="0.3"/>
+  </testsuite>
+</testsuites>
+EOF
+    _junit_to_timings "${xml}" "${REPO_ROOT}/test/bats/unit"
+  '
+  assert_success
+  # 2.4 -> 2; a name relative to the first target joins that directory
+  assert_line "2 test/bats/unit/foo_spec.bats"
+  # 0.3 rounds to 0 then floors to 1 (non-zero LPT weight); an absolute
+  # name loses the repo-root prefix
+  assert_line "1 test/bats/integration/bar_spec.bats"
+}
+
+@test "_junit_to_timings: ignores the <testsuites> root and a missing file is a no-op (#733)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _junit_to_timings "/no/such/report.xml"
+    echo "rc=$?"
+  '
+  assert_success
+  assert_output "rc=0"
+}
+
+@test "_run_coverage: writes coverage/timings.tsv from the bats junit report (#733)" {
+  # A coverage run records each spec FILE's real kcov-mode runtime so the
+  # NEXT partition is time-balanced. Mock kcov to simulate the wrapped
+  # `bats --report-formatter junit --output DIR` by dropping a report at the
+  # requested dir; assert _run_coverage converts it into coverage/timings.tsv.
+  # REPO_ROOT is redirected to a tmpdir so the real mounted /source/coverage
+  # is never touched.
+  run bash -c '
+    # Source only the bats driver (test.sh makes REPO_ROOT readonly, which we
+    # must redirect to a tmpdir here); the driver is a pure function library.
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" \
+             "${REPO_ROOT}/test/bats/unit" "${REPO_ROOT}/test/bats/integration"
+    source /source/script/test/drivers/bats.sh
+    mkdir -p "${BATS_TEST_TMPDIR}/bin"
+    cat > "${BATS_TEST_TMPDIR}/bin/kcov" <<"SH"
+#!/usr/bin/env bash
+outdir=""; prev=""
+for a in "$@"; do [[ "${prev}" == "--output" ]] && outdir="${a}"; prev="${a}"; done
+mkdir -p "${outdir}"
+printf "%s\n" "<testsuites><testsuite name=\"mock_spec.bats\" time=\"4.0\"></testsuite></testsuites>" \
+  > "${outdir}/report.xml"
+exit 0
+SH
+    chmod +x "${BATS_TEST_TMPDIR}/bin/kcov"
+    PATH="${BATS_TEST_TMPDIR}/bin:${PATH}" _run_coverage >/dev/null 2>&1
+    cat "${REPO_ROOT}/coverage/timings.tsv"
+  '
+  assert_success
+  # The full run's first target is the unit pool, so a junit name relative
+  # to it is a unit spec (base#1410).
+  assert_output "4 test/bats/unit/mock_spec.bats"
+}
+
+@test "_run_coverage: a full-suite run names every spec file, subfolders included (#952)" {
+  # The full run is the ONLY one whose manifest has to come out complete:
+  # `scope=full` on the release certificate is exactly the claim that
+  # coverage/timings.tsv names every spec in the tree. And the full run is
+  # the one place the manifest is produced differently -- kcov is handed
+  # two DIRECTORIES and bats recurses into them, where a shard is handed a
+  # list of FILES. If the junit report named the directory, or skipped the
+  # test/bats/unit/<lib>/ subfolders, every release would be refused with
+  # nothing to point at.
+  #
+  # So bats runs for real here. kcov is replaced by a shim that drops its
+  # own flags, leaves a report in the report directory (a slice with no
+  # report is refused, base#1414) and execs the command it wraps, which
+  # leaves the genuine
+  # `bats --recursive --report-formatter junit --output DIR <dirs>` --
+  # the invocation whose output _junit_to_timings has to parse. The
+  # `--merge` that joins the slices is answered with a merged report.
+  mock_cmd "kcov" '
+    if [ "$1" = "--merge" ]; then
+      mkdir -p "$2/kcov-merged" && : > "$2/kcov-merged/cobertura.xml"
+      exit 0
+    fi
+    while [ $# -gt 0 ]; do
+      case "$1" in --*) shift ;; *) break ;; esac
+    done
+    mkdir -p "$1/bats" && : > "$1/bats/cobertura.xml"
+    shift
+    exec "$@"'
+
+  run bash -c '
+    set -e
+    mkdir -p "${BATS_TEST_TMPDIR}/repo/coverage" \
+             "${BATS_TEST_TMPDIR}/repo/test/bats/unit/sub" \
+             "${BATS_TEST_TMPDIR}/repo/test/bats/integration"
+    for _f in unit/a_spec.bats unit/b_spec.bats unit/sub/c_spec.bats \
+              integration/d_spec.bats unit/e.bats; do
+      printf "@test \"t\" { :; }\n" \
+        > "${BATS_TEST_TMPDIR}/repo/test/bats/${_f}"
+    done
+    (
+      REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+      _die() { echo "DIE: $*"; exit 1; }
+      source /source/script/test/drivers/bats.sh
+      _run_coverage >/dev/null
+    )
+    echo "MANIFEST:"
+    sort "${BATS_TEST_TMPDIR}/repo/coverage/timings.tsv"
+    # The reader, on the tree the writer just described. REPO_ROOT is
+    # readonly in test.sh and stays /source; the scope is asked of the
+    # scratch root by argument.
+    source /source/script/test/test.sh
+    echo "SCOPE: $(_measured_coverage_scope "${BATS_TEST_TMPDIR}/repo")"
+  '
+  assert_success
+  assert_output --partial "1 test/bats/unit/a_spec.bats"
+  assert_output --partial "1 test/bats/unit/b_spec.bats"
+  assert_output --partial "1 test/bats/unit/sub/c_spec.bats"
+  assert_output --partial "1 test/bats/integration/d_spec.bats"
+
+  # `e.bats` is the file shape half of the same question. The run hands
+  # kcov two DIRECTORIES and `bats --recursive`, which executes every
+  # *.bats under them -- not only the ones named *_spec.bats. A manifest
+  # therefore names files an inventory keyed on the *_spec.bats
+  # convention would not, and the scope comes out `partial n/n specs`:
+  # unpublishable, and pointing at nothing.
+  assert_output --partial "1 test/bats/unit/e.bats"
+
+  # The whole point: a complete manifest is what earns `full`, and it is
+  # earned over a tree with a subfolder in it.
+  assert_output --partial "SCOPE: full"
+}
+
+@test "_run_coverage: the full run covers the pools the inventory reads (#952)" {
+  # Two rosters of the same list is one roster too many. The full run
+  # hands kcov a list of DIRECTORIES; the scope on the release
+  # certificate is derived by enumerating the specs under a list of
+  # directories (_coverage_spec_inventory). Typed out twice, a pool can
+  # join the run without joining the inventory -- and every release is
+  # then refused with `partial n/n specs`, a self-contradictory message
+  # that points at nothing. So there is ONE roster, and this reads the
+  # run's targets back against it.
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    set -e
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    for _p in ${_COVERAGE_FULL_SUITE_POOLS[@]+"${_COVERAGE_FULL_SUITE_POOLS[@]}"}; do
+      printf "POOL %s\n" "${_p}"
+    done
+    _run_coverage >/dev/null
+  '
+  assert_success
+
+  local _pools
+  _pools="$(printf '%s\n' "${output}" | sed -n 's/^POOL //p' | sort -u)"
+  # A roster that enumerated nothing would make the comparison below
+  # vacuous, which is how a guard over a list becomes a guard over
+  # nothing.
+  [ "$(printf '%s\n' "${_pools}" | grep -c .)" -ge 2 ]
+
+  # What the run actually handed kcov, root prefix and trailing slash
+  # removed: it must be that roster, and nothing besides.
+  local _targets
+  _targets="$(tr ' ' '\n' < "${_log}" \
+    | sed -n 's#^.*/\(test/bats/.*\)$#\1#p' \
+    | sed 's#/$##' | sort -u)"
+  if [[ "${_targets}" != "${_pools}" ]]; then
+    printf 'run targets:\n%s\nroster:\n%s\n' "${_targets}" "${_pools}"
+    false
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The union of the shard slices is a partition only under ONE weight source
+#
+# Greedy-LPT partitions the pool PER WEIGHT SOURCE. Each coverage shard
+# used to look the weights blob up for itself, so the twelve slices were
+# computed from twelve independent reads, and their union was a partition
+# only if all twelve reads returned the same bytes. Nothing in CI could
+# see otherwise: every slice is non-empty (so the empty-shard guard never
+# fires), the merge keys on the spec path (so a spec measured twice reads
+# as one entry), and a spec measured NOWHERE leaves no entry at all.
+#
+# _coverage_union_gap is the detector. It compares the MERGED run
+# manifest -- what the shards between them reported running -- against
+# the inventory of what a full run covers, and names the specs no shard
+# reported. The structural half (one lookup, done once in compute-shards)
+# lives in self-test.yaml and is asserted in self_test_yaml_spec.bats.
+# ════════════════════════════════════════════════════════════════════
+
+# _divergent_union_program
+#   Echo the shell program that drives the real partitioner over a
+#   six-spec fixture pool, ONE SHARD PER PROCESS, and merges the slices
+#   into one run manifest the way the coverage-gate job does. SHARD_SOURCES
+#   carries one token per shard: `w` = that shard reads the seconds file,
+#   `-` = that shard finds no weights file and falls back to @test counts.
+#   A mixed value reproduces the independent-lookup divergence; a uniform
+#   one is the single-source control.
+#
+#   A process per shard is the load-bearing detail. Slices evaluated in
+#   ONE shell against ONE weight source agree by construction, which is
+#   why the exhaustive-and-disjoint case above cannot see this at all.
+#
+#   The two sources genuinely disagree on this fixture: every spec carries
+#   one @test, so the fallback weighs them all 1 and greedy fills the bins
+#   in name order (a,b,c then d,e,f), while the seconds file ranks them
+#   10..5 strictly descending so greedy fills the lightest bin instead.
+#   Shard 3 is {c,d} under seconds and {c,f} under counts.
+_divergent_union_program() {
+  cat <<'PROGRAM'
+_root="${BATS_TEST_TMPDIR}/repo"
+mkdir -p "${_root}/test/bats/unit" "${_root}/test/bats/integration"
+for _n in a b c d e f; do
+  printf '@test "%s" { :; }\n' "${_n}" \
+    > "${_root}/test/bats/unit/${_n}_spec.bats"
+done
+_wf="${BATS_TEST_TMPDIR}/seconds.tsv"
+printf '%s\n' "10 test/bats/unit/a_spec.bats" "9 test/bats/unit/b_spec.bats" \
+  "8 test/bats/unit/c_spec.bats" "7 test/bats/unit/d_spec.bats" \
+  "6 test/bats/unit/e_spec.bats" "5 test/bats/unit/f_spec.bats" > "${_wf}"
+
+# One shard per PROCESS, each reading the weight source it was handed --
+# the independent per-shard cache lookups, in miniature.
+_i=0
+for _src in ${SHARD_SOURCES}; do
+  _i=$(( _i + 1 ))
+  _use="${BATS_TEST_TMPDIR}/no-such-weights"
+  [[ "${_src}" == w ]] && _use="${_wf}"
+  env REPO_ROOT="${_root}" SHARD_WEIGHTS_FILE="${_use}" bash -c '
+      _die() { echo "DIE: $*"; exit 1; }
+      source /source/script/test/drivers/bats.sh
+      _shard_unit_files "${1}"
+    ' _ "${_i}/3" \
+    | sed "s|^${_root}/|1 |" > "${BATS_TEST_TMPDIR}/timings-${_i}.tsv"
+  printf 'shard %s (%s): %s\n' "${_i}" "${_src}" \
+    "$(tr '\n' ' ' < "${BATS_TEST_TMPDIR}/timings-${_i}.tsv")"
+done
+
+# The coverage-gate job's own merge, over the per-shard manifests.
+bash /source/script/test/drivers/coverage_gate.sh --merge-timings \
+  "${BATS_TEST_TMPDIR}/merged.tsv" "${BATS_TEST_TMPDIR}"/timings-*.tsv
+
+source /source/script/test/test.sh
+echo "GAP:"
+_coverage_union_gap "${BATS_TEST_TMPDIR}/merged.tsv" "${_root}" || true
+echo "END"
+PROGRAM
+}
+
+# why: The load-bearing case, and the observable base#1114 measured on the
+# real tree: two weight sources across shard processes leave specs in NO
+# shard, every slice still non-empty, and this is the only check that can
+# say which specs went unrun.
+@test "_coverage_union_gap: names the specs no shard ran when the shards disagree about the weights (#1114)" {
+  SHARD_SOURCES="w w -" run bash -c "$(_divergent_union_program)"
+  assert_success
+  # Shard 3 read the counts and took {c,f}; shards 1-2 read the seconds
+  # and left d to the shard 3 that only a seconds-weighted partition has.
+  assert_output --partial "GAP:
+test/bats/unit/d_spec.bats
+END"
+}
+
+# why: The control that makes the case above mean something. Same fixture,
+# same six specs, same partitioner -- one weight source, and the union is
+# the whole pool. Without it, a detector that always reported a gap would
+# pass the case above.
+@test "_coverage_union_gap: one weight source across every shard leaves no spec behind (#1114)" {
+  SHARD_SOURCES="w w w" run bash -c "$(_divergent_union_program)"
+  assert_success
+  assert_output --partial "GAP:
+END"
+}
+
+# why: The @test-count fallback is a weight SOURCE, not the absence of
+# one: shards that ALL miss the cache still partition the pool. Without
+# this case a green gate could be read as "the weights were there" rather
+# than "the weights agreed", and the fix would look like a cache-hit
+# problem instead of a consistency one.
+@test "_coverage_union_gap: a cache miss on every shard is still one source, so still a partition (#1114)" {
+  SHARD_SOURCES="- - -" run bash -c "$(_divergent_union_program)"
+  assert_success
+  assert_output --partial "GAP:
+END"
+}
+
+# why: No evidence must not read as a clean bill of health. An unreadable
+# manifest, a missing one, and an inventory that enumerated nothing would
+# each make a gap of zero mean nothing -- which is how this gate goes
+# vacuous while still printing a pass.
+@test "_coverage_union_gap: refuses rather than reporting an empty gap when there is nothing to compare (#1114)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _root="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${_root}/test/bats/unit"
+    printf "@test \"a\" { :; }\n" > "${_root}/test/bats/unit/a_spec.bats"
+    : > "${BATS_TEST_TMPDIR}/empty.tsv"
+    printf "%s\n" "1 test/bats/unit/a_spec.bats" > "${BATS_TEST_TMPDIR}/full.tsv"
+    _coverage_union_gap "${BATS_TEST_TMPDIR}/empty.tsv" "${_root}" \
+      && { echo "EMPTY-MANIFEST-ACCEPTED"; exit 1; }
+    _coverage_union_gap "${BATS_TEST_TMPDIR}/missing.tsv" "${_root}" \
+      && { echo "MISSING-MANIFEST-ACCEPTED"; exit 1; }
+    _coverage_union_gap "${BATS_TEST_TMPDIR}/full.tsv" \
+      "${BATS_TEST_TMPDIR}/nowhere" \
+      && { echo "NO-INVENTORY-ACCEPTED"; exit 1; }
+    echo OK
+  '
+  assert_success
+  assert_output --partial "OK"
+}
+
+# why: The entry point the coverage-gate job runs. The function answers
+# with data; this turns a gap into a non-zero exit that NAMES the specs,
+# which is the whole of what a red CI job has to tell its reader.
+@test "main --coverage-union-check: refuses, naming the specs no shard ran (#1114)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _coverage_spec_inventory "${REPO_ROOT}" \
+      | sed "1d" | sed "s/^/1 /" > "${BATS_TEST_TMPDIR}/short.tsv"
+    _coverage_spec_inventory "${REPO_ROOT}" | sed -n "1p"
+  '
+  assert_success
+  local _dropped="${output}"
+  [ -n "${_dropped}" ]
+
+  run bash /source/script/test/test.sh \
+    --coverage-union-check "${BATS_TEST_TMPDIR}/short.tsv"
+  assert_failure
+  assert_output --partial "${_dropped}"
+}
+
+# why: The pass direction of the same entry point, over the live
+# inventory. A manifest naming every spec is what a healthy coverage
+# matrix produces, so refusing it would make the gate unshippable -- and
+# it is the half that proves the refusal above is about the gap and not
+# about the flag.
+@test "main --coverage-union-check: accepts a manifest naming every spec in the inventory (#1114)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _coverage_spec_inventory "${REPO_ROOT}" | sed "s/^/1 /" \
+      > "${BATS_TEST_TMPDIR}/whole.tsv"
+  '
+  assert_success
+
+  run bash /source/script/test/test.sh \
+    --coverage-union-check "${BATS_TEST_TMPDIR}/whole.tsv"
+  assert_success
+  assert_output --partial "exhaustive"
+}
+
+@test "_shard_unit_files: integration specs are partitioned into the pool, not pinned to one shard (#724)" {
+  # Previously ALL integration specs ran on the last shard (count-era). They
+  # are now folded into the time-balanced pool so an integration spec lands
+  # on exactly one shard (still kcov'd once across the matrix) but spread by
+  # time.
+  run bash -c '
+    source /source/script/test/test.sh
+    union=$( { _shard_unit_files 1/3; _shard_unit_files 2/3; _shard_unit_files 3/3; } )
+    printf "%s\n" "${union}" | grep -q "/test/bats/integration/.*_spec.bats" \
+      || { echo MISSING-INTEGRATION; exit 1; }
+    echo OK
+  '
+  assert_success
+  assert_output --partial "OK"
+}
+
+# why: #615 sharded kcov targets
+@test "_run_coverage: shard N/T kcov's only that unit slice, not the whole tree (#615)" {
+  # No PATH override: _run_coverage shells out to find/sort/awk via
+  # _shard_unit_files. mock_cmd already PREPENDS MOCK_DIR to PATH, so the
+  # kcov + bats mocks win while the real coreutils stay reachable.
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    # REPO_ROOT points at a scratch tree, and the DRIVER is sourced rather
+    # than test.sh, because test.sh makes REPO_ROOT readonly. _run_coverage
+    # writes ${REPO_ROOT}/coverage/timings.tsv as its last act, so run
+    # against the real root it truncates the run manifest in the mounted
+    # checkout -- the file a concurrent `just test coverage` derives its
+    # certificate from, under 32 parallel bats jobs.
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    for _n in i j; do
+      printf "@test \"t1\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/integration/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 1/4
+  '
+  assert_success
+  assert_output --partial "shard 1/4"
+
+  run cat "${_log}"
+  assert_success
+  # kcov wraps bats over specific shard spec files, not the whole unit dir.
+  assert_output --partial "_spec.bats"
+  refute_output --partial "test/bats/unit/ bats"
+}
+
+@test "_run_coverage: shard targets are individual spec files, never the whole integration dir (#724)" {
+  # This supersedes the old last-shard rule: integration specs are folded
+  # into the time-balanced pool, so a shard kcov's individual spec FILES
+  # (unit + integration mixed) and the whole integration DIR is never a
+  # target (which would re-cover all integration on one shard).
+  _kcov_slice_mock "${BATS_TEST_TMPDIR}/kcov.log"
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    # REPO_ROOT points at a scratch tree, and the DRIVER is sourced rather
+    # than test.sh, because test.sh makes REPO_ROOT readonly. _run_coverage
+    # writes ${REPO_ROOT}/coverage/timings.tsv as its last act, so run
+    # against the real root it truncates the run manifest in the mounted
+    # checkout -- the file a concurrent `just test coverage` derives its
+    # certificate from, under 32 parallel bats jobs.
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    for _n in i j; do
+      printf "@test \"t1\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/integration/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 2/2
+  '
+  assert_success
+  refute_output --partial "integration suite (last shard)"
+  refute_output --regexp 'cov-shard:.*/test/bats/integration/$'
+  assert_output --partial "_spec.bats"
+}
+
+# why: #615 local full-coverage path
+@test "_run_coverage: no argument keeps the full-suite path (unit + integration) (#615)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    # REPO_ROOT points at a scratch tree, and the DRIVER is sourced rather
+    # than test.sh, because test.sh makes REPO_ROOT readonly. _run_coverage
+    # writes ${REPO_ROOT}/coverage/timings.tsv as its last act, so run
+    # against the real root it truncates the run manifest in the mounted
+    # checkout -- the file a concurrent `just test coverage` derives its
+    # certificate from, under 32 parallel bats jobs.
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    for _n in i j; do
+      printf "@test \"t1\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/integration/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage
+  '
+  assert_success
+  assert_output --partial "full suite"
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "test/bats/unit/"
+  assert_output --partial "test/bats/integration/"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The coverage run is a bats run, and takes its parallelism from the
+# same helper every other bats run does -- including the decision NOT
+# to be parallel
+#
+# kcov wraps bats, so `_run_coverage`'s command IS a bats invocation --
+# and it was the only one in the driver that never received the `--jobs`
+# that `_bats_args_with_label` gives every other runner. It was one of
+# TWO assembled by hand (`_run_system` is the other, below); being
+# hand-assembled is why a second `--jobs` could drift, being the one
+# without the flag is why this path ran serial for two and a half months.
+# The two branches of the function get different answers, and both
+# answers are measured, not assumed:
+#
+#   - a SHARD (what the CI matrix runs, ~550 specs' worth of tests) is
+#     parallel: over three slices, seven of eight parallel runs
+#     reproduce the serial covered and valid line sets exactly, and the
+#     eighth missed 3 lines of 6207 -- at 1.9x-3.1x the speed, into a
+#     gate that unions eight shards over a floor with points to spare.
+#   - the FULL SUITE is serial by declared policy: at ~4500 tests every
+#     parallel run records a strict SUBSET of what serial records
+#     (8617 lines serial, twice; 8532 and 8587 parallel, nothing extra
+#     either time), so the published figure would move and jitter. The
+#     policy is decided by what the run WALKS, so a shard slice that is
+#     the whole suite (`1/1`) lands here rather than in the branch above.
+#
+# These assert on the arguments kcov was handed, because the args are
+# where the divergence was invisible: both runs pass, one takes three
+# times as long.
+# ════════════════════════════════════════════════════════════════════
+
+# why: the full-suite run is the one that stamps scope=full and feeds the
+# release badge, and at that volume kcov's single parser drops trace data
+# from passing tests -- two serial runs record the same 8617 covered
+# lines, two parallel runs record 8532 and 8587, each a strict subset. So
+# it is serial, declared through the helper rather than by omission: the
+# omission is what this issue is about.
+@test "_run_coverage: the full-suite run declares serial, and kcov gets no --jobs (#1060)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  # parallel IS present and nproc DOES answer: the run must still come
+  # out serial, or the policy is not being declared, merely unreachable.
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 8'
+
+  run bash -c '
+    # REPO_ROOT points at a scratch tree, and the DRIVER is sourced rather
+    # than test.sh, because test.sh makes REPO_ROOT readonly. _run_coverage
+    # writes ${REPO_ROOT}/coverage/timings.tsv as its last act.
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage
+  '
+  assert_success
+  # The label the helper set, printed where the run announces itself --
+  # the same one-line report every other runner prints. It says WHICH
+  # serial this is: a policy, not a missing GNU parallel.
+  assert_output --partial "serial by policy"
+
+  run cat "${_log}"
+  assert_success
+  refute_output --partial "--jobs"
+  # --recursive still reaches the wrapped bats, so the directory targets
+  # descend into the per-lib subfolders (ADR-00000015).
+  assert_output --partial "--recursive"
+  # Serial is ONE slice: one kcov around one bats, then the merge
+  # (base#1414).
+  run grep -vc '^--merge' "${_log}"
+  assert_output "1"
+}
+
+# why: an unreadable policy must not resolve to a default that silently
+# runs the wrong way round -- a typo'd `seriel` reaching the parallel
+# branch is how the full suite would quietly start losing lines again.
+@test "_bats_args_with_label: an unknown jobs policy dies rather than defaulting (#1060)" {
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    declare -a _args
+    declare _label
+    _bats_args_with_label _args _label seriel
+  '
+  assert_failure
+  assert_output --partial "DIE:"
+  assert_output --partial "seriel"
+  # The refusal names every policy a caller may pass, the CPU-bound one
+  # included (base#1429), so the fix for a typo is in the message.
+  assert_output --partial "parallel|cpu-bound|metered|serial"
+}
+
+# why: an EMPTY policy is unreadable too, and it is the one a caller
+# reaches by accident -- `_bats_args_with_label _a _l "${SOME_POLICY}"`
+# with that variable unset. A `:-` default answers it with `parallel`
+# before the guard can see it, which is the silent wrong answer the
+# argument exists to refuse; only an OMITTED third argument is a default.
+@test "_bats_args_with_label: an empty jobs policy dies rather than defaulting (#1060)" {
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    declare -a _args
+    declare _label
+    _bats_args_with_label _args _label "${SOME_POLICY:-}"
+  '
+  assert_failure
+  assert_output --partial "DIE:"
+  assert_output --partial "jobs policy"
+  assert_output --partial "parallel|cpu-bound|metered|serial"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# The job count is a FLOOR under the core count, because this gate
+# WAITS rather than computes -- and a count nobody could read is not a
+# reading (base#1068)
+#
+# `nproc` is the right default for a CPU-bound workload and this is not
+# one: a bats test spends its time waiting on subprocesses (base#1002
+# measured 1-2 of 32 cores busy). CI's runner has 4 cores, so
+# `--jobs $(nproc)` ran the gate at exactly the ratio the flag exists to
+# remove, and it measured as worth NOTHING: one real coverage shard on a
+# 4-CPU cpuset took 113.4s / 104.8s at jobs=4 against a 108.4s / 108.9s
+# SERIAL control. 8 gives 1.28x, 32 gives 1.75x, 64 the same as 32.
+# Plain bats on the same shard and the same 4 cores: 88.4s / 93.8s at
+# jobs=4 against 42.5s / 42.2s at jobs=32, so the effect is not
+# coverage-shaped and the floor is for every runner.
+#
+# The rule is max(cores, floor) and NOT `k x cores`, and that is a
+# measurement rather than a taste -- but the measurement says KNEE, not
+# peak. Same slice on a 32-core host, four INTERLEAVED reps per point:
+# 16 jobs 43.7s, 32 jobs 26.5s, 64 jobs 25.8s, 128 jobs 25.7s. Below the
+# knee costs 1.65x; above it the curve is flat out to 4x the core count.
+# So the count above the knee is free, and a floor is chosen for the
+# property rather than for a winner: it is monotone and cannot land
+# BELOW the knee, where `k x cores` lands on any machine smaller than
+# 32/k -- which is the 4-core runner this started on.
+#
+# So these tests assert the SHAPE -- never below the cores, ABOVE them
+# when the machine is small, EQUAL to them when it is large,
+# non-decreasing in between. The constants are figures measured on a few
+# machines and will be re-derived, so ONE table test pins them (base#1429):
+# a shape alone passes a floor moved to 16 or 64, and a re-tune should be
+# an edit to that table rather than a drift no test notices.
+# ════════════════════════════════════════════════════════════════════
+
+# why: `nproc` names how many things a machine can COMPUTE at once, and
+# this gate computes almost nothing -- it waits on subprocesses. On CI's
+# 4-core runner `--jobs 4` measured indistinguishable from serial (113.4s
+# / 104.8s against a 108.4s / 108.9s serial control on a real coverage
+# shard under a 4-CPU cpuset), so a small machine has to be
+# OVERSUBSCRIBED. The assertion is `> cores` and not any particular
+# number, because the number is the thing that gets re-measured.
+@test "_bats_args_with_label: a small machine is oversubscribed, not run at one job per core (#1068)" {
+  mock_cmd "parallel" 'exit 0'
+  # 4 = the core count of the CI runner the defect was measured on.
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _jobs_of() {
+      local _p="" _n="" _x
+      for _x in "$@"; do [ "${_p}" = "--jobs" ] && _n="${_x}"; _p="${_x}"; done
+      printf "%s\n" "${_n}"
+    }
+    declare -a _args; declare _label
+    _bats_args_with_label _args _label
+    printf "JOBS:%s\n" "$(_jobs_of "${_args[@]}")"
+    printf "LABEL:%s\n" "${_label}"
+    _bats_args_with_label _args _label cpu-bound
+    printf "CPUJOBS:%s\n" "$(_jobs_of "${_args[@]}")"
+    printf "CPULABEL:%s\n" "${_label}"
+  '
+  assert_success
+  local _jobs
+  _jobs="$(printf '%s\n' "${output}" | sed -n 's/^JOBS://p')"
+  assert [ -n "${_jobs}" ]
+  assert [ "${_jobs}" -gt 4 ]
+  # The label reports the count that was CHOSEN, next to the one that was
+  # read, so the run's first line explains itself.
+  assert_output --partial "LABEL:jobs=${_jobs}"
+  # The cpu-bound policy is floored too (base#1429): a lower floor, but
+  # still a floor, so a 4-core machine still runs more than 4 jobs.
+  local _cpu_jobs
+  _cpu_jobs="$(printf '%s\n' "${output}" | sed -n 's/^CPUJOBS://p')"
+  assert [ -n "${_cpu_jobs}" ]
+  assert [ "${_cpu_jobs}" -gt 4 ]
+  assert_output --partial "CPULABEL:jobs=${_cpu_jobs}"
+}
+
+# why: the floor has to be a FLOOR. 32 is a knee and not a peak -- four
+# interleaved reps per point on a 32-core host read 43.7s at 16 jobs
+# against 26.5s / 25.8s / 25.7s at 32 / 64 / 128 -- so what a rule must
+# guarantee is that it never lands BELOW the knee, which `k x cores`
+# fails to do on any machine smaller than 32/k, the 4-core runner
+# included. A large machine therefore gets exactly its cores, and the
+# rule stays monotone so a bigger host is never handed less than a
+# smaller one. This is the assertion that lets the constant be re-tuned
+# without editing a test: never-below-the-machine, non-decreasing, and
+# equal at the top name nothing the measurement picked.
+@test "_bats_args_with_label: --jobs is a floor under the core count, never a multiple of it (#1068)" {
+  mock_cmd "parallel" 'exit 0'
+
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _jobs_of() {
+      local _p="" _n="" _x
+      for _x in "$@"; do [ "${_p}" = "--jobs" ] && _n="${_x}"; _p="${_x}"; done
+      printf "%s\n" "${_n}"
+    }
+    # Both floored policies: the default and the CPU-bound one (base#1429).
+    for _policy in parallel cpu-bound; do
+      for _c in 1 2 4 8 64 1000; do
+        printf "#!/bin/bash\necho %s\n" "${_c}" > "'"${MOCK_DIR}"'/nproc"
+        chmod +x "'"${MOCK_DIR}"'/nproc"
+        declare -a _args; declare _label
+        _bats_args_with_label _args _label "${_policy}" || exit 1
+        printf "%s %s %s\n" "${_policy}" "${_c}" "$(_jobs_of "${_args[@]}")"
+      done
+    done
+  '
+  assert_success
+  local _sweep="${output}"
+
+  local _policy _cores _jobs _last=0 _prev_policy=""
+  while read -r _policy _cores _jobs; do
+    [[ "${_policy}" == "${_prev_policy}" ]] || _last=0
+    _prev_policy="${_policy}"
+    assert [ -n "${_jobs}" ]
+    # Never below the machine.
+    assert [ "${_jobs}" -ge "${_cores}" ]
+    # Monotone in the core count: a bigger machine is never handed less.
+    assert [ "${_jobs}" -ge "${_last}" ]
+    _last="${_jobs}"
+  done <<< "${_sweep}"
+
+  # The biggest machine in the sweep gets EXACTLY its core count under
+  # either policy. A factor rule would hand it thousands of jobs; a floor
+  # cannot.
+  assert [ "$(printf '%s\n' "${_sweep}" | awk '$1 == "parallel" && $2 == 1000 {print $3}')" = "1000" ]
+  assert [ "$(printf '%s\n' "${_sweep}" | awk '$1 == "cpu-bound" && $2 == 1000 {print $3}')" = "1000" ]
+}
+
+# why: `nproc 2>/dev/null || echo 4` printed `jobs=4` for a FAILED probe
+# and for a genuine 4-core machine alike, so the run's own log could not
+# say which had happened -- and on CI both readings were 4 at once. That
+# is the shape the policy argument three lines up refuses. A FALLBACK is
+# the right answer here where a `_die` is the right answer there: an
+# unreadable POLICY is a caller's bug with no correct run to give it,
+# while an unreadable CORE COUNT is an ENVIRONMENT -- the same kind as
+# `parallel` missing from PATH, which this helper already falls back on
+# and NAMES. So it falls back and says so, and what is pinned is the
+# saying: the two labels must differ even when the two counts agree.
+@test "_bats_args_with_label: an unreadable core count is labelled a fallback, not a reading (#1068)" {
+  mock_cmd "parallel" 'exit 0'
+  # Present but broken -- the failure the old `|| echo N` swallowed.
+  mock_cmd "nproc" 'echo "nproc: cannot determine number of CPUs" >&2; exit 1'
+
+  local _probe='
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _jobs_of() {
+      local _p="" _n="" _x
+      for _x in "$@"; do [ "${_p}" = "--jobs" ] && _n="${_x}"; _p="${_x}"; done
+      printf "%s\n" "${_n}"
+    }
+    declare -a _args; declare _label
+    _bats_args_with_label _args _label "${PROBE_POLICY}"
+    printf "JOBS:%s\n" "$(_jobs_of "${_args[@]}")"
+    printf "LABEL:%s\n" "${_label}"
+  '
+
+  # Both floored policies fall back the same way: the default and the
+  # CPU-bound one (base#1429).
+  local _policy
+  for _policy in parallel cpu-bound; do
+    export PROBE_POLICY="${_policy}"
+    mock_cmd "nproc" 'echo "nproc: cannot determine number of CPUs" >&2; exit 1'
+    run bash -c "${_probe}"
+    # An environment, not a caller bug: the run still happens.
+    assert_success
+    local _guessed _guess_label
+    _guessed="$(printf '%s\n' "${output}" | sed -n 's/^JOBS://p')"
+    _guess_label="$(printf '%s\n' "${output}" | sed -n 's/^LABEL://p')"
+    assert [ -n "${_guessed}" ]
+    # The fallback is the policy's own floor, not one shared number: a
+    # CPU-bound run that lost its core count must not fall back to the
+    # default floor the hosted runner timed out under (base#1429).
+    if [[ "${_policy}" == "cpu-bound" ]]; then
+      assert [ "${_guessed}" = "8" ]
+    else
+      assert [ "${_guessed}" = "32" ]
+    fi
+
+    # Now a machine that genuinely HAS that many cores. Same count, and the
+    # label must not be the same sentence -- that is the whole defect.
+    mock_cmd "nproc" "echo ${_guessed}"
+    run bash -c "${_probe}"
+    assert_success
+    assert [ "$(printf '%s\n' "${output}" | sed -n 's/^JOBS://p')" = "${_guessed}" ]
+    refute [ "$(printf '%s\n' "${output}" | sed -n 's/^LABEL://p')" = "${_guess_label}" ]
+  done
+}
+
+# why: every runner calls this helper, so the floor reaches all of them
+# unless a policy says otherwise -- and for the kcov runners the
+# measurement says otherwise. N bats jobs feed ONE single-threaded trace
+# parser: raising a shard from 4 to 32 jobs is 1.75x and costs a
+# REPRODUCIBLE hole, four runs at 16/32 jobs unioning to 31 lines short
+# of the serial set (30 of them one region of wrapper/run.sh), ~0.45
+# points off the reported rate, where two runs at jobs=4 union to the
+# serial set EXACTLY. Faster while losing lines is not an improvement for
+# the runner whose output IS the line set, so `metered` is one job per
+# core and no more -- until base#726 stops the parser being the drain.
+@test "_bats_args_with_label: the metered policy holds a run at one job per core (#1068)" {
+  mock_cmd "parallel" 'exit 0'
+  # Below the floor, so a metered run and a floored one are visibly
+  # different rather than coincidentally equal.
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _jobs_of() {
+      local _p="" _n="" _x
+      for _x in "$@"; do [ "${_p}" = "--jobs" ] && _n="${_x}"; _p="${_x}"; done
+      printf "%s\n" "${_n}"
+    }
+    declare -a _args; declare _label
+    _bats_args_with_label _args _label
+    printf "PARALLEL:%s\n" "$(_jobs_of "${_args[@]}")"
+    _bats_args_with_label _args _label cpu-bound
+    printf "CPUBOUND:%s\n" "$(_jobs_of "${_args[@]}")"
+    _bats_args_with_label _args _label metered
+    printf "METERED:%s\n" "$(_jobs_of "${_args[@]}")"
+    printf "LABEL:%s\n" "${_label}"
+  '
+  assert_success
+  # Metered == the core count exactly; both floored policies, the default
+  # and the CPU-bound one (base#1429), are above it.
+  assert_output --partial "METERED:4"
+  local _par _cpu
+  _par="$(printf '%s\n' "${output}" | sed -n 's/^PARALLEL://p')"
+  assert [ "${_par}" -gt 4 ]
+  _cpu="$(printf '%s\n' "${output}" | sed -n 's/^CPUBOUND://p')"
+  assert [ -n "${_cpu}" ]
+  assert [ "${_cpu}" -gt 4 ]
+  # And it says so, the way "serial by policy" does: a reader can tell a
+  # decision from a machine that happens to have that many cores.
+  assert_output --partial "metered"
+}
+
+# why: the shape tests above would pass a floor of 16 for the CPU-bound
+# policy or 64 for the default, and either is a regression: 16
+# integration jobs on the 4-core hosted runner stretch the slowest test
+# toward the per-test bound again, and a moved default floor changes
+# every unit runner's concurrency (base#1429). So the specified counts
+# are pinned here at representative core counts -- below, at and above
+# each floor -- next to the shapes, and a re-tune is an edit to this
+# table rather than a silent drift.
+@test "_bats_args_with_label: the default floor is 32 and the cpu-bound floor is 8 (#1429)" {
+  mock_cmd "parallel" 'exit 0'
+
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _jobs_of() {
+      local _p="" _n="" _x
+      for _x in "$@"; do [ "${_p}" = "--jobs" ] && _n="${_x}"; _p="${_x}"; done
+      printf "%s\n" "${_n}"
+    }
+    for _policy in parallel cpu-bound metered; do
+      for _c in 1 4 8 16 32 64; do
+        printf "#!/bin/bash\necho %s\n" "${_c}" > "'"${MOCK_DIR}"'/nproc"
+        chmod +x "'"${MOCK_DIR}"'/nproc"
+        declare -a _args; declare _label
+        _bats_args_with_label _args _label "${_policy}" || exit 1
+        printf "%s %s %s\n" "${_policy}" "${_c}" "$(_jobs_of "${_args[@]}")"
+      done
+    done
+  '
+  assert_success
+  assert_output "parallel 1 32
+parallel 4 32
+parallel 8 32
+parallel 16 32
+parallel 32 32
+parallel 64 64
+cpu-bound 1 8
+cpu-bound 4 8
+cpu-bound 8 8
+cpu-bound 16 16
+cpu-bound 32 32
+cpu-bound 64 64
+metered 1 1
+metered 4 4
+metered 8 8
+metered 16 16
+metered 32 32
+metered 64 64"
+}
+
+# why: the integration suite is not the workload the default floor was
+# measured on. On the 4-core hosted runner it ran at
+# `jobs=32 (floor, over 4 cores)` and tests crossed the 120 s per-test
+# bound (base#1429). So the integration runner -- and a single-path run
+# of an integration spec, which must schedule it the same way -- has to be
+# LESS oversubscribed than the unit runner on a small machine, while the
+# unit runner keeps its floor. The shape is asserted, and so are the
+# counts on that runner: 32 for unit, 8 for integration.
+@test "_run_integration_tests / _run_bats_path: an integration run is less oversubscribed than a unit run (#1429)" {
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "parallel" 'exit 0'
+  # 4 = the core count of the hosted runner the timeouts were seen on.
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_unit_tests
+    _run_integration_tests
+    BATS_FILE="test/bats/unit/ci_spec.bats" BATS_FILTER="" _run_bats_path
+    BATS_FILE="test/bats/integration/" BATS_FILTER="" _run_bats_path
+  '
+  assert_success
+
+  # One logged bats argv per run, in call order.
+  _jobs_of_line() {
+    sed -n "${1}p" "${_log}" | awk '{for (i = 1; i < NF; i++) if ($i == "--jobs") print $(i + 1)}'
+  }
+  local _unit _integ _path_unit _path_integ
+  _unit="$(_jobs_of_line 1)"
+  _integ="$(_jobs_of_line 2)"
+  _path_unit="$(_jobs_of_line 3)"
+  _path_integ="$(_jobs_of_line 4)"
+  assert [ -n "${_unit}" ]
+  assert [ -n "${_integ}" ]
+  assert [ -n "${_path_unit}" ]
+  assert [ -n "${_path_integ}" ]
+
+  # Never below the machine, on either runner.
+  assert [ "${_integ}" -ge 4 ]
+  # Less oversubscribed than the unit runner.
+  assert [ "${_integ}" -lt "${_unit}" ]
+  # And at the specified counts: the unit runner keeps its floor of 32,
+  # the integration runner takes the CPU-bound floor of 8 (base#1429).
+  assert [ "${_unit}" = "32" ]
+  assert [ "${_integ}" = "8" ]
+  # A single-path run schedules its suite the way that suite's runner does.
+  assert [ "${_path_unit}" = "${_unit}" ]
+  assert [ "${_path_integ}" = "${_integ}" ]
+}
+
+# why: the shard is the kcov path CI runs eight of, and the one whose
+# covered set the badge publishes. It has to DECLARE that it is metered
+# rather than merely happen to sit at the core count today, or the next
+# change to the default silently takes 0.45 points off the reported rate
+# and puts a 31-line hole in wrapper/run.sh.
+@test "_run_coverage: a shard declares metered, so kcov's one parser is not oversubscribed (#1068)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h j k l m n o p q; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    printf "@test \"t1\" { :; }\n" \
+      > "${REPO_ROOT}/test/bats/integration/i_spec.bats"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 1/2
+  '
+  assert_success
+  assert_output --partial "metered"
+
+  # The metered count is the SLICE count since base#1414: four cores, four
+  # kcov processes over a shard of more than four specs, and no bats
+  # under any of them runs jobs of its own.
+  run grep -vc '^--merge' "${_log}"
+  assert_output "4"
+  run cat "${_log}"
+  refute_output --partial "--jobs"
+}
+
+# why: `_run_coverage_path` is the driver's other kcov runner. It
+# publishes no figure, but its whole purpose is to show what one spec
+# covers under instrumentation, so oversubscribing it corrupts exactly
+# the thing the person ran it to look at.
+@test "_run_coverage_path: a directory under kcov is metered too (#1068)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  mock_cmd "bats" 'exit 0'
+  _kcov_slice_mock "${_log}"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats/unit"
+    for _n in a b c d e f g h; do
+      printf "@test \"t1\" { :; }\n" > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage_path test/bats/unit
+  '
+  assert_success
+  assert_output --partial "metered"
+
+  # Eight specs on four cores: four kcov slices, not eight (base#1414).
+  run grep -vc '^--merge' "${_log}"
+  assert_output "4"
+}
+
+# why: the shard path and the full-suite path are the same function, and
+# the shard is the one CI runs eight of; a fix that reached only the
+# full-suite branch would leave the measured critical path untouched.
+@test "_run_coverage: a shard takes its slice count from COVERAGE_JOBS, not nproc (#1060, base#1410)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 2'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h j k l m n o p q r s t u; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    printf "@test \"t1\" { :; }\n" \
+      > "${REPO_ROOT}/test/bats/integration/i_spec.bats"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    COVERAGE_JOBS=8 _run_coverage 1/2
+  '
+  assert_success
+  assert_output --partial "jobs=8"
+
+  # COVERAGE_JOBS is the slice count (base#1414, base#1410): eight kcov
+  # processes over a shard of more than eight specs, on two cores.
+  run grep -vc '^--merge' "${_log}"
+  assert_output "8"
+}
+
+# why: `1/1` is a shard by SYNTAX and the whole suite by CONTENT, and the
+# certificate is derived from what ran, not from the argument -- so such a
+# run stamps scope=full, the only scope the release badge publishes, off a
+# parallel measurement the full-suite branch declares serial precisely
+# because it under-reports. `just test coverage 1/1` reaches it, and so
+# does vars.CI_SHARDS=1, which self-test.yaml turns into the matrix
+# ["1/1"]. The policy must follow the walked set, so a slice that IS the
+# suite is serial like the suite.
+@test "_run_coverage: a shard that is the whole suite runs serial, like the suite (#1060)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  # parallel IS present and nproc DOES answer: the run must still come out
+  # serial, or the whole-suite case is not being asked.
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 8'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    printf "@test \"t1\" { :; }\n" \
+      > "${REPO_ROOT}/test/bats/integration/i_spec.bats"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 1/1
+  '
+  assert_success
+  assert_output --partial "serial by policy"
+
+  run cat "${_log}"
+  assert_success
+  refute_output --partial "--jobs"
+  # Every spec of BOTH pools is in the run: this is the whole suite, which
+  # is why the policy had to change.
+  assert_output --partial "a_spec.bats"
+  assert_output --partial "i_spec.bats"
+  # Serial is one slice: one kcov around every spec (base#1414).
+  run grep -vc '^--merge' "${_log}"
+  assert_output "1"
+}
+
+# why: a shard's slices are independent kcov processes, none of which
+# hands bats --jobs, so GNU parallel has no part in them -- and a shard is
+# the same run on every host only if its slice count does not hang on what
+# that host has installed (base#1410). Proven by CONFINING PATH so parallel
+# is genuinely gone, not by reading the helper.
+@test "_run_coverage: with parallel absent a shard still runs its COVERAGE_JOBS slices (#1060, base#1410)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+
+  # A PATH of its OWN, not MOCK_DIR: the run is confined to it, and
+  # teardown removes MOCK_DIR with an `rm` the confined shell would
+  # otherwise have hashed inside the directory being deleted.
+  run bash -c '
+    set -e
+    _bin="${BATS_TEST_TMPDIR}/serial-bin"
+    mkdir -p "${_bin}"
+    cat > "${_bin}/kcov" <<SH
+#!/bin/bash
+printf "%s\n" "\$*" >> "'"${_log}"'"
+[ "\$1" = "--merge" ] && exit 0
+for _a in "\$@"; do
+  case "\$_a" in -*) ;; *) mkdir -p "\$_a/bats"; : > "\$_a/bats/cobertura.xml"; break ;; esac
+done
+exit 0
+SH
+    chmod +x "${_bin}/kcov"
+    # The externals the shard run still reaches for -- the partition
+    # shells out to find / sort / awk / grep / basename, and the slices
+    # (base#1414) to mktemp / chmod / mkdir. `parallel` is deliberately
+    # not among them: that absence IS the test.
+    for _c in mktemp chmod mkdir rm find sort awk grep basename cat printf; do
+      _p="$(command -v "${_c}")" && ln -sf "${_p}" "${_bin}/${_c}"
+    done
+
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d; do
+      printf "@test \"t1\" { :; }\n@test \"t2\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    export PATH="${_bin}"
+    _run_coverage 1/2
+  '
+  assert_success
+  assert_output --partial "metered to COVERAGE_JOBS"
+  refute_output --partial "parallel not in PATH"
+
+  run cat "${_log}"
+  assert_success
+  refute_output --partial "--jobs"
+  # Two specs in shard 1/2, so the default four slices are capped at two.
+  run grep -vc '^--merge' "${_log}"
+  assert_output "2"
+}
+
+# _kcov_slice_mock <log>
+#   A kcov stand-in for the sliced shape (base#1414): it logs its argv one
+#   line per call and leaves the report a real kcov would, so a driver that
+#   refuses a slice with no report is not refused by the mock. `--merge`
+#   is logged the same way and writes the merged report.
+_kcov_slice_mock() {
+  local _log="${1}"
+  mock_cmd "kcov" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    if [ "${1}" = "--merge" ]; then
+      mkdir -p "${2}/kcov-merged"
+      printf "<coverage/>\n" > "${2}/kcov-merged/cobertura.xml"
+      exit 0
+    fi
+    _out=""
+    while [ $# -gt 0 ]; do
+      case "${1}" in
+        -*) shift ;;
+        *)  _out="${1}"; break ;;
+      esac
+    done
+    mkdir -p "${_out}/kcov-merged"
+    printf "<coverage/>\n" > "${_out}/kcov-merged/cobertura.xml"
+    exit 0'
+}
+
+# why: N bats jobs under ONE kcov share one trace pipe, and their records
+# interleave: kcov credits only the first marker on a line and echoes the
+# marker-less pieces to the step output (base#1414). A concurrent shard
+# therefore runs one kcov per slice, each around a SERIAL bats, and joins
+# the slices with `kcov --merge`; every shard spec runs in exactly one
+# slice.
+@test "_run_coverage: a concurrent shard runs one kcov per serial bats slice, joined by --merge (base#1414)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d e f g h; do
+      printf "@test \"t1\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    printf "@test \"t1\" { :; }\n" \
+      > "${REPO_ROOT}/test/bats/integration/i_spec.bats"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 1/2
+  '
+  assert_success
+  local _shard
+  _shard="$(printf '%s\n' "${output}" | sed -n 's|^  cov-shard:.*/||p' | LC_ALL=C sort)"
+  [[ -n "${_shard}" ]] || fail "the shard listed no specs: ${output}"
+
+  run cat "${_log}"
+  assert_success
+  local _wraps _merges
+  _wraps="$(grep -vc '^--merge' "${_log}" || true)"
+  _merges="$(grep -c '^--merge' "${_log}" || true)"
+  # More than one kcov, one merge, and no wrapped bats runs concurrently.
+  assert [ "${_wraps}" -gt 1 ]
+  assert [ "${_merges}" -eq 1 ]
+  refute_output --partial "--jobs"
+  # Every shard spec is in exactly one slice.
+  run bash -c "grep -v '^--merge' '${_log}' | grep -oE '[a-z]_spec\.bats' | LC_ALL=C sort"
+  assert_output "${_shard}"
+}
+
+# why: `_run_coverage_path` is the other kcov runner, and a directory path
+# runs several specs at once, so it shares the pipe the same way
+# (base#1414). It slices the same way: one kcov per serial bats slice,
+# joined by `kcov --merge`.
+@test "_run_coverage_path: a directory runs one kcov per serial bats slice, joined by --merge (base#1414)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 4'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats/unit/dir"
+    for _n in a b c d; do
+      printf "@test \"t1\" { :; }\n" \
+        > "${REPO_ROOT}/test/bats/unit/dir/${_n}_spec.bats"
+    done
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage_path test/bats/unit/dir
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  local _wraps _merges
+  _wraps="$(grep -vc '^--merge' "${_log}" || true)"
+  _merges="$(grep -c '^--merge' "${_log}" || true)"
+  assert [ "${_wraps}" -gt 1 ]
+  assert [ "${_merges}" -eq 1 ]
+  refute_output --partial "--jobs"
+  run bash -c "grep -v '^--merge' '${_log}' | grep -oE '[a-z]_spec\.bats' | LC_ALL=C sort"
+  assert_output "$(printf '%s\n' a_spec.bats b_spec.bats c_spec.bats d_spec.bats)"
+}
+
+# why: one kcov wrapped bats, and bats prints the TAP plan `1..0` for a
+# directory with no specs. The sliced runner deals FILES, so an empty
+# directory has no slice to run; it must still print that plan and pass,
+# or an empty selection reads differently under the sliced shape
+# (base#1414).
+@test "_run_coverage_path: an empty directory prints the 1..0 plan and passes (base#1414)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats/acceptance"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage_path test/bats/acceptance
+  '
+  assert_success
+  assert_line "1..0"
+  [[ ! -e "${_log}" ]] || fail "kcov ran on an empty selection: $(cat "${_log}")"
+}
+
+# why: the defect was never a missing flag, it was a second place to
+# write one -- _run_coverage assembled its own bats command, so what the
+# helper decides never reached it. A guard on the FLAG rather than on one
+# call site is what keeps a third hand-rolled invocation from appearing:
+# the driver may name --jobs exactly once, in the helper's own body.
+@test "drivers/bats.sh: --jobs is written in exactly one place, the shared helper (#1060)" {
+  # code_grep, so a comment that merely discusses --jobs (this driver's
+  # header does) cannot satisfy an assertion about code.
+  run code_grep -c -- '--jobs' /source/script/test/drivers/bats.sh
+  assert_success
+  assert_output "1"
+
+  # ...and the one place is inside _bats_args_with_label, not merely
+  # somewhere in the file. Comment lines are dropped here for the same
+  # reason code_grep drops them above: the helper's own header discusses
+  # the flag it owns, twice.
+  run bash -c "awk '/^_bats_args_with_label\\(\\) \\{/,/^\\}/' \
+    /source/script/test/drivers/bats.sh \
+    | grep -vE '^[[:space:]]*(#|\$)' | grep -c -- '--jobs'"
+  assert_success
+  assert_output "1"
+}
+
+# why: the system runner was the driver's OTHER hand-rolled bats command
+# -- its own nproc probe, no --recursive, and nothing said when parallel
+# was missing. It is the second copy the one-writer guard refuses, so it
+# takes its arguments from the helper like everything else.
+# It gets the FLOORED count like every other runner with no kcov in the
+# loop (base#1068): its tests are the most subprocess-bound in the suite, so
+# it is where oversubscription has the most to give.
+@test "_run_system: its bats takes --jobs and the label from the shared helper (#1060)" {
+  # A per-test socket so the prerequisite guard passes without touching
+  # the process-global /var/run/docker.sock.
+  local _sock="${BATS_TEST_TMPDIR}/present.sock"
+  perl -e 'use IO::Socket::UNIX; my $p = $ARGV[0]; unlink $p; IO::Socket::UNIX->new(Type=>SOCK_STREAM, Local=>$p, Listen=>1) or die $!;' "${_sock}"
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "docker" 'exit 0'
+  mock_cmd "parallel" 'exit 0'
+  mock_cmd "nproc" 'echo 8'
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run env SYSTEM_DOCKER_SOCK="${_sock}" bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats/system"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_system
+  '
+  assert_success
+  # Floored, not equal to the core count: the system runner has no kcov
+  # in its loop either, and it is the MOST subprocess-bound runner in the
+  # driver -- every one of its tests waits on docker (base#1068).
+  local _jobs
+  _jobs="$(printf '%s\n' "${output}" | sed -n 's/.*jobs=\([0-9][0-9]*\).*/\1/p' | head -n1)"
+  assert [ -n "${_jobs}" ]
+  assert [ "${_jobs}" -gt 8 ]
+
+  run cat "${_log}"
+  assert_success
+  # ...and the label is not a story told beside a different command line.
+  assert_output --partial "--jobs ${_jobs}"
+  assert_output --partial "--recursive"
+}
+
+# why: #615 shard env plumbing
+@test "main --coverage-shard: routes to the coverage service with COVERAGE_SHARD set (#615)" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    # The provenance pair is STUBBED, not exercised: it reads and writes
+    # ${REPO_ROOT}/coverage, which here is the mounted checkout, so running
+    # it for real erases the certificate and the run manifest of whatever
+    # `just test coverage` is in flight (bats runs 32 jobs). This test is
+    # about the compose call.
+    _invalidate_coverage_head() { :; }
+    _stamp_coverage_head() { :; }
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-shard 2/4
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " coverage"
+  assert_output --partial "COVERAGE=1"
+  assert_output --partial "COVERAGE_SHARD=2/4"
+}
+
+# why: #615 coverage path skips lint
+@test "main --ci with COVERAGE=1 skips the lint phase (lint is a separate matrix concern) (#615)" {
+  # The coverage shards are a kcov-only concern; lint is measured by the
+  # dedicated shellcheck/hadolint jobs. Running the lint phase once per
+  # coverage shard would be wasted work, so COVERAGE=1 deliberately skips
+  # it even though the shared test-tools image now ships both linters.
+  # Assert the --ci COVERAGE path does NOT shell out to either.
+  local _sc_log="${BATS_TEST_TMPDIR}/sc.log"
+  local _hd_log="${BATS_TEST_TMPDIR}/hd.log"
+  mock_cmd "shellcheck" 'printf "called\n" >> "'"${_sc_log}"'"; exit 0'
+  mock_cmd "hadolint" 'printf "called\n" >> "'"${_hd_log}"'"; exit 0'
+  mock_cmd "kcov" 'exit 0'
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    # The kcov runner is a MARKER, not a real run. REPO_ROOT here is the
+    # mounted checkout, and _run_coverage writes coverage/timings.tsv into
+    # it -- truncating the run manifest of whatever `just test coverage`
+    # is in flight, since bats runs this alongside 31 other jobs. The
+    # marker still proves the coverage branch was the one taken.
+    _run_coverage() { printf "COVERAGE-RAN shard=[%s]\n" "${1:-}"; }
+    _fix_permissions() { :; }
+    # Routing is under test, not the bare-run prerequisites (base#1423).
+    # Whether shard 1/4 needs .prev-release depends on the live partition.
+    _check_suite_prerequisites() { :; }
+    # Every selector the dispatch forwards is PINNED here, set or
+    # emptied: this block inherits whatever the container was started
+    # with, and each selector the dispatch reads before the shard would
+    # otherwise decide the branch instead of the shard under test.
+    # `just test coverage-path` sets COVERAGE_PATH; `just test
+    # coverage-local` sets COVERAGE_LOCAL_JOBS, and leaving that one
+    # unpinned routed this block past the `_run_coverage` stub into the
+    # real parallel runner -- 32 nested kcov processes inside a unit test
+    # (base#726). The guard in coverage_local_spec, "specs driving the
+    # in-container coverage entry pin every forwarded selector", is what
+    # keeps the roster here complete as it grows.
+    # All ELEVEN of them, not the three whose names start COVERAGE_:
+    # LINT_ONLY=1 would short-circuit this dispatch into the linters
+    # before the coverage branch is reached at all, and BATS_ONLY is
+    # pinned to 0 on purpose -- 1 would skip the lint phase by itself and
+    # make the assertion below true whatever COVERAGE did.
+    # (No apostrophes in this block: it lives inside a single-quoted
+    # bash -c string, where one ends the program.)
+    COVERAGE=1 COVERAGE_SHARD=1/4 COVERAGE_PATH= COVERAGE_LOCAL_JOBS= \
+      BATS_ONLY=0 BATS_UNIT_SHARD= BATS_FRAGILE=0 BATS_INTEGRATION=0 \
+      BATS_FILE= BATS_FILTER= LINT_ONLY=0 LINT_TOOL= LINT_GROUP= PER_TEST_TIMEOUT= \
+      COVERAGE_JOBS= SHARD_WEIGHTS_BLOB= main --ci
+  '
+  assert_success
+  assert_output --partial "COVERAGE-RAN shard=[1/4]"
+  assert [ ! -f "${_sc_log}" ]
+  assert [ ! -f "${_hd_log}" ]
+}
+
+# why: #615 single-path/coverage combo guard
+@test "main --coverage-shard + --bats-path is rejected (coverage mode guard) (#615)" {
+  # --coverage-shard sets coverage mode, which the single-path guard
+  # rejects (single-path is the fast no-kcov loop).
+  run bash -c '
+    source /source/script/test/test.sh
+    # Stubbed for the same reason as the dispatch tests above, and as a
+    # statement: a REFUSED invocation must never reach the provenance
+    # pair, so a day when it does is a failure here rather than a
+    # deleted certificate.
+    _invalidate_coverage_head() { :; }
+    _stamp_coverage_head() { :; }
+    main --coverage-shard 1/4 --bats-path test/bats/unit/ci_spec.bats
+  '
+  assert_failure
+  assert_output --partial "cannot combine with --coverage"
+}
+
+@test "no spec drives a coverage run against the mounted checkout (#952)" {
+  # The coverage dispatch ERASES /source/coverage/.head-sha and
+  # /source/coverage/timings.tsv before the run and rewrites the stamp
+  # after it; _run_coverage WRITES timings.tsv there. A spec that calls
+  # either against the real REPO_ROOT therefore mutates the checkout it is
+  # running in -- and under bats' parallel jobs it does so WHILE a real
+  # `just test coverage` is mid-run, truncating the manifest that run's
+  # certificate is derived from and re-creating it under the eraser's feet.
+  #
+  # That is not a hypothetical. It is how this guard was found: a full
+  # kcov run died two thirds of the way through with "cannot remove the
+  # stale coverage evidence /source/coverage/timings.tsv", because three
+  # sibling specs recreate that file from a mocked kcov while this one
+  # tries to erase it.
+  #
+  # The IN-CONTAINER entry counts too, and it is the one a name-based
+  # reading misses: `COVERAGE=1 COVERAGE_SHARD=1/4 main --ci` reaches
+  # _run_coverage without the string `_run_coverage` or `--coverage`
+  # appearing anywhere in the block. It is how the second half of this
+  # spill survived the first version of this guard.
+  #
+  # REPO_ROOT is readonly, so there are three ways to comply: source the
+  # DRIVER with REPO_ROOT pointed at a scratch tree, stub BOTH halves of
+  # the provenance pair before calling main -- the eraser alone is not
+  # compliance, since the real _stamp_coverage_head then writes
+  # /source/coverage/.head-sha -- or stub the runner itself.
+  #
+  # A CALL is a runner name that opens a statement: after a newline, a
+  # `;`, a `&&`, a `||` or a `(`. That is what distinguishes
+  # `bash -c 'source ...; _run_coverage 1/4'`, which drives a run, from
+  # `for _fn in ... _run_coverage ...`, which drives nothing -- and the
+  # one-liner is the form the first version of this rule, anchored on the
+  # start of a LINE, could not see at all. Comment lines are stripped
+  # first, so prose about a runner is not an accusation either.
+  local _script="${BATS_TEST_TMPDIR}/scan.awk"
+  cat > "${_script}" <<'AWK'
+    FNR == 1 { files++ }
+    /^@test / { blk = $0; body = ""; inblk = 1; next }
+    inblk && /^[[:space:]]*#/ { next }
+    inblk { body = body "\n" $0 }
+    inblk && /^}$/ {
+      inblk = 0
+      if (body !~ /main --coverage([^-]|-shard)/ \
+          && body !~ /(\n[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|[|][|][[:space:]]*|[(][[:space:]]*)_run_coverage([^_]|$)/ \
+          && body !~ /COVERAGE=1[^\n]*main --ci/) next
+      total++
+      if (body ~ /REPO_ROOT="\$\{BATS_TEST_TMPDIR\}/) next
+      if (body ~ /_invalidate_coverage_head\(\)/ \
+          && body ~ /_stamp_coverage_head\(\)/) next
+      if (body ~ /_run_coverage\(\)/) next
+      if (body ~ /_dispatch_script /) next
+      print FILENAME ": " blk
+    }
+    END { print "FILES=" files; print "TOTAL=" total }
+AWK
+
+  # First the detector, on a fixture that enumerates the shapes it has to
+  # tell apart -- because the tree scan below can only report what the
+  # detector can see, and a shape it cannot see is reported as compliance.
+  # Every entry point that reaches a coverage run has to be COUNTED
+  # (statement-start call, one-liner call after a `;`, the flag entry, the
+  # in-container entry), the two complying forms have to be counted and
+  # not accused, and a runner merely NAMED in a word list has to be
+  # neither. The half-stubbed block is the one that reads like compliance
+  # and is not: stubbing the eraser alone leaves the real
+  # _stamp_coverage_head writing /source/coverage/.head-sha.
+  run awk -f "${_script}" \
+    /source/test/fixtures/coverage_checkout_shapes.bats.txt
+  assert_success
+  assert_output --partial "FILES=1"
+  assert_output --partial "TOTAL=7"
+  assert_output --partial "FLAG statement-start runner call"
+  assert_output --partial "FLAG one-liner runner call"
+  assert_output --partial "FLAG the flag entry"
+  assert_output --partial "FLAG the in-container entry"
+  assert_output --partial "FLAG half-stubbed provenance"
+  refute_output --partial "PASS scratch REPO_ROOT"
+  refute_output --partial "PASS both provenance halves"
+  refute_output --partial "IGNORE a runner named"
+
+  # The roster is FOUND, not typed: every *.bats under test/bats, at any
+  # depth and at every level. The two flat globs this replaces were the
+  # defect -- a hand-kept roster of two directories, exempting whatever
+  # moved into a subfolder or a new level.
+  local -a _scanned=()
+  local _f
+  while IFS= read -r _f; do
+    _scanned+=("${_f}")
+  done < <(find /source/test/bats -type f -name '*.bats' | sort)
+
+  run awk -f "${_script}" "${_scanned[@]}"
+  assert_success
+
+  # A scan that enumerated nothing would report every spec compliant.
+  local _total
+  _total="$(printf '%s\n' "${output}" | sed -n 's/^TOTAL=//p')"
+  [ -n "${_total}" ]
+  [ "${_total}" -ge 8 ]
+
+  # ... and a scan that enumerated only SOME of the tree reports the rest
+  # compliant, which is the same failure one folder down. The roster the
+  # scan is handed must be the whole spec tree -- every level, every
+  # subfolder -- so it is checked against an independent enumeration by a
+  # different mechanism (shell globstar here, whatever the scan uses
+  # there). A spec that moves into test/bats/unit/<lib>/ must not fall out
+  # of this guard the way it fell out of the two flat globs this started
+  # as.
+  local _globstar_was_set=0
+  shopt -q globstar && _globstar_was_set=1
+  shopt -s globstar
+  local -a _all_specs=(/source/test/bats/**/*.bats)
+  (( _globstar_was_set )) || shopt -u globstar
+  [ "${#_all_specs[@]}" -gt 100 ]
+
+  local _files
+  _files="$(printf '%s\n' "${output}" | sed -n 's/^FILES=//p')"
+  [ -n "${_files}" ]
+  if [ "${_files}" -ne "${#_all_specs[@]}" ]; then
+    printf 'scanned %s spec files, the tree has %s\n' \
+      "${_files}" "${#_all_specs[@]}"
+    false
+  fi
+
+  local _offenders
+  _offenders="$(printf '%s\n' "${output}" | grep -Ev '^(TOTAL|FILES)=' || true)"
+  if [[ -n "${_offenders}" ]]; then
+    printf 'specs mutating the checkout coverage evidence:\n%s\n' "${_offenders}"
+    false
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _coverage_skip_audit: every test that skips under kcov is tagged
+#
+# The coverage shards skip the kcov-fragile tests, and bats-fragile runs
+# them plain by bats' own tag filter. The audit compares, by (testsuite,
+# testcase) pair, what a slice's junit marks skipped with what
+# `COVERAGE=1 bats --filter-tags kcov-fragile` selects over the same
+# targets. It reads no source text, so a guard in any spelling counts.
+# ════════════════════════════════════════════════════════════════════
+
+# _skip_audit_fixture <dir> <body>
+#   Write one spec file into <dir> holding <body>, with the leading "|" of
+#   each line removed. Every body line carries that "|" so no line of THIS
+#   file starts with the test keyword or a test_tags comment except its
+#   own: bats would rewrite such a line inside the string literal, and the
+#   fixture on disk would lose its tags.
+_skip_audit_fixture() {
+  mkdir -p "${1}"
+  printf '%s\n' "${2}" | sed 's/^|//' > "${1}/fixture_spec.bats"
+}
+
+# _skip_audit_run <dir>
+#   Run the fixture tree the way a coverage slice does (COVERAGE=1, junit
+#   report), then audit that report against the same target.
+_skip_audit_run() {
+  local _dir="${1}"
+  # bats refuses --output to a directory that does not exist.
+  mkdir -p "${_dir}/junit"
+  COVERAGE=1 bats --recursive --report-formatter junit \
+    --output "${_dir}/junit" "${_dir}/tree" > "${_dir}/slice.log" 2>&1 || true
+  # JSON log lines carry the event name; text lines carry only the message.
+  run env LOG_FORMAT=json bash -c '
+    source /source/script/test/test.sh
+    _coverage_skip_audit "$1/junit/report.xml" "$1/tree"
+  ' _ "${_dir}"
+}
+
+# why: base#1573 a skip outside the plain leg runs nowhere
+@test "_coverage_skip_audit: fails a coverage skip with no kcov-fragile tag, by name (base#1573)" {
+  # (a) A tagged in-body guard is explained; an untagged guard in a
+  # spelling no grep for the old guard matches is not. Only the untagged
+  # test may be named: an audit that names every skip fails here.
+  local _a="${BATS_TEST_TMPDIR}/a"
+  _skip_audit_fixture "${_a}/tree" '|# bats test_tags=kcov-fragile
+|@test "tagged guarded skip" {
+|  [ "${COVERAGE:-0}" = 1 ] && skip "kcov-fragile"
+|  true
+|}
+|
+|@test "untagged hidden skip" {
+|  [[ ${COVERAGE:-0} == 1 ]] && skip "hidden"
+|  true
+|}'
+  _skip_audit_run "${_a}"
+  assert_failure
+  assert_output --partial "ci_coverage_unexplained_skip"
+  assert_output --partial "untagged hidden skip"
+  refute_output --partial "tagged guarded skip"
+
+  # (b) One tagged test that never skips plus one untagged test that does:
+  # the counts match (one skip, one tag), the names do not. Both are named.
+  local _b="${BATS_TEST_TMPDIR}/b"
+  _skip_audit_fixture "${_b}/tree" '|# bats test_tags=kcov-fragile
+|@test "tagged never skips" {
+|  true
+|}
+|
+|@test "untagged hidden skip" {
+|  [[ ${COVERAGE:-0} == 1 ]] && skip "hidden"
+|  true
+|}'
+  _skip_audit_run "${_b}"
+  assert_failure
+  assert_output --partial "ci_coverage_unexplained_skip"
+  assert_output --partial "tagged never skips"
+  assert_output --partial "untagged hidden skip"
+
+  # (c) Every skip tagged, every tag skipping: the audit passes.
+  local _c="${BATS_TEST_TMPDIR}/c"
+  _skip_audit_fixture "${_c}/tree" '|# bats test_tags=kcov-fragile
+|@test "tagged guarded skip" {
+|  [ "${COVERAGE:-0}" = 1 ] && skip "kcov-fragile"
+|  true
+|}
+|
+|# bats test_tags=other,kcov-fragile
+|@test "second tagged guarded skip" {
+|  [[ ${COVERAGE:-0} == 1 ]] && skip "kcov-fragile"
+|  true
+|}
+|
+|@test "untagged plain test" {
+|  true
+|}'
+  _skip_audit_run "${_c}"
+  assert_success
+}
+
+# why: base#1573 the plain leg runs exactly the coverage-skipped tests
+@test "kcov-fragile tag: selects exactly the 33 coverage-guarded tests of the 11 real unit specs (base#1573)" {
+  # Expected counts are the guard lines per file today (grep -c of the
+  # in-body COVERAGE skip guard) and sum to the 33 `# skip` lines of
+  # coverage run 42576563105's shards -- not the tag filter's own output.
+  # Each file must select exactly that many tests, every one `ok ... # skip`
+  # under COVERAGE=1: fewer is a missed tag, an ok without skip is a tag on
+  # an unguarded test, a `not ok` is a skip point that broke teardown.
+  local -A _want=(
+    [lib_spec]=1 [entrypoint_logging_spec]=1 [conf_accessor_spec]=6
+    [build_sh_spec]=1 [gitignore_spec]=1 [stop_sh_spec]=1 [exec_sh_spec]=1
+    [transcript_spec]=1 [watchdog_supervision_spec]=16
+    [conf_refusal_event_spec]=3 [run_sh_spec]=1
+  )
+  local _f _n _total=0 _bad=""
+  for _f in "${!_want[@]}"; do
+    _n="${_want[${_f}]}"
+    _total=$(( _total + _n ))
+    run env COVERAGE=1 bats --filter-tags kcov-fragile \
+      "/source/test/bats/unit/${_f}.bats"
+    local _plan _skips _oks _notok
+    _plan="$(head -n1 <<< "${output}")"
+    _skips="$(grep -c '^ok .* # skip' <<< "${output}" || true)"
+    _oks="$(grep -c '^ok ' <<< "${output}" || true)"
+    _notok="$(grep -c '^not ok ' <<< "${output}" || true)"
+    if (( status != 0 )) || [[ "${_plan}" != "1..${_n}" ]] \
+      || (( _skips != _n || _oks != _n || _notok != 0 )); then
+      _bad+="${_f}: want ${_n}, status=${status} plan=${_plan} ok=${_oks} skip=${_skips} notok=${_notok}"$'\n'
+    fi
+  done
+  [[ -z "${_bad}" ]] || { printf '%s' "${_bad}"; return 1; }
+  (( _total == 33 ))
+}
+
+# why: base#1573 an audit nothing calls guards nothing
+@test "_run_coverage: an untagged coverage skip fails the run with ci_coverage_unexplained_skip (base#1573)" {
+  # The coverage runner itself, not the audit called by hand: kcov is a
+  # shim that drops its own flags, leaves a report and execs the bats it
+  # wraps, so the slice's junit is real bats output. The unit pool holds
+  # one tagged in-body guard and one untagged guard in a spelling the old
+  # grep never matched; the run must fail naming only the untagged one.
+  mock_cmd "kcov" '
+    if [ "$1" = "--merge" ]; then
+      mkdir -p "$2/kcov-merged" && : > "$2/kcov-merged/cobertura.xml"
+      exit 0
+    fi
+    while [ $# -gt 0 ]; do
+      case "$1" in --*) shift ;; *) break ;; esac
+    done
+    mkdir -p "$1/bats" && : > "$1/bats/cobertura.xml"
+    shift
+    exec "$@"'
+
+  run bash -c '
+    set -e
+    _repo="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${_repo}/coverage" "${_repo}/test/bats/unit" \
+             "${_repo}/test/bats/integration"
+    cat > "${_repo}/test/bats/unit/a_spec.bats" <<"BATS"
+# bats test_tags=kcov-fragile
+@test "tagged guarded skip" {
+  [ "${COVERAGE:-0}" = 1 ] && skip "kcov-fragile"
+  true
+}
+
+@test "untagged hidden skip" {
+  [[ ${COVERAGE:-0} == 1 ]] && skip "hidden"
+  true
+}
+BATS
+    printf "@test \"plain integration\" { :; }\n" \
+      > "${_repo}/test/bats/integration/i_spec.bats"
+    export COVERAGE=1
+    REPO_ROOT="${_repo}"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage
+  '
+  assert_failure
+  # The slice log replay names every test, so the names are read off the
+  # refusal line alone.
+  assert_output --regexp "DIE: ci_coverage_unexplained_skip.*untagged hidden skip"
+  refute_output --regexp "DIE: .*tagged guarded skip"
+}
+
+# why: base#1573 the plain leg runs the tagged tests, not their files
+@test "_run_bats_fragile: runs exactly the kcov-fragile tagged tests of the unit and integration pools (base#1573)" {
+  # A fixture REPO_ROOT holds both coverage pools, each with one tagged
+  # test beside an untagged one. Real bats runs them, so the TAP lines are
+  # bats' own. Selecting by file would also run the untagged unit test;
+  # a pool of unit alone would miss the integration test.
+  local _repo="${BATS_TEST_TMPDIR}/repo"
+  _skip_audit_fixture "${_repo}/test/bats/unit" '|# bats test_tags=kcov-fragile
+|@test "unit tagged fragile" {
+|  [ "${COVERAGE:-0}" = 1 ] && skip "kcov-fragile"
+|  true
+|}
+|
+|@test "unit untagged neighbour" {
+|  true
+|}'
+  _skip_audit_fixture "${_repo}/test/bats/integration" '|@test "integration untagged neighbour" {
+|  true
+|}
+|
+|# bats test_tags=other,kcov-fragile
+|@test "integration tagged fragile" {
+|  [[ ${COVERAGE:-0} == 1 ]] && skip "kcov-fragile"
+|  true
+|}'
+
+  run bash -c '
+    unset COVERAGE
+    cd "${BATS_TEST_TMPDIR}"
+    REPO_ROOT="$1"
+    source /source/script/test/drivers/bats.sh
+    _run_bats_fragile
+  ' _ "${_repo}"
+  assert_success
+
+  local _tap
+  _tap="$(grep -E '^(1\.\.|ok |not ok )' <<< "${output}" \
+    | sed -E 's/^(ok|not ok) [0-9]+ /\1 /' | sort)"
+  assert_equal "${_tap}" "1..2
+ok integration tagged fragile
+ok unit tagged fragile"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --bats-fragile: the kcov-fragile tests run in plain mode
+#
+# The coverage matrix is the primary gate but SKIPS the kcov-fragile
+# tests (each tagged `# bats test_tags=kcov-fragile` and guarded in its
+# body by a COVERAGE == 1 skip). The bats-fragile job runs exactly the
+# tagged tests in plain mode so no test goes unrun; which tests that is
+# is bats' tag filter's answer, and _coverage_skip_audit holds the tags
+# to what coverage skips (base#1573).
+# ════════════════════════════════════════════════════════════════════
+
+# why: #677 plain mode runs the skipped tests
+@test "_run_bats_fragile: does NOT set COVERAGE=1 so the kcov-skip guards fall through (#677)" {
+  # The fragile tests are precisely the ones coverage skips; running them
+  # here in PLAIN mode (COVERAGE != 1) is the whole point. Run with
+  # COVERAGE explicitly unset in the child shell and assert the runner
+  # never turns it into 1.
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "bats" '
+    printf "COVERAGE=[%s]\n" "${COVERAGE:-unset}" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    unset COVERAGE
+    source /source/script/test/test.sh
+    _run_bats_fragile
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "COVERAGE=[unset]"
+  refute_output --partial "COVERAGE=[1]"
+}
+
+# why: #677 fragile flag dispatch
+@test "main --bats-fragile: routes to the ci service with BATS_FRAGILE=1 + BATS_ONLY=1, no COVERAGE (#677)" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-fragile
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " ci"
+  assert_output --partial "BATS_FRAGILE=1"
+  assert_output --partial "BATS_ONLY=1"
+  assert_output --partial "COVERAGE=0"
+  refute_output --partial "COVERAGE=1"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --bats-path / --filter single-path inner loop
+# ════════════════════════════════════════════════════════════════════
+
+# why: #523 single-file dispatch
+@test "main --bats-path: dispatches a single spec to the ci service with BATS_FILE + BATS_ONLY=1" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/unit/ci_spec.bats
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " ci"
+  assert_output --partial "BATS_FILE=test/bats/unit/ci_spec.bats"
+  assert_output --partial "BATS_ONLY=1"
+  refute_output --partial "COVERAGE=1"
+}
+
+# why: #523 directory path
+@test "main --bats-path: accepts a directory" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/unit/
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "BATS_FILE=test/bats/unit/"
+}
+
+# why: #523 missing-path guard
+@test "main --bats-path: non-existent path dies with ci_bats_path_not_found" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/unit/does_not_exist_spec.bats
+  '
+  assert_failure
+  assert_output --partial "No such spec file or directory"
+  refute_output --partial "docker should not be called"
+}
+
+# why: #523 system guard
+@test "main --bats-path: test/bats/system/ path dies with a clear hint" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/system/runtime_test_smoke_spec.bats
+  '
+  assert_failure
+  assert_output --partial "ci-system"
+  refute_output --partial "docker should not be called"
+}
+
+# why: #523 coverage-combo guard
+@test "main --bats-path + --coverage is rejected (ci_bats_path_coverage)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/unit/ci_spec.bats --coverage
+  '
+  assert_failure
+  assert_output --partial "cannot combine with --coverage"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --coverage-path: ONE spec under kcov instrumentation
+#
+# The kcov-only failure class ("this spec is red under kcov and green
+# without it") had no inner loop: the only instrumented entries were the
+# whole suite and a whole shard, 8-12 minutes each, and --bats-path
+# refuses --coverage because it is the fast NO-kcov loop. --coverage-path
+# is the third mode: kcov wrapping exactly one named spec.
+#
+# Two properties carry the whole design and are asserted below rather
+# than described:
+#
+#   1. It produces NO coverage figure. The report goes to a throwaway
+#      directory inside the container and is deleted, so nothing this
+#      mode runs can reach the cobertura/timings artifacts the
+#      coverage-gate merges -- a one-spec run must never be able to feed
+#      the gate a number.
+#   2. It is independent of the shard partition. The spec is named
+#      directly, so neither the greedy-LPT bin-packing nor the recorded
+#      weights file decides what runs -- the local partition and CI's
+#      differ (locally there is no weights file to restore), and
+#      "run THIS spec" has to mean the same thing in both.
+# ════════════════════════════════════════════════════════════════════
+
+# why: The gate's artifacts stay untouched -- no figure can be fabricated
+# from one spec
+@test "_run_coverage_path: writes nothing into the checkout's coverage/ (#887)" {
+  # The gate reads coverage/cobertura.xml + coverage/timings.tsv from the
+  # mounted checkout. A single-spec run that dropped either there would
+  # hand the merge a partial figure (or reweight the next partition off
+  # one spec), so the checkout's coverage/ must come out untouched.
+  mock_cmd "bats" 'exit 0'
+  mock_cmd "kcov" '
+    _out=""
+    for _a in "$@"; do
+      case "${_a}" in --*) continue ;; esac
+      _out="${_a}"; break
+    done
+    mkdir -p "${_out}"
+    : > "${_out}/cobertura.xml"
+    : > "${_out}/index.html"
+    exit 0'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit"
+    : > "${REPO_ROOT}/coverage/sentinel"
+    : > "${REPO_ROOT}/test/bats/unit/one_spec.bats"
+    source /source/script/test/drivers/bats.sh
+    _run_coverage_path test/bats/unit/one_spec.bats >/dev/null
+    ls -A "${REPO_ROOT}/coverage"
+  '
+  assert_success
+  assert_output "sentinel"
+}
+
+# why: Report lands in container-local scratch and is deleted
+@test "_run_coverage_path: the kcov report dir is a throwaway outside the checkout, removed after the run (#887)" {
+  local _log="${BATS_TEST_TMPDIR}/outdir.log"
+  mock_cmd "bats" 'exit 0'
+  mock_cmd "kcov" '
+    _out=""
+    for _a in "$@"; do
+      case "${_a}" in --*) continue ;; esac
+      _out="${_a}"; break
+    done
+    printf "%s\n" "${_out}" >> "'"${_log}"'"
+    mkdir -p "${_out}"
+    : > "${_out}/cobertura.xml"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_coverage_path test/bats/unit/ci_spec.bats >/dev/null
+    _out="$(cat "'"${_log}"'")"
+    [[ -n "${_out}" ]] || { echo "KCOV-NEVER-RAN"; exit 1; }
+    [[ "${_out}" != "${REPO_ROOT}"* ]] \
+      || { echo "REPORT-INSIDE-CHECKOUT: ${_out}"; exit 1; }
+    [[ ! -e "${_out}" ]] || { echo "REPORT-DIR-LEFT-BEHIND: ${_out}"; exit 1; }
+    echo OK
+  '
+  assert_success
+  assert_output --partial "OK"
+}
+
+# why: Shard independence: a planted .shard-weights pulls in nothing
+@test "_run_coverage_path: kcov's exactly the named spec, never a shard slice (#887)" {
+  # A weights file is planted that a greedy-LPT partition would honour, so
+  # a re-implementation routed through _shard_unit_files would pull in the
+  # other specs. Naming the spec must mean that spec and nothing else --
+  # this is what makes the entry point behave identically on a host with no
+  # restored .shard-weights and on CI where the cache restores one.
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  mock_cmd "bats" 'exit 0'
+  mock_cmd "kcov" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/test/bats/unit" "${REPO_ROOT}/test/bats/integration"
+    for _n in a b c d; do
+      printf "@test \"%s\" { :; }\n" "${_n}" > "${REPO_ROOT}/test/bats/unit/${_n}_spec.bats"
+    done
+    printf "%s\n" "90 a_spec.bats" "1 b_spec.bats" "80 c_spec.bats" "70 d_spec.bats" \
+      > "${REPO_ROOT}/test/bats/.shard-weights"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage_path test/bats/unit/b_spec.bats >/dev/null
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "/test/bats/unit/b_spec.bats"
+  refute_output --partial "a_spec.bats"
+  refute_output --partial "c_spec.bats"
+  refute_output --partial "d_spec.bats"
+}
+
+# why: Same instrumented tree as a shard, so the failure reproduces
+@test "_run_coverage_path: instruments with the same include/exclude set a coverage shard uses (#887)" {
+  # The point of the mode is to reproduce what the coverage shard does to
+  # one spec. Instrument a different tree than the shard does and the
+  # red-under-kcov failure it exists to reproduce may not reproduce, so
+  # the two runners must hand kcov the same paths.
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  mock_cmd "bats" 'exit 0'
+  # Leaves the report a real slice kcov would, so the shard's merge does
+  # not refuse the slice (base#1414).
+  mock_cmd "kcov" '
+    [ "$1" = "--merge" ] && exit 0
+    _out=""
+    for _a in "$@"; do
+      case "${_a}" in
+        --include-path=*|--exclude-path=*) printf "%s\n" "${_a}" >> "'"${_log}"'" ;;
+        -*) ;;
+        *) [ -n "${_out}" ] || _out="${_a}" ;;
+      esac
+    done
+    mkdir -p "${_out}/bats" && : > "${_out}/bats/cobertura.xml"
+    exit 0'
+
+  run bash -c '
+    REPO_ROOT="${BATS_TEST_TMPDIR}/repo"
+    mkdir -p "${REPO_ROOT}/coverage" "${REPO_ROOT}/test/bats/unit" \
+             "${REPO_ROOT}/test/bats/integration"
+    printf "@test \"a\" { :; }\n" > "${REPO_ROOT}/test/bats/unit/a_spec.bats"
+    printf "@test \"b\" { :; }\n" > "${REPO_ROOT}/test/bats/unit/b_spec.bats"
+    _die() { echo "DIE: $*"; exit 1; }
+    source /source/script/test/drivers/bats.sh
+    _run_coverage 1/2 >/dev/null
+    _run_coverage_path test/bats/unit/b_spec.bats >/dev/null
+    _n="$(wc -l < "'"${_log}"'")"
+    [[ "${_n}" -eq 4 ]] \
+      || { echo "EXPECTED-TWO-INSTRUMENTED-RUNS-GOT-${_n}-PATH-ARGS"; exit 1; }
+    _shard="$(head -2 "'"${_log}"'")"
+    _single="$(tail -2 "'"${_log}"'")"
+    [[ "${_shard}" == "${_single}" ]] \
+      || { printf "shard:\n%s\nsingle:\n%s\n" "${_shard}" "${_single}"; exit 1; }
+    printf "%s\n" "${_single}"
+  '
+  assert_success
+  assert_output --partial "--include-path=${BATS_TEST_TMPDIR}/repo"
+  assert_output --partial "--exclude-path="
+}
+
+# why: Exit-status propagation -- the loop is useless if failure is
+# swallowed
+@test "_run_coverage_path: propagates the spec's exit status so a red spec is a red run (#887)" {
+  # The entry point exists to be a red-green loop. A runner that swallowed
+  # the failure would report green on the exact run whose whole purpose is
+  # to show the spec failing under instrumentation.
+  mock_cmd "bats" 'exit 0'
+  mock_cmd "kcov" 'exit 3'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_coverage_path test/bats/unit/ci_spec.bats >/dev/null
+    echo "rc=$?"
+  '
+  assert_success
+  assert_output "rc=3"
+}
+
+# why: Composes with --filter to instrument a single @test
+@test "_run_coverage_path: BATS_FILTER appends a bats -f name filter (#887)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  mock_cmd "bats" 'exit 0'
+  mock_cmd "kcov" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    BATS_FILTER="SIGTERM" _run_coverage_path test/bats/unit/ci_spec.bats >/dev/null
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "-f SIGTERM"
+  assert_output --partial "test/bats/unit/ci_spec.bats"
+}
+
+# why: Dispatch: coverage service, COVERAGE_PATH plumbed, never a shard
+@test "main --coverage-path: routes one spec to the coverage service with COVERAGE_PATH + BATS_ONLY=1 (#887)" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  # The ambient environment this mode is actually reached from. Both other
+  # selectors are set here because `_run_via_compose` forwards them FROM
+  # THE ENVIRONMENT: this suite's own specs run inside a coverage shard, or
+  # inside a `--coverage-local` run, and whatever that run carries is what
+  # this dispatch inherits unless it says otherwise.
+  run env COVERAGE_SHARD=1/4 COVERAGE_LOCAL_JOBS=32 bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-path test/bats/unit/ci_spec.bats --filter shard
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial " coverage"
+  assert_output --partial "COVERAGE=1"
+  assert_output --partial "COVERAGE_PATH=test/bats/unit/ci_spec.bats"
+  assert_output --partial "BATS_FILTER=shard"
+  assert_output --partial "BATS_ONLY=1"
+  # Never a shard: the mode names its target, it does not partition. And
+  # never a job count: this mode runs ONE spec, while a forwarded
+  # COVERAGE_LOCAL_JOBS is a whole-suite parallel run's selector, ignored
+  # here only because the in-container dispatch happens to read
+  # COVERAGE_PATH first. An ignored value carried into the container is the
+  # value a later reordering turns into a read one.
+  #
+  # Each refutation is paired with the positive that makes it mean
+  # something, because a refutation on its own is satisfied by the
+  # forwarder not carrying the selector AT ALL -- the defect base#1090 is
+  # about. Measured on 1c9ccb2: with both `-e COVERAGE_SHARD=` and
+  # `-e COVERAGE_LOCAL_JOBS=` deleted from `_run_via_compose`'s dispatch,
+  # this case still reported `ok 1` of 1.
+  #
+  # The pairing is also the real contract rather than a prop for the
+  # refutation. The mode CLEARS these selectors; it does not omit them. An
+  # omitted `-e` leaves the container to take the name from the service
+  # definition instead of from the dispatch, so the one place that decides
+  # what this mode runs would no longer be the dispatch -- which is why
+  # `_run_via_compose` forwards each as `-e NAME="${NAME:-}"` and why
+  # coverage_local_spec's roster guard reads that shape off this very
+  # dispatch.
+  assert_output --partial "COVERAGE_SHARD="
+  refute_output --regexp 'COVERAGE_SHARD=[0-9]'
+  assert_output --partial "COVERAGE_LOCAL_JOBS="
+  refute_output --regexp 'COVERAGE_LOCAL_JOBS=[0-9]'
+}
+
+# why: In-container branch sits ahead of _run_coverage; no report line
+@test "main --ci: COVERAGE=1 with COVERAGE_PATH runs the one spec and reports no coverage figure (#887)" {
+  # The in-container dispatch must branch BEFORE _run_coverage, which
+  # kcov's the whole suite and writes coverage/timings.tsv + the report
+  # line into the mounted checkout.
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _kcov_slice_mock "${_log}"
+  mock_cmd "bats" 'exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    # A marker on the runner this branch must NOT reach. Refuting it is a
+    # stronger reading than refuting the report line, and it also keeps
+    # the day the branch regresses from writing coverage/timings.tsv into
+    # the mounted checkout while the assertion is still red.
+    _run_coverage() { printf "REACHED-FULL-RUNNER\n"; }
+    # Every other selector the dispatch forwards is pinned for the same
+    # reason the marker exists: COVERAGE_PATH is asserted to out-rank
+    # them, and a block that inherited one from the run it is inside
+    # would be asserting that only for whichever run happened to be in
+    # flight. LINT_ONLY earns its place too -- set, it returns from this
+    # dispatch before the coverage branch is read.
+    COVERAGE=1 COVERAGE_PATH=test/bats/unit/ci_spec.bats COVERAGE_SHARD= \
+      COVERAGE_LOCAL_JOBS= BATS_ONLY=0 BATS_UNIT_SHARD= BATS_FRAGILE=0 \
+      BATS_INTEGRATION=0 BATS_FILE= BATS_FILTER= LINT_ONLY=0 LINT_TOOL= LINT_GROUP= PER_TEST_TIMEOUT= \
+      COVERAGE_JOBS= SHARD_WEIGHTS_BLOB= \
+      main --ci
+  '
+  assert_success
+  refute_output --partial "REACHED-FULL-RUNNER"
+  refute_output --partial "Coverage report:"
+  refute_output --partial "full suite"
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "test/bats/unit/ci_spec.bats"
+  refute_output --partial "/test/bats/integration/ "
+}
+
+# why: Host-side missing-path guard
+@test "main --coverage-path: non-existent path dies before docker is called (#887)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-path test/bats/unit/does_not_exist_spec.bats
+  '
+  assert_failure
+  assert_output --partial "No such spec file or directory"
+  refute_output --partial "docker should not be called"
+}
+
+# why: Host-side system-spec guard (needs the ci-system service)
+@test "main --coverage-path: test/bats/system/ dies with the ci-system hint (#887)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-path test/bats/system/runtime_test_smoke_spec.bats
+  '
+  assert_failure
+  assert_output --partial "ci-system"
+  refute_output --partial "docker should not be called"
+}
+
+# why: A figure over a partition and one instrumented spec are different
+# asks
+@test "main --coverage-path + --coverage-shard is rejected (#887)" {
+  # One asks for a figure over a partition, the other for instrumentation
+  # over one named spec. Silently letting one win would be how a one-spec
+  # run ends up uploaded as a shard.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-path test/bats/unit/ci_spec.bats --coverage-shard 1/4
+  '
+  assert_failure
+  assert_output --partial "--coverage-path"
+  assert_output --partial "cannot combine"
+  refute_output --partial "Unknown option"
+  refute_output --partial "docker should not be called"
+}
+
+# why: Two runners, two services -- refused by name
+@test "main --coverage-path + --bats-path is rejected (#887)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --coverage-path test/bats/unit/ci_spec.bats --bats-path test/bats/unit/lib_spec.bats
+  '
+  assert_failure
+  assert_output --partial "--coverage-path"
+  assert_output --partial "cannot combine"
+  refute_output --partial "Unknown option"
+  refute_output --partial "docker should not be called"
+}
+
+# why: #523's refusal is intact; the combination is --coverage-path
+@test "main --bats-path + --coverage stays rejected: the fast loop is still kcov-free (#887)" {
+  # --coverage-path did NOT lift the original refusal. --bats-path is the
+  # no-kcov loop by definition; combining it with --coverage would have
+  # meant one flag pair with two runners behind it.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bats-path test/bats/unit/ci_spec.bats --coverage
+  '
+  assert_failure
+  assert_output --partial "cannot combine with --coverage"
+  assert_output --partial "--coverage-path"
+  refute_output --partial "docker should not be called"
+}
+
+# why: #692 unknown-flag guard
+@test "main: unknown option dies with ci_unknown_option (#692)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --bogus
+  '
+  assert_failure
+  assert_output --partial "Unknown option"
+  refute_output --partial "docker should not be called"
+}
+
+# why: #692 narrowing-flag typo guard
+@test "main: --hadolint without --lint dies (narrowing flag, not standalone) (#692)" {
+  # `--hadolint` narrows --lint; standalone is the easy-to-make typo for
+  # --hadolint-only. It must fail loudly, not silently no-op.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --hadolint
+  '
+  assert_failure
+  assert_output --partial "narrows --lint"
+  refute_output --partial "docker should not be called"
+}
+
+# why: base#1412. `--group` narrows `--lint` the way `--hadolint` does;
+# standalone it is a typo, and with a tool it asks for two narrowings of
+# one run. Both refuse before compose, so neither costs an image or runs
+# a lint the caller did not ask for.
+@test "main: --group without --lint, or beside a tool, dies before compose (base#1412)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --group 1/4
+  '
+  assert_failure
+  assert_output --partial "narrows --lint"
+  refute_output --partial "docker should not be called"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --lint --group 1/4 --shellcheck
+  '
+  assert_failure
+  assert_output --partial "two narrowings of --lint"
+  refute_output --partial "docker should not be called"
+}
+
+# why: base#1412. A malformed group spec is refused on the host, before
+# compose: it is a typo, and a typo should cost no image build.
+@test "main: --lint --group refuses a malformed spec before compose (base#1412)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --lint --group 9/4
+  '
+  assert_failure
+  assert_output --partial "lint group '9/4' is outside its own total"
+  refute_output --partial "docker should not be called"
+}
+
+# why: base#1412. LINT_GROUP is how the in-image lint-static job selects
+# its group; it has to reach `_run_lint_group`, whose refusal of an
+# out-of-range spec is the observable proof that the group branch, not the
+# whole-phase or single-tool branch, took the run.
+@test "main --ci: LINT_GROUP routes the lint-only run to one group (base#1412)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    LINT_ONLY=1 LINT_TOOL= LINT_GROUP=9/4 main --ci
+  '
+  assert_failure
+  assert_output --partial "lint group '9/4' is outside its own total"
+}
+
+# why: base#1412 review round 7. CI lints inside the test-tools image, as
+# the local gate does. A reading of the workflow cannot see every way a
+# step reaches a host arm (a value an earlier step put in $GITHUB_ENV, a
+# step that runs only on some runs), so the one lint dispatch refuses a CI
+# runner's host itself. Every host entry point goes through it: the
+# --<tool>-only family, --hadolint-only, --lint-group and `--ci` run on
+# the host. None of them may reach a driver.
+@test "_run_lint_tool: every host lint entry point is refused on a CI runner (base#1412)" {
+  local _entry
+  local -a _entries=(
+    'main --doc-counts-only'
+    'main --hadolint-only'
+    'main --lint-group 1/4'
+    'LINT_ONLY=1 LINT_TOOL=doc-counts main --ci'
+    'LINT_ONLY=1 LINT_TOOL= LINT_GROUP= main --ci'
+  )
+  for _entry in "${_entries[@]}"; do
+    run env LOG_FORMAT=json bash -c '
+      source /source/script/test/test.sh
+      # Every driver the one dispatch names, read from its own body.
+      for _f in $(declare -f _run_lint_tool | grep -oE "\b_run_[a-z_]+" | sort -u | grep -vx _run_lint_tool); do
+        eval "${_f}() { echo REACHED-DRIVER; }"
+      done
+      [ "$(_run_doc_counts)" = REACHED-DRIVER ] && [ "$(_run_hadolint)" = REACHED-DRIVER ] \
+        || { echo "BUG: the drivers were not stubbed"; exit 0; }
+      export GITHUB_ACTIONS=true
+      '"${_entry}"'
+    '
+    assert_failure
+    assert_output --partial '"body":"ci_host_lint_on_runner"'
+    refute_output --partial "REACHED-DRIVER"
+  done
+}
+
+# why: base#1412 review round 7. The refusal is the runner's mark, not a
+# refusal of host arms: off a runner an operator still times one driver
+# with them.
+@test "_run_lint_tool: off a CI runner a host arm still reaches its driver (base#1412)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_doc_counts() { echo REACHED-DRIVER; }
+    unset GITHUB_ACTIONS
+    main --doc-counts-only
+  '
+  assert_success
+  assert_output --partial "REACHED-DRIVER"
+  refute_output --partial "ci_host_lint_on_runner"
+}
+
+# why: #692 LINT_TOOL validation
+@test "main --ci: unknown LINT_TOOL dies with ci_unknown_lint_tool (#692)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    LINT_ONLY=1 LINT_TOOL=bogus main --ci
+  '
+  assert_failure
+  assert_output --partial "Unknown LINT_TOOL"
+}
+
+# why: #845 stale setup.conf lint reaches the CI gate
+@test "main --ci: LINT_TOOL=stale-setup-conf runs the stale setup.conf lint (#845)" {
+  # Wiring guard: the lint must reach the CI gate, not only an Edit-time
+  # hook. An unwired tool falls through to the ci_unknown_lint_tool branch
+  # (the test above), so a passing run here proves the dispatch case exists.
+  run bash -c '
+    source /source/script/test/test.sh
+    LINT_ONLY=1 LINT_TOOL=stale-setup-conf main --ci
+  '
+  assert_success
+  assert_output --partial "stale setup.conf path lint: clean"
+}
+
+# why: #846 localized README sync lint reaches the CI gate
+@test "main --ci: LINT_TOOL=readme-sync runs the localized README sync lint (#846)" {
+  # Wiring guard: the translation drift guard must reach the CI gate, not
+  # only the on-demand generator. An unwired tool falls through to the
+  # ci_unknown_lint_tool branch, so a passing run here proves the dispatch
+  # case exists.
+  run bash -c '
+    source /source/script/test/test.sh
+    LINT_ONLY=1 LINT_TOOL=readme-sync main --ci
+  '
+  assert_success
+  assert_output --partial "localized README sync lint: clean"
+}
+
+# why: #864 doc/test count drift gate reaches the CI gate
+@test "main --ci: LINT_TOOL=doc-counts runs the doc/test count drift gate (#864)" {
+  # Wiring guard: the doc-count drift gate must reach the CI gate, not only
+  # `just test sync-docs-check` and the advisory harness hook. An unwired
+  # tool falls through to the ci_unknown_lint_tool branch, so a passing run
+  # here proves the dispatch case exists.
+  run bash -c '
+    source /source/script/test/test.sh
+    LINT_ONLY=1 LINT_TOOL=doc-counts main --ci
+  '
+  assert_success
+  assert_output --partial "doc/test count drift gate: clean"
+}
+
+# why: #864 host-direct primitive so a CI job can run the gate without
+# compose
+@test "main --doc-counts-only: runs the drift gate on the host, no compose (#864)" {
+  # The host-direct arm is kept to time one driver; CI runs the gate with
+  # --lint --doc-counts inside the test-tools image instead (base#1412).
+  # Docker must not be touched on this path.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --doc-counts-only
+  '
+  assert_success
+  assert_output --partial "doc/test count drift gate: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --issueref-only: runs the issue-ref comment lint on the host, no compose (#866)" {
+  # CI-reachability guard, same shape as --doc-counts-only / --shellcheck-only.
+  # The lint phase is what enforces ADR-00000013, and no CI job ran that
+  # phase, so the rule gated nothing on a PR. A lint-static group runs this
+  # driver on a plain ubuntu-latest runner; docker must not be touched on
+  # the path.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --issueref-only
+  '
+  assert_success
+  assert_output --partial "issue-ref comment lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --adr-structure-only: runs the ADR-structure lint on the host, no compose (#994)" {
+  # Ungated in CI for the same reason its sibling is: an ADR body is a
+  # doc-only change, so a code_changed gate would skip the lint on exactly
+  # the PR that lands a malformed ADR. That only works host-direct.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --adr-structure-only
+  '
+  assert_success
+  assert_output --partial "ADR-structure lint:"
+  assert_output --partial "clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --adr-numbering-only: runs the ADR-numbering lint on the host, no compose (#866)" {
+  # Ungated in CI on purpose: doc/adr/ filenames are a doc-only change, so a
+  # code_changed gate would skip the lint on exactly the PR that duplicates
+  # an ADR number. That only works if the lint is host-direct.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --adr-numbering-only
+  '
+  assert_success
+  assert_output --partial "ADR-numbering lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --stale-setup-conf-only: runs the stale setup.conf path lint on the host, no compose (#866)" {
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --stale-setup-conf-only
+  '
+  assert_success
+  assert_output --partial "stale setup.conf path lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --home-literal-only: runs the hardcoded home path lint on the host, no compose (#799)" {
+  # Same CI-reachability shape as the sibling primitives: a lint-static
+  # group runs this driver on a plain ubuntu-latest runner, so it must be
+  # pure bash over the checkout and never touch docker.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --home-literal-only
+  '
+  assert_success
+  assert_output --partial "hardcoded home path lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --changelog-entry-only: runs the changelog entry-length lint on the host, no compose (#917)" {
+  # Same CI-reachability shape as the sibling primitives: a lint-static
+  # group runs this driver on a plain ubuntu-latest runner, so it must be
+  # pure bash over the checkout and never touch docker.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --changelog-entry-only
+  '
+  assert_success
+  assert_output --partial "changelog entry lint:"
+  refute_output --partial "docker should not be called"
+}
+
+# why: The CI join is host-direct, like its siblings
+@test "main --action-ref-agreement-only: runs the action ref agreement lint on the host, no compose (#949)" {
+  # Same CI-reachability shape as the sibling primitives: a lint-static
+  # group runs this driver on a plain ubuntu-latest runner, so it must be
+  # pure bash over the checkout and never touch docker.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --action-ref-agreement-only
+  '
+  assert_success
+  assert_output --partial "action ref agreement lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main --readme-sync-only: runs the localized README sync lint on the host, no compose (#866)" {
+  # The clearest case for an ungated CI job: a README.md edit that leaves a
+  # translation behind is a doc-only change end to end.
+  mock_cmd "docker" 'echo "docker should not be called"; exit 1'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"':${PATH}"
+    main --readme-sync-only
+  '
+  assert_success
+  assert_output --partial "localized README sync lint: clean"
+  refute_output --partial "docker should not be called"
+}
+
+@test "main: _LINT_TOOLS is the one table every lint-phase caller dispatches through (#866)" {
+  # Three callers used to repeat the tool list (the full phase, the
+  # in-container LINT_TOOL narrowing, the host-direct --<tool>-only
+  # primitives), so a new lint could be wired into one and missed by the
+  # others. They now share this table, which is also what the
+  # self-test.yaml completeness guard reads to prove every lint has a CI
+  # job.
+  run bash -c '
+    source /source/script/test/test.sh
+    printf "%s\n" "${_LINT_TOOLS[@]}"
+  '
+  assert_success
+  assert_line "shellcheck"
+  assert_line "hadolint"
+  assert_line "issueref"
+  assert_line "adr-numbering"
+  assert_line "adr-structure"
+  assert_line "stale-setup-conf"
+  assert_line "readme-sync"
+  assert_line "doc-counts"
+  assert_line "home-literal"
+  assert_line "changelog-entry"
+  assert_line "action-ref-agreement"
+}
+
+# why: #523 filter-only dispatch
+@test "main --filter: dispatches with BATS_FILTER + BATS_ONLY=1 and no BATS_FILE" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    main --filter cap_add
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "BATS_FILTER=cap_add"
+  assert_output --partial "BATS_ONLY=1"
+  assert_output --partial "BATS_FILE= "
+}
+
+# why: #523 single-path runner
+@test "_run_bats_path: BATS_FILE runs bats on that path; BATS_FILTER appends -f" {
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    BATS_FILE="test/bats/unit/ci_spec.bats" BATS_FILTER="shard" _run_bats_path
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "test/bats/unit/ci_spec.bats"
+  assert_output --partial "-f shard"
+}
+
+# why: #523 filter-only runner
+@test "_run_bats_path: filter-only runs bats across unit + integration" {
+  local _log="${BATS_TEST_TMPDIR}/bats.log"
+  mock_cmd "bats" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    BATS_FILE="" BATS_FILTER="cap_add" _run_bats_path
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "test/bats/unit/"
+  assert_output --partial "test/bats/integration/"
+  assert_output --partial "-f cap_add"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Dispatcher + per-tool driver structure (ADR-00000011 #5)
+#
+# test.sh is the dispatcher; the per-tool execution lives in sourced
+# driver libraries under script/test/drivers/. These guards pin the
+# split so a future refactor can't silently re-inline a tool or drop a
+# `source` line.
+#
+# THE DIRECTORY IS THE POPULATION (base#1113). The guards below used to
+# name three driver files -- shellcheck, hadolint, bats -- against a
+# directory holding twenty-nine, and _LINT_TOOLS' completeness was asked
+# only of _LINT_TOOLS itself: both the lint-static partition and
+# self_test_yaml_spec's CI-join guard shard that same table, so a driver
+# never added to it is in no group, and nothing has anything to say.
+# Measured on 3f20ffe: a drivers/probe_lint.sh defining _run_probe_lint,
+# with _LINT_TOOLS untouched, left `--bats-path
+# test/bats/unit/self_test_yaml_spec.bats --filter lint` at 20/20 and
+# `--bats-path test/bats/unit/ci_spec.bats --filter driver` at 14/14,
+# both exit 0. So the population is read from drivers/, and the
+# hand-written part is reduced to the exemptions below, each of which has
+# to say why.
+# ════════════════════════════════════════════════════════════════════
+
+# Driver files that hold no lint entry point, each with the reason.
+# Anything NOT listed here has every `_run_*` it defines held to
+# _LINT_TOOLS -- that is what makes a new driver file fail these specs
+# instead of quietly running nowhere.
+_NON_LINT_DRIVER_FILES=(
+  # The suite's test tiers: unit / integration / system, the shards, the
+  # fragile set and the coverage legs. main's own option parser
+  # dispatches them as phases; _run_lint_tool never sees them, and
+  # _LINT_TOOLS is the lint phase's table.
+  bats.sh
+  # The coverage-floor gate. A phase, not a lint, and CI runs it as a
+  # standalone CLI (`bash script/test/drivers/coverage_gate.sh
+  # <cobertura>...`) with no dispatcher in the picture.
+  coverage_gate.sh
+)
+
+# Driver files test.sh deliberately does not `source`, each with the
+# reason. Anything NOT listed here must have a source line, so a driver
+# file added without one fails instead of leaving its `_run_*` undefined
+# at dispatch.
+_UNSOURCED_DRIVER_FILES=(
+  # Executed, not sourced: the file's own tail runs _coverage_gate_run
+  # when invoked directly, which is how both CI and the kcov legs call
+  # it. Sourcing it into the dispatcher would buy nothing -- no
+  # _LINT_TOOLS entry and no option arm reach _run_coverage_gate.
+  coverage_gate.sh
+  # Executed, not sourced: the required-kill roster runner (base#1461) is
+  # a standalone program that re-executes itself once per row as a worker
+  # in its own process group; _run_mutation_required and the
+  # `mutation-required` recipe invoke it with bash.
+  mutation_required.sh
+)
+
+# Lint entry points _LINT_TOOLS deliberately does not carry, each with
+# the reason. Anything NOT listed here must be in the table, so a lint
+# driver written and spec'd but never registered fails instead of
+# gating nothing while its own specs stay green.
+#
+# TRANSITIONAL, THE FIRST FOUR. _run_lint_tool dispatches them and the reason
+# they are out of the table is written at that dispatch point:
+# _LINT_TOOLS runs INSIDE the ci container, while these judge by an
+# adoption ceiling read from the git index, and a `git worktree`
+# checkout's .git is a file pointing outside the bind mount. base#994
+# phase 4 gives the lint phase a host-direct leg and folds them in --
+# and the guard below refuses an entry that the table has meanwhile
+# grown, so this array cannot outlive that.
+#
+# PERMANENT, THE FIFTH. changelog-entry-fix is not a lint. It is the REPAIR
+# behind `--changelog-entry-fix`, which WRITES doc/changelog's [Unreleased]
+# section and judges nothing, dispatched through the `repair` seam beside
+# `--clean-coverage` and never through _run_lint_tool. Putting a writer in the
+# table the lint phase loops over would have CI rewriting the tree it is there
+# to check. The scan finds it because it is a `_run_*` in a drivers/ file, and
+# an exemption saying so is the honest answer -- renaming the function to slip
+# past the scan would be the dishonest one.
+# PROVISIONAL, THE SIXTH. log-event-registry is a lint and it is finished:
+# it found all four unregistered ids base#1220 was filed for, two of them
+# through a forwarding wrapper nothing else can see. It is out of the table
+# because of its READER, not its rule. Its first spelling was a regex over
+# the raw line; it is now a shell word splitter, and review found a
+# reproduced parser defect in forty-one consecutive rounds -- twenty-five
+# of them FALSE POSITIVES on valid shell. Round thirty-four came back
+# clean and the seven rounds after it found sixteen more, the last four at
+# once, so a clean round says nothing about the reader being finished. In
+# the table, each of those would
+# have blocked a PR whose logging was correct, and the author's only
+# recourse would have been to read fourteen hundred lines of awk to tell a
+# parser bug from a finding. A gate that does that once gets muted, and a
+# muted gate is worse than none because it still carries the claim that
+# the question is being asked.
+#
+# The reverse direction is cheap by comparison: an id goes unregistered
+# until someone runs the scan, which is exactly the state base#1220
+# describes and which a manual run closes. So it ships dispatchable --
+# `./script/test/test.sh --log-event-registry-only`, `just test lint
+# --log-event-registry` -- and gates nothing.
+#
+# PROMOTION HAS ONE CONDITION: a release cycle clean against a moving
+# tree. Then this entry goes and the name joins _LINT_TOOLS, which the
+# hygiene guard below forces -- it refuses a name that is in both.
+_UNTABLED_LINT_ENTRY_POINTS=(
+  nesting-depth
+  function-length
+  positional-params
+  shell-metrics
+  changelog-entry-fix
+  log-event-registry
+)
+
+# Tabled lints that deliberately have NO host-direct `--<tool>-only` arm,
+# each with the reason. The MIRROR of _UNTABLED_LINT_ENTRY_POINTS above:
+# that array models arms the table does not carry, this one models table
+# entries no arm carries, and neither direction is equality. Anything NOT
+# listed here must have an arm, so a lint added to _LINT_TOOLS without one
+# fails instead of gating nothing visible while the operator's
+# `--<tool>-only` dies on `Unknown option`.
+#
+# base#1277 MEASURED THAT STATE. canonical-ignore-sync joined the table in
+# base#1276, ran in CI inside a lint-static group, was green in every
+# check the tree has, and its first host-direct run died on
+# `Unknown option: --canonical-ignore-sync-only`. The arm had to be added
+# by hand as a fourth edit, which is the edit base#1275's own Seams said
+# was not owed.
+#
+# HADOLINT IS THE ONLY ONE, and it is not transitional. Its binary exists
+# only in the alpine test-tools image and has no install-it-on-the-runner
+# form, so its CI job runs the driver INSIDE that image
+# (`--lint --hadolint`) instead of host-direct. test.sh says so twice --
+# at the usage flag list ("no `--hadolint-only` equivalent: hadolint
+# exists only in the test-tools image") and in the table's own prose
+# ("Every tool but hadolint is runnable host-direct"). Giving it an arm is
+# base#1277's Out of scope for that reason, so the exemption is the
+# honest record and this is where it stops being prose.
+#
+# NOT _LINT_TOOLS_OWN_CI_JOB, which is a different question: which lints
+# carry a dedicated CI job. It holds shellcheck and doc-counts too, and
+# both of those DO have arms, so reusing it here would excuse two tools
+# that need no excuse and would stop refusing the next armless entry.
+_TABLED_LINTS_WITHOUT_HOST_ARM=(
+  hadolint
+)
+
+# Whether <needle> is one of the remaining arguments.
+_in_set() {
+  local _needle="${1}" _item
+  shift
+  for _item in "$@"; do
+    [[ "${_item}" != "${_needle}" ]] || return 0
+  done
+  return 1
+}
+
+# The driver file names the drivers directory holds, one per line.
+_driver_files() {
+  local _path
+  for _path in /source/script/test/drivers/*.sh; do
+    printf '%s\n' "${_path##*/}"
+  done
+}
+
+# The `_run_<name>` entry points one driver file defines, spelled the way
+# _LINT_TOOLS spells a tool (underscores become dashes).
+#
+# The entry points, not the file names: bats.sh defines ten and
+# shell_metrics.sh four, so "each drivers/<name>.sh defines _run_<name>"
+# is not a rule this tree follows, and a population built on it would
+# miss every lint that shares a file.
+_entry_points_of() {
+  local _def _name
+  while IFS= read -r _def; do
+    _name="${_def#_run_}"
+    _name="${_name%%(*}"
+    printf '%s\n' "${_name//_/-}"
+  done < <(grep -oE '^_run_[a-z0-9_]+\(\) \{' "${1}")
+}
+
+# Every lint entry point the drivers directory defines: the `_run_*` of
+# every driver file not declared non-lint above.
+_lint_entry_points() {
+  local _file
+  while IFS= read -r _file; do
+    if _in_set "${_file}" "${_NON_LINT_DRIVER_FILES[@]}"; then
+      continue
+    fi
+    _entry_points_of "/source/script/test/drivers/${_file}"
+  done < <(_driver_files)
+}
+
+# why: #650 driver files present (incl. hadolint)
+@test "drivers: bats.sh, shellcheck.sh and hadolint.sh driver files exist" {
+  assert [ -f /source/script/test/drivers/bats.sh ]
+  assert [ -f /source/script/test/drivers/shellcheck.sh ]
+  # hadolint joins the per-tool drivers so it runs in BOTH `just
+  # test` and the CI hadolint job (local==CI single source).
+  assert [ -f /source/script/test/drivers/hadolint.sh ]
+}
+
+# why: base#1113 three source lines were checked against a directory of
+# twenty-nine driver files
+@test "drivers: test.sh sources every driver file in drivers/ (base#1113)" {
+  # This used to grep the shellcheck / hadolint / bats source lines and be
+  # titled "all per-tool drivers". A driver file that arrived with no
+  # source line was named by nothing: its `_run_*` is undefined when the
+  # dispatcher reaches it, and the failure surfaces as a missing command
+  # on the day the lint is supposed to be doing its job.
+  local -a _files=()
+  mapfile -t _files < <(_driver_files)
+  # Refuse the no-evidence state: an unreadable directory would leave the
+  # loop below with nothing to check and this guard reporting clean.
+  [ "${#_files[@]}" -ge 20 ] \
+    || fail "drivers/ yielded ${#_files[@]} files; the population did not parse"
+
+  local _file _missing=""
+  for _file in "${_files[@]}"; do
+    if _in_set "${_file}" "${_UNSOURCED_DRIVER_FILES[@]}"; then
+      continue
+    fi
+    if grep -qF "source \"\${SCRIPT_DIR}/drivers/${_file}\"" \
+        /source/script/test/test.sh; then
+      continue
+    fi
+    _missing+=" ${_file}"
+  done
+  [ -z "${_missing}" ] \
+    || fail "driver file(s) test.sh neither sources nor declares unsourced:${_missing}"
+}
+
+# why: base#1113 a driver never added to the table is in no lint phase and
+# no CI group, and the guards all read the table
+@test "_LINT_TOOLS: every lint entry point under drivers/ is in the table or stated exempt (base#1113)" {
+  local -a _found=() _table=()
+  mapfile -t _found < <(_lint_entry_points | sort -u)
+  mapfile -t _table < <(_declared_array _LINT_TOOLS)
+
+  # Non-vacuity, both sides. A scan that matched nothing and a table that
+  # did not parse both reduce the comparison below to two empty sets, and
+  # an empty derived population is not a passing gate -- it is the gate
+  # reporting clean having read nothing.
+  [ "${#_found[@]}" -ge 20 ] \
+    || fail "drivers/ yielded ${#_found[@]} lint entry points; the scan did not parse"
+  [ "${#_table[@]}" -ge 20 ] \
+    || fail "_LINT_TOOLS yielded ${#_table[@]} entries; the table did not parse"
+  _in_set shellcheck "${_found[@]}" \
+    || fail "the scan found no 'shellcheck' entry point; it is reading something other than the drivers"
+
+  local _entry _orphan=""
+  for _entry in "${_found[@]}"; do
+    if _in_set "${_entry}" "${_table[@]}"; then
+      continue
+    fi
+    if _in_set "${_entry}" "${_UNTABLED_LINT_ENTRY_POINTS[@]}"; then
+      continue
+    fi
+    _orphan+=" ${_entry}"
+  done
+  [ -z "${_orphan}" ] \
+    || fail "lint entry point(s) in neither _LINT_TOOLS nor the stated exemptions:${_orphan} -- a lint the table does not carry is run by no lint phase and lands in no lint-static group, while its own unit specs stay green"
+}
+
+# why: base#1113 an exemption array is the one hand-written thing left, so
+# it is held to the rule that each entry excuses something real
+@test "_LINT_TOOLS: each stated exemption names something real and nothing the table carries (base#1113)" {
+  local -a _found=() _table=() _files=()
+  mapfile -t _found < <(_lint_entry_points | sort -u)
+  mapfile -t _table < <(_declared_array _LINT_TOOLS)
+  mapfile -t _files < <(_driver_files)
+  [ "${#_found[@]}" -ge 20 ] \
+    || fail "drivers/ yielded ${#_found[@]} lint entry points; the scan did not parse"
+  [ "${#_table[@]}" -ge 20 ] \
+    || fail "_LINT_TOOLS yielded ${#_table[@]} entries; the table did not parse"
+
+  # A name exempted from the table must still BE an entry point -- an
+  # exemption that names nothing excuses an entry point of that name
+  # arriving later, on sight -- and must not meanwhile be in the table,
+  # which is how base#994 phase 4 folding these in forces the array to
+  # shrink with it instead of silently widening the guard.
+  local _entry
+  for _entry in "${_UNTABLED_LINT_ENTRY_POINTS[@]}"; do
+    _in_set "${_entry}" "${_found[@]}" \
+      || fail "'${_entry}' is exempted from _LINT_TOOLS but no lint driver defines its entry point -- the exemption excuses nothing today and anything of that name tomorrow"
+    if _in_set "${_entry}" "${_table[@]}"; then
+      fail "'${_entry}' is in _LINT_TOOLS and still exempted from it -- the table has grown it, so the exemption entry has to go with it"
+    fi
+  done
+
+  # A file-level exemption is the same fail-open one level up if the file
+  # it excuses turns out to hold lints, so each one must exist, must hold
+  # entry points at all, and must hold none the table carries.
+  local _file
+  for _file in "${_NON_LINT_DRIVER_FILES[@]}"; do
+    _in_set "${_file}" "${_files[@]}" \
+      || fail "'${_file}' is declared a non-lint driver file but drivers/ has no such file -- the exemption excuses nothing"
+    local -a _own=()
+    mapfile -t _own < <(_entry_points_of "/source/script/test/drivers/${_file}")
+    [ "${#_own[@]}" -ge 1 ] \
+      || fail "'${_file}' is declared a non-lint driver file but defines no _run_* entry point, so it needs no exemption"
+    for _entry in "${_own[@]}"; do
+      if _in_set "${_entry}" "${_table[@]}"; then
+        fail "'${_file}' is excused as a non-lint driver file yet defines '${_entry}', which _LINT_TOOLS carries -- the file-level exemption is hiding lint entry points"
+      fi
+    done
+  done
+
+  for _file in "${_UNSOURCED_DRIVER_FILES[@]}"; do
+    _in_set "${_file}" "${_files[@]}" \
+      || fail "'${_file}' is declared unsourced by test.sh but drivers/ has no such file -- the exemption excuses nothing"
+  done
+}
+
+# The narrowing flags the justfile ADVERTISES, one per line: every
+# `just test lint --<flag>` it spells anywhere, with the leading dashes
+# dropped so the name is spelled the way _LINT_TOOLS spells a tool.
+#
+# The advertisement is the whole point of reading it from there: the
+# comment on the `lint` recipe is where an operator learns which flags
+# exist, and it is prose -- nothing else in the tree had to agree with it.
+_advertised_lint_flags() {
+  grep -oE 'just test lint --[a-z0-9-]+' /source/script/test/justfile.test \
+    | sed 's/.*--//' \
+    | sort -u
+}
+
+# The tool names `_run_lint_tool` can dispatch, one per line: its own case
+# labels, read between its definition and the `*)` that dies on an unknown
+# one. Derived from the dispatcher rather than from the table, because
+# those are two different questions and this guard exists because they
+# are.
+_dispatchable_lint_tools() {
+  awk '
+    /^_run_lint_tool\(\) \{/ { inside = 1; next }
+    !inside                  { next }
+    /^    \*\)/              { inside = 0; next }
+    /^    [a-z0-9|-]+\)/ {
+      k = $1
+      sub(/\).*/, "", k)
+      n = split(k, parts, "|")
+      for (i = 1; i <= n; i++) print parts[i]
+    }
+  ' /source/script/test/test.sh | sort -u
+}
+
+# The host-direct narrowing arms of `main`'s option `case`, one per line as
+# `<flag-name> <host_lint-value>`: the flag with its leading `--` and its
+# trailing `-only` stripped, then the tool name that arm narrows the run
+# to. Read out of the tree with the same awk shape the two guards above
+# use, and NOT by sourcing test.sh --
+# test/bats/unit/self_test_yaml_spec.bats:1944 records why (the lib chain
+# reads BASH_SOURCE unguarded, and under the kcov-instrumented bash of the
+# coverage shard the source aborts and its stderr gets parsed as a lint
+# name).
+#
+# `host_lint=` IS THE POPULATION, not `--*-only`. Two arms spell
+# `--<something>-only` and narrow no tool: `--hadolint-only` sets
+# `hadolint_only=1` for the in-container job, and `--bats-only` sets
+# `bats_only=1`. That is why a raw count of `--*-only)` lines is 34 where
+# the arms are 32, and counting the raw lines would excuse two names that
+# are not tools.
+#
+# THE CHARACTER CLASS CARRIES A DIGIT, deliberately. `[a-z-]` silently
+# drops `--i18n-orphan-only`, which is a real arm; that hole gave two
+# separate readings of this file a count of 33 where it has 34
+# (base#1277). The spec below refuses a derivation that has it.
+_host_direct_lint_arms() {
+  local _file="${1:-/source/script/test/test.sh}"
+  awk '
+    /^[[:space:]]+--[a-z0-9-]+-only\)[[:space:]]+host_lint=/ {
+      flag = $1
+      sub(/\).*/, "", flag)
+      sub(/^--/, "", flag)
+      sub(/-only$/, "", flag)
+      value = $0
+      sub(/^.*host_lint="/, "", value)
+      sub(/".*$/, "", value)
+      print flag " " value
+    }
+  ' "${_file}" | sort -u
+}
+
+# why: base#1226 shipped the log event registry scan as a MANUAL tool --
+# dispatchable, in no lint phase and no CI job -- and added
+# `just test lint --log-event-registry` to the justfile's narrowing list,
+# where it sat indistinguishable from the twenty-one flags that DO narrow
+# the bare phase. The list's own closing sentence then generalised over
+# it: "the behaviour matches the bare `lint`", which cannot hold for a
+# tool the bare `lint` never runs. Nothing was red, because the flag
+# dispatches and exits 0 -- the divergence was entirely in the prose, and
+# a comment is where base#1117 and base#1175 both found a claim nothing
+# had to keep. Three rules, each over a set derived from the tree
+@test "lint flags: every flag the justfile advertises is backed by the tree (base#1226)" {
+  assert_spec_subject /source/script/test/justfile.test \
+      "the recipe comment whose narrowing list this spec derives"
+  local -a _adv=() _table=() _disp=()
+  mapfile -t _adv < <(_advertised_lint_flags)
+  mapfile -t _table < <(_declared_array _LINT_TOOLS)
+  mapfile -t _disp < <(_dispatchable_lint_tools)
+
+  # Non-vacuity on all three sides: an empty set makes every rule below
+  # pass having compared nothing.
+  [ "${#_adv[@]}" -ge 15 ] \
+    || fail "the justfile advertised ${#_adv[@]} narrowing flags; the comment did not parse"
+  [ "${#_table[@]}" -ge 20 ] \
+    || fail "_LINT_TOOLS yielded ${#_table[@]} entries; the table did not parse"
+  [ "${#_disp[@]}" -ge 20 ] \
+    || fail "_run_lint_tool yielded ${#_disp[@]} case labels; the dispatcher did not parse"
+  _in_set shellcheck "${_adv[@]}" \
+    || fail "the advertised set holds no 'shellcheck'; it is reading something other than the narrowing list"
+
+  # R1 -- backed. An advertised flag is in the table, or is one of the
+  # stated untabled entry points. Advertised and in neither is a flag the
+  # comment offers that nothing in the tree answers for.
+  local _f _unbacked="" _undispatchable="" _unmarked=""
+  for _f in "${_adv[@]}"; do
+    if ! _in_set "${_f}" "${_table[@]}" \
+       && ! _in_set "${_f}" "${_UNTABLED_LINT_ENTRY_POINTS[@]}"; then
+      _unbacked+=" ${_f}"
+    fi
+  done
+  [ -z "${_unbacked}" ] \
+    || fail "the justfile advertises narrowing flag(s) in neither _LINT_TOOLS nor the stated untabled entry points:${_unbacked} -- the comment promises a dispatch nothing in the tree backs"
+
+  # R2 -- dispatchable. Every advertised flag has a `_run_lint_tool` case
+  # label. For a tabled flag the lint phase proves this on every run; for
+  # an untabled one NOTHING else does, which is the direction that would
+  # exit non-zero in front of an operator.
+  for _f in "${_adv[@]}"; do
+    _in_set "${_f}" "${_disp[@]}" || _undispatchable+=" ${_f}"
+  done
+  [ -z "${_undispatchable}" ] \
+    || fail "the justfile advertises narrowing flag(s) _run_lint_tool has no case label for:${_undispatchable} -- the advertised dispatch dies on 'Unknown LINT_TOOL'"
+
+  # R3 -- marked. An advertised flag the table does NOT carry has to name
+  # the table where it is advertised, because the list is read as the
+  # table's contents and the sentence closing it generalises over every
+  # entry. The required token is the array's own name, so a rename moves
+  # the requirement with it rather than stranding a marker.
+  local _line
+  for _f in "${_adv[@]}"; do
+    _in_set "${_f}" "${_table[@]}" && continue
+    _line="$(grep -nE "just test lint --${_f}([^a-z0-9-]|\$)" \
+      /source/script/test/justfile.test | grep -c '_LINT_TOOLS' || true)"
+    [[ "${_line}" != "0" ]] || _unmarked+=" ${_f}"
+  done
+  [ -z "${_unmarked}" ] \
+    || fail "the justfile advertises narrowing flag(s) _LINT_TOOLS does not carry without naming the table on the same line:${_unmarked} -- a reader takes the narrowing list for the table, and the bare 'lint' does not run these"
+}
+
+# why: base#1277 nothing held the host-direct arms to _LINT_TOOLS.
+# canonical-ignore-sync joined the table, ran in a lint-static group and
+# was green everywhere; its first host-direct run died on
+# `Unknown option: --canonical-ignore-sync-only`. The three guards that
+# look adjacent all miss that direction: the base#1226 case above reads
+# the justfile's advertised list (advertised subset of the table, never
+# the arms), self_test_yaml_spec's CI-join case falls back to "in exactly
+# one lint-static group" so a table entry with no arm anywhere takes the
+# group branch and passes, and the dispatch-table case names "the
+# host-direct `--<tool>-only` primitives" in its comment while asserting
+# only that eleven names are in the table. Both populations derived from
+# the tree, superset not equality, exemptions as data
+@test "lint flags: every tabled lint has a host-direct --<tool>-only arm (base#1277)" {
+  assert_spec_subject /source/script/test/test.sh \
+      "the option case whose host-direct narrowing arms this spec derives"
+  local -a _table=() _pairs=() _arms=()
+  mapfile -t _table < <(_declared_array _LINT_TOOLS)
+  mapfile -t _pairs < <(_host_direct_lint_arms)
+  local _pair
+  for _pair in "${_pairs[@]}"; do
+    _arms+=("${_pair%% *}")
+  done
+
+  # Non-vacuity on both sides. An unparsed or empty population makes every
+  # rule below pass having compared nothing, which is the declared-population
+  # failure this repo names most often (base#1089, base#1090, base#1113,
+  # base#1112, base#1109, base#1214).
+  [ "${#_table[@]}" -ge 20 ] \
+    || fail "_LINT_TOOLS yielded ${#_table[@]} entries; the table did not parse"
+  [ "${#_arms[@]}" -ge 25 ] \
+    || fail "main's option case yielded ${#_arms[@]} host-direct arms; the case did not parse"
+
+  # And non-vacuity of the PATTERN, not just of the count: i18n-orphan is a
+  # real arm that the digit-less class `[a-z-]` drops silently. A derivation
+  # with that hole would excuse every future lint whose name carries a digit.
+  if ! _in_set i18n-orphan "${_arms[@]}"; then
+    fail "the derived arm set holds no 'i18n-orphan', which IS an arm -- the pattern dropped a name containing a digit, the hole that gave base#1277 two wrong counts"
+  fi
+  # The two `--*-only` flags that narrow no tool must not be counted as
+  # arms: --hadolint-only sets hadolint_only=1 and --bats-only sets
+  # bats_only=1. Counting either would excuse a name that is not a tool,
+  # and hadolint's would excuse the one entry this gate is here to name.
+  if _in_set hadolint "${_arms[@]}"; then
+    fail "the derived arm set holds 'hadolint'; --hadolint-only sets hadolint_only=1 for the in-container job and is not tool narrowing"
+  fi
+  if _in_set bats "${_arms[@]}"; then
+    fail "the derived arm set holds 'bats'; --bats-only sets bats_only=1 and is not tool narrowing"
+  fi
+
+  local _t _x _flag _value _armless="" _unexcused="" _stale="" _mismatch=""
+
+  # R1 -- every tabled lint is reachable host-direct, unless named.
+  for _t in "${_table[@]}"; do
+    if _in_set "${_t}" "${_arms[@]}"; then
+      continue
+    fi
+    if _in_set "${_t}" "${_TABLED_LINTS_WITHOUT_HOST_ARM[@]}"; then
+      continue
+    fi
+    _armless+=" ${_t}"
+  done
+  [ -z "${_armless}" ] \
+    || fail "THE RULE APPLIED: every _LINT_TOOLS entry has a host-direct '--<tool>-only' arm in main's option case, unless _TABLED_LINTS_WITHOUT_HOST_ARM in this file names it with its reason. Entry/entries in neither:${_armless} -- each of those runs in CI inside a lint-static group and is green in every check the tree has, while the operator's '--<entry>-only' dies on 'Unknown option'. Add the arm beside the others (script/test/test.sh, the host_lint block of main's case), or name it in that exemption array. THE RULE IS ONE-DIRECTIONAL: arms the table does not carry are allowed, and _UNTABLED_LINT_ENTRY_POINTS is where those are named (${_UNTABLED_LINT_ENTRY_POINTS[*]}), so nothing here asks you to delete an arm."
+  # R2 -- the exemption excuses something real. A name in it that the
+  # table does not carry excuses nothing, and a name in it that HAS an
+  # arm is a spent excuse that would cover the next regression silently.
+  for _x in "${_TABLED_LINTS_WITHOUT_HOST_ARM[@]}"; do
+    if ! _in_set "${_x}" "${_table[@]}"; then
+      _unexcused+=" ${_x}"
+    elif _in_set "${_x}" "${_arms[@]}"; then
+      _stale+=" ${_x}"
+    fi
+  done
+  [ -z "${_unexcused}" ] \
+    || fail "_TABLED_LINTS_WITHOUT_HOST_ARM names:${_unexcused} -- which _LINT_TOOLS does not carry, so the exemption excuses nothing and R1 above is weaker than it reads"
+  [ -z "${_stale}" ] \
+    || fail "_TABLED_LINTS_WITHOUT_HOST_ARM names:${_stale} -- which DOES have a host-direct arm, so the exemption is spent: drop the name, or the next entry added to the table behind it goes unrefused"
+
+  # R3 -- an arm narrows to the tool it advertises. The flag is what the
+  # operator types, so '--foo-only' setting host_lint=bar satisfies R1 for
+  # 'bar' while '--bar-only' is still an unknown option.
+  for _pair in "${_pairs[@]}"; do
+    _flag="${_pair%% *}"
+    _value="${_pair##* }"
+    [[ "${_flag}" == "${_value}" ]] || _mismatch+=" --${_flag}-only sets ${_value}"
+  done
+  [ -z "${_mismatch}" ] \
+    || fail "host-direct arm(s) narrow to a tool their flag does not name:${_mismatch} -- the flag is what an operator types, so R1 above would be satisfied for a name no flag reaches"
+}
+
+# why: #650 bats runners moved out
+@test "drivers: the bats runners live in drivers/bats.sh, not test.sh" {
+  # Each runner must be defined once (in the driver), and NOT re-inlined
+  # back into the dispatcher.
+  local _fn
+  for _fn in _run_unit_tests _run_integration_tests _run_unit_shard \
+             _run_bats_fragile _run_bats_path _run_system _run_coverage \
+             _bats_args_with_label; do
+    run grep -E "^${_fn}\(\) \{" /source/script/test/drivers/bats.sh
+    assert_success
+    run grep -E "^${_fn}\(\) \{" /source/script/test/test.sh
+    assert_failure
+  done
+}
+
+# why: #650 shellcheck moved out
+@test "drivers: _run_shellcheck lives in drivers/shellcheck.sh, not test.sh" {
+  run grep -E '^_run_shellcheck\(\) \{' /source/script/test/drivers/shellcheck.sh
+  assert_success
+  run grep -E '^_run_shellcheck\(\) \{' /source/script/test/test.sh
+  assert_failure
+}
+
+# why: #650 hadolint in its driver
+@test "drivers: _run_hadolint lives in drivers/hadolint.sh, not test.sh (#650)" {
+  run grep -E '^_run_hadolint\(\) \{' /source/script/test/drivers/hadolint.sh
+  assert_success
+  run grep -E '^_run_hadolint\(\) \{' /source/script/test/test.sh
+  assert_failure
+}
+
+# why: #650 driver is a library
+@test "drivers: are sourced libraries (no top-level main invocation)" {
+  run grep -E '^main "\$@"' /source/script/test/drivers/bats.sh
+  assert_failure
+  run grep -E '^main "\$@"' /source/script/test/drivers/shellcheck.sh
+  assert_failure
+  run grep -E '^main "\$@"' /source/script/test/drivers/hadolint.sh
+  assert_failure
+}
+
+# why: #650 driver self-shellcheck
+@test "drivers: _run_shellcheck also lints the driver files themselves" {
+  local _log="${BATS_TEST_TMPDIR}/shellcheck.log"
+  mock_cmd "shellcheck" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_shellcheck
+  '
+  assert_success
+  run cat "${_log}"
+  assert_output --partial "script/test/drivers"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _run_hadolint (ADR-00000011)
+#
+# Single source of truth for the Dockerfiles + config the self-test
+# lints. These guards pin the exact file list + config so the driver
+# can't silently drift from the self-test.yaml hadolint job (which now
+# runs THIS driver, not the hadolint-action).
+# ════════════════════════════════════════════════════════════════════
+
+# why: #650 single-source Dockerfile list + config
+@test "_run_hadolint: lints every Dockerfile in the tree with the shared config" {
+  local _log="${BATS_TEST_TMPDIR}/hadolint.log"
+  mock_cmd "hadolint" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_hadolint
+  '
+  assert_success
+
+  assert [ -f "${_log}" ]
+  run cat "${_log}"
+  # Every Dockerfile the repo carries, with the dist/.hadolint.yaml config
+  # (single source of truth). A Dockerfile no lint pass names is a
+  # Dockerfile whose next edit is unchecked, which is how the tooling one
+  # was linted only by a CI action before this driver existed.
+  assert_output --partial "--config /source/dist/.hadolint.yaml"
+  assert_output --partial "dist/dockerfile/Dockerfile"
+  assert_output --partial "dockerfile/Dockerfile.test-tools"
+  assert_output --partial "dockerfile/Dockerfile.smoke"
+}
+
+# why: A Dockerfile added beside the others and never added to the list is a
+# Dockerfile no lint pass names
+@test "_run_hadolint: the linted list is every Dockerfile the tree carries" {
+  # The list is hand-maintained (the CI hadolint job invokes this driver,
+  # so it has to be a constant, not a glob evaluated at some other cwd).
+  # This is what notices a Dockerfile added beside the others and never
+  # added to it.
+  local _found _listed
+  # A `<Dockerfile>.dockerignore` beside one is BuildKit's per-Dockerfile
+  # ignore file (Dockerfile.config-gen.dockerignore, base#1467), not a
+  # Dockerfile.
+  _found="$( (cd /source && ls dockerfile/Dockerfile.* dist/dockerfile/Dockerfile) | grep -v '\.dockerignore$' | sort)"
+  _listed="$(bash -c '
+    source /source/script/test/test.sh
+    printf "%s\n" "${_HADOLINT_DOCKERFILES[@]}"' | sort)"
+  [[ "${_found}" == "${_listed}" ]]
+}
+
+# why: The config generator's Dockerfile is linted like every other one;
+# ci_spec's equality above holds only once the file and the list entry land
+# together (base#1462).
+@test "_run_hadolint: lints dockerfile/Dockerfile.config-gen (base#1462)" {
+  assert_spec_subject /source/dockerfile/Dockerfile.config-gen \
+      "the config generator's Dockerfile (base#1462)"
+  run bash -c '
+    source /source/script/test/test.sh
+    printf "%s\n" "${_HADOLINT_DOCKERFILES[@]}"'
+  assert_success
+  assert_line 'dockerfile/Dockerfile.config-gen'
+}
+
+# why: A list entry proves only that the name is spelled there. The real
+# hadolint, run by the real driver over a scratch copy of the tree with one
+# violation planted in Dockerfile.config-gen, must go red and name that
+# file; a driver that skipped it would lint the other Dockerfiles clean and
+# exit 0 (base#1462).
+@test "_run_hadolint: a violation planted in Dockerfile.config-gen fails the driver, naming the file (base#1462)" {
+  command -v hadolint >/dev/null 2>&1 \
+    || fail "hadolint is not on PATH; this spec runs in the test-tools image"
+  local _tree="${BATS_TEST_TMPDIR}/tree"
+  mkdir -p "${_tree}"
+  cp -R /source/script /source/dist /source/dockerfile "${_tree}/"
+  # The copy lints clean before the plant, so the red below is the plant's.
+  run bash -c 'set -e; source "$1/script/test/test.sh"; _run_hadolint' _ "${_tree}"
+  assert_success
+  # DL4000 (MAINTAINER is deprecated) is an error-level rule the shared
+  # config does not ignore.
+  printf 'MAINTAINER planted@example.invalid\n' >> "${_tree}/dockerfile/Dockerfile.config-gen"
+  run bash -c 'set -e; source "$1/script/test/test.sh"; _run_hadolint' _ "${_tree}"
+  assert_failure
+  # hadolint's own finding line, `<path>:<line> DL4000 ...`, not the
+  # driver's echo of the command it is about to run.
+  assert_output --regexp '/dockerfile/Dockerfile\.config-gen:[0-9]+ DL4000 '
+}
+
+# why: #650 one invocation per listed Dockerfile
+@test "_run_hadolint: invokes hadolint once per Dockerfile (no extra targets)" {
+  local _log="${BATS_TEST_TMPDIR}/hadolint.log"
+  mock_cmd "hadolint" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  run bash -c '
+    source /source/script/test/test.sh
+    _run_hadolint
+  '
+  assert_success
+  # One hadolint invocation per listed Dockerfile, no extras.
+  local _n
+  _n="$(bash -c '
+    source /source/script/test/test.sh
+    printf "%s\n" "${#_HADOLINT_DOCKERFILES[@]}"')"
+  run grep -c -- '--config' "${_log}"
+  assert_output "${_n}"
+}
+
+# why: #650 host-missing-binary guard
+@test "_run_hadolint: dies with a clear message when hadolint is absent" {
+  # The host has no hadolint binary; the driver must fail loudly pointing
+  # at the test-tools container path, not silently no-op.
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_hadolint
+  '
+  assert_failure
+  assert_output --partial "hadolint not in PATH"
+}
+
+# why: #650 propagates lint failure
+@test "_run_hadolint: exits non-zero when hadolint fails on any Dockerfile" {
+  mock_cmd "hadolint" '
+    for _arg in "$@"; do
+      if [[ "${_arg}" == *"Dockerfile.test-tools" ]]; then
+        printf "DL3000 fake violation\n" >&2
+        exit 1
+      fi
+    done
+    exit 0'
+  run bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _run_hadolint
+  '
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _system_setup prerequisite guards (drivers/bats.sh)
+# ════════════════════════════════════════════════════════════════════
+#
+# _system_setup fails fast with two distinct _die calls when the
+# system prerequisites are absent. Both guards probe SYSTEM_DOCKER_SOCK
+# (default /var/run/docker.sock), so each test points it at its OWN
+# BATS_TEST_TMPDIR path: the socket-absent test needs a path that does not
+# exist, the CLI-absent test creates a transient socket at its path so the
+# socket guard passes first. Per-test paths eliminate the race the two
+# tests used to have on the shared process-global /var/run/docker.sock
+# under parallel bats jobs.
+
+# why: #692 system socket guard
+@test "_system_setup: dies ci_no_docker_socket when the docker socket is absent (#692)" {
+  local _sock="${BATS_TEST_TMPDIR}/absent.sock"
+  run env SYSTEM_DOCKER_SOCK="${_sock}" bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _system_setup
+  '
+  assert_failure
+  assert_output --partial "requires ${_sock}"
+}
+
+# why: #692 system docker-CLI guard
+@test "_system_setup: dies ci_no_docker_cli when docker is not on PATH (#692)" {
+  # Create a transient unix socket at a per-test path so the socket guard
+  # passes, then run with a PATH that omits docker to hit the CLI guard.
+  local _sock="${BATS_TEST_TMPDIR}/present.sock"
+  perl -e 'use IO::Socket::UNIX; my $p = $ARGV[0]; unlink $p; IO::Socket::UNIX->new(Type=>SOCK_STREAM, Local=>$p, Listen=>1) or die $!;' "${_sock}"
+  local _clean="${BATS_TEST_TMPDIR}/nodocker"
+  mkdir -p "${_clean}"
+  local _cmd _src
+  for _cmd in bash sh env cat printf date grep sed find sort awk mktemp \
+              dirname basename id tr head tail cut wc rm mkdir ln cp test pwd; do
+    _src="$(command -v "${_cmd}" 2>/dev/null)" && ln -sf "${_src}" "${_clean}/${_cmd}"
+  done
+  run env PATH="${_clean}" SYSTEM_DOCKER_SOCK="${_sock}" bash -c '
+    set -e
+    source /source/script/test/test.sh
+    _system_setup
+  '
+  assert_failure
+  assert_output --partial "requires docker CLI"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _compute_test_tools_hash / _resolve_test_tools_image
+#
+# The local tooling tag used to be the fixed literal `test-tools:local`,
+# written identically by every checkout on the host. A sibling run
+# rebuilding it displaced the image a live run was already using, with no
+# error anywhere: kcov vanished from the image mid-pass and the pass still
+# reported green. The tag is now keyed to the build inputs -- identical
+# inputs resolve to one tag (a build-cache hit, NOT a rebuild), any input
+# difference resolves to a tag that cannot clobber the other.
+# ════════════════════════════════════════════════════════════════════
+
+# why: #891 content-keyed local tag cannot clobber
+@test "_resolve_test_tools_image: different tooling inputs resolve to different tags (#891)" {
+  local _a="${BATS_TEST_TMPDIR}/a.Dockerfile"
+  local _b="${BATS_TEST_TMPDIR}/b.Dockerfile"
+  printf 'FROM alpine:3.21\nRUN apk add --no-cache kcov\n' > "${_a}"
+  printf 'FROM alpine:3.21\n' > "${_b}"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_a}"'"
+    _resolve_test_tools_image "'"${_b}"'"
+  '
+  assert_success
+  assert [ "${lines[0]}" != "${lines[1]}" ]
+  [[ "${lines[0]}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+  [[ "${lines[1]}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+}
+
+# why: #891 same inputs -> cache hit, not a rebuild
+@test "_resolve_test_tools_image: identical inputs at different paths resolve to the same tag (#891)" {
+  # The cache contract: two checkouts whose tooling Dockerfile is
+  # byte-identical must land on ONE tag, so the second build is a cache hit
+  # rather than a rebuild. The checkout path must therefore not enter the
+  # digest.
+  local _a="${BATS_TEST_TMPDIR}/one/Dockerfile.test-tools"
+  local _b="${BATS_TEST_TMPDIR}/two/Dockerfile.test-tools"
+  mkdir -p "${BATS_TEST_TMPDIR}/one" "${BATS_TEST_TMPDIR}/two"
+  printf 'FROM alpine:3.21\nRUN apk add --no-cache kcov\n' > "${_a}"
+  cp "${_a}" "${_b}"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_a}"'"
+    _resolve_test_tools_image "'"${_b}"'"
+  '
+  assert_success
+  assert [ "${lines[0]}" = "${lines[1]}" ]
+}
+
+# why: #891 CI's pinned published tags untouched
+@test "_resolve_test_tools_image: TEST_TOOLS_IMAGE wins verbatim (#891)" {
+  # CI pins published, version-scoped tags through this env
+  # (build-worker / publish-worker / release-test-tools), and
+  # self-test.yaml pins test-tools:local. The derivation must never
+  # rewrite a caller-pinned value.
+  run bash -c '
+    source /source/script/test/test.sh
+    TEST_TOOLS_IMAGE=ghcr.io/ycpss91255-lab/test-tools:v9.9.9 \
+      _resolve_test_tools_image "/source/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  assert_output "ghcr.io/ycpss91255-lab/test-tools:v9.9.9"
+}
+
+# why: #891 no silent bare-literal fallback
+@test "_resolve_test_tools_image: fails loud when the tooling Dockerfile is missing (#891)" {
+  # No bare-literal fallback: a silent `test-tools:local` here would resolve
+  # to whatever another checkout last built.
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${BATS_TEST_TMPDIR}"'/absent.Dockerfile"
+  '
+  assert_failure
+  assert_output --partial "absent.Dockerfile"
+}
+
+# why: #1166 a build-context COPY is an input; the tag must move with it
+@test "_resolve_test_tools_image: a file the Dockerfile COPYs from the context moves the tag (#1166)" {
+  # The premise this derivation was written on -- "every COPY is
+  # --from=<stage>, so no file of the checkout can reach a layer" -- stopped
+  # holding when the toml-bridge stage arrived. A tag that does not move
+  # when a copied file changes makes _ensure_test_tools_image skip the
+  # rebuild, and the suite then reports a verdict about code that is not in
+  # the tree.
+  local _root="${BATS_TEST_TMPDIR}/moves"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tool.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  local _before="${output}"
+  [[ "${_before}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+
+  printf 'two\n' > "${_root}/dockerfile/tool.py"
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  assert [ "${output}" != "${_before}" ]
+  [[ "${output}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+}
+
+# why: #1166 an instruction that defers a COPY must not be read as context-free
+@test "_resolve_test_tools_image: refuses ONBUILD, which can defer a context COPY (#1166)" {
+  # Every verb but COPY is read as reading no context. ONBUILD is the one
+  # that breaks that reading: it carries another instruction, which may be
+  # a COPY, so passing over it is exactly the silent under-hash this
+  # derivation exists to stop.
+  local _root="${BATS_TEST_TMPDIR}/onbuild"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nONBUILD COPY dockerfile/tool.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_failure
+  assert_output --partial "Dockerfile.test-tools:2"
+  assert_output --partial "ONBUILD"
+}
+
+# why: #1166 the tag must not become a hash of the whole checkout
+@test "_resolve_test_tools_image: a file the Dockerfile does NOT COPY leaves the tag alone (#1166)" {
+  # The other half of the rule. Hashing the whole context would move the
+  # tag on every unrelated source edit -- a rebuild of the tooling image on
+  # every commit, and the build cache defeated -- while changing nothing
+  # about the image.
+  local _root="${BATS_TEST_TMPDIR}/unrelated"
+  mkdir -p "${_root}/dockerfile" "${_root}/script"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tool.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+  printf 'echo one\n' > "${_root}/script/unrelated.sh"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  local _before="${output}"
+
+  printf 'echo two\n' > "${_root}/script/unrelated.sh"
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  assert_output "${_before}"
+}
+
+# why: #1166 a stage source is not a checkout path and must not be looked for
+@test "_resolve_test_tools_image: a COPY --from= source is never looked for in the context (#1166)" {
+  # Every other COPY in the tooling Dockerfile is one of these. If the
+  # derivation went looking for /usr/local/bin/kcov under the checkout it
+  # would refuse every tree it is asked about.
+  local _root="${BATS_TEST_TMPDIR}/staged"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21 AS builder\nFROM alpine:3.21\nCOPY --from=builder /usr/local/bin/kcov /usr/local/bin/kcov\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  [[ "${output}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+}
+
+# why: #1166 a flag that changes WHICH files are copied cannot be guessed at
+@test "_resolve_test_tools_image: refuses a COPY flag it does not model, naming the line (#1166)" {
+  local _root="${BATS_TEST_TMPDIR}/badflag"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY --exclude=*.pyc dockerfile/tool.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_failure
+  assert_output --partial "Dockerfile.test-tools:2"
+  assert_output --partial "--exclude"
+}
+
+# why: #1166 a source that needs docker's own parser is refused, not guessed
+@test "_resolve_test_tools_image: refuses a COPY source it cannot resolve to files (#1166)" {
+  local _root="${BATS_TEST_TMPDIR}/glob"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/*.py /usr/local/bin/\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_failure
+  assert_output --partial "Dockerfile.test-tools:2"
+  assert_output --partial "dockerfile/*.py"
+}
+
+# why: #1166 a partial digest names an image it does not describe
+@test "_resolve_test_tools_image: refuses when a COPYed context path cannot be read (#1166)" {
+  # The loud direction, chosen deliberately: a digest taken over the inputs
+  # that happened to be readable would resolve to a tag that says "this
+  # image" about an image built from something else.
+  local _root="${BATS_TEST_TMPDIR}/absent"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/gone.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_failure
+  assert_output --partial "dockerfile/gone.py"
+}
+
+# _tag_as_nobody <dockerfile>
+#
+# Resolves the tag in a shell that has no privilege to override file
+# modes, and sets $output/$status the way `run` does. The suite runs as
+# root inside the tooling container, where a mode-000 file is still
+# readable, so "unreadable" can only be staged by dropping privilege --
+# every directory from the test tmpdir down has to be traversable for
+# that user, or the probe fails on the way in and the test proves
+# nothing about the derivation.
+_tag_as_nobody() {
+  local _df="${1:?_tag_as_nobody requires <dockerfile>}"
+  local _probe="${BATS_TEST_TMPDIR}/probe.sh"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'source /source/script/test/test.sh' \
+    'unset TEST_TOOLS_IMAGE' \
+    '_resolve_test_tools_image "$1"' > "${_probe}"
+  chmod 755 "${_probe}"
+  local _p="${BATS_TEST_TMPDIR}"
+  while [[ "${_p}" == /* && "${_p}" != "/" ]]; do
+    chmod o+rx "${_p}"
+    _p="$(dirname "${_p}")"
+  done
+  if [[ "$(id -u)" -eq 0 ]]; then
+    run su -s /bin/bash nobody -c "${_probe} ${_df}"
+  else
+    run "${_probe}" "${_df}"
+  fi
+}
+
+# why: #1166 an unreadable Dockerfile hashed the empty string into a real tag
+@test "_resolve_test_tools_image: refuses a tooling Dockerfile it cannot read (#1166)" {
+  # The Dockerfile was the one input that skipped the readability rule its
+  # own COPY sources are held to: the guard tested existence only, so an
+  # unreadable file fell through to `cat`, which wrote to stderr and left
+  # sha256sum hashing an EMPTY stream. Every host that hit it resolved the
+  # SAME tag -- e3b0c44298fc, the digest of the empty string -- and said
+  # nothing, because the pipeline's status was `cut`'s.
+  local _root="${BATS_TEST_TMPDIR}/unreadable"
+  mkdir -p "${_root}/dockerfile"
+  local _df="${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'FROM alpine:3.21\nRUN apk add --no-cache kcov\n' > "${_df}"
+  chmod -R o+rX "${_root}"
+  chmod 000 "${_df}"
+
+  _tag_as_nobody "${_df}"
+  assert_failure
+  # The specific shape of the regression: a tag at all, and that tag in
+  # particular, is the thing that must never come back.
+  refute_output --partial "test-tools:e3b0c44298fc"
+  refute_output --regexp 'test-tools:[0-9a-f]{12}'
+  assert_output --partial "Dockerfile.test-tools"
+}
+
+# why: #1166 a failing producer must not surface as a green partial digest
+@test "_resolve_test_tools_image: refuses a directory COPY holding a file it cannot read (#1166)" {
+  # Not subsumed by the Dockerfile case above, and the reason is the
+  # asymmetry: _reclaim_tool_context_files tests -r on the DIRECTORY and
+  # then globs it, so an unreadable member never meets a guard at all. Its
+  # `cat` fails inside the digest stream and the bytes simply go missing,
+  # leaving a digest that is not empty -- so no e3b0c44298fc to notice --
+  # but partial, naming an image it does not describe.
+  #
+  # The tell, and what makes this a defect rather than a lossy hash: two
+  # different contents of the unreadable member resolved to ONE tag.
+  local _root="${BATS_TEST_TMPDIR}/dirmember"
+  mkdir -p "${_root}/dockerfile/tools"
+  local _df="${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tools /opt/tools\n' > "${_df}"
+  printf 'readable\n' > "${_root}/dockerfile/tools/b.py"
+  printf 'one\n' > "${_root}/dockerfile/tools/a.py"
+  chmod -R o+rX "${_root}"
+  chmod 000 "${_root}/dockerfile/tools/a.py"
+
+  _tag_as_nobody "${_df}"
+  assert_failure
+  refute_output --regexp 'test-tools:[0-9a-f]{12}'
+  assert_output --partial "a.py"
+}
+
+# why: #1166 a subdirectory nothing can enter leaves the digest silently partial
+@test "_resolve_test_tools_image: refuses a directory COPY holding a subdirectory it cannot enter (#1166)" {
+  # The third shape of the one defect, and the one the member case above
+  # cannot see. There the unreadable thing is a FILE: globstar lists it,
+  # its `cat` fails inside the digest stream, and pipefail turns that into
+  # a refusal. Here the unreadable thing is a DIRECTORY: globstar never
+  # enumerates what is under it, so no member of it reaches the stream,
+  # no `cat` is ever attempted, and the pipefail guard has nothing to
+  # fire on. The directory entry itself is dropped by the -f filter. The
+  # digest completes, status 0, over a tree that is missing everything
+  # under `private/` -- and, the tell again, two different contents of
+  # `private/a.py` resolve to ONE tag.
+  local _root="${BATS_TEST_TMPDIR}/dirsub"
+  mkdir -p "${_root}/dockerfile/tools/private"
+  local _df="${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tools /opt/tools\n' > "${_df}"
+  printf 'readable\n' > "${_root}/dockerfile/tools/b.py"
+  printf 'one\n' > "${_root}/dockerfile/tools/private/a.py"
+  chmod -R o+rX "${_root}"
+  chmod 000 "${_root}/dockerfile/tools/private"
+
+  _tag_as_nobody "${_df}"
+  assert_failure
+  refute_output --regexp 'test-tools:[0-9a-f]{12}'
+  assert_output --partial "private"
+}
+
+# why: #1166 a continued COPY is one instruction, not two unparseable ones
+@test "_resolve_test_tools_image: reads a COPY split across a line continuation (#1166)" {
+  local _root="${BATS_TEST_TMPDIR}/cont"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tool.py \\\n    /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  local _before="${output}"
+
+  printf 'two\n' > "${_root}/dockerfile/tool.py"
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  assert [ "${output}" != "${_before}" ]
+}
+
+# why: #1166 the retention rule must retire exactly what the resolver mints
+@test "_resolve_test_tools_image: agrees with the retention derivation on a context COPY (#1166)" {
+  # The reason the derivation is shared rather than written twice: the
+  # retention policy keeps every tag a live checkout still resolves, which
+  # it can only do by computing what the producer computed. Two
+  # implementations of one rule is how they come to disagree, and the
+  # disagreement deletes an image a live run is using.
+  local _root="${BATS_TEST_TMPDIR}/agree"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nCOPY dockerfile/tool.py /usr/local/bin/tool\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+  printf 'one\n' > "${_root}/dockerfile/tool.py"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+    _reclaim_tool_tag_for_path "'"${_root}"'"
+  '
+  assert_success
+  assert [ "${lines[0]}" = "${lines[1]}" ]
+  [[ "${lines[0]}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+}
+
+# why: #1166 a tooling Dockerfile reading no context keeps the tag it had
+@test "_resolve_test_tools_image: a Dockerfile with no context COPY keeps its old tag (#1166)" {
+  # The digest of a Dockerfile that COPYs nothing from the context is the
+  # digest of its bytes and nothing else, exactly as before this rule. The
+  # expected value is the sha256 of that literal content, taken
+  # independently -- not recomputed the way the code does -- so a change of
+  # composition that orphans every image already on the host fails here.
+  local _root="${BATS_TEST_TMPDIR}/nocontext"
+  mkdir -p "${_root}/dockerfile"
+  printf 'FROM alpine:3.21\nRUN apk add --no-cache kcov\n' \
+    > "${_root}/dockerfile/Dockerfile.test-tools"
+
+  run bash -c '
+    source /source/script/test/test.sh
+    unset TEST_TOOLS_IMAGE
+    _resolve_test_tools_image "'"${_root}"'/dockerfile/Dockerfile.test-tools"
+  '
+  assert_success
+  assert_output "test-tools:4f7deb31757c"
+}
+
+# why: #891 one entry point for build + consumers
+@test "main --test-tools-image: prints the resolved tag for the justfile (#891)" {
+  # The single entry point the `just test system` recipe reads, so the
+  # build-only test-tools service and the ci-system consumer cannot
+  # disagree about which tag this run means.
+  run bash -c '
+    unset TEST_TOOLS_IMAGE
+    /source/script/test/test.sh --test-tools-image
+  '
+  assert_success
+  [[ "${output}" =~ ^test-tools:[0-9a-f]{12}$ ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _compute_compose_project_name / _resolve_compose_project_name
+#
+# `docker compose run` was invoked with no `-p`, so compose fell back to
+# the checkout DIRECTORY BASENAME. Two checkouts at ~/a/base and ~/b/base
+# therefore shared one project -- one set of containers, one network --
+# with no warning. The project name is now derived from the ABSOLUTE
+# checkout path, which is the actual discriminator (two worktrees are
+# routinely on the same commit, so a commit-keyed name would collide in
+# exactly the concurrent case this separates).
+# ════════════════════════════════════════════════════════════════════
+
+# why: #891 path-keyed, not directory-basename
+@test "_compute_compose_project_name: two checkouts sharing a basename get different names (#891)" {
+  run bash -c '
+    source /source/script/test/test.sh
+    _n=""
+    _compute_compose_project_name "/home/dev/a/base" _n; printf "%s\n" "${_n}"
+    _compute_compose_project_name "/home/dev/b/base" _n; printf "%s\n" "${_n}"
+  '
+  assert_success
+  [[ "${lines[0]}" =~ ^base-[0-9a-f]{12}$ ]]
+  [[ "${lines[1]}" =~ ^base-[0-9a-f]{12}$ ]]
+  assert [ "${lines[0]}" != "${lines[1]}" ]
+}
+
+# why: #891 one project per checkout, no per-commit churn
+@test "_compute_compose_project_name: the same checkout path is stable across calls (#891)" {
+  # Keyed to the path, not the commit or the run: a checkout keeps ONE
+  # project (and one network) instead of churning a fresh one per commit.
+  run bash -c '
+    source /source/script/test/test.sh
+    _n=""
+    _compute_compose_project_name "/home/dev/a/base" _n; printf "%s\n" "${_n}"
+    _compute_compose_project_name "/home/dev/a/base" _n; printf "%s\n" "${_n}"
+  '
+  assert_success
+  assert [ "${lines[0]}" = "${lines[1]}" ]
+}
+
+# why: #891 compose grammar guaranteed, not hoped for
+@test "_compute_compose_project_name: a hostile checkout path still yields a legal project name (#891)" {
+  # Compose accepts only [a-z0-9][a-z0-9_-]* and a checkout path can hold
+  # anything: spaces, uppercase, punctuation, non-ASCII, a leading dot.
+  # The derivation has to guarantee the grammar, not hope for it.
+  run bash -c '
+    source /source/script/test/test.sh
+    _n=""
+    _compute_compose_project_name "/home/Dev/.My Projects/(BASE) #1/ünïcode/BASE/" _n
+    printf "%s\n" "${_n}"
+  '
+  assert_success
+  [[ "${output}" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+}
+
+# why: #891 env override still wins
+@test "_resolve_compose_project_name: COMPOSE_PROJECT_NAME wins verbatim (#891)" {
+  # CI keys the project to its run id through this env; the derivation is a
+  # local default only.
+  run bash -c '
+    source /source/script/test/test.sh
+    COMPOSE_PROJECT_NAME=ci-run-4242 _resolve_compose_project_name
+  '
+  assert_success
+  assert_output "ci-run-4242"
+}
+
+# why: #891 the missing -p is the defect
+@test "_run_via_compose: passes an explicit -p so the project is not the directory basename (#891)" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    unset COMPOSE_PROJECT_NAME
+    _run_via_compose ci 0
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --regexp "compose -p base-[0-9a-f]{12} "
+}
+
+# why: #891 -p forwards the caller's name
+@test "_run_via_compose: honours COMPOSE_PROJECT_NAME (#891)" {
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    export COMPOSE_PROJECT_NAME=ci-run-4242
+    _run_via_compose ci 0
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "compose -p ci-run-4242 "
+}
+
+# why: #896 one derivation, exported for interpolation
+@test "_run_via_compose: hands compose the very tag the tooling resolver prints (#896)" {
+  # compose.yaml names every service's image ${TEST_TOOLS_IMAGE} with NO
+  # default, so this runner resolves it -- and it must be the SAME value
+  # `just docker build --target test-tools` writes, not a second derivation
+  # that happens to agree. Exported, because compose reads it while
+  # interpolating the file on the host, not inside the container.
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s|%s\n" "${TEST_TOOLS_IMAGE:-<unset>}" "$*" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" 'echo 1000'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    unset TEST_TOOLS_IMAGE
+    _run_via_compose ci 0
+  '
+  assert_success
+
+  local _resolved
+  _resolved="$(unset TEST_TOOLS_IMAGE; /source/script/test/test.sh --test-tools-image)"
+  run grep -F "${_resolved}|compose -p" "${_log}"
+  assert_success
+}
+
+# why: #896 a local-only tag absent means not built, not pull
+@test "_ensure_test_tools_image: builds the derived tag when the host does not have it (#896)" {
+  # The derived tag is local-only -- no registry can serve it -- so an
+  # absent one means "not built yet", never "pull it". It is built through
+  # the same compose service the docker namespace builds.
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    [[ "${1}" == "image" ]] && exit 1
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    unset TEST_TOOLS_IMAGE
+    _ensure_test_tools_image test-tools:abc123abc123 base-000000000000
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_output --partial "compose -p base-000000000000 -f /source/compose.yaml build test-tools"
+}
+
+# why: base#1187 -- a failed tooling build was not observed AT ALL
+@test "_ensure_test_tools_image: a failed build refuses and names the way past it (base#1187)" {
+  # Run directly, test.sh:78 turns on errexit, so a failed build did abort --
+  # with no line saying what to do about it. SOURCED, which is how this spec
+  # reaches the function, the caller's settings apply and neither caller
+  # checks the return, so it simply returned. Either way the operator read
+  # apk reporting every package as "no such package" -- an unreachable index
+  # reads as an EMPTY one -- and went looking for a packaging mistake that
+  # was never there.
+  #
+  # The hint is NOT conditioned on the failure's shape -- a matcher on apk's
+  # wording is one upstream string change away from silence -- but the two
+  # escapes it names are SCOPED, and not scoped alike. A mirror answers an
+  # unreachable index and nothing else; the published image gets past a
+  # broken local build whatever broke it, a typo included, without fixing it;
+  # neither starts a daemon that is not running. This arm asserts both names
+  # are PRESENT, not that either one would work.
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    [[ "${1}" == "image" ]] && exit 1
+    [[ "${1}" == "compose" ]] && exit 1
+    exit 0'
+
+  # The sentinel is what makes this an assertion about STOPPING rather than
+  # about the message. Two things about it are load-bearing: the call sits
+  # inside an `if` CONDITION, and the marker is a FILE.
+  #
+  # The condition, because bash suppresses errexit there. A failure branch
+  # that merely logs and returns -- even one that runs `set -e` first --
+  # reaches the sentinel, and would pass an arm that only ran the function
+  # bare and checked the status.
+  #
+  # The file, because every later way of beating this arm found in review
+  # beat the OBSERVING, not the stopping: closing stdout makes an echoed
+  # marker fail to appear, and `trap 'exit 1' EXIT` forges the status that
+  # would otherwise have given the continuation away. A file written under
+  # BATS_TEST_TMPDIR survives both of those, because it depends on neither.
+  # It is not a proof against every shell state a branch could leave behind
+  # -- `set -r` would refuse the redirection itself -- so what this arm
+  # claims is what was tried against it: `log; return 1`, the same with
+  # `set -e`, the same with `exec 1>&-`, and the same with `trap 'exit 1'
+  # EXIT` all fail it.
+  local _sentinel="${BATS_TEST_TMPDIR}/continued-past-the-failed-build"
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    unset TEST_TOOLS_IMAGE
+    if _ensure_test_tools_image test-tools:abc123abc123 base-000000000000; then :; fi
+    : > "'"${_sentinel}"'"
+  '
+  assert_failure
+  refute [ -e "${_sentinel}" ]
+  # Both escapes NAMED -- neither is discoverable from the build output. What
+  # each one is good for is the diagnostic's business, not this arm's.
+  assert_output --partial "APK_MIRROR"
+  assert_output --partial "TEST_TOOLS_IMAGE"
+  # It really did attempt the build -- otherwise this arm would pass for a
+  # function that refused before trying.
+  run cat "${_log}"
+  assert_output --partial "build test-tools"
+}
+
+# why: #896 CI provisions its own
+@test "_ensure_test_tools_image: leaves a caller-pinned image alone (#896)" {
+  # CI pins a published GHCR tag, or an in-run tag it built itself, and
+  # provisioning it is the caller's job -- building over it here would
+  # replace what the caller asked for.
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    [[ "${1}" == "image" ]] && exit 1
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    export TEST_TOOLS_IMAGE=ghcr.io/ycpss91255-lab/test-tools:v9.9.9
+    _ensure_test_tools_image "${TEST_TOOLS_IMAGE}" base-000000000000
+  '
+  assert_success
+
+  run cat "${_log}"
+  refute_output --partial "build test-tools"
+}
+
+# why: #896 identical inputs are a cache hit
+@test "_ensure_test_tools_image: does not rebuild a tag the host already has (#896)" {
+  # Identical tooling inputs resolve to one tag on purpose: the second run
+  # is a cache HIT, not a rebuild.
+  local _log="${BATS_TEST_TMPDIR}/docker.log"
+  mock_cmd "docker" '
+    printf "%s\n" "$*" >> "'"${_log}"'"
+    exit 0'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    unset TEST_TOOLS_IMAGE
+    _ensure_test_tools_image test-tools:abc123abc123 base-000000000000
+  '
+  assert_success
+
+  run cat "${_log}"
+  refute_output --partial "build test-tools"
+}
+
+# why: #891 one entry point for both call sites
+@test "main --compose-project-name: prints the resolved project for the justfile (#891)" {
+  # The `just test system` recipe reads this so its bare `docker compose run`
+  # names the project the same way test.sh's does, instead of inheriting the
+  # directory basename at a second call site.
+  run bash -c '
+    unset COMPOSE_PROJECT_NAME
+    /source/script/test/test.sh --compose-project-name
+  '
+  assert_success
+  [[ "${output}" =~ ^base-[0-9a-f]{12}$ ]]
+}
+
+# why: #891 no silent degrade to the shared bare prefix
+@test "_compute_compose_project_name: fails loud when the digest cannot be produced (#891)" {
+  # A short/empty digest would degrade to the bare `base-` prefix -- a name
+  # EVERY checkout resolves, i.e. the collision this derivation exists to
+  # prevent, reintroduced silently.
+  local _clean="${BATS_TEST_TMPDIR}/nosha"
+  mkdir -p "${_clean}"
+  printf '#!/bin/bash\nexit 0\n' > "${_clean}/sha256sum"
+  chmod +x "${_clean}/sha256sum"
+  local _cmd _src
+  for _cmd in bash cut printf date grep sed tr head; do
+    _src="$(command -v "${_cmd}" 2>/dev/null)" && ln -sf "${_src}" "${_clean}/${_cmd}"
+  done
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${_clean}"'"
+    _n=""
+    _compute_compose_project_name "/home/dev/a/base" _n
+  '
+  assert_failure
+  assert_output --partial "no usable digest"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# HOST_UID / HOST_GID: the ownership of everything the suite writes
+#
+# The self-test containers run against a bind-mounted checkout, so these
+# two decide who owns the files the suite leaves in the working tree.
+# compose used to substitute 1000 when they were absent, which on any host
+# whose developer is not uid 1000 wrote files owned by a stranger and said
+# nothing. The fallback is gone, so every path that reaches compose has to
+# supply them -- and `-e HOST_UID=...` does NOT: that sets the variable
+# inside the container, while compose's own `${HOST_UID}` interpolation
+# reads the environment of the `docker compose` process.
+# ════════════════════════════════════════════════════════════════════
+
+@test "_run_via_compose: the real ids are in the environment compose interpolates (#895)" {
+  local _log="${BATS_TEST_TMPDIR}/docker-env.log"
+  mock_cmd "docker" '
+    printf "uid=%s gid=%s\n" "${HOST_UID:-UNSET}" "${HOST_GID:-UNSET}" >> "'"${_log}"'"
+    exit 0'
+  mock_cmd "id" '
+    case "${1}" in
+      -u) echo 4242 ;;
+      -g) echo 4243 ;;
+    esac'
+
+  run bash -c '
+    source /source/script/test/test.sh
+    export PATH="'"${MOCK_DIR}"'"
+    _run_via_compose ci 0
+  '
+  assert_success
+
+  run cat "${_log}"
+  assert_success
+  assert_output --partial "uid=4242 gid=4243"
+}
+
+@test "_fix_permissions: refuses a non-numeric id instead of handing it to chown (#895)" {
+  # A junk id reaches `chown` as a username, and `chown -R nobody:` on a
+  # tree the suite just wrote is not a diagnostic anyone wants to read
+  # backwards from. Say which variable is wrong.
+  local _dir="${BATS_TEST_TMPDIR}/repo"
+  mkdir -p "${_dir}/coverage"
+  run env HOST_UID="root " HOST_GID=1000 bash -c '
+    source /source/script/test/test.sh
+    REPO_ROOT="'"${_dir}"'"
+    _fix_permissions
+  '
+  assert_failure
+  assert_output --partial "HOST_UID"
+}

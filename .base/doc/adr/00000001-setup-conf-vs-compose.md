@@ -1,5 +1,8 @@
 # Responsibility split between setup.conf and compose-native mechanisms
 
+> Serves: mechanism -- the config-resolution boundary (setup.conf vs
+> compose-native); serves the one-source-render goal, no invariant.
+
 - **Date:** 2026-05-28
 - **Status:** Accepted
 
@@ -94,8 +97,41 @@ to N>=2 -> setup.conf. Only one repo -> escape hatch.
   setup.conf's merge semantics.
 - setup.conf keeps section-replace semantics. No change to
   key-level merge.
+
+**Amendment (ADR-37 D4 #1130, 2026-09-07): type-aware merge for TOML.**
+The `.setup.toml` format introduces type-aware merge semantics: scalar
+keys within a `[table]` get key-level merge (upper layer overrides only
+the keys it defines; unmentioned keys inherit), while `[[array of
+tables]]` entries get array replace (the entire array comes from the
+highest layer that defines it). This applies only to TOML layers; the
+INI `.setup.conf` chain retains section-replace. The TOML merge runs
+in Python inside the containerised bridge (ADR-37), where type
+information (dict vs list) is natively available.
+
+**Amendment (#1137, 2026-10-10):** "the highest layer that defines it"
+includes a layer that defines it with ZERO entries -- see ADR-00000037's
+zero-entry amendment for why the absent key and the empty array are not
+the same state.
+
+**Amendment (#1235, 2026-10-11):** the key-level half of that rule can
+change what a scalar resolves to wherever section-replace had masked a
+lower layer's value -- see ADR-00000037's masked-scalar amendment for the
+accepted cost and the check an upgrader runs.
 - If the same kind of customization appears in 3+ repos later,
   re-evaluate -- it may graduate into setup.conf.
 - Downstream repos can still write `compose.override.yaml` for
   local ad-hoc tweaks (compose auto-loads it); no need to detour
   through setup.conf.
+
+**Amendment (#600 / #881, 2026-08-17): the per-instance overlay named
+above is historical, not a mechanism to reach for.** `--instance`,
+`INSTANCE_SUFFIX` and `config/instances/<name>.{yaml,env}` were removed
+by #600; base is **single-instance** -- one fixed-name container /
+project per repo, and multi-instance orchestration belongs to the
+compose layer. The decision recorded here is unchanged, and this is not
+a reversal of it: per-instance isolation was the single-repo case the
+generality rule was argued over, and its removal is that rule applied.
+Running two *checkouts* of the same repo side by side is a different
+problem, and it **is** answered inside setup.conf, by `[project] name`
+in `.setup.conf.local` (#893, ADR-00000025) -- read that ADR rather
+than the Context paragraph above for a mechanism that exists today.

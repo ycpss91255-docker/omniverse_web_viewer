@@ -1,0 +1,1016 @@
+#!/usr/bin/env bats
+#
+# Unit tests for dist/script/docker/wrapper/build.sh argument handling and control flow.
+#
+# Strategy:
+#   * A sandbox tree mirrors the layout build.sh expects (script alongside a
+#     .base/ subtree). We copy the real _lib.sh into the sandbox so
+#     _load_env / _compose_project are exercised, while setup.sh is replaced
+#     with a mock that records invocations and touches .env + compose.yaml.
+#   * docker is stubbed via PATH prepend — the stub logs its argv to
+#     ${DOCKER_LOG} and exits 0. Combined with DRY_RUN=true in build.sh's
+#     _compose path, the stub only receives docker build / docker rmi calls.
+#
+# why: Unit tests for `build.sh` argument handling and control flow. Uses a
+# sandbox tree mirroring the expected layout (build.sh + `template/` subtree
+# with real `_lib.sh` / `i18n.sh`, mock `setup.sh`). `docker` is
+# PATH-shimmed so the stub captures argv; `build.sh` is symlinked (not
+# copied) so kcov attributes coverage to the real source file.
+#
+# Covers: `--help` (en/zh/zh-CN/ja), `--setup`/`-s`, auto-bootstrap on
+# missing `.env` / `setup.toml` / `compose.yaml`, drift-check path when all
+# three are present, bootstrap staying non-interactive (setup.sh direct, not
+# `setup_tui.sh`), defensive guard when setup produces no `.env`, TARGETARCH
+# build-arg forwarding, `--no-cache`, `--clean-tools`, positional `TARGET`,
+# **`-t` / `--target TARGET` alias** (#280: short + long form, last-wins
+# resolution against positional `[TARGET]` in both orderings, `-t`
+# value-required guard, usage help mention), `--lang` argument validation,
+# fallback `_detect_lang` branches (zh_TW/zh_CN/ja), real (non-dry-run)
+# docker build invocation, **version-scoped local test-tools tag** (#828:
+# the internal build derives `test-tools:<version>` from `.base/.version`
+# and forwards it as the `TEST_TOOLS_IMAGE` build-arg; fails loud on a
+# missing version, no bare-tag fallback), **the self-managed-repo tooling
+# tag** (#896: a repo with no `.base/` subtree has no pinned version to
+# scope a local tag by, so build.sh asks that repo's own
+# `script/test/test.sh --test-tools-image` rather than deriving a second
+# tag, and forwards the result on BOTH channels -- the `--build-arg` a
+# consumer Dockerfile reads and the exported environment a self-managed
+# `compose.yaml` interpolates; repos that do carry `.base/` keep the
+# version-scoped derivation), **runtime log-line i18n** (bootstrap /
+# drift-regen / err_no_env messages translate in all four languages via the
+# local `_msg()` table; English remains the default), and **`-C` / `--chdir`
+# flag** (docker_harness#53: pre-pass overrides FILE_PATH to redirect the
+# wrapper to a different repo, both short and long form, value-required and
+# directory-existence guards, usage help mention), and **`-v` / `--verbose`
+# / `-vv` / `--very-verbose` flag** (#311: exports `BUILDKIT_PROGRESS=plain`
+# so a hung `docker build`'s RUN step output is visible; `-vv` adds `set -x`
+# on the wrapper itself; usage help mentions all four spellings), and **#690
+# pre-build hook abort** (a failing `script/hooks/pre/build.sh` makes the
+# wrapper exit the hook's rc via `_run_pre_hook build "$@" || exit $?` AND
+# `docker compose build` never runs).
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  export LOG_FORMAT=text
+  load "${BATS_TEST_DIRNAME}/test_helper"
+
+  # shellcheck disable=SC2154
+  TEMP_DIR="$(mktemp -d)"
+  export TEMP_DIR
+
+  SANDBOX="${TEMP_DIR}/repo"
+  mkdir -p "${SANDBOX}/.base/dist/script/docker/lib" \
+           "${SANDBOX}/.base/dist/script/docker/wrapper" \
+           "${SANDBOX}/.base/dockerfile" \
+           "${SANDBOX}/config/docker"
+
+  cp /source/dist/script/docker/lib/_lib.sh     "${SANDBOX}/.base/dist/script/docker/lib/_lib.sh"
+  cp /source/dist/script/docker/lib/i18n.sh     "${SANDBOX}/.base/dist/script/docker/lib/i18n.sh"
+  # _lib.sh is an umbrella that sources lib/*.sh sub-libs.
+  cp /source/dist/script/docker/lib/*    "${SANDBOX}/.base/dist/script/docker/lib/"
+  # Symlink (not copy) so kcov attributes coverage to /source/dist/script/docker/wrapper/build.sh.
+  ln -s /source/dist/script/docker/wrapper/build.sh "${SANDBOX}/build.sh"
+  touch "${SANDBOX}/.base/dockerfile/Dockerfile.test-tools"
+  # Pinned base subtree version -- build.sh version-scopes the local
+  # test-tools tag by this file so two base versions never collide on
+  # one host (tag derivation asserted below).
+  printf 'v9.9.9-test\n' > "${SANDBOX}/.base/.version"
+
+  MOCK_SETUP_LOG="${TEMP_DIR}/setup.log"
+  export MOCK_SETUP_LOG
+
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+# Mock setup.sh (subprocess-only after Phase B-1):
+#   - `check-drift` subcommand → exit 0 (no drift in this baseline)
+#   - apply (default / explicit / legacy flag-only) → write .env + compose
+set -euo pipefail
+_subcmd="apply"
+case "${1:-}" in
+  check-drift) _subcmd="check-drift"; shift ;;
+  apply)       shift ;;
+esac
+_base=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base-path) _base="$2"; shift 2 ;;
+    --lang)      shift 2 ;;
+    *)           shift ;;
+  esac
+done
+case "${_subcmd}" in
+  check-drift) exit 0 ;;
+  apply)
+    printf 'setup.sh invoked --base-path %s\n' "${_base}" >> "${MOCK_SETUP_LOG}"
+    {
+      echo "USER_NAME=tester"
+      echo "IMAGE_NAME=mockimg"
+      echo "DOCKER_HUB_USER=mockuser"
+    } > "${_base}/.env.generated"
+    echo "# mock compose" > "${_base}/compose.yaml"
+    ;;
+esac
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+
+  BIN_DIR="${TEMP_DIR}/bin"
+  mkdir -p "${BIN_DIR}"
+  DOCKER_LOG="${TEMP_DIR}/docker.log"
+  export DOCKER_LOG
+  cat > "${BIN_DIR}/docker" <<'EOS'
+#!/usr/bin/env bash
+{
+  printf 'docker'
+  printf ' %q' "$@"
+  printf '\n'
+} | tee -a "${DOCKER_LOG}"
+EOS
+  chmod +x "${BIN_DIR}/docker"
+  export PATH="${BIN_DIR}:${PATH}"
+}
+
+teardown() {
+  rm -rf "${TEMP_DIR}"
+}
+
+@test "build.sh --help exits 0 and shows usage" {
+  run bash "${SANDBOX}/build.sh" --help
+  assert_success
+  assert_output --partial "build.sh"
+}
+
+@test "build.sh --setup forces setup.sh to run" {
+  run bash "${SANDBOX}/build.sh" --setup --dry-run
+  assert_success
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  run cat "${MOCK_SETUP_LOG}"
+  assert_output --partial "setup.sh invoked --base-path ${SANDBOX}"
+}
+
+@test "build.sh -s short flag is equivalent to --setup" {
+  run bash "${SANDBOX}/build.sh" -s --dry-run
+  assert_success
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+}
+
+@test "build.sh bootstraps setup.sh when .env is missing" {
+  # Sandbox starts without .env → build.sh must auto-bootstrap via setup.sh.
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "First run"
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  assert [ -f "${SANDBOX}/.env.generated" ]
+}
+
+@test "build.sh auto-regens .env / compose.yaml when drift detected" {
+  # Regression (v0.9.5): drift used to be warn-only, leaving the stale
+  # .env in place. Users had to remember `./build.sh --setup` after
+  # every git pull / setup.toml edit. Now the drift branch regens
+  # automatically since .env / compose.yaml are derived artifacts.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  # Patch the mock so check-drift subcommand reports drift (exit 1).
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+_subcmd="apply"
+case "${1:-}" in
+  check-drift) _subcmd="check-drift"; shift ;;
+  apply)       shift ;;
+esac
+_base=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base-path) _base="$2"; shift 2 ;;
+    --lang)      shift 2 ;;
+    *)           shift ;;
+  esac
+done
+case "${_subcmd}" in
+  check-drift)
+    printf '[setup] drift detected: stub\n' >&2
+    exit 1
+    ;;
+  apply)
+    printf 'setup.sh invoked --base-path %s\n' "${_base}" >> "${MOCK_SETUP_LOG}"
+    {
+      echo "USER_NAME=tester"
+      echo "IMAGE_NAME=mockimg"
+      echo "DOCKER_HUB_USER=mockuser"
+    } > "${_base}/.env.generated"
+    echo "# mock compose" > "${_base}/compose.yaml"
+    ;;
+esac
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "regenerating"
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  run cat "${MOCK_SETUP_LOG}"
+  assert_output --partial "setup.sh invoked --base-path ${SANDBOX}"
+}
+
+@test "build.sh skips setup.sh when .env AND setup.toml AND compose.yaml exist (drift-check path)" {
+  # Pre-create all three derived files → build.sh must NOT execute
+  # setup.sh, only source it for drift detection.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  refute_output --partial "First run"
+  assert [ ! -f "${MOCK_SETUP_LOG}" ]
+}
+
+@test "build.sh bootstraps setup.sh when setup.toml is missing (even if .env exists)" {
+  # Regression: previously build.sh only checked .env. If the user
+  # manually deleted setup.toml to reset to defaults, .env alone is
+  # stale and build would skip the bootstrap. Now missing setup.toml
+  # also triggers the bootstrap path.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  rm -f "${SANDBOX}/setup.toml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "First run"
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+}
+
+@test "build.sh bootstraps setup.sh when compose.yaml is missing (fresh clone)" {
+  # Regression (v0.9.2): v0.9.0 started gitignoring compose.yaml, so
+  # a fresh clone has .env.example absent + setup.toml tracked +
+  # compose.yaml missing. Prior bootstrap check only looked at .env /
+  # setup.toml and skipped to the drift path, which then blew up in
+  # _load_env because .env also wasn't there. Missing compose.yaml
+  # must now trigger the bootstrap path on its own.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  rm -f "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "First run"
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  assert [ -f "${SANDBOX}/compose.yaml" ]
+}
+
+@test "build.sh bootstrap calls setup.sh directly, not setup_tui.sh" {
+  # Regression (v0.9.2): bootstrap used to dispatch through
+  # _run_interactive, which on a TTY launches setup_tui.sh. A user who
+  # pressed Esc / Ctrl+C in the TUI ended up with no .env and the next
+  # build step blew up. Bootstrap must always go through setup.sh
+  # non-interactively; TUI is reserved for explicit --setup.
+  cat > "${SANDBOX}/setup_tui.sh" <<'EOS'
+#!/usr/bin/env bash
+echo "TUI_INVOKED" >> "${MOCK_SETUP_LOG}.tui"
+exit 0
+EOS
+  chmod +x "${SANDBOX}/setup_tui.sh"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  assert [ ! -f "${MOCK_SETUP_LOG}.tui" ]
+}
+
+@test "build.sh fails with clear error if setup.sh produced no .env" {
+  # Defensive guard: if bootstrap runs but setup.sh exits without
+  # writing .env (user cancelled a TUI, setup.sh crashed, etc.), the
+  # next step would fail deep in _load_env with a cryptic path error.
+  # Surface a helpful message instead.
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+# Mock that exits cleanly but produces nothing.
+exit 0
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_failure
+  assert_output --partial ".env"
+  assert_output --partial "--setup"
+}
+
+@test "build.sh --no-cache is forwarded to docker build and compose" {
+  run bash "${SANDBOX}/build.sh" --no-cache --dry-run
+  assert_success
+  assert_output --partial "--no-cache"
+}
+
+@test "build.sh --clean-tools schedules docker rmi via trap" {
+  run bash "${SANDBOX}/build.sh" --clean-tools --dry-run
+  assert_success
+}
+
+@test "build.sh accepts positional TARGET argument" {
+  # Asserted on compose's ARGV, not on the transcript. The whole-transcript
+  # form this replaced was satisfied by the prune hint
+  # (`[dry-run] docker rmi <old-id-of mockuser/mockimg:test if displaced>`)
+  # and by the config summary, so pinning the compose target to a literal
+  # `devel` left this and the four cases below green.
+  run bash "${SANDBOX}/build.sh" --dry-run test
+  assert_success
+  assert_compose_verb_target build test
+}
+
+@test "build.sh -t TARGET (short form) selects the build target (#280)" {
+  run bash "${SANDBOX}/build.sh" --dry-run -t test
+  assert_success
+  assert_compose_verb_target build test
+}
+
+@test "build.sh --target TARGET (long form) selects the build target (#280)" {
+  run bash "${SANDBOX}/build.sh" --dry-run --target test
+  assert_success
+  assert_compose_verb_target build test
+}
+
+@test "build.sh -t + positional: last positional wins (#280)" {
+  # Documented contract: when both forms are passed, the rightmost
+  # argument wins regardless of which style it was given in.
+  run bash "${SANDBOX}/build.sh" --dry-run -t test runtime
+  assert_success
+  # `runtime` was the last token, so it should be the TARGET compose is
+  # handed -- and the loser must not be what compose got.
+  assert_compose_verb_target build runtime
+}
+
+@test "build.sh positional + -t: last -t wins (#280)" {
+  run bash "${SANDBOX}/build.sh" --dry-run test -t runtime
+  assert_success
+  assert_compose_verb_target build runtime
+}
+
+@test "build.sh -t with no value errors clearly (#280)" {
+  run bash "${SANDBOX}/build.sh" --dry-run -t
+  assert_failure
+  assert_output --partial "-t/--target requires a value"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Unrecognised leading-dash token is a usage error, not a target
+# ════════════════════════════════════════════════════════════════════
+
+# why: the reported defect, in its plainest form -- before this guard the
+# wrapper exited 0 and the only complaint came from compose, naming a service
+# the caller never typed.
+@test "build.sh refuses a mistyped flag instead of building it as a target (#1120)" {
+  run bash "${SANDBOX}/build.sh" --dry-run --no-cahce
+  assert_failure 2
+  assert_output --partial "--no-cahce"
+  refute_output --partial "build --no-cahce"
+}
+
+# why: the worst shape of the defect and the one a happy-path assertion cannot
+# tell apart from a correct run: the swallowed flag was overwritten by the next
+# token, so a wrong invocation produced the right build and said nothing.
+@test "build.sh refuses an unimplemented flag even when a target follows it (#1120)" {
+  # `--stage` is designed in ADR-00000011 and not implemented by the wrapper,
+  # which is why a caller plausibly types it.
+  run bash "${SANDBOX}/build.sh" --dry-run --stage test-tools
+  assert_failure 2
+  assert_output --partial "--stage"
+  refute_output --partial "build test-tools"
+}
+
+# why: the flag used to reach BOTH docker compose build (as the service name)
+# and docker rmi (as the image tag), so a refusal has to happen before either
+# -- not merely be reported after.
+@test "build.sh refuses a valueless unimplemented flag rather than naming it as the service (#1120)" {
+  run bash "${SANDBOX}/build.sh" --dry-run --stage
+  assert_failure 2
+  assert_output --partial "--stage"
+  refute_output --partial "build --stage"
+}
+
+# why: the load-bearing control case. The guard would be a regression if it
+# cost the positional TARGET the README documents, so this is what keeps the
+# fix from turning into a blanket refusal of the positional form.
+@test "build.sh still accepts a bare positional TARGET after the dash guard (#1120)" {
+  run bash "${SANDBOX}/build.sh" --dry-run runtime
+  assert_success
+  assert_output --partial "runtime"
+}
+
+# why: pins the boundary from the other side -- the token names a target that
+# really exists, so the leading dash is the only thing that may refuse it.
+@test "build.sh refuses a dash-prefixed spelling of a real target (#1120)" {
+  run bash "${SANDBOX}/build.sh" --dry-run --runtime
+  assert_failure 2
+  assert_output --partial "--runtime"
+}
+
+@test "build.sh --help mentions -t / --target (#280)" {
+  run bash "${SANDBOX}/build.sh" --help
+  assert_success
+  assert_output --partial "-t, --target"
+}
+
+@test "build.sh passes --build-arg TARGETARCH=<value> when TARGET_ARCH set in .env" {
+  # Seed .env with TARGET_ARCH so the drift-check path loads it into
+  # the build.sh environment; then the test-tools build should forward
+  # it via --build-arg.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+    echo "TARGET_ARCH=arm64"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "--build-arg TARGETARCH=arm64"
+}
+
+@test "build.sh omits --build-arg TARGETARCH when TARGET_ARCH absent from .env" {
+  # No TARGET_ARCH line → BuildKit auto-fills, build.sh must not pass
+  # any --build-arg for TARGETARCH.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  refute_output --partial "TARGETARCH"
+}
+
+@test "build.sh passes --network <value> to docker build when BUILD_NETWORK set in .env" {
+  # Seed .env with BUILD_NETWORK. [build] network controls the docker
+  # build network mode for the auxiliary test-tools image. Required on
+  # hosts where Docker's bridge NAT can't reach the outside (e.g.
+  # Jetson L4T without iptable_raw kernel module).
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+    echo "BUILD_NETWORK=host"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "--network host"
+}
+
+@test "build.sh omits --network when BUILD_NETWORK absent from .env" {
+  # No BUILD_NETWORK line → docker build uses its default network
+  # (bridge). build.sh must not pass any --network flag.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  refute_output --partial "--network"
+}
+
+# why: Both Chinese usage heredocs open with the same two characters
+# meaning "Usage", so asserting that shared token could not tell
+# Traditional from Simplified: pointing the zh-CN arm at the Traditional
+# block left every locale test green. The token asserted here is the
+# help-flag description line in its Traditional spelling, which the
+# Simplified block cannot contain, and the refute names the Simplified
+# spelling that must not appear -- so the pair is red in both directions.
+@test "build.sh --lang zh-TW prints Traditional Chinese usage text" {
+  run bash "${SANDBOX}/build.sh" --lang zh-TW --help
+  assert_success
+  assert_output --partial "顯示此說明"
+  refute_output --partial "显示此说明"
+}
+
+@test "build.sh --lang requires a value" {
+  run bash "${SANDBOX}/build.sh" --lang
+  assert_failure
+}
+
+# why: The Simplified half of the same decision. The shared "Usage" token
+# this used to assert is byte-identical in both Chinese heredocs, so a
+# zh-CN arm rendering the Traditional block read green. The token asserted
+# here is the help-flag description line in its Simplified spelling, which
+# the Traditional block cannot contain.
+@test "build.sh --lang zh-CN prints Simplified Chinese usage text" {
+  run bash "${SANDBOX}/build.sh" --lang zh-CN --help
+  assert_success
+  assert_output --partial "显示此说明"
+  refute_output --partial "顯示此說明"
+}
+
+@test "build.sh --lang ja prints Japanese usage text" {
+  run bash "${SANDBOX}/build.sh" --lang ja --help
+  assert_success
+  assert_output --partial "使用法"
+}
+
+@test "build.sh --help documents QUIET in every locale (#895)" {
+  # QUIET mutes the pre-build configuration summary. It shipped in the same
+  # commit as the summary it mutes, with a code comment naming the use case
+  # (piped / CI logs) and nothing a user could read. Help text is where a
+  # user looks for it, and a string that lands in one locale is not done.
+  local _lang
+  for _lang in en zh-TW zh-CN ja; do
+    run bash "${SANDBOX}/build.sh" --lang "${_lang}" --help
+    assert_success
+    assert_output --partial "QUIET=1"
+  done
+}
+
+# ── /lint/-layout _resolve_lang (flat dir: build.sh + _lib.sh + i18n.sh) ───
+# After the inline fallback is gone; scripts in the Dockerfile test
+# stage rely on _lib.sh + i18n.sh copied alongside. One locale exercises
+# that layout, by symlinking build.sh (for kcov) and copying the helpers.
+
+# why: The flat layout has no `template/` beside the wrapper, so the
+# wrapper's own bootstrap has to find `lib/i18n.sh` next to it and let
+# `_resolve_lang` pick the heredoc. That composition is the property only a
+# test in this file can pin, and one locale pins it. The zh_CN and ja twins
+# were folded away because the halves they added are pinned closer to the
+# source: the LANG-to-code mapping at the function seam in lib_spec.bats
+# (`_resolve_lang sets 'zh-CN' for zh_CN.UTF-8`, `... for zh_SG`, `... 'ja'
+# for ja_JP.UTF-8`) and each usage() arm by the `--lang` tests above.
+# Measured on the whole unit tier: pointing `_detect_lang`'s `zh_CN*|zh_SG*`
+# and `ja*` arms at "en" turned 14 of 4726 tests red with the twins present
+# and 6 with them gone -- the three `_resolve_lang` tests, the two
+# `_sanitize_lang` locale tests, and justfile_user_spec's Japanese recipe
+# summaries (base#1117).
+@test "build.sh in /lint/ layout maps zh_TW.UTF-8 to zh-TW" {
+  local _tmp
+  _tmp="$(mktemp -d)"
+  ln -s /source/dist/script/docker/wrapper/build.sh "${_tmp}/build.sh"
+  mkdir -p "${_tmp}/lib"
+  cp /source/dist/script/docker/lib/* "${_tmp}/lib/"
+  LANG=zh_TW.UTF-8 run bash "${_tmp}/build.sh" -h
+  assert_success
+  assert_output --partial "顯示此說明"
+  refute_output --partial "显示此说明"
+  rm -rf "${_tmp}"
+}
+
+@test "build.sh calls real docker build when --dry-run is not set" {
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  echo "# mock compose" > "${SANDBOX}/compose.yaml"
+
+  bash "${SANDBOX}/build.sh"
+  run cat "${DOCKER_LOG}"
+  assert_output --partial "docker build"
+  # Local tag is version-scoped by .base/.version (not a bare
+  # test-tools:local), so different base versions never collide on
+  # one host.
+  assert_output --partial "-t test-tools:v9.9.9-test"
+  refute_output --partial "-t test-tools:local"
+  # The resolved tag is forwarded to the compose build so the
+  # downstream Dockerfile's FROM ${TEST_TOOLS_IMAGE} resolves it.
+  assert_output --partial "TEST_TOOLS_IMAGE=test-tools:v9.9.9-test"
+}
+
+# why: the tooling Dockerfile COPYs dockerfile/toml_bridge.py from its
+# build context, a path only the vendored base carries -- a consumer root
+# has no dockerfile/ -- so the context is the `.base/` subtree, not the
+# consumer root (base#1172)
+@test "build.sh builds the local test-tools image with the .base subtree as its context (base#1172)" {
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  echo "# mock compose" > "${SANDBOX}/compose.yaml"
+
+  bash "${SANDBOX}/build.sh"
+  run cat "${DOCKER_LOG}"
+  assert_output --partial "-f ${SANDBOX}/.base/dockerfile/Dockerfile.test-tools ${SANDBOX}/.base -q"
+  refute_output --partial "-f ${SANDBOX}/.base/dockerfile/Dockerfile.test-tools ${SANDBOX} -q"
+}
+
+# why: --dry-run prints the build it would run; the printed context must
+# be the one the real build uses (base#1172)
+@test "build.sh --dry-run prints the .base subtree as the test-tools build context (base#1172)" {
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "-f ${SANDBOX}/.base/dockerfile/Dockerfile.test-tools ${SANDBOX}/.base -q"
+  refute_output --partial "-f ${SANDBOX}/.base/dockerfile/Dockerfile.test-tools ${SANDBOX} -q"
+}
+
+@test "build.sh fails loud when .base/.version is missing (no bare test-tools:local fallback)" {
+  # No silent fallback to a bare, version-agnostic tag: if build.sh
+  # must build the local test-tools image but cannot resolve the base
+  # version, it aborts rather than tagging test-tools:local.
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  echo "# mock compose" > "${SANDBOX}/compose.yaml"
+  rm -f "${SANDBOX}/.base/.version"
+
+  run bash "${SANDBOX}/build.sh"
+  assert_failure
+  run cat "${DOCKER_LOG}"
+  refute_output --partial "-t test-tools:local"
+}
+
+@test "build.sh skips internal test-tools build when TEST_TOOLS_IMAGE is set (#317 P2)" {
+  # When the caller has its own test-tools provisioning (CI pre-builds
+  # via buildx GHA cache; downstream production builds pin to a GHCR
+  # rolling/release tag), the internal `docker build -t test-tools:local`
+  # in build.sh is wasted work. Set TEST_TOOLS_IMAGE and assert the
+  # internal build step does not run; the main `docker compose build`
+  # still runs (that's not what we're skipping).
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  echo "# mock compose" > "${SANDBOX}/compose.yaml"
+
+  TEST_TOOLS_IMAGE=test-tools:local bash "${SANDBOX}/build.sh"
+  run cat "${DOCKER_LOG}"
+  refute_output --partial "-t test-tools:local"
+  # The caller-pinned value is still forwarded to the compose build so
+  # the Dockerfile's FROM ${TEST_TOOLS_IMAGE} resolves the pinned image.
+  assert_output --partial "TEST_TOOLS_IMAGE=test-tools:local"
+}
+
+# ── self-managed repo: the tooling tag comes from that repo's resolver ─────
+#
+# base is the template SOURCE (ADR-00000011 sec.4): no `.base/` subtree, so
+# no pinned version to scope a local tools tag by, and a hand-authored
+# compose.yaml whose `image: ${TEST_TOOLS_IMAGE}` carries no default at
+# all. Deriving a SECOND tag in build.sh is what let the tag the build
+# writes differ from the tag the repo's test entry runs, so build.sh asks
+# that repo's own resolver.
+
+# _make_self_managed_repo <dir> <tag>
+#
+# A repo laid out the way base lays itself out: dist/ at the root (no
+# `.base/`), the wrapper reached by symlink, a hand-authored compose.yaml,
+# and a stub `script/test/test.sh --test-tools-image` printing <tag>.
+_make_self_managed_repo() {
+  local _dir="${1}"
+  local _tag="${2}"
+  mkdir -p "${_dir}/dist/script/docker/lib" "${_dir}/script/test"
+  cp /source/dist/script/docker/lib/* "${_dir}/dist/script/docker/lib/"
+  ln -s /source/dist/script/docker/wrapper/build.sh "${_dir}/build.sh"
+  echo "# hand-authored compose" > "${_dir}/compose.yaml"
+  cat > "${_dir}/script/test/test.sh" <<EOS
+#!/usr/bin/env bash
+[[ "\${1:-}" == "--test-tools-image" ]] || exit 2
+printf '%s\n' '${_tag}'
+EOS
+  chmod +x "${_dir}/script/test/test.sh"
+}
+
+@test "build.sh takes a self-managed repo's tooling tag from that repo's own resolver (#896)" {
+  local _self="${TEMP_DIR}/selfmanaged"
+  _make_self_managed_repo "${_self}" "test-tools:cafebabe1234"
+
+  run bash "${_self}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "TEST_TOOLS_IMAGE=test-tools:cafebabe1234"
+}
+
+@test "build.sh exports the tooling tag so a self-managed compose.yaml interpolates it (#896)" {
+  # The consumer channel is a --build-arg (`FROM ${TEST_TOOLS_IMAGE}`); a
+  # self-managed compose.yaml reads the variable by INTERPOLATION instead,
+  # where a --build-arg never reaches. Probe the docker stub's ENVIRONMENT
+  # so the assertion cannot be satisfied by the build-arg on the argv.
+  local _self="${TEMP_DIR}/selfmanaged"
+  _make_self_managed_repo "${_self}" "test-tools:cafebabe1234"
+
+  cat > "${BIN_DIR}/docker" <<'EOS'
+#!/usr/bin/env bash
+printf 'ENVPROBE=%s\n' "${TEST_TOOLS_IMAGE:-<unset>}" >> "${DOCKER_LOG}"
+EOS
+  chmod +x "${BIN_DIR}/docker"
+
+  run bash "${_self}/build.sh"
+  assert_success
+  run cat "${DOCKER_LOG}"
+  assert_output --partial "ENVPROBE=test-tools:cafebabe1234"
+}
+
+@test "build.sh keeps deriving the version-scoped tag for a repo that has a .base subtree (#896)" {
+  # The self-managed branch must not capture consumers: they carry a
+  # `.base/` subtree and their local tag stays version-scoped by
+  # `.base/.version`.
+  mkdir -p "${SANDBOX}/script/test"
+  cat > "${SANDBOX}/script/test/test.sh" <<'EOS'
+#!/usr/bin/env bash
+printf 'test-tools:must-not-be-used\n'
+EOS
+  chmod +x "${SANDBOX}/script/test/test.sh"
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  echo "# mock compose" > "${SANDBOX}/compose.yaml"
+
+  bash "${SANDBOX}/build.sh"
+  run cat "${DOCKER_LOG}"
+  assert_output --partial "TEST_TOOLS_IMAGE=test-tools:v9.9.9-test"
+  refute_output --partial "must-not-be-used"
+}
+
+# ── i18n log lines (bootstrap / drift / err_no_env) ────────────────────────
+# These exercise _msg for every language on every log line that build.sh
+# emits directly. Usage-text coverage lives above; these assert that the
+# *runtime* messages (not just --help) translate end-to-end.
+
+@test "build.sh --lang zh-TW prints Chinese bootstrap log" {
+  run bash "${SANDBOX}/build.sh" --lang zh-TW --dry-run
+  assert_success
+  assert_output --partial "首次執行"
+}
+
+@test "build.sh --lang zh-CN prints Simplified Chinese bootstrap log" {
+  run bash "${SANDBOX}/build.sh" --lang zh-CN --dry-run
+  assert_success
+  assert_output --partial "首次运行"
+}
+
+@test "build.sh --lang ja prints Japanese bootstrap log" {
+  run bash "${SANDBOX}/build.sh" --lang ja --dry-run
+  assert_success
+  assert_output --partial "初回実行"
+}
+
+@test "build.sh default bootstrap log is English" {
+  run bash "${SANDBOX}/build.sh" --dry-run
+  assert_success
+  assert_output --partial "First run"
+}
+
+@test "build.sh --lang zh-TW prints Chinese drift-regen log" {
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+_subcmd="apply"
+case "${1:-}" in
+  check-drift) _subcmd="check-drift"; shift ;;
+  apply)       shift ;;
+esac
+_base=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base-path) _base="$2"; shift 2 ;;
+    --lang)      shift 2 ;;
+    *)           shift ;;
+  esac
+done
+case "${_subcmd}" in
+  check-drift) exit 1 ;;
+  apply)
+    {
+      echo "USER_NAME=tester"
+      echo "IMAGE_NAME=mockimg"
+      echo "DOCKER_HUB_USER=mockuser"
+    } > "${_base}/.env.generated"
+    echo "# mock compose" > "${_base}/compose.yaml"
+    ;;
+esac
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+  run bash "${SANDBOX}/build.sh" --lang zh-TW --dry-run
+  assert_success
+  assert_output --partial "重新產生"
+}
+
+@test "build.sh --lang zh-TW prints Chinese err_no_env on failed bootstrap" {
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+  run bash "${SANDBOX}/build.sh" --lang zh-TW --dry-run
+  assert_failure
+  # Level keyword is now English-only; zh-TW body still localised.
+  assert_output --partial "[build] ERROR:"
+  assert_output --partial "setup 未產生 .env.generated"
+}
+
+@test "build.sh --lang ja prints Japanese err_no_env on failed bootstrap" {
+  cat > "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+  chmod +x "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh"
+  run bash "${SANDBOX}/build.sh" --lang ja --dry-run
+  assert_failure
+  # Level keyword is now English-only; ja body still localised.
+  assert_output --partial "[build] ERROR:"
+  assert_output --partial "setup が .env.generated を生成"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# --reset-conf flag
+# ════════════════════════════════════════════════════════════════════
+
+@test "build.sh --reset-conf --yes --dry-run prints init.sh --gen-conf --force cmd" {
+  # -y skips the interactive prompt; --dry-run makes the init.sh call
+  # a printf instead of an exec so we can assert it without sandbox
+  # side effects.
+  echo "# old" > "${SANDBOX}/setup.toml"
+  run bash "${SANDBOX}/build.sh" --reset-conf --yes --dry-run
+  assert_success
+  assert_output --partial "[dry-run]"
+  assert_output --partial ".base/dist/script/base/init.sh --gen-conf --force"
+}
+
+@test "build.sh --reset-conf is mentioned in usage help" {
+  run bash "${SANDBOX}/build.sh" --help
+  assert_success
+  assert_output --partial "--reset-conf"
+  assert_output --partial "setup.toml.bak"
+}
+
+@test "build.sh --reset-conf with no existing setup.toml / .env skips prompt" {
+  # Nothing to overwrite → no confirmation needed, --dry-run just prints
+  # the init.sh call and exits cleanly.
+  rm -f "${SANDBOX}/setup.toml" "${SANDBOX}/.env.generated"
+  run bash "${SANDBOX}/build.sh" --reset-conf --dry-run
+  assert_success
+  refute_output --partial "proceed?"
+}
+
+@test "build.sh --reset-conf without -y on closed stdin aborts cleanly, no set-e crash (#702, #700)" {
+  # EOF path: an existing setup.toml forces the interactive confirm. With
+  # no --yes and a closed stdin, `read` returns non-zero on EOF. Pre-fix,
+  # the bare `read _reply` under `set -e` aborted at the read line BEFORE
+  # the case could map empty->abort, so a piped/CI invocation died with NO
+  # '[build] aborted.' diagnostic. Post-fix, EOF maps to an empty reply
+  # which the default case treats as an explicit abort.
+  echo "# old" > "${SANDBOX}/setup.toml"
+  run bash "${SANDBOX}/build.sh" --reset-conf </dev/null
+  assert_failure 1
+  assert_output --partial "[build] aborted."
+}
+
+# ════════════════════════════════════════════════════════════════════
+# -C / --chdir flag (issue docker_harness#53)
+#
+# The pre-pass at file scope must override FILE_PATH so _lib.sh + setup.sh
+# + .env / compose.yaml all resolve against DIR instead of the wrapper's
+# symlink dir. Critical for Claude Code's sandbox excludedCommands match
+# (top-level token stays `./build.sh ...` rather than subshell / bash -c).
+# ════════════════════════════════════════════════════════════════════
+
+@test "build.sh -C <dir> redirects FILE_PATH to <dir>" {
+  # Build a second sandbox tree mirroring the primary one, then invoke
+  # the *primary* build.sh with -C pointing at the alt tree. The mock
+  # setup.sh stamps MOCK_SETUP_LOG with whatever --base-path it received,
+  # so the log proves which tree FILE_PATH resolved to.
+  local ALT="${TEMP_DIR}/alt"
+  mkdir -p "${ALT}/.base/dist/script/docker/lib" "${ALT}/.base/dist/script/docker/wrapper" "${ALT}/.base/dockerfile"
+  cp /source/dist/script/docker/lib/_lib.sh "${ALT}/.base/dist/script/docker/lib/_lib.sh"
+  cp /source/dist/script/docker/lib/i18n.sh "${ALT}/.base/dist/script/docker/lib/i18n.sh"
+  cp /source/dist/script/docker/lib/* "${ALT}/.base/dist/script/docker/lib/"
+  cp "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" "${ALT}/.base/dist/script/docker/wrapper/setup.sh"
+  chmod +x "${ALT}/.base/dist/script/docker/wrapper/setup.sh"
+  touch "${ALT}/.base/dockerfile/Dockerfile.test-tools"
+  printf 'v9.9.9-test\n' > "${ALT}/.base/.version"
+
+  run bash "${SANDBOX}/build.sh" -C "${ALT}" --dry-run
+  assert_success
+  assert [ -f "${MOCK_SETUP_LOG}" ]
+  run cat "${MOCK_SETUP_LOG}"
+  assert_output --partial "setup.sh invoked --base-path ${ALT}"
+  refute_output --partial "setup.sh invoked --base-path ${SANDBOX}"
+}
+
+@test "build.sh --chdir <dir> long form is equivalent to -C" {
+  local ALT="${TEMP_DIR}/alt2"
+  mkdir -p "${ALT}/.base/dist/script/docker/lib" "${ALT}/.base/dist/script/docker/wrapper" "${ALT}/.base/dockerfile"
+  cp /source/dist/script/docker/lib/_lib.sh "${ALT}/.base/dist/script/docker/lib/_lib.sh"
+  cp /source/dist/script/docker/lib/i18n.sh "${ALT}/.base/dist/script/docker/lib/i18n.sh"
+  cp /source/dist/script/docker/lib/* "${ALT}/.base/dist/script/docker/lib/"
+  cp "${SANDBOX}/.base/dist/script/docker/wrapper/setup.sh" "${ALT}/.base/dist/script/docker/wrapper/setup.sh"
+  chmod +x "${ALT}/.base/dist/script/docker/wrapper/setup.sh"
+  touch "${ALT}/.base/dockerfile/Dockerfile.test-tools"
+  printf 'v9.9.9-test\n' > "${ALT}/.base/.version"
+
+  run bash "${SANDBOX}/build.sh" --chdir "${ALT}" --dry-run
+  assert_success
+  run cat "${MOCK_SETUP_LOG}"
+  assert_output --partial "setup.sh invoked --base-path ${ALT}"
+}
+
+@test "build.sh -C without a value exits 2" {
+  run bash "${SANDBOX}/build.sh" -C
+  assert_failure 2
+  assert_output --partial "requires a value"
+}
+
+@test "build.sh -C with a non-existent directory exits 2" {
+  run bash "${SANDBOX}/build.sh" -C /definitely/does/not/exist
+  assert_failure 2
+  assert_output --partial "not a directory"
+}
+
+@test "build.sh -C is mentioned in usage help" {
+  run bash "${SANDBOX}/build.sh" --help
+  assert_success
+  assert_output --partial "-C"
+  assert_output --partial "--chdir"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# -v / --verbose / -vv / --very-verbose (BUILDKIT_PROGRESS=plain,)
+# ════════════════════════════════════════════════════════════════════
+
+@test "build.sh -v / --verbose / -vv / --very-verbose are mentioned in usage help (#311)" {
+  run bash "${SANDBOX}/build.sh" --help
+  assert_success
+  assert_output --partial "-v, --verbose"
+  assert_output --partial "-vv, --very-verbose"
+  assert_output --partial "BUILDKIT_PROGRESS=plain"
+}
+
+@test "build.sh -v --dry-run is accepted and exits 0 (#311)" {
+  run bash "${SANDBOX}/build.sh" -v --dry-run
+  assert_success
+}
+
+@test "build.sh --verbose long form is accepted (#311)" {
+  run bash "${SANDBOX}/build.sh" --verbose --dry-run
+  assert_success
+}
+
+# bats test_tags=kcov-fragile
+@test "build.sh -vv --dry-run enables bash trace (set -x output on stderr) (#311)" {
+  run --separate-stderr bash "${SANDBOX}/build.sh" -vv --dry-run
+  assert_success
+  # set -x emits trace lines starting with `+ ` to stderr. After the case
+  # branch fires the wrapper continues hitting other lines that all get
+  # traced.
+  # kcov instruments bash (set -x/PS4), so the wrapper's `-vv` trace
+  # prefix `+ ` does not reach stderr under coverage; the real -vv
+  # behaviour is covered by the normal (non-kcov) job. Skip the fragile
+  # observation under kcov.
+  [ "${COVERAGE:-0}" = 1 ] && skip "set -x trace not observable under kcov instrumentation (#613)"
+  [[ "${stderr}" == *"+ "* ]]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Pre-build hook abort
+#
+# build.sh guards its main work with `_run_pre_hook build "$@" || exit $?`
+# (after env prep, before `_compose_project build`). A failing pre-hook
+# must abort the wrapper with the hook's rc AND must NOT run docker build.
+# The `|| exit $?` idiom is fragile under set -e + ||-chaining, so a
+# regression that drops/reorders it would leave the build running after a
+# pre-hook said 'do not proceed' — locked here. Real mode (the hook
+# no-ops under --dry-run).
+@test "build.sh aborts on a failing pre-build hook and skips docker build (#690)" {
+  {
+    echo "USER_NAME=tester"
+    echo "IMAGE_NAME=mockimg"
+    echo "DOCKER_HUB_USER=mockuser"
+  } > "${SANDBOX}/.env.generated"
+  : > "${SANDBOX}/setup.toml"
+  : > "${SANDBOX}/compose.yaml"
+  mkdir -p "${SANDBOX}/script/hooks/pre"
+  cat > "${SANDBOX}/script/hooks/pre/build.sh" <<'HOOK'
+#!/usr/bin/env bash
+echo "PRE_BUILD_HOOK_FIRED"
+exit 7
+HOOK
+  chmod +x "${SANDBOX}/script/hooks/pre/build.sh"
+  run -7 bash "${SANDBOX}/build.sh" test
+  assert_output --partial "PRE_BUILD_HOOK_FIRED"
+  # The docker build must never have run. The docker stub tees every
+  # invocation to DOCKER_LOG; assert no `docker compose build` reached it.
+  refute_output --partial "docker compose"
+  assert [ ! -s "${DOCKER_LOG}" ] || ! grep -q 'compose .* build' "${DOCKER_LOG}"
+}

@@ -4,7 +4,7 @@
 #
 # Proves, without a human in front of a browser, that a REAL Kit producer's
 # picture reaches the viewer: boots the pinned deterministic producer image
-# (ghcr.io/ycpss91255-docker/isaac-stream-source, isaac#223 / isaac PR #243),
+# (ghcr.io/ycpss91255-lab/isaac-stream-source, isaac#223 / isaac PR #243),
 # waits for its WebRTC streaming server, then runs the `e2e-test` image against
 # it. That container serves the REAL stream-only dist through the production
 # entrypoint and drives headless Chromium at it (test/e2e/run-tier-b.sh ->
@@ -80,7 +80,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # the registry (`docker buildx imagetools inspect`). Moving the pin is a
 # deliberate edit here (or a TIER_B_PRODUCER_IMAGE override for a one-off), not
 # something a registry push can do on our behalf.
-PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-docker/isaac-stream-source@sha256:cb765323fcfa05a86fbc194c37fa37362f4d8879af0136d9218679010b654bb5"
+PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-lab/isaac-stream-source@sha256:cb765323fcfa05a86fbc194c37fa37362f4d8879af0136d9218679010b654bb5"
 PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-${PRODUCER_IMAGE_DEFAULT}}"
 
 # `--print-producer-image` prints the resolved producer reference and exits, so
@@ -357,7 +357,7 @@ _drop "${PRODUCER_NAME}"
 # FrameGrabFailed.` about 16 s in, the session gone and every sampled frame
 # black. isaac#233 records the same signature from the other side (a hand-built
 # stream container missing --ipc=host, Kit SIGKILLed on first client connect);
-# the isaac repo itself sets `ipc = host` in config/docker/setup.conf, which is
+# the isaac repo itself sets `ipc = host` in setup.toml, which is
 # why its own compose-run stacks never hit this and a bare `docker run` does.
 #
 # Deliberately NOT --rm: the container's log is the only diagnosis a nightly

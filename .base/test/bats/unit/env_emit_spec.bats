@@ -1,0 +1,607 @@
+#!/usr/bin/env bats
+#
+# why: Mirrors `lib/env_emit.sh`. `write_env` (.env contents + SETUP_*
+# metadata, SSH X11 `XAUTHORITY` override #321) and `_scaffold_env_overlay`
+# idempotency.
+
+bats_require_minimum_version 1.5.0
+
+load "${BATS_TEST_DIRNAME}/setup_spec_helper"
+
+# ════════════════════════════════════════════════════════════════════
+# write_env: SSH X11 XAUTHORITY override
+# ════════════════════════════════════════════════════════════════════
+@test "write_env emits XAUTHORITY=<rewritten> when _ssh_x11_xauth arg is set (#321)" {
+  local _env="${TEMP_DIR}/.env.generated"
+  # Pass all positional args incl. the new trailing _ssh_x11_xauth.
+  write_env "${_env}" \
+    alice alice 1000 1000 \
+    x86_64 alice false myrepo /tmp/ws \
+    tw.archive.ubuntu.com mirror.twds.com.tw Asia/Taipei \
+    bridge host private false all "gpu compute" \
+    true confhash dockerhash \
+    "" "" "" "" \
+    "/path/to/.docker.xauth"
+  assert [ -f "${_env}" ]
+  run grep -F 'XAUTHORITY=/path/to/.docker.xauth' "${_env}"
+  assert_success
+  run grep -F 'SSH X11 forwarding cookie override' "${_env}"
+  assert_success
+}
+
+@test "write_env does NOT emit XAUTHORITY override when _ssh_x11_xauth arg is empty (#321)" {
+  local _env="${TEMP_DIR}/.env.generated"
+  write_env "${_env}" \
+    alice alice 1000 1000 \
+    x86_64 alice false myrepo /tmp/ws \
+    tw.archive.ubuntu.com mirror.twds.com.tw Asia/Taipei \
+    bridge host private false all "gpu compute" \
+    true confhash dockerhash \
+    "" "" "" "" \
+    ""
+  assert [ -f "${_env}" ]
+  run cat "${_env}"
+  refute_output --partial "SSH X11 forwarding cookie override"
+  refute_output --partial $'\nXAUTHORITY='
+}
+
+# ════════════════════════════════════════════════════════════════════
+# write_env
+# ════════════════════════════════════════════════════════════════════
+@test "write_env creates .env with all required variables and SETUP_* metadata" {
+  local _env="${TEMP_DIR}/.env.generated"
+  write_env "${_env}" \
+    "testuser" "testgroup" "1001" "1001" \
+    "x86_64" "dockerhub" "true" \
+    "ros_noetic" "/workspace" \
+    "tw.archive.ubuntu.com" "mirror.twds.com.tw" "Asia/Taipei" \
+    "host" "host" "private" "true" \
+    "all" "gpu" \
+    "true" "abc123" "df456"
+
+  assert [ -f "${_env}" ]
+  run grep 'USER_NAME=testuser' "${_env}"; assert_success
+  run grep 'USER_UID=1001'      "${_env}"; assert_success
+  run grep 'GPU_ENABLED=true'   "${_env}"; assert_success
+  run grep 'IMAGE_NAME=ros_noetic' "${_env}"; assert_success
+  run grep 'NETWORK_MODE=host'  "${_env}"; assert_success
+  run grep 'IPC_MODE=host'      "${_env}"; assert_success
+  run grep 'PID_MODE=private'   "${_env}"; assert_success
+  run grep 'PRIVILEGED=true'    "${_env}"; assert_success
+  run grep 'GPU_COUNT=all'      "${_env}"; assert_success
+  run grep -F 'GPU_CAPABILITIES="gpu"' "${_env}"; assert_success
+  run grep 'SETUP_CONF_HASH=abc123' "${_env}"; assert_success
+  run grep 'SETUP_DOCKERFILE_HASH=df456' "${_env}"; assert_success
+  run grep 'SETUP_GUI_DETECTED=true' "${_env}"; assert_success
+  run grep -E '^SETUP_TIMESTAMP=' "${_env}"; assert_success
+  run grep 'APT_MIRROR_UBUNTU=tw.archive.ubuntu.com' "${_env}"; assert_success
+  run grep 'APT_MIRROR_DEBIAN=mirror.twds.com.tw' "${_env}"; assert_success
+  run grep 'TZ=Asia/Taipei' "${_env}"; assert_success
+  # bash-source round-trip: re-loading the file must not raise a
+  # "command not found" on any multi-word value (regression: previously
+  # GPU_CAPABILITIES="gpu compute utility graphics" was unquoted).
+  run bash -c "set -o allexport; source '${_env}'"
+  assert_success
+  refute_output --partial "command not found"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# write_env: the population is the EMITTED compose document's, not a roster
+# ════════════════════════════════════════════════════════════════════
+
+# why: Every USER_GID / USER_GROUP assertion in the tree is a CONSUMER
+# carrying its own hand-written fixture (lib_spec writes its own .env,
+# gen_spec asserts the compose text), so expectation and subject never share
+# the producer and the producer was free to stop producing. Deleting both
+# lines from write_env's heredoc left the whole unit and integration tiers
+# green, while a real consumer gets USER_GID="" overriding the Dockerfile's
+# ARG default and `groupadd: invalid group ID ''`, exit 3. The one gate that
+# does catch it is the dual-arch acceptance job, the most expensive in CI
+@test "write_env writes every key the emitted compose.yaml interpolates with no fallback (#1115)" {
+  # The population is DERIVED from the emitter's own output rather than
+  # written down here, so it moves when the emitter moves instead of rotting.
+  #
+  # The split is the emitter's own and needs no list: `${KEY}` has nowhere
+  # else to come from, so .env.generated must carry it; `${KEY:-default}`
+  # states its own fallback and legitimately comes from the host environment
+  # (DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, WAYLAND_DISPLAY) or from the
+  # default itself (PORT_n, TZ, the apt mirrors, DOCKER_HUB_USER).
+  local _compose="${TEMP_DIR}/compose.yaml"
+  local _env="${TEMP_DIR}/.env.generated"
+  # generate_compose_yaml reads the Dockerfile beside its output path to
+  # discover the stages it emits services for.
+  cat > "${TEMP_DIR}/Dockerfile" <<'EOF'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+EOF
+  # The WIDEST shape the emitter has -- GUI on, GPU on, a bridge network, a
+  # published port -- so every fallback-carrying key is actually in the
+  # document. On a narrow fixture the exclusion below would pass by absence
+  # rather than by doing anything, and the premise assertion further down is
+  # what says so.
+  local _extras=()
+  generate_compose_yaml "${_compose}" "myrepo" \
+    true true all "gpu compute" _extras \
+    "" "" "" "" "8080:80" "" bridge host host
+
+  write_env "${_env}" \
+    "testuser" "testgroup" "1001" "1001" \
+    "x86_64" "dockerhub" "true" \
+    "myrepo" "/workspace" \
+    "tw.archive.ubuntu.com" "mirror.twds.com.tw" "Asia/Taipei" \
+    "bridge" "host" "host" "true" \
+    "all" "gpu compute" \
+    "true" "abc123" "df456" \
+    "mynet" "" "" "" "" "local-myrepo"
+
+  local -a _required=() _defaulted=()
+  mapfile -t _required < <(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' "${_compose}" \
+    | tr -d '${}' | sort -u)
+  mapfile -t _defaulted < <(grep -oE '\$\{[A-Z_][A-Z0-9_]*:-' "${_compose}" \
+    | sed -E 's/^\$\{//; s/:-$//' | sort -u)
+
+  # Two premises, because a derived population that silently became empty
+  # would turn the loop below into a pass that observed nothing -- a derived
+  # guard's own failure mode, and the one a sibling audit was filed about.
+  (( ${#_required[@]} > 0 )) || fail \
+    "the emitted compose.yaml interpolates no key without a fallback, so this case asserts nothing about what write_env must write. Either the emitter stopped interpolating or the scan stopped matching it"
+  (( ${#_defaulted[@]} > 0 )) || fail \
+    "the emitted compose.yaml carries no \${KEY:-default} at all, so the fallback exclusion is untested by this fixture and the rule it rests on is unobserved"
+
+  local _k _excluded=0
+  for _k in "${_defaulted[@]}"; do
+    printf '%s\n' "${_required[@]}" | grep -qxF "${_k}" || _excluded=$(( _excluded + 1 ))
+  done
+  # The third premise: the fallback split EXCLUDED something. Without this,
+  # a scan that happened to collapse into "every key in the document" would
+  # read as a stricter guard while being an unsatisfiable one.
+  (( _excluded > 0 )) || fail \
+    "every \${KEY:-default} in the document is also interpolated bare somewhere, so the fallback rule excluded nothing and this case cannot distinguish the two halves it is built on"
+
+  for _k in "${_required[@]}"; do
+    grep -qE "^${_k}=" "${_env}" || fail \
+      "the emitted compose.yaml interpolates \${${_k}} with no fallback and .env.generated does not write it, so compose resolves it to the empty string and silently OVERRIDES the Dockerfile ARG default. write_env is the only producer: add it to the heredoc. Required: ${_required[*]}"
+  done
+}
+
+# ════════════════════════════════════════════════════════════════════
+# .env.local -- the operator's override file (never touched by tooling)
+# ════════════════════════════════════════════════════════════════════
+@test "_scaffold_env_local is idempotent (never overwrites) (#868)" {
+  printf 'USER_KEY=keep\n' > "${TEMP_DIR}/.env.local"
+  run _scaffold_env_local "${TEMP_DIR}/.env.local"
+  assert_success
+  run cat "${TEMP_DIR}/.env.local"
+  assert_output "USER_KEY=keep"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# write_env: the deferred project rename
+# ════════════════════════════════════════════════════════════════════
+@test "write_env emits PROJECT_NAME_PENDING only when a rename is deferred (#920)" {
+  # PROJECT_NAME is the name the checkout RUNS under; the pending one is
+  # what its configuration now resolves to but cannot take effect as until
+  # the old project is empty. An ordinary file carries no such line.
+  local _env="${TEMP_DIR}/.env.generated"
+  write_env "${_env}" \
+    alice alice 1000 1000 \
+    x86_64 alice false myrepo /tmp/ws \
+    tw.archive.ubuntu.com mirror.twds.com.tw Asia/Taipei \
+    bridge host private false all "gpu compute" \
+    true confhash dockerhash \
+    "" "" "" "" \
+    "" "local-myrepo" "alice-myrepo"
+  run grep -Fx 'PROJECT_NAME=local-myrepo' "${_env}"
+  assert_success
+  run grep -Fx 'PROJECT_NAME_PENDING=alice-myrepo' "${_env}"
+  assert_success
+
+  write_env "${_env}" \
+    alice alice 1000 1000 \
+    x86_64 alice false myrepo /tmp/ws \
+    tw.archive.ubuntu.com mirror.twds.com.tw Asia/Taipei \
+    bridge host private false all "gpu compute" \
+    true confhash dockerhash \
+    "" "" "" "" \
+    "" "alice-myrepo"
+  run grep -Fx 'PROJECT_NAME=alice-myrepo' "${_env}"
+  assert_success
+  run grep -c '^PROJECT_NAME_PENDING=' "${_env}"
+  assert_failure
+}
+
+# why: Both files are GUIDANCE an operator follows, and the only authority
+# on which override file compose actually reads is
+# `_emit_env_file_block` -- the function that writes the `env_file:` list
+# into the generated compose. It lists `.env` and `.env.local`; nothing
+# reads `env.local.toml`, which init.sh states where it declines to call
+# the converter (base#1163, readers on base#1168). Both files named it
+# anyway, and the scaffold went further and put a TOML `[environment]`
+# table into the dotenv file compose parses -- measured against compose
+# 2.x, that does not refuse, it improvises: the header line is skipped,
+# `KEY = "42"` arrives as `42`, and a second header such as
+# `[stage:headless]` arrives as a variable literally named `[stage`. So an
+# operator following the shipped instructions either edits a file nothing
+# reads or puts junk in the container, with no error either way. The
+# loaded set is DERIVED here, so moving the `env_file:` list moves what
+# the guidance is allowed to say rather than stranding this assertion --
+# which is what the previous `--partial ".env.local"` check did, since
+# the old `.env.local.toml` spelling satisfies it.
+# And the generated `.env` is now written WITH a service-env entry, which is
+# the arm that was missing. The section header carries the name of the file
+# the block came from, and it is emitted only when `<service_env_str>` is
+# non-empty -- so passing "" asked this rule about every line of the
+# artifact except the one line that names another file. Under the dotted
+# spelling base#1167 retired, that header advertised `.env.toml` inside a
+# file compose parses as dotenv, which is precisely what this test forbids
+# and could not see.
+@test "_scaffold_env_local / write_container_env: the guidance names only files the env_file block loads" {
+  local -a _loaded=()
+  mapfile -t _loaded < <(_emit_env_file_block | sed -n 's/^[[:space:]]*-[[:space:]]*//p')
+  [ "${#_loaded[@]}" -ge 2 ] \
+    || fail "the env_file block yielded ${#_loaded[@]} files; it did not parse"
+  printf '%s\n' "${_loaded[@]}" | grep -qx -- '.env.local' \
+    || fail "the env_file block does not list .env.local; the files below are guidance for something else now"
+
+  _scaffold_env_local "${TEMP_DIR}/.env.local"
+  write_container_env "${TEMP_DIR}/.env" "" "" "" 'ROS_DOMAIN_ID=7'
+
+  # Every `.env*` path either file mentions must be one compose loads.
+  local _f _named _bad=""
+  for _f in "${TEMP_DIR}/.env.local" "${TEMP_DIR}/.env"; do
+    while IFS= read -r _named; do
+      printf '%s\n' "${_loaded[@]}" | grep -qx -- "${_named}" \
+        || _bad+=" ${_f##*/}:${_named}"
+    done < <(grep -oE '\.env[.a-z]*' "${_f}" | sort -u)
+  done
+  [ -z "${_bad}" ] \
+    || fail "guidance names env file(s) the env_file block does not load:${_bad}"
+
+  # And the override file's example is in the format compose parses: a
+  # TOML table header is not one.
+  run grep -c '\[environment\]' "${TEMP_DIR}/.env.local"
+  assert_output "0"
+  run grep -cE '^#   [A-Z_][A-Z0-9_]*=' "${TEMP_DIR}/.env.local"
+  refute_output "0"
+}
+
+# why: Both generated files tell the consumer how `.env` is rewritten, and the
+# consumer's entry justfile has no top-level `setup` recipe (ADR-00000011), so
+# `just setup` in either answers itself with `error: justfile does not contain
+# recipe`; the command they can type is `just docker setup apply` (base#1355)
+@test "_scaffold_env_local / write_container_env: the regenerate command named is one the consumer can run (base#1349)" {
+  _scaffold_env_local "${TEMP_DIR}/.env.local"
+  write_container_env "${TEMP_DIR}/.env" "" ""
+  local _f
+  for _f in "${TEMP_DIR}/.env" "${TEMP_DIR}/.env.local"; do
+    run grep -nE '`just (setup|build|run)`' "${_f}"
+    assert_failure
+    run grep -F '`just docker setup apply`' "${_f}"
+    assert_success
+  done
+}
+
+# _comment_prose <file> -- the `#` lines of <file> as one line of prose: the
+# comment marker stripped and the wrapping undone, so a pin reads the
+# sentence a consumer reads rather than where it happens to break.
+_comment_prose() {
+  sed -n 's/^#[[:space:]]*//p' "$1" | tr '\n' ' ' | tr -s ' '
+}
+
+# why: A bare `just docker setup` prints the setup help and exits 0 without
+# writing anything (wrapper/setup.sh main: no argument -> usage), so a header
+# that says it rewrites `.env` sends the consumer to a command that leaves
+# the file exactly as it was. The command that regenerates is `just docker
+# setup apply`; the whole header is pinned so the promise and the command
+# that keeps it are read together
+@test "write_container_env: the .env header names the command that regenerates it (base#1355)" {
+  write_container_env "${TEMP_DIR}/.env" "" ""
+  # Line 1 is the dated auto-gen stamp; everything after it is the header,
+  # and with no entries given the header is the whole remaining file, so
+  # the comparison is exact rather than a substring a cut could still meet.
+  run grep -cE '^# Auto-generated by setup\.sh on ' "${TEMP_DIR}/.env"
+  assert_output "1"
+  tail -n +2 "${TEMP_DIR}/.env" > "${TEMP_DIR}/env_header"
+  run _comment_prose "${TEMP_DIR}/env_header"
+  assert_output 'Container env defaults -- OURS. `just docker setup apply` rewrites this file from setup.toml, so an edit here is lost on the next apply. To change a value for THIS machine / site, put it in `.env.local` instead, one KEY=VALUE per line: compose loads that file after this one, so its keys win and nothing in the toolchain ever rewrites it. '
+  run grep -F '`just docker setup`' "${TEMP_DIR}/.env"
+  assert_failure
+}
+
+# why: The .env.local seed repeats the same promise about `.env`, and it is
+# the file a consumer opens to decide where an edit belongs (base#1355)
+@test "_scaffold_env_local: the .env.local seed names the command that regenerates .env (base#1355)" {
+  _scaffold_env_local "${TEMP_DIR}/.env.local"
+  # The whole seed, not only the regeneration paragraph: ownership and
+  # gitignore, the override examples, precedence and the README pointer
+  # are what the consumer reads to decide where an edit belongs, so a seed
+  # missing any of them fails here.
+  run _comment_prose "${TEMP_DIR}/.env.local"
+  assert_output 'Your overrides -- yours. No part of the toolchain ever rewrites this file, and it is gitignored, so it never leaves this machine. One KEY=VALUE per line -- compose reads this file as a dotenv file: ROS_DOMAIN_ID=42 LOG_LEVEL=debug compose loads the generated `.env` first and this file second, so a key named in both resolves to the value here. `.env` is OURS: `just docker setup apply` regenerates it from setup.toml and an edit there is lost. Machine-bound / set-once params (GPU, privileged, mounts, IMAGE_NAME, APT mirror) belong in setup.toml instead. See .base/doc/guide/env-vs-workload.md. '
+  run grep -F '`just docker setup`' "${TEMP_DIR}/.env.local"
+  assert_failure
+}
+
+@test "_scaffold_env_local creates a comment-only override file naming .env (#868)" {
+  run _scaffold_env_local "${TEMP_DIR}/.env.local"
+  assert_success
+  assert [ -f "${TEMP_DIR}/.env.local" ]
+  run cat "${TEMP_DIR}/.env.local"
+  assert_output --partial ".env"
+  # Comment-only: nothing here may look like a setting the user did not write.
+  run grep -cE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "${TEMP_DIR}/.env.local"
+  assert_output "0"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# write_container_env -- the generated, shipped `.env`
+# ════════════════════════════════════════════════════════════════════
+@test "write_container_env emits the [environment] defaults it is given (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" $'ROS_DOMAIN_ID=42\nLOG_LEVEL=debug' ""
+  assert [ -f "${_out}" ]
+  run grep -xF "ROS_DOMAIN_ID='42'" "${_out}"; assert_success
+  run grep -xF "LOG_LEVEL='debug'"  "${_out}"; assert_success
+}
+
+@test "write_container_env emits the WATCHDOG_* block into .env, not compose (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "" \
+    $'WATCHDOG_CHECK=pgrep -f my_node\nWATCHDOG_INTERVAL=30'
+  run grep -xF "WATCHDOG_CHECK='pgrep -f my_node'" "${_out}"; assert_success
+  run grep -xF "WATCHDOG_INTERVAL='30'"            "${_out}"; assert_success
+}
+
+@test "write_container_env marks the file as ours and names .env.local (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "" ""
+  assert [ -f "${_out}" ]
+  run cat "${_out}"
+  assert_output --partial "Auto-generated"
+  assert_output --partial ".env.local"
+}
+
+@test "write_container_env rewrites the file on every call (it is ours) (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  printf 'STALE=yes\n' > "${_out}"
+  write_container_env "${_out}" "FRESH=yes" ""
+  run grep -qxF 'STALE=yes' "${_out}"; assert_failure
+  run grep -xF "FRESH='yes'" "${_out}"; assert_success
+}
+
+@test "write_container_env expands cross-references against the interpolation cache (#868)" {
+  local _cache="${TEMP_DIR}/.env.generated"
+  printf 'WS_PATH=/home/dev/ws\n' > "${_cache}"
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'ROS_LOG_DIR=${WS_PATH}/log' "" "${_cache}"
+  run grep -xF "ROS_LOG_DIR='/home/dev/ws/log'" "${_out}"
+  assert_success
+}
+
+# `${VAR}` cross-reference expansion. Moved here from gen_spec.bats with
+# the code: compose's own substitution layer never saw sibling environment
+# entries, and now that the list is written to an env_file -- whose values
+# compose takes LITERALLY -- expanding at write time is the only chance.
+@test "write_container_env expands a cross-reference to an earlier sibling (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" \
+    $'BUILD_TARGET=production\nLD_LIBRARY_PATH=/foo/${BUILD_TARGET}/lib' ""
+  run grep -xF "LD_LIBRARY_PATH='/foo/production/lib'" "${_out}"
+  assert_success
+  run grep -F 'BUILD_TARGET}' "${_out}"
+  assert_failure
+}
+
+@test "write_container_env leaves a forward reference literal (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" \
+    $'LD_LIBRARY_PATH=/foo/${BUILD_TARGET}/lib\nBUILD_TARGET=production' ""
+  run grep -xF 'LD_LIBRARY_PATH=${BUILD_TARGET}' "${_out}"
+  assert_failure
+  run grep -xF "LD_LIBRARY_PATH='/foo/\${BUILD_TARGET}/lib'" "${_out}"
+  assert_success
+  run grep -xF "BUILD_TARGET='production'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env leaves an unknown reference literal (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'PATH_PREFIX=/foo/${UNDEFINED_VAR}/bar' ""
+  run grep -xF "PATH_PREFIX='/foo/\${UNDEFINED_VAR}/bar'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env expands multiple references in one value (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" \
+    $'BUILD_TARGET=production\nARCH=aarch64\nPLUGIN_PATH=/opt/${BUILD_TARGET}/lib/${ARCH}' ""
+  run grep -xF "PLUGIN_PATH='/opt/production/lib/aarch64'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env resolves a transitive reference chain (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" \
+    $'ROOT=/opt\nBASE=${ROOT}/lib\nINCLUDE=${BASE}/include' ""
+  run grep -xF "BASE='/opt/lib'" "${_out}"
+  assert_success
+  run grep -xF "INCLUDE='/opt/lib/include'" "${_out}"
+  assert_success
+}
+
+# Env-file quoting. The values used to land in a compose `environment:`
+# list, where a YAML double-quoted scalar protected them. An env_file is a
+# different parser with its own hazards -- an unquoted value is truncated
+# at an inline ` #`, and a double-quoted one has its `${VAR}` expanded --
+# so every value is emitted as a quoted scalar with `\`, `"` and `$`
+# escaped. Silent truncation of a token or a check command is exactly the
+# class of failure a field operator cannot diagnose.
+@test "write_container_env quotes a value carrying an inline ' #' (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'NOTE=a #b' ""
+  run grep -xF "NOTE='a #b'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env quotes a value carrying a colon-space (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'MSG=a: b' ""
+  run grep -xF "MSG='a: b'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env passes a double quote and a backslash through (#868)" {
+  # Neither is special to the single-quoted form, and the parser does NOT
+  # unescape a doubled backslash -- doubling one would ADD a character.
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'Q=a"b\c' ""
+  run grep -xF "Q='a\"b\\c'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env escapes the delimiter inside a value (#868)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "NOTE=it's fine" ""
+  run grep -xF "NOTE='it\\'s fine'" "${_out}"
+  assert_success
+}
+
+@test "write_container_env keeps \$ literal, unexpanded (#868)" {
+  # A double-quoted env_file value is variable-expanded and `\$` does not
+  # stop it, so the single-quoted form is what keeps the reference intact.
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "" 'WATCHDOG_NOTIFY=echo $HOSTNAME'
+  run grep -xF "WATCHDOG_NOTIFY='echo \$HOSTNAME'" "${_out}"
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# write_container_env -- service env from env.toml (ADR-37 D6)
+# ════════════════════════════════════════════════════════════════════
+# why: ADR-37 splits service runtime env into env.toml. The emitter
+# must produce a headed section so the operator can see which file each
+# block came from, and each key must land single-quoted (the same
+# format _emit_env_file_line uses for setup.toml entries).
+@test "write_container_env emits env.toml [environment] entries under a service env header (#1135)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "" "" "" $'ROS_DOMAIN_ID=42\nLOG_LEVEL=debug'
+  run grep -F '# ── [environment] (from env.toml) ──' "${_out}"
+  assert_success
+  run grep -xF "ROS_DOMAIN_ID='42'" "${_out}"
+  assert_success
+  run grep -xF "LOG_LEVEL='debug'" "${_out}"
+  assert_success
+}
+
+# why: An empty service_env_str means the repo carries no env.toml
+# entries. The section header must not appear -- a headed empty block
+# misleads the operator into thinking the file was read but had nothing.
+@test "write_container_env omits the service env section when the parameter is empty (#1135)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" "" "" "" ""
+  run grep -F 'env.toml' "${_out}"
+  assert_failure
+}
+
+# why: The two env sources (setup.toml infra + env.toml service) and
+# the watchdog block must coexist in one .env file. A merge bug would
+# drop one source or intermingle their headers.
+@test "write_container_env emits both infra and service env sections (#1135)" {
+  local _out="${TEMP_DIR}/.env"
+  write_container_env "${_out}" 'BUILD_TARGET=release' 'WATCHDOG_ENABLED=true' "" 'ROS_DOMAIN_ID=7'
+  # Infra env from setup.toml
+  run grep -xF "BUILD_TARGET='release'" "${_out}"
+  assert_success
+  # Watchdog
+  run grep -xF "WATCHDOG_ENABLED='true'" "${_out}"
+  assert_success
+  # Service env from env.toml
+  run grep -xF "ROS_DOMAIN_ID='7'" "${_out}"
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _migrate_env_to_local -- a hand-written .env predates the naming rule
+# ════════════════════════════════════════════════════════════════════
+@test "_migrate_env_to_local renames a hand-written .env to .env.local (#868)" {
+  printf '# mine\nROS_DOMAIN_ID=7\n' > "${TEMP_DIR}/.env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert [ ! -e "${TEMP_DIR}/.env" ]
+  run cat "${TEMP_DIR}/.env.local"
+  assert_output --partial "ROS_DOMAIN_ID=7"
+}
+
+# why: The migration notice explains WHY the hand-written .env had to move:
+# the toolchain regenerates it. The command it names for that has to be the
+# one that does, or the explanation points at a help screen (base#1355)
+@test "_migrate_env_to_local: the migration notice names the command that regenerates .env (base#1355)" {
+  printf 'ROS_DOMAIN_ID=7\n' > "${TEMP_DIR}/.env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert_output --partial '.env is regenerated by `just docker setup apply` from setup.toml'
+  refute_output --partial '`just docker setup`'
+}
+
+# why: Same promise in the conflict notice, the branch where both files exist
+@test "_migrate_env_to_local: the conflict notice names the command that regenerates .env (base#1355)" {
+  printf 'ROS_DOMAIN_ID=7\n' > "${TEMP_DIR}/.env"
+  printf 'LOG_LEVEL=debug\n' > "${TEMP_DIR}/.env.local"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert_output --partial '.env is now generated by `just docker setup apply`'
+  refute_output --partial '`just docker setup`'
+}
+
+@test "_migrate_env_to_local is inert on a second run (#868)" {
+  printf 'ROS_DOMAIN_ID=7\n' > "${TEMP_DIR}/.env"
+  _migrate_env_to_local "${TEMP_DIR}"
+  printf 'REGENERATED=1\n' > "${TEMP_DIR}/.env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  # The user's file is not clobbered by the regenerated one.
+  run cat "${TEMP_DIR}/.env.local"
+  assert_output --partial "ROS_DOMAIN_ID=7"
+  refute_output --partial "REGENERATED=1"
+  assert [ -f "${TEMP_DIR}/.env" ]
+}
+
+@test "_migrate_env_to_local leaves a generated .env alone (#868)" {
+  printf '# Auto-generated by setup.sh on 2026-01-01 00:00:00\nFOO=bar\n' \
+    > "${TEMP_DIR}/.env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert [ -f "${TEMP_DIR}/.env" ]
+  assert [ ! -e "${TEMP_DIR}/.env.local" ]
+}
+
+@test "_migrate_env_to_local leaves a comment-only scaffold alone (#868)" {
+  printf '# Workload overlay -- hand-authored, gitignored.\n#\n' \
+    > "${TEMP_DIR}/.env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert [ ! -e "${TEMP_DIR}/.env.local" ]
+}
+
+@test "_migrate_env_to_local is a no-op when there is no .env (#868)" {
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  assert [ ! -e "${TEMP_DIR}/.env.local" ]
+}
+
+@test "_migrate_env_to_local stages the removal when .env was git-tracked (#868)" {
+  git -C "${TEMP_DIR}" init -q
+  git -C "${TEMP_DIR}" config user.email t@t
+  git -C "${TEMP_DIR}" config user.name t
+  printf 'ROS_DOMAIN_ID=7\n' > "${TEMP_DIR}/.env"
+  git -C "${TEMP_DIR}" add -f .env
+  git -C "${TEMP_DIR}" commit -q -m "tracked env"
+  run _migrate_env_to_local "${TEMP_DIR}"
+  assert_success
+  run git -C "${TEMP_DIR}" diff --cached --name-status
+  assert_output --partial "D	.env"
+  run cat "${TEMP_DIR}/.env.local"
+  assert_output --partial "ROS_DOMAIN_ID=7"
+}

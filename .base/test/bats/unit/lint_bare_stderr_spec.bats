@@ -1,0 +1,189 @@
+#!/usr/bin/env bats
+#
+# Unit tests for script/test/lint_bare_stderr.sh -- the "all stderr goes
+# through lib/log.sh helpers" lint. It scans the docker wrapper/lib tree
+# and the test tree for bare `printf/echo ... >&2` lines that bypass the
+# _log_* / _die helpers.
+#
+# The lint takes the repo root as $1 (defaulting to two levels up from the
+# script), so the spec drives it against synthesized fixture trees laid out
+# exactly like the real repo: sources live under dist/script/docker/**
+# and script/test/**. Exit contract: 0 = clean, 1 = violations found.
+#
+# why: Unit tests for `script/test/lint_bare_stderr.sh` (#692), the "all
+# stderr goes through lib/log.sh helpers" lint. The lint takes the repo root
+# as `$1`, so the spec drives it against synthesized fixture trees laid out
+# like the real repo (sources under `dist/script/docker/**`, tests under
+# `script/test/**`). A real-repo-root clean-tree case guards against the
+# path-drift bug (an empty find root passing vacuously) by proving the scan
+# actually walks the populated `dist/script/docker` tree.
+
+bats_require_minimum_version 1.5.0
+
+LINT="/source/script/test/lint_bare_stderr.sh"
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  FIXTURE="$(mktemp -d)"
+  mkdir -p "${FIXTURE}/dist/script/docker/lib" \
+           "${FIXTURE}/script/test"
+}
+
+teardown() {
+  rm -rf "${FIXTURE}"
+}
+
+# why: exit 1 + violation line on the correct tree
+@test "flags a bare 'printf ... >&2' under dist/script/docker (#692)" {
+  cat > "${FIXTURE}/dist/script/docker/lib/foo.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  printf 'boom: %s\n' "${1}" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_failure
+  assert_equal "${status}" 1
+  assert_output --partial "dist/script/docker/lib/foo.sh"
+  assert_output --partial "bare stderr output"
+}
+
+# why: clean fixture passes silently
+@test "exits 0 on a clean tree (no bare stderr) (#692)" {
+  cat > "${FIXTURE}/dist/script/docker/lib/foo.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  _log_err thing thing_failed "display=boom"
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_success
+  assert_output ""
+}
+
+# why: `_log_*` line exempt
+@test "does NOT flag an allowlisted _log_* line (#692)" {
+  cat > "${FIXTURE}/dist/script/docker/lib/foo.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  _log_warn thing thing_warn "display=heads up" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_success
+}
+
+# why: getopts / prompt lines exempt
+@test "does NOT flag an allowlisted getopts / [y/N] prompt line (#692)" {
+  cat > "${FIXTURE}/dist/script/docker/lib/foo.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  printf 'Overwrite? [y/N] ' >&2
+  while getopts ":h" opt; do printf 'bad: %s\n' "${OPTARG}" >&2; done
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_success
+}
+
+# why: standalone log.sh-free CI tool excluded
+@test "does NOT flag bare stderr in the standalone coverage_gate.sh CI tool (#710)" {
+  # coverage_gate.sh is a deliberately log.sh-free standalone CI tool (it
+  # runs as bare `bash coverage_gate.sh ...` under GitHub Actions / GitLab
+  # CI), so its diagnostics go straight to stderr and the file is excluded
+  # wholesale -- same rationale class as the bootstrap pre-sourcing
+  # allowlist.
+  mkdir -p "${FIXTURE}/script/test/drivers"
+  cat > "${FIXTURE}/script/test/drivers/coverage_gate.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  echo "coverage_gate: report not found" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_success
+  assert_output ""
+}
+
+# why: the in-image apt retry helper is excluded (base#1602): it is a
+# /bin/sh script copied into the image and run by Dockerfile RUN layers,
+# where no lib/log.sh exists, so its per-attempt failure line goes straight
+# to fd 2 -- the build log
+@test "does NOT flag bare stderr in the in-image apt-retry.sh helper (base#1602)" {
+  mkdir -p "${FIXTURE}/dist/script/docker/build"
+  cat > "${FIXTURE}/dist/script/docker/build/apt-retry.sh" <<'EOF'
+#!/bin/sh
+printf 'apt-retry: attempt %d/%d failed (exit %d)\n' "${i}" "${attempts}" "${rc}" >&2
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_success
+  assert_output ""
+}
+
+# why: config-gen's in-image event protocol: the admit stage runs with no
+# lib/log.sh, so its refusal is a `cg_event` line on stderr that the host
+# runner reads back and re-emits through _log_err (base#1465)
+@test "does NOT flag a printf of a cg_event line, but still flags any other bare stderr in the same file (base#1465)" {
+  cat > "${FIXTURE}/script/test/config_gen_thing.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  printf 'cg_event config_gen_manifest_stale file=%s reason=%s\n' "${1}" "${2}" >&2
+  printf 'boom: %s\n' "${1}" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_equal "${status}" 1
+  assert_output --partial "script/test/config_gen_thing.sh:4:"
+  refute_output --partial "config_gen_thing.sh:3:"
+  assert_output --partial "1 bare stderr output(s) found"
+}
+
+# why: the same protocol's gate id line: config_gen_coverage.sh runs in
+# the config-gen test stage with no lib/log.sh, and the host runner reads
+# its `config_gen_gate_<g>_failed` stderr line back as the gate that went
+# red (base#1467)
+@test "does NOT flag a printf of a config_gen_gate_ id line, but still flags any other bare stderr in the same file (base#1467)" {
+  cat > "${FIXTURE}/script/test/config_gen_thing.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  printf 'config_gen_gate_coverage_failed reason=%s pkg=%s\n' "${1}" "${2}" >&2
+  printf 'boom: %s\n' "${1}" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_equal "${status}" 1
+  assert_output --partial "script/test/config_gen_thing.sh:4:"
+  refute_output --partial "config_gen_thing.sh:3:"
+  assert_output --partial "1 bare stderr output(s) found"
+}
+
+# why: config-gen's timing lines are read back by line shape, the gates
+# runner's `config-gen stage=` and the redpath's `config-gen redpath
+# case=`, so a _log_* prefix would break their readers (base#1547)
+@test "does NOT flag a printf of a config-gen stage= or redpath case= timing line, but still flags any other bare stderr in the same file (base#1547)" {
+  cat > "${FIXTURE}/script/test/config_gen_thing.sh" <<'EOF'
+#!/usr/bin/env bash
+_thing() {
+  printf 'config-gen stage=%s start=%s end=%s secs=%s status=%s\n' "${1}" "${2}" "${3}" "${4}" "${5}" >&2
+  printf 'config-gen redpath case=%s start=%s end=%s secs=%s result=%s\n' "${1}" "${2}" "${3}" "${4}" "${5}" >&2
+  printf 'config-gen other=%s\n' "${1}" >&2
+}
+EOF
+  run bash "${LINT}" "${FIXTURE}"
+  assert_equal "${status}" 1
+  assert_output --partial "script/test/config_gen_thing.sh:5:"
+  refute_output --partial "config_gen_thing.sh:3:"
+  refute_output --partial "config_gen_thing.sh:4:"
+  assert_output --partial "1 bare stderr output(s) found"
+}
+
+# why: live-tree guard against path drift
+@test "the real repo tree (default root) is clean (#692)" {
+  # No $1: the lint defaults its root to two levels up from the script,
+  # i.e. the real /source tree. This guards the live wrapper/lib + test
+  # tree against an un-allowlisted bare stderr AND the path-drift bug --
+  # an empty find root would pass vacuously, but a populated correct root
+  # proves the scan actually walks dist/script/docker.
+  run bash "${LINT}"
+  assert_success
+}

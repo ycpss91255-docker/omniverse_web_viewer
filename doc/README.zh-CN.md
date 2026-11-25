@@ -2,7 +2,7 @@
 
 **[English](../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
-通用、与 Kit 解耦的浏览器 WebRTC 查看器 sidecar，用于 Omniverse Kit 串流应用程序（Isaac Sim、USD Viewer 等）。镜像构建于 [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) 之上，启动时依 `VIEWER_UI_MODE` 选择下列两个静态应用之一来提供服务：
+通用、与 Kit 解耦的浏览器 WebRTC 查看器 sidecar，用于 Omniverse Kit 串流应用程序（Isaac Sim、USD Viewer 等）。镜像构建于 [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base) 之上，启动时依 `VIEWER_UI_MODE` 选择下列两个静态应用之一来提供服务：
 
 - **`usd-viewer`** — NVIDIA 的 [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2，未经修改构建。提供着陆界面、完整 USD Viewer UI 以及任意应用串流，全部以交互方式（点击）进入。
 - **`stream-only`** — 我们自家的全屏自动连接应用，构建于 `stream-core` 包之上。直接进入串流、无需点击；专为 Isaac Sim 与任何无头串流消费端设计。
@@ -44,14 +44,14 @@ just run -t runtime -d
 #    usd-viewer: click the landing screen to choose a view
 ```
 
-如需覆盖默认的主机 IP 或端口，请编辑 `config/docker/setup.conf`：
+如需覆盖默认的主机 IP 或端口，请编辑 `setup.toml`：
 
-```ini
+```toml
 [environment]
-env_1 = SIGNALING_SERVER=<host-ip>
-env_2 = SIGNALING_PORT=49100
-env_3 = SERVE_PORT=5173
-env_4 = VIEWER_UI_MODE=stream-only
+env_1 = "SIGNALING_SERVER=<host-ip>"
+env_2 = "SIGNALING_PORT=49100"
+env_3 = "SERVE_PORT=5173"
+env_4 = "VIEWER_UI_MODE=stream-only"
 ```
 
 `env_N = KEY=VALUE` 是语法，不是排版风格：`setup.sh` 只收集以 `env_` 开头的
@@ -67,15 +67,17 @@ env_4 = VIEWER_UI_MODE=stream-only
 每个 git tag 都会在同一次 CI run、以同一个 commit，同时发布 GitHub Release **和**对应的容器镜像，两者永远成对存在 — 拿到镜像可以回溯它的 release，拿到 release 也能找到它的镜像：
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **路径变更（2026-11-22）：** GitHub 组织已由 `ycpss91255-docker` 改名为 `ycpss91255-lab`。镜像新路径为 `ghcr.io/ycpss91255-lab/omniverse_web_viewer`，旧的 `ghcr.io/ycpss91255-docker/...` 已无法拉取，请更新已有的固定引用。
 
 镜像的 tag 就是 release 版本号去掉开头的 `v`。这个值由 CI 从 git tag 推导得出，不是人工填写，release 与镜像因此不可能对不上：
 
 | Git tag | 镜像 |
 |---------|------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 Release candidate 同样会发布：正式 tag 出来之前，真正被验证的就是 rc。
 
@@ -89,7 +91,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 然后用 Chrome 打开 `http://<host-ip>:5173`。可调参数即下方环境变量表所列。
@@ -106,7 +108,7 @@ docker run --rm -d --name owv \
 
 `VIEWER_UI_MODE` 选择 entrypoint 提供哪个应用，它不会被注入到资源中。`SIGNALING_SERVER`、`SIGNALING_PORT` 与 `MEDIA_PORT` 是被注入的 sentinel：构建会将每个带有 sentinel 的 chunk 保存为 `*.js.tmpl`，entrypoint 在每次启动时重新渲染 `*.js.tmpl -> *.js`（具幂等性 — 重启或值变更会在下次启动被采用）。校验即是转义处理：无效值会让容器失败（`exit 1`），而非烤进损坏的 JS。会被拒绝的有：`SIGNALING_SERVER` 含 `A-Za-z0-9.-` 以外的字符；`SIGNALING_PORT`、`MEDIA_PORT`、`SERVE_PORT` 任一不是「1..65535 且不带前导零」的整数 — 因此 `80x`、`0`、`99999`、`049100` 都会失败。前导零这一条并非吹毛求疵：端口 sentinel 是不带引号代入的，`049100` 会渲染成裸的 `049100` token，在 strict mode 是 `SyntaxError`，容器启动正常但查看器一片黑。`SERVE_PORT` 只在有设置时检查（`example` stage 用的是 `EXAMPLE_PORT`），且可以是单纯的端口号或 `serve -l` 的 endpoint — `SERVE_PORT=tcp://127.0.0.1:5173` 只绑 loopback，这是唯一能让查看器不监听所有网卡的方式。支持的形式正好两种：`<port>` 与 `tcp://<host>:<port>`。`serve -l` 另外还列了两种，两种都是「指名拒绝」而非漏掉：UNIX domain socket（`unix:/path/to/socket.sock`）没有任何本容器的消费方能寻址得到（浏览器打的是 URL，镜像自身的 serve 冒烟与两个 e2e runner 都是 curl `http://127.0.0.1:<port>`），而 Windows 具名管道（`pipe:\\.\pipe\Name`）在发布的 linux/amd64 镜像里根本不可能存在。媒体 sentinel 仅存在于 `stream-only` bundle（其 `streamTarget.json`）；`usd-viewer` 仅带 server + port，并通过 SDP 协商媒体。已提供服务的 bundle 只以该次渲染为目标来源：`?server=`/`?port=`/`?media=` query string 仅是 `npm run dev` 的便利功能，build 出来的 bundle 会忽略它，因此无法用一条链接把运行中的 viewer 指向别的主机。
 
-端口（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）通过 `.env` 机制（`[environment]` 表 / `setup.conf`）递送，而非 `host.yaml`，也非硬编的 `-e`。`config/host.yaml` 仅承载 `public_ip`（并可选择性带 `viewer.ui_mode`）。优先级：`public_ip` / `ui_mode` -> `host.yaml` > env > 默认；端口 -> `.env`。见 `config/host.yaml.example`。这两个 key 只从「自己的 section」读取（`network.public_ip`、`viewer.ui_mode`），因为该文件按设计就是与主机上其他容器共用的 — 别人 section 里的同名 key 一律不碰。写在第 0 栏（不属于任何 section）的 key 同样不会被读取 — 而两个 key 在这里分道扬镳。第 0 栏的 `public_ip:` 会让 entrypoint **拒绝启动**并指出该 key 应该放进哪个 section：缺少 `network:` section 本身就是异常，因为那个 section 正是这个文件被读取的理由，忽略它就等于退回 env / 默认值去连一个没人选过的地址。第 0 栏的 `ui_mode:` 则是**在 stderr 报告后忽略**：缺少 `viewer:` section 是常态（模式通常由 `VIEWER_UI_MODE` 提供），在那里拒绝启动会让一台配置完全正确的查看器因为别的容器的 key 而起不来 — 而且文件里没有任何线索能区分「本来就是要给我们、只是位置写错」与「那是别人的 key」。那行消息会指出被忽略的 key、实际生效的模式，以及它的来源。
+端口（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）通过 `.env` 机制（`[environment]` 表 / `setup.toml`）递送，而非 `host.yaml`，也非硬编的 `-e`。`config/host.yaml` 仅承载 `public_ip`（并可选择性带 `viewer.ui_mode`）。优先级：`public_ip` / `ui_mode` -> `host.yaml` > env > 默认；端口 -> `.env`。见 `config/host.yaml.example`。这两个 key 只从「自己的 section」读取（`network.public_ip`、`viewer.ui_mode`），因为该文件按设计就是与主机上其他容器共用的 — 别人 section 里的同名 key 一律不碰。写在第 0 栏（不属于任何 section）的 key 同样不会被读取 — 而两个 key 在这里分道扬镳。第 0 栏的 `public_ip:` 会让 entrypoint **拒绝启动**并指出该 key 应该放进哪个 section：缺少 `network:` section 本身就是异常，因为那个 section 正是这个文件被读取的理由，忽略它就等于退回 env / 默认值去连一个没人选过的地址。第 0 栏的 `ui_mode:` 则是**在 stderr 报告后忽略**：缺少 `viewer:` section 是常态（模式通常由 `VIEWER_UI_MODE` 提供），在那里拒绝启动会让一台配置完全正确的查看器因为别的容器的 key 而起不来 — 而且文件里没有任何线索能区分「本来就是要给我们、只是位置写错」与「那是别人的 key」。那行消息会指出被忽略的 key、实际生效的模式，以及它的来源。
 
 ## 多实例
 

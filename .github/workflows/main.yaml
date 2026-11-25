@@ -93,12 +93,12 @@ on:
 # `packages: write` to docker/login-action and lets docker/build-push-action do
 # the push, so a retag of either would yield the registry credential and the
 # ability to publish arbitrary content to
-# ghcr.io/ycpss91255-docker/omniverse_web_viewer, which downstream consumers pin
+# ghcr.io/ycpss91255-lab/omniverse_web_viewer, which downstream consumers pin
 # and execute. `busybox` is pinned by digest for the same reason and one more:
 # that container runs as root with the workspace bind-mounted, BEFORE checkout,
 # on a persistent self-hosted GPU host.
 #
-# `ycpss91255-docker/base/...` reusable workflows stay on version TAGS
+# `ycpss91255-lab/base/...` reusable workflows stay on version TAGS
 # deliberately: they are first-party, the tags are ours, and the refs are the
 # subject of their own tracked decisions (#37, #67, base#915). Bumping a pin
 # means replacing both the SHA and the trailing version comment -- there is no
@@ -142,12 +142,11 @@ jobs:
     # build and carries no registry login). Read is all it can justify.
     permissions:
       contents: read
-    uses: ycpss91255-docker/base/.github/workflows/build-worker.yaml@v0.41.0
+    uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@v0.43.0-rc7
     with:
       image_name: omniverse_web_viewer
       submodules: recursive
       build_runtime: true
-      test_tools_version: v0.41.0
       # Tier-1 browser config-dial e2e (#47): an extra Dockerfile stage
       # (FROM runtime) that boots the served dists in headless Chromium and
       # asserts the bundle dials the injected server/port (+ media). No GPU,
@@ -280,7 +279,7 @@ jobs:
     # upstream -- but here means THIS job, not the whole workflow.
     permissions:
       contents: write
-    uses: ycpss91255-docker/base/.github/workflows/release-worker.yaml@v0.42.0
+    uses: ycpss91255-lab/base/.github/workflows/release-worker.yaml@v0.43.0-rc7
     with:
       archive_name_prefix: omniverse_web_viewer
 
@@ -395,8 +394,8 @@ jobs:
           # the upstream `src` submodule.
           submodules: recursive
 
-      # `GITHUB_REPOSITORY` is ycpss91255-docker/omniverse_web_viewer, i.e. the
-      # ghcr.io/ycpss91255-docker/omniverse_web_viewer the READMEs document; it
+      # `GITHUB_REPOSITORY` is ycpss91255-lab/omniverse_web_viewer, i.e. the
+      # ghcr.io/ycpss91255-lab/omniverse_web_viewer the READMEs document; it
       # follows the repo automatically if it is ever renamed. The full
       # reference is assembled here so the push step below stays a one-liner
       # and the run summary records exactly what was published.
@@ -547,7 +546,7 @@ jobs:
   # ------------------------- Tier B visual acceptance (#48) -----------------
   # The gate that finally answers "is there actually a picture?" without a
   # human in front of a browser: a REAL Kit producer (the pinned deterministic
-  # ghcr.io/ycpss91255-docker/isaac-stream-source image, isaac#223) -> the REAL
+  # ghcr.io/ycpss91255-lab/isaac-stream-source image, isaac#223) -> the REAL
   # served stream-only dist -> headless Chromium, asserting a connected
   # RTCPeerConnection, a remote track, videoWidth > 0 and a NON-BLACK sampled
   # frame. Everything per-PR stops one step short of that (config dial against
@@ -650,7 +649,7 @@ jobs:
     steps:
       # Pre-checkout self-heal: a prior GPU run can leave root-owned residue in
       # the workspace that breaks the non-root runner's checkout clean step.
-      # Mirrors isaac's stream-smoke; refs ycpss91255-docker/github_runner#77.
+      # Mirrors isaac's stream-smoke; refs ycpss91255-lab/github_runner#77.
       - name: Pre-checkout cleanup (clear stale root-owned residue)
         run: |
           docker run --rm -v "${GITHUB_WORKSPACE}":/w -w /w busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616 sh -c '

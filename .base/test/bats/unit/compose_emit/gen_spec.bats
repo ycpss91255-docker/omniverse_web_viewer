@@ -1,0 +1,1567 @@
+#!/usr/bin/env bats
+#
+# Tests for generate_compose_yaml in dist/script/docker/wrapper/setup.sh.
+# Verifies conditional emission of GPU deploy block, GUI env/volumes,
+# extra volumes list, and baseline structural elements.
+#
+# why: Covers `generate_compose_yaml` conditional output: AUTO-GENERATED
+# header, baseline workspace volume, network/ipc/privileged env-var
+# references, conditional pid emission (only for `host`; omitted for
+# `private` since Docker rejects the literal), `test` service presence,
+# image name threading, conditional GPU deploy block + GUI env/volumes +
+# extra volumes from `[volumes]` section, and the deploy-scoped `[lifecycle]
+# restart` emission (never on devel, on a deployable stage in both the
+# `extends: devel` and the standalone shapes, absent on any `*-test` stage).
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/../test_helper"
+
+  # shellcheck disable=SC1091
+  source /source/dist/script/docker/wrapper/setup.sh
+
+  TEMP_DIR="$(mktemp -d)"
+  COMPOSE_OUT="${TEMP_DIR}/compose.yaml"
+  # (A1'-b): the `test` service is emitted from the `devel-test`
+  # baseline stage via the per-stage loop, so generate_compose_yaml now
+  # needs a Dockerfile that declares it. Ship a minimal baseline so the
+  # default (no custom Dockerfile) path still produces devel + test.
+  # Tests that need extra stages overwrite this file.
+  cat > "${TEMP_DIR}/Dockerfile" <<'EOF'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+EOF
+  # Override toml_bridge_{parse,merge} to use the in-container bridge
+  # directly instead of docker run (the test container has the bridge
+  # installed at /usr/local/bin/toml-bridge via Dockerfile.test-tools).
+  toml_bridge_parse() {
+    local _file="${1:?missing file}"
+    shift
+    [[ -f "${_file}" ]] || { echo "toml_bridge_parse: file not found: ${_file}" >&2; return 1; }
+    /usr/local/bin/toml-bridge "$@" < "${_file}"
+  }
+  toml_bridge_merge() {
+    local _kv_flag=""
+    if [[ "${1:-}" == "--kv" ]]; then _kv_flag="--kv"; shift; fi
+    local -a _args=("--merge")
+    [[ -n "${_kv_flag}" ]] && _args+=("--kv")
+    _args+=("$@")
+    /usr/local/bin/toml-bridge "${_args[@]}"
+  }
+}
+
+teardown() {
+  rm -rf "${TEMP_DIR}"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Baseline (always present)
+# ════════════════════════════════════════════════════════════════════
+
+# why: Header check
+@test "generate_compose_yaml outputs AUTO-GENERATED header" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run head -n 1 "${COMPOSE_OUT}"
+  assert_output --partial "AUTO-GENERATED"
+}
+
+@test "generate_compose_yaml emits top-level name: as the resolved PROJECT_NAME (#472)" {
+  # Top-level name: lets non-wrapper tools (lazydocker / docker compose ps /
+  # IDE panels) resolve the same project name the wrapper pins via -p. It is
+  # ONE interpolation of the value setup resolved into .env.generated, not a
+  # re-derivation of `<hub>-<image>` here -- a second computation is what
+  # made this file and the wrapper two answerers to the same question.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'name: ${PROJECT_NAME}' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml top-level name: precedes services: (#472)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  local _name_ln _svc_ln
+  _name_ln="$(grep -n '^name:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _svc_ln="$(grep -n '^services:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  [ -n "${_name_ln}" ]
+  [ -n "${_svc_ln}" ]
+  (( _name_ln < _svc_ln ))
+}
+
+@test "generate_compose_yaml emits exactly one top-level name: (#472)" {
+  # Even with stage variants, name: is a single top-level key, never
+  # per-service / per-stage.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -c '^name:' "${COMPOSE_OUT}"
+  assert_output "1"
+}
+
+# ── top-level volumes: (Option A / D-Strict) ───────────────────────────
+
+@test "generate_compose_yaml named volume mount emits top-level volumes: stub (#482)" {
+  local _extras=('my_state:/srv/state')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^volumes:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -E '^  my_state:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- my_state:/srv/state' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml bind mounts never enter top-level volumes: (#482)" {
+  # /, ./, ~/, ${ prefixes are all binds -> no top-level volumes block.
+  local _extras=('/var/log:/log' './data:/data' '~/.ssh:/home/u/.ssh:ro' '${WS_PATH}:/work')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^volumes:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml bind-only repo is zero-diff (no top-level volumes:) (#482)" {
+  # Critical: bind-only output must be unchanged for the 17 downstream repos.
+  local _extras=('${WS_PATH}:/home/${USER_NAME}/work')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^volumes:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml named volume with :mode strips mode from top-level name (#482)" {
+  local _extras=('my_state:/srv/state:rw')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  # top-level stub has the bare name, no :rw
+  run grep -E '^  my_state:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -E '^  my_state:rw' "${COMPOSE_OUT}"
+  assert_failure
+  # service level keeps the mode
+  run grep -F -- '- my_state:/srv/state:rw' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml dedups a named volume referenced twice (#482)" {
+  local _extras=('my_state:/srv/state' 'my_state:/srv/other:rw')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -c '^  my_state:$' "${COMPOSE_OUT}"
+  assert_output "1"
+}
+
+@test "generate_compose_yaml top-level volumes: stub has no driver/labels (#482)" {
+  local _extras=('my_state:/srv/state')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  # the line after `  my_state:` must not be an indented driver/labels key
+  run grep -A1 '^  my_state:$' "${COMPOSE_OUT}"
+  refute_output --partial "driver"
+  refute_output --partial "labels"
+}
+
+@test "generate_compose_yaml emits volumes: before networks: (#482)" {
+  # network on -> both top-level blocks present; volumes precedes networks.
+  #
+  # The network name is the EIGHTH POSITIONAL argument. This used to be
+  # passed as `NETWORK_MODE=bridge NETWORK_NAME=mynet` in the environment,
+  # which generate_compose_yaml never reads, so `networks:` was never
+  # emitted and the ordering assertion never ran -- an `else skip` reported
+  # that as a pass on every run since the test was written. Both blocks are
+  # now asserted present before the order is compared, so a generator that
+  # stops emitting either one fails here instead of skipping.
+  #
+  # `bridge` is the FOURTEENTH positional argument and it is now required
+  # for a named network to be emitted at all: base#1094 made the devel
+  # service and this top-level block honour `[network] mode` the way the
+  # per-stage emitter and the field bundle always have. Before that the
+  # name alone was enough here, which is precisely the divergence
+  # base#1094 measured -- so this test used to pass while asserting the
+  # defect.
+  local _extras=('my_state:/srv/state')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "mynet" "" "" "" "" "" "bridge"
+  run grep -cE '^volumes:$' "${COMPOSE_OUT}"
+  assert_output "1"
+  run grep -cE '^networks:$' "${COMPOSE_OUT}"
+  assert_output "1"
+  local _vol_ln _net_ln
+  _vol_ln="$(grep -n '^volumes:$' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _net_ln="$(grep -n '^networks:$' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  (( _vol_ln < _net_ln ))
+}
+
+# why: `_classify_volume_lhs` listed `/`, `./`, `~/` and `${` as its bind
+# prefixes and nothing else, so a parent-relative host path read as a
+# Docker named volume: the mount was emitted as a reference to a managed
+# volume AND declared in the top-level `volumes:` block under the literal
+# name `../foo`. compose does not error on that -- the service comes up
+# with an empty managed volume where the operator's sibling directory
+# should be. The gate is on the emitted file rather than on the
+# classifier's return value, because a return-value assertion passes
+# while the symptom stands (base#1115, base#1117, base#1175).
+@test "generate_compose_yaml keeps a parent-relative bind out of top-level volumes: (base#1257)" {
+  local _extras=('../foo:/bar')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- ../foo:/bar' "${COMPOSE_OUT}"
+  assert_success
+  run grep -E '^volumes:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: the gap was three spellings, not one. `.` and `..` carry no
+# trailing slash for the prefix globs to match, and they are the spelling
+# an operator reaches for to mount the repo itself or its parent -- so a
+# bind-only repo using either one grew a top-level `volumes:` block
+# declaring a volume literally named `.`, and lost the mount it asked for.
+@test "generate_compose_yaml keeps the bare-dot bind sources out of top-level volumes: (base#1257)" {
+  local _extras=('.:/bar' '..:/baz')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- .:/bar' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- ..:/baz' "${COMPOSE_OUT}"
+  assert_success
+  run grep -E '^volumes:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: widening the bind arm must not stop a genuine named volume being
+# declared, and the two cannot be checked apart: a repo that mixes them
+# gets the block, and the block must name the volume and ONLY the volume.
+# Asserting the block's absence over relative sources alone would also be
+# satisfied by a classifier that called everything a bind.
+@test "generate_compose_yaml declares only the real named volume when a relative bind sits beside it (base#1257)" {
+  local _extras=('../foo:/bar' '.:/here' 'my_state:/srv/state')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -cE '^volumes:$' "${COMPOSE_OUT}"
+  assert_output "1"
+  run grep -E '^  my_state:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -nE '^  (\.\./foo|\.):$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: the classifier and `_compose_is_repo_relative` are two readings of
+# the same left-hand side, and base#1257 is what their disagreement cost.
+# The population is taken FROM the predicate rather than written out
+# here: every spelling it calls explicitly repo-relative is a host path,
+# so the classifier owes it `bind`. A spelling added to the predicate is
+# covered by the edit that adds it.
+@test "every repo-relative spelling the rebase predicate accepts classifies as a bind (base#1257)" {
+  local _lhs _rel
+  for _lhs in . .. ./foo ../foo ../../foo './a b' myvol my_state '' /abs '~/h' '${X}/y'; do
+    _compose_is_repo_relative "${_lhs}" && _rel=yes || _rel=no
+    [[ "${_rel}" == yes ]] || continue
+    run _classify_volume_lhs "${_lhs}:/tgt"
+    assert_output "bind"
+  done
+  # Non-vacuous in the other direction: a bare name is still a volume.
+  run _classify_volume_lhs 'my_state:/srv/state'
+  assert_output "named"
+}
+
+@test "generate_compose_yaml emits workspace mount when present in extras" {
+  # Workspace is now driven by [volumes] mount_1 (setup.sh writeback),
+  # not a hard-coded baseline. Simulate the extras array containing a
+  # mount_1 entry (format produced by setup.sh upsert).
+  local _extras=('${WS_PATH}:/home/${USER_NAME}/work')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F '${WS_PATH}:/home/${USER_NAME}/work' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml omits workspace when extras is empty (opt-out)" {
+  # When the user clears mount_1, no workspace mount appears. GUI is also
+  # disabled here, so the volumes block itself should not be emitted.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F ':/home/${USER_NAME}/work' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml default (no network_name) keeps network_mode env var" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'network_mode: ${NETWORK_MODE}' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'external: true' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml with network_name emits networks list + bridge driver block (compose self-managed)" {
+  # `bridge` as the fourteenth positional is now part of the condition:
+  # base#1094 made `[network] mode` decide here too, so a name beside
+  # `mode = host` is reported and ignored rather than silently winning.
+  # The sibling case lives in validated_key_reach_spec.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "mynet" "" "" "" "" "" "bridge"
+  # network_mode is replaced
+  run grep -F 'network_mode: ${NETWORK_MODE}' "${COMPOSE_OUT}"
+  assert_failure
+  # service joins the named network
+  run grep -F -- '- mynet' "${COMPOSE_OUT}"
+  assert_success
+  # top-level networks block: compose self-manages (driver: bridge)
+  run grep -F 'driver: bridge' "${COMPOSE_OUT}"
+  assert_success
+  # NOT external (would require user to `docker network create` first)
+  run grep -F 'external: true' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml omits devices block when both inputs empty" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" ""
+  run grep -E '^    devices:$' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -E '^    device_cgroup_rules:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml emits devices: block from device list" {
+  local _extras=()
+  local _devices
+  printf -v _devices '%s\n%s' "/dev/video0:/dev/video0" "/dev/dri"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "${_devices}" ""
+  run grep -E '^    devices:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /dev/video0:/dev/video0' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /dev/dri' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml accepts /dev:/dev (full /dev tree bind)" {
+  # Default template value; must pass through verbatim.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev"
+  run grep -E '^    devices:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /dev:/dev' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# ── device propagation → volumes long-form ──────────────────────
+
+@test "generate_compose_yaml: device with propagation emits to volumes long-form (#450 P1)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev:rslave"
+  run grep -F 'propagation: rslave' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'source: /dev' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'target: /dev' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml: device without propagation stays in devices: (#450 P1)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev/video0:/dev/video0"
+  run grep -E '^    devices:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /dev/video0:/dev/video0' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'propagation:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml: mixed devices split correctly (#450 P1)" {
+  local _extras=()
+  local _devices
+  printf -v _devices '%s\n%s' "/dev/video0:/dev/video0" "/dev:/dev:rslave"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "${_devices}"
+  run grep -F -- '- /dev/video0:/dev/video0' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'propagation: rslave' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml: device rw,rslave emits combined propagation (#450 P1)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev:rw,rslave"
+  run grep -F 'propagation: rslave' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'read_only: false' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml: device ro,rshared emits read_only + propagation (#450 P1)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/data:/data:ro,rshared"
+  run grep -F 'propagation: rshared' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'read_only: true' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml: propagation-only device creates volumes: header even without extras (#450)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev:rslave"
+  run grep -E '^    volumes:$' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml: all devices have propagation → no devices: section (#450)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev:rslave"
+  run grep -E '^    devices:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# NOTE: the `[environment]` env_N block moved out of the compose
+# `environment:` list and into the generated `.env` (compose ranks
+# `environment:` above `env_file`, so a default left there outranks the
+# operator's `.env.local`). Its emission and its `${VAR}` cross-reference
+# expansion are covered where the code now lives, in env_emit_spec.bats
+# against write_container_env (ADR-00000015: tests mirror source).
+
+# why: append-mode tail expands against the shared prefix
+@test "generate_compose_yaml expands \${VAR} env cross-refs in a per-stage env_N addition (refs #955)" {
+  # A `[stage:*]` that APPENDS its own env_N is the append-mode case: the
+  # shared prefix stays in `.env` (where write_container_env expands
+  # it) and only this stage's own tail is restated inline. That tail
+  # skipped the expansion entirely, so the SAME setup.toml produced two
+  # different container envs -- `.env` carried the resolved value and the
+  # stage service a literal `${VAR}` compose cannot resolve, because its
+  # substitution layer never sees sibling env entries. Expansion has to
+  # run over the FULL effective list (the referenced sibling lives in the
+  # prefix) while still emitting only the tail.
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS probe
+DOCK
+  mkdir -p "${TEMP_DIR}"
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:probe"]
+"environment.env_1" = "LD_LIBRARY_PATH=/foo/${BUILD_TARGET}/lib"
+CONF
+  local _extras=()
+  local _env="BUILD_TARGET=production"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "${_env}" "" "" "" "host" "host"
+
+  local _probe_block
+  _probe_block="$(awk '/^  probe:/{f=1;next} /^  [a-z]/{f=0} f' "${COMPOSE_OUT}")"
+  assert [ -n "$(grep -F -- 'LD_LIBRARY_PATH=/foo/production/lib' <<< "${_probe_block}")" ]
+  refute [ -n "$(grep -F -- '${BUILD_TARGET}' <<< "${_probe_block}")" ]
+  # The shared prefix is still NOT restated here: a compose
+  # `environment:` entry outranks `.env.local`.
+  refute [ -n "$(grep -F -- 'BUILD_TARGET=production' <<< "${_probe_block}")" ]
+}
+
+# why: stage replaces the list, its own env_N cross-refs
+@test "generate_compose_yaml expands cross-refs in a per-stage environment.env_N replacement (refs #955)" {
+  # Same rule when the stage REPLACES the inherited list: the stage's own
+  # env_N entries cross-reference each other exactly like the devel ones.
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS probe
+DOCK
+  mkdir -p "${TEMP_DIR}"
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:probe"]
+"environment.env_inherit" = "false"
+"environment.env_1" = "ROOT=/opt"
+"environment.env_2" = "BASE=${ROOT}/lib"
+CONF
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host"
+
+  local _probe_block
+  _probe_block="$(awk '/^  probe:/{f=1;next} /^  [a-z]/{f=0} f' "${COMPOSE_OUT}")"
+  assert [ -n "$(grep -F -- 'BASE=/opt/lib' <<< "${_probe_block}")" ]
+  refute [ -n "$(grep -F -- '${ROOT}' <<< "${_probe_block}")" ]
+}
+
+@test "generate_compose_yaml emits tmpfs block from tmpfs_ list" {
+  local _extras=()
+  local _tmpfs
+  printf -v _tmpfs '%s\n%s' "/tmp" "/var/run:size=64m"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "${_tmpfs}" "" "" "host" "host"
+  run grep -E '^    tmpfs:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /tmp' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /var/run:size=64m' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits ports block only under network_mode=bridge" {
+  local _extras=()
+  local _ports
+  printf -v _ports '%s\n%s' "8080:80" "5000:5000"
+  # host mode: ports dropped
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "${_ports}" "" "host" "host"
+  run grep -E '^    ports:$' "${COMPOSE_OUT}"
+  assert_failure
+  # bridge mode: ports emitted
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "${_ports}" "" "bridge" "host"
+  run grep -E '^    ports:$' "${COMPOSE_OUT}"
+  assert_success
+  # Ports are overlay-overridable ${PORT_N:-default} interpolations, not
+  # baked literals, so a multi_run .env overlay can remap the host port
+  # per instance (ADR-00000022). The setup.toml value is the :- default;
+  # the index is 1-based (PORT_1 = first port) matching base's indexed-key
+  # convention (port_1 / mount_1 / arg_1).
+  run grep -F -- '- "${PORT_1:-8080:80}"' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- "${PORT_2:-5000:5000}"' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits shm_size only when ipc_mode != host" {
+  local _extras=()
+  # ipc=host: shm_size ignored
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "2gb" "host" "host"
+  run grep -E '^    shm_size: 2gb$' "${COMPOSE_OUT}"
+  assert_failure
+  # ipc=private: shm_size emitted
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "2gb" "host" "private"
+  run grep -E '^    shm_size: 2gb$' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits cap_add from security list" {
+  local _extras=()
+  local _cap_add
+  printf -v _cap_add '%s\n%s' "SYS_ADMIN" "NET_ADMIN"
+  # positional: out name gui gpu count caps extras net_name devices env tmpfs ports shm net_mode ipc_mode pid_mode cap_add cap_drop sec_opt
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "private" "${_cap_add}" "" ""
+  run grep -E '^    cap_add:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- SYS_ADMIN' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- NET_ADMIN' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits cap_drop from security list" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "private" "" "ALL" ""
+  run grep -E '^    cap_drop:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- ALL' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits security_opt from security list" {
+  local _extras=()
+  local _sec_opt
+  printf -v _sec_opt '%s\n%s' "seccomp:unconfined" "apparmor:unconfined"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "private" "" "" "${_sec_opt}"
+  run grep -E '^    security_opt:$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- seccomp:unconfined' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- apparmor:unconfined' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml omits cap_add / cap_drop / security_opt blocks when empty" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^    cap_add:$' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -E '^    cap_drop:$' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -E '^    security_opt:$' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: per-stage caps clear
+@test "generate_compose_yaml per-stage security.cap_add_inherit=false clears inherited caps for that stage only (#526)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS probe
+DOCK
+  mkdir -p "${TEMP_DIR}"
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:probe"]
+"security.cap_add_inherit" = "false"
+"security.security_opt_inherit" = "false"
+CONF
+  local _extras=()
+  local _cap_add _sec_opt
+  printf -v _cap_add '%s' "SYS_ADMIN"
+  printf -v _sec_opt '%s' "seccomp:unconfined"
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "private" "${_cap_add}" "" "${_sec_opt}"
+  # devel inherits the top-level caps.
+  run awk '/^  devel:/{f=1} f&&/cap_add:/{print; exit}' "${COMPOSE_OUT}"
+  assert_output --partial "cap_add:"
+  # probe (cleared) carries no cap_add / security_opt.
+  local _probe_block
+  _probe_block="$(awk '/^  probe:/{f=1;next} /^  [a-z]/{f=0} f' "${COMPOSE_OUT}")"
+  refute [ -n "$(grep -F 'SYS_ADMIN' <<< "${_probe_block}")" ]
+  refute [ -n "$(grep -F 'seccomp:unconfined' <<< "${_probe_block}")" ]
+}
+
+# why: per-stage caps append emit
+@test "generate_compose_yaml per-stage security.cap_add_N appends to inherited caps (#526)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS flash
+DOCK
+  mkdir -p "${TEMP_DIR}"
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:flash"]
+"security.cap_add_1" = "MKNOD"
+CONF
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "private" "SYS_ADMIN" "" ""
+  local _flash_block
+  _flash_block="$(awk '/^  flash:/{f=1;next} /^  [a-z]/{f=0} f' "${COMPOSE_OUT}")"
+  assert [ -n "$(grep -F 'SYS_ADMIN' <<< "${_flash_block}")" ]
+  assert [ -n "$(grep -F 'MKNOD' <<< "${_flash_block}")" ]
+}
+
+# why: env-var baked
+@test "generate_compose_yaml emits network_mode/ipc/privileged via env var" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'network_mode: ${NETWORK_MODE}' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'ipc: ${IPC_MODE}' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'privileged: ${PRIVILEGED}' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: pid omit
+@test "generate_compose_yaml omits pid when default private" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'pid:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: pid host
+@test "generate_compose_yaml emits pid env-var ref when host" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "host"
+  run grep -F 'pid: ${PID_MODE}' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: `container:` names no container. _pid_mode_emits lets through
+# `host` and `container:<name>` with a non-empty name only, so the key is
+# omitted for the empty target as it is for private (base#1399).
+@test "generate_compose_yaml omits pid for container: with an empty target (base#1399)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "" "" "" "" "" "host" "host" "container:"
+  run grep -F 'pid:' "${COMPOSE_OUT}"
+  assert_failure
+  run _pid_mode_emits "container:"
+  assert_failure
+  run _pid_mode_emits "container:db"
+  assert_success
+}
+
+# why: test service
+@test "generate_compose_yaml emits test service with profiles: [test]" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- test' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F ':test' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: Image name
+@test "generate_compose_yaml image field contains repo name" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F "local}/myrepo:devel" "${COMPOSE_OUT}"
+  assert_success
+  run grep -F "local}/myrepo:test" "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits TZ build arg with Asia/Taipei default" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'TZ: ${TZ:-Asia/Taipei}' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits TARGETARCH build arg on devel (test inherits via extends, #493)" {
+  local _extras=()
+  # Positional args up to are optional (defaults via ${N:-}); pos is target_arch.
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras \
+    "" "" "" "" "" "" "host" "host" "private" \
+    "" "" "" "" "" "arm64"
+  # (A1'-b): the test service is now an extends:devel stage with no
+  # override, so it does not re-emit its own build.args — it inherits
+  # devel's TARGETARCH at compose-merge time. The line appears once.
+  run grep -cF 'TARGETARCH: ${TARGET_ARCH}' "${COMPOSE_OUT}"
+  assert_success
+  assert_output "1"
+}
+
+@test "generate_compose_yaml omits TARGETARCH line when target_arch empty (BuildKit auto-fill)" {
+  local _extras=()
+  # Omit the final target_arch arg entirely — default is empty.
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'TARGETARCH:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml emits build.network on devel (test inherits via extends, #493)" {
+  local _extras=()
+  # Pos is build_network.
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras \
+    "" "" "" "" "" "" "host" "host" "private" \
+    "" "" "" "" "" "" "host"
+  # (A1'-b): test is an extends:devel stage with no override, so the
+  # build.network line is emitted once on devel and inherited by test.
+  run grep -cE '^      network: host$' "${COMPOSE_OUT}"
+  assert_success
+  assert_output "1"
+}
+
+@test "generate_compose_yaml omits build.network line when build_network empty" {
+  local _extras=()
+  # Default = empty → no network key under build.
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^      network:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: Baseline scope
+@test "generate_compose_yaml does NOT emit /dev:/dev by default (not in baseline)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- /dev:/dev' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# GPU deploy block — conditional
+# ════════════════════════════════════════════════════════════════════
+
+# why: GPU on
+@test "generate_compose_yaml GPU enabled => deploy block present" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "true" "all" "gpu" _extras
+  run grep -F 'deploy:' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'driver: nvidia' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'count: all' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: GPU off
+@test "generate_compose_yaml GPU disabled => no deploy block" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'deploy:' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -F 'driver: nvidia' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: GPU args
+@test "generate_compose_yaml GPU with specific count and capabilities" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "true" "2" "compute utility" _extras
+  run grep -F 'count: 2' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'capabilities: [compute, utility]' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# GUI block — conditional
+# ════════════════════════════════════════════════════════════════════
+
+# why: GUI on
+@test "generate_compose_yaml GUI enabled => DISPLAY env + X11 volumes present" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "false" "0" "gpu" _extras
+  run grep -F 'DISPLAY=${DISPLAY' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'WAYLAND_DISPLAY' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F '/tmp/.X11-unix:/tmp/.X11-unix:ro' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'XAUTHORITY' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: #582 mount target
+@test "generate_compose_yaml GUI: xauth mounts at fixed neutral target, not host abs path (#582)" {
+  # The host XAUTHORITY resolves to a deep absolute path (e.g.
+  # <...>/workspace/docker/app/<repo>/.docker.xauth). Mirroring it as the
+  # mount target makes Docker auto-create the intermediate dirs inside the
+  # container HOME -> a confusing empty ~/workspace tree next to ~/work.
+  # Source stays the host cookie; target is a fixed neutral path.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "false" "0" "gpu" _extras
+  run grep -F '${XAUTHORITY:-/dev/null}:/tmp/.docker.xauth:ro' "${COMPOSE_OUT}"
+  assert_success
+  # The old self-mirrored form (target == host abs path) must be gone.
+  run grep -F ':${XAUTHORITY:-/dev/null}:ro' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# why: #582 env sync
+@test "generate_compose_yaml GUI: container XAUTHORITY points at the fixed mount target (#582)" {
+  # The in-container XAUTHORITY env must match where the cookie is now
+  # mounted, otherwise X11 clients cannot find it.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "false" "0" "gpu" _extras
+  run grep -F 'XAUTHORITY=/tmp/.docker.xauth' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: GUI off
+@test "generate_compose_yaml GUI disabled => no DISPLAY env + no X11 volumes" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'DISPLAY=${DISPLAY' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -F '/tmp/.X11-unix:/tmp/.X11-unix:ro' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# ── relocated from the shipped smoke spec ───────────────────────────────
+#
+# dist/test/bats/smoke/devel-test/display_env.bats used to assert these
+# against /lint/compose.yaml. compose.yaml is a derived artifact listed in
+# .dockerignore, so it is never in a build context and that file never
+# exists -- the assertions were gated on a condition that is false in every
+# repo and every runner, so they only ever skipped. Here the emitter is
+# driven directly with the GUI resolved both ON and OFF, so both sides can
+# fail.
+
+@test "generate_compose_yaml GUI enabled => XDG_RUNTIME_DIR env (Wayland socket dir)" {
+  # The Wayland compositor socket lives in XDG_RUNTIME_DIR; without the env
+  # the client looks in the container's own (empty) runtime dir.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "false" "0" "gpu" _extras
+  run grep -F 'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1000}' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml GUI enabled => XDG_RUNTIME_DIR mounted rw at the same path" {
+  # rw, and mirrored path: the Wayland client connects to
+  # ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}, so the mount target has to match
+  # the env, and the socket handshake writes.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "false" "0" "gpu" _extras
+  run grep -E '\$\{XDG_RUNTIME_DIR:-/run/user/1000\}:\$\{XDG_RUNTIME_DIR:-/run/user/1000\}:rw' \
+    "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml GUI disabled => no XDG_RUNTIME_DIR env or mount" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'XDG_RUNTIME_DIR' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# _assert_no_duplicate_service_keys <compose_file>
+#
+# Fail if any service block repeats a mapping key. Two `environment:` or two
+# `tmpfs:` keys under one service is not a style nit -- it is a hard
+# `docker compose up` parse error, and the emitter builds each block from an
+# independent conditional, so a new emitter that forgets an existing one is
+# exactly how it happens. Structural, and completely independent of the GUI.
+_assert_no_duplicate_service_keys() {
+  local _file="${1:?_assert_no_duplicate_service_keys: missing file}"
+  run awk '
+    /^  [A-Za-z0-9_.-]+:/ { svc = $0; split("", seen); next }
+    /^    [A-Za-z0-9_.-]+:/ {
+      key = $0
+      sub(/:.*/, "", key)
+      if (key in seen) {
+        printf "line %d: duplicate key%s inside%s\n", NR, key, svc
+        found = 1
+      }
+      seen[key] = 1
+    }
+    END { exit found ? 1 : 0 }
+  ' "${_file}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits no duplicate key within a service (GUI on)" {
+  local _extras=("/dev:/dev")
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "true" "1" "gpu" _extras
+  _assert_no_duplicate_service_keys "${COMPOSE_OUT}"
+}
+
+@test "generate_compose_yaml emits no duplicate key within a service (GUI off)" {
+  local _extras=("/dev:/dev")
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  _assert_no_duplicate_service_keys "${COMPOSE_OUT}"
+}
+
+@test "the duplicate-key detector actually fires on a duplicated service key" {
+  # A structural checker that never reports anything is the same failure
+  # mode as the spec this one replaces. Feed it a known-bad document.
+  cat > "${COMPOSE_OUT}" <<'YAML'
+services:
+  devel:
+    image: a
+    environment:
+      - FOO=1
+    environment:
+      - BAR=2
+YAML
+  run awk '
+    /^  [A-Za-z0-9_.-]+:/ { svc = $0; split("", seen); next }
+    /^    [A-Za-z0-9_.-]+:/ {
+      key = $0
+      sub(/:.*/, "", key)
+      if (key in seen) {
+        printf "line %d: duplicate key%s inside%s\n", NR, key, svc
+        found = 1
+      }
+      seen[key] = 1
+    }
+    END { exit found ? 1 : 0 }
+  ' "${COMPOSE_OUT}"
+  assert_failure
+  assert_output --partial "duplicate key"
+  assert_output --partial "environment"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Extra volumes ([volumes] section)
+# ════════════════════════════════════════════════════════════════════
+
+# why: volumes list
+@test "generate_compose_yaml extra volumes appended after baseline" {
+  local _extras=("/dev:/dev" "/data:/data" "/etc/machine-id:/etc/machine-id:ro")
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- /dev:/dev' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /data:/data' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /etc/machine-id:/etc/machine-id:ro' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: empty list
+@test "generate_compose_yaml empty extras => no extra mount lines" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F -- '- /data:' "${COMPOSE_OUT}"
+  assert_failure
+  run grep -F -- '- /dev:/dev' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Fully loaded — GUI + GPU + extras
+# ════════════════════════════════════════════════════════════════════
+
+# why: fully loaded
+@test "generate_compose_yaml with GUI+GPU+extras => all sections present" {
+  local _extras=("/dev:/dev" "/srv:/srv")
+  generate_compose_yaml "${COMPOSE_OUT}" "isaac_sim" \
+    "true" "true" "all" "gpu" _extras
+  run grep -F 'DISPLAY=${DISPLAY' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F 'driver: nvidia' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- /srv:/srv' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F "local}/isaac_sim:devel" "${COMPOSE_OUT}"
+  assert_success
+}
+
+# ════════════════════════════════════════════════════════════════════
+# [devices] cgroup_rule_* → compose.yaml device_cgroup_rules: (B10)
+# ════════════════════════════════════════════════════════════════════
+
+@test "generate_compose_yaml emits device_cgroup_rules: when cgroup rules provided" {
+  local _extras=()
+  # positional: gui gpu count caps extras net_name devices env tmpfs ports
+  # shm_size net_mode ipc_mode pid_mode cap_add cap_drop sec_opt cgroup_rules
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" \
+    "" "" "" "" \
+    "" "host" "host" "private" "" "" "" \
+    $'c 189:* rwm\nc 81:* rwm'
+  run grep -F 'device_cgroup_rules:' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- "c 189:* rwm"' "${COMPOSE_OUT}"
+  assert_success
+  run grep -F -- '- "c 81:* rwm"' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml omits device_cgroup_rules: when rules list is empty" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -F 'device_cgroup_rules:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+# ════════════════════════════════════════════════════════════════════
+# [deploy] runtime → compose.yaml service-level runtime key (Jetson)
+# ════════════════════════════════════════════════════════════════════
+
+@test "generate_compose_yaml omits runtime: when runtime arg is empty (desktop default)" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^    runtime:' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml emits runtime: nvidia under devel when runtime=nvidia" {
+  local _extras=()
+  # positional args 1..23 unchanged; 24th is _runtime.
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "true" "all" "gpu" _extras "" \
+    "" "" "" "" \
+    "" "host" "host" "private" "" "" "" \
+    "" "" "" "" \
+    "nvidia"
+  run grep -F '    runtime: nvidia' "${COMPOSE_OUT}"
+  assert_success
+  # Only in devel (one occurrence); test service must not get runtime:
+  [ "$(grep -c '^    runtime:' "${COMPOSE_OUT}")" = "1" ]
+}
+
+@test "generate_compose_yaml placement: runtime: appears between tty and cap_add region" {
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "true" "all" "gpu" _extras "" \
+    "" "" "" "" \
+    "" "host" "host" "private" "SYS_ADMIN" "" "" \
+    "" "" "" "" \
+    "nvidia"
+  # runtime: must appear after `tty: true` and before `cap_add:` in devel
+  local _tty_line _runtime_line _cap_line
+  _tty_line="$(grep -n '^    tty: true' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _runtime_line="$(grep -n '^    runtime:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _cap_line="$(grep -n '^    cap_add:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  (( _tty_line < _runtime_line ))
+  (( _runtime_line < _cap_line ))
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Runtime service auto-emission
+# ════════════════════════════════════════════════════════════════════
+#
+# When the sibling Dockerfile declares `FROM <base> AS runtime`, setup.sh
+# emits a dedicated `runtime` compose service alongside `devel`/`test`.
+# Absent that stage, emission is skipped so plain-dev repos don't get a
+# broken service entry.
+
+# why: #108 auto-emit
+@test "generate_compose_yaml emits runtime service when Dockerfile has AS runtime" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS devel
+CMD ["bash"]
+
+FROM devel AS runtime
+CMD ["/entrypoint.sh"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^  runtime:' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: opt-out by absence
+@test "generate_compose_yaml skips runtime service when Dockerfile lacks AS runtime" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS devel
+CMD ["bash"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -cE '^  runtime:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+# why: no-Dockerfile guard
+@test "generate_compose_yaml skips runtime service when Dockerfile is absent" {
+  # No Dockerfile in TEMP_DIR at all.
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -cE '^  runtime:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+# why: compose extends shape
+@test "runtime service extends devel and overrides target/image/tty/profile" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS devel
+CMD ["bash"]
+
+FROM devel AS runtime
+CMD ["/app"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  # extends → devel (compose merges base volumes, env, caps, etc.)
+  run grep -F 'service: devel' "${COMPOSE_OUT}"
+  assert_success
+  # build target override
+  run grep -F 'target: runtime' "${COMPOSE_OUT}"
+  assert_success
+  # image tag is :runtime (not :devel)
+  run grep -E '^    image:.*:runtime$' "${COMPOSE_OUT}"
+  assert_success
+  # No container_name: a fixed name is global to the daemon, so it pins the
+  # stage to one instance per host and makes compose refuse `--scale`. The
+  # name compose derives instead is project-scoped.
+  run grep -F 'container_name:' "${COMPOSE_OUT}"
+  assert_failure
+  # non-interactive (runtime is headless auto-run, Dockerfile CMD drives)
+  run grep -E '^    stdin_open: false$' "${COMPOSE_OUT}"
+  assert_success
+  run grep -E '^    tty: false$' "${COMPOSE_OUT}"
+  assert_success
+  # profiles gate prevents plain `compose up` from starting runtime.
+  # `--` guards against grep reading the leading `-` as an option.
+  run grep -F -- '- runtime' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: ordering
+@test "runtime service appears between devel and test blocks" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS devel
+CMD ["bash"]
+
+FROM devel AS runtime
+CMD ["/app"]
+
+FROM devel AS devel-test
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  local _devel _runtime _test
+  _devel="$(grep -n '^  devel:'   "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _runtime="$(grep -n '^  runtime:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _test="$(grep -n '^  test:'    "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  (( _devel < _runtime ))
+  (( _runtime < _test ))
+}
+
+# why: regex tolerance
+@test "runtime detection is robust against weird whitespace" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04    AS    devel
+CMD ["bash"]
+
+FROM   devel   AS   runtime
+CMD ["/app"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  run grep -E '^  runtime:' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: strict match
+@test "runtime detection ignores non-runtime stage names" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS runtime-base
+FROM runtime-base AS devel
+CMD ["bash"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras
+  # "runtime-base" doesn't count as the runtime stage (strict match).
+  run grep -cE '^  runtime:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+# ── [lifecycle] restart is deploy-scoped ────────────────────────────
+#
+# A devel container IS the interactive shell: it lives exactly as long as
+# that shell, so a restart policy on it means typing `exit` relaunches it
+# forever. Service-shaped containers (a deployable stage, the field
+# bundle) are the opposite -- they are meant to run forever. So `restart:`
+# is emitted ONLY for deployable stages (ADR-00000023 sec.4: not devel and
+# not `*-test`), never on devel and never inherited through `extends`.
+
+# Drive generate_compose_yaml with only the [lifecycle] restart tuned
+# (positional 28); every other knob keeps its default.
+_gen_restart() {
+  local _restart="$1"
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras \
+    "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+    "${_restart}"
+}
+
+@test "generate_compose_yaml never emits restart: on the devel service (#840)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+DOCK
+  _gen_restart "unless-stopped"
+  run grep -cE '^    restart:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+@test "generate_compose_yaml emits restart: on a deployable stage service (#840)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS runtime
+DOCK
+  _gen_restart "unless-stopped"
+  # Exactly one restart: line, and it sits inside the runtime service --
+  # devel must not carry one for `extends: devel` to inherit.
+  run grep -cE '^    restart: unless-stopped$' "${COMPOSE_OUT}"
+  assert_output "1"
+  local _svc _restart
+  _svc="$(grep -n '^  runtime:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  _restart="$(grep -n '^    restart:' "${COMPOSE_OUT}" | head -1 | cut -d: -f1)"
+  (( _svc < _restart ))
+}
+
+@test "generate_compose_yaml omits restart: on a *-test stage -- it exits by design (#840)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS devel-test
+FROM devel AS smoke-test
+DOCK
+  _gen_restart "always"
+  run grep -cE '^    restart:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+# why: The emitter is where the predicate turns into a restart: line; this
+# pins both sides, so a fix that drops the policy everywhere fails too
+@test "generate_compose_yaml omits restart: on base's test-tools-stage and keeps it on a deployable stage (#1325)" {
+  # Mirrors the template Dockerfile: test-tools-stage is a tooling stage
+  # pulled from TEST_TOOLS_IMAGE, runtime is the deployable one.
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+ARG TEST_TOOLS_IMAGE=test-tools:local
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS runtime
+FROM ${TEST_TOOLS_IMAGE} AS test-tools-stage
+FROM devel AS devel-test
+DOCK
+  _gen_restart "unless-stopped"
+  # The test-tools-stage service is emitted, but carries no restart:.
+  run grep -n '^  test-tools-stage:' "${COMPOSE_OUT}"
+  assert_success
+  run awk '/^  test-tools-stage:/{f=1;next} /^  [^ ]/{f=0} f && /^    restart:/' "${COMPOSE_OUT}"
+  assert_output ""
+  # The deployable runtime service keeps its policy.
+  run awk '/^  runtime:/{f=1;next} /^  [^ ]/{f=0} f && /^    restart:/' "${COMPOSE_OUT}"
+  assert_output "    restart: unless-stopped"
+}
+
+@test "generate_compose_yaml emits restart: on a deployable stage that carries overrides (#840)" {
+  # The standalone (no `extends: devel`) shape re-emits every inherited
+  # field itself, so it needs its own restart: line.
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS headless
+DOCK
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:headless"]
+"gui.mode" = "off"
+CONF
+  _gen_restart "unless-stopped"
+  run grep -cE '^    restart: unless-stopped$' "${COMPOSE_OUT}"
+  assert_output "1"
+  run grep -F 'service: devel' "${COMPOSE_OUT}"
+  assert_failure
+}
+
+@test "generate_compose_yaml quotes an on-failure:N policy on the deployable stage (#840)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS runtime
+DOCK
+  _gen_restart "on-failure:5"
+  run grep -F -- '    restart: "on-failure:5"' "${COMPOSE_OUT}"
+  assert_success
+}
+
+@test "generate_compose_yaml emits no restart: field at all for restart = no (#840)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel
+FROM devel AS runtime
+DOCK
+  _gen_restart "no"
+  run grep -cE '^    restart:' "${COMPOSE_OUT}"
+  assert_output "0"
+}
+
+# ── P3: per-stage device propagation redirect ───────────────
+
+@test "generate_compose_yaml: runtime stage inherits device propagation from devel (#450 P3)" {
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM ubuntu:24.04 AS devel
+CMD ["bash"]
+
+FROM devel AS runtime
+CMD ["/app"]
+DOCK
+  local _extras=()
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "false" "false" "0" "gpu" _extras "" "/dev:/dev:rslave"
+  run grep -c 'propagation: rslave' "${COMPOSE_OUT}"
+  [[ "${output}" -ge 1 ]]
+  run grep -E '^  runtime:' "${COMPOSE_OUT}"
+  assert_success
+}
+
+# why: byte-identical golden
+@test "generate_compose_yaml per-stage emit is byte-identical via _resolve_docker_flags (#505 golden master)" {
+  # Full-file golden master guarding the refactor: the per-stage
+  # resolution now flows through the single _resolve_docker_flags layer.
+  # The fixture exercises a [stage:headless] override hitting every
+  # branch -- gui off, gpu off, ipc override (shm emit), privileged
+  # override, runtime inherit, net inherit, env replace, volume replace,
+  # port append -- so any drift in the assembled compose.yaml fails here.
+  # Pin HOSTNAME so the GUI+bridge hostname injection (ADR-00000019) on the devel
+  # service is deterministic in the golden (devel is gui=true + bridge; the
+  # headless stage is gui=off so it stays hostname-less).
+  export HOSTNAME="test-host-42"
+  cat > "${TEMP_DIR}/Dockerfile" <<'DOCK'
+FROM scratch AS sys
+FROM sys AS devel-base
+FROM devel-base AS devel
+FROM devel AS devel-test
+FROM devel AS headless
+DOCK
+  mkdir -p "${TEMP_DIR}"
+  cat > "${TEMP_DIR}/setup.toml" <<'CONF'
+["stage:headless"]
+"gui.mode" = "off"
+"deploy.gpu_mode" = "off"
+"network.ipc" = "private"
+"security.privileged" = "true"
+"volumes.mount_inherit" = "false"
+"volumes.mount_1" = "./hl-data:/data"
+"environment.env_inherit" = "false"
+"environment.env_1" = "HEADLESS=1"
+"network.port_1" = "8080:80"
+CONF
+  local _extras=('./ws:/workspace' 'state_vol:/srv/state')
+  generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
+    "true" "true" "1" "gpu compute" \
+    _extras "mynet" \
+    "" \
+    $'TOP_ENV=1' "" $'9000:9000' \
+    "256m" "bridge" "host" "private" \
+    "" "" "" \
+    "" \
+    "" \
+    "" \
+    "host" \
+    "nvidia" \
+    "" \
+    "" \
+    "" \
+    "no" \
+    ""
+  cat > "${TEMP_DIR}/expected.yaml" <<'GOLDEN'
+# AUTO-GENERATED BY setup.sh — DO NOT EDIT.
+# Edit setup.toml instead. Regenerate via just docker setup apply.
+name: ${PROJECT_NAME}
+services:
+  devel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: devel
+      network: host
+      args:
+        APT_MIRROR_UBUNTU: ${APT_MIRROR_UBUNTU:-archive.ubuntu.com}
+        APT_MIRROR_DEBIAN: ${APT_MIRROR_DEBIAN:-deb.debian.org}
+        TZ: ${TZ:-Asia/Taipei}
+        USER_NAME: ${USER_NAME}
+        USER_GROUP: ${USER_GROUP}
+        USER_UID: ${USER_UID}
+        USER_GID: ${USER_GID}
+    image: ${DOCKER_HUB_USER:-local}/myrepo:devel
+    privileged: ${PRIVILEGED}
+    ipc: ${IPC_MODE}
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+      - .env.local
+    runtime: nvidia
+    init: true
+    networks:
+      - mynet
+    hostname: test-host-42
+    environment:
+      - DISPLAY=${DISPLAY:-}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1000}
+      - XAUTHORITY=/tmp/.docker.xauth
+    ports:
+      - "${PORT_1:-9000:9000}"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}:${XDG_RUNTIME_DIR:-/run/user/1000}:rw
+      - ${XAUTHORITY:-/dev/null}:/tmp/.docker.xauth:ro
+      - ./ws:/workspace
+      - state_vol:/srv/state
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute]
+
+  test:
+    extends:
+      service: devel
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: devel-test
+    image: ${DOCKER_HUB_USER:-local}/myrepo:test
+    stdin_open: false
+    tty: false
+    profiles:
+      - test
+
+  headless:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: headless
+      network: host
+      args:
+        APT_MIRROR_UBUNTU: ${APT_MIRROR_UBUNTU:-archive.ubuntu.com}
+        APT_MIRROR_DEBIAN: ${APT_MIRROR_DEBIAN:-deb.debian.org}
+        TZ: ${TZ:-Asia/Taipei}
+        USER_NAME: ${USER_NAME}
+        USER_GROUP: ${USER_GROUP}
+        USER_UID: ${USER_UID}
+        USER_GID: ${USER_GID}
+    image: ${DOCKER_HUB_USER:-local}/myrepo:headless
+    stdin_open: false
+    tty: false
+    profiles:
+      - headless
+    env_file:
+      - .env.local
+    privileged: true
+    ipc: private
+    runtime: nvidia
+    init: true
+    networks:
+      - mynet
+    environment:
+      - "HEADLESS=1"
+    ports:
+      - "${PORT_1:-9000:9000}"
+      - "${PORT_2:-8080:80}"
+    volumes:
+      - ./hl-data:/data
+    shm_size: 256m
+
+volumes:
+  state_vol:
+
+networks:
+  mynet:
+    driver: bridge
+GOLDEN
+  run diff -u "${TEMP_DIR}/expected.yaml" "${COMPOSE_OUT}"
+  assert_success
+}

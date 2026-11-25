@@ -1,0 +1,1649 @@
+#!/usr/bin/env bats
+#
+# Integration test: a RELEASED upgrade.sh must still drive THIS tree.
+#
+# An upgrade is never driven by the code in this repo. It is driven by the
+# consumer's own vendored copy of upgrade.sh, which shipped in an older
+# release and cannot be changed retroactively. Every other spec in this
+# suite runs the CURRENT upgrade.sh against the CURRENT tree, so a file
+# move that an old caller names by hand is invisible here and only shows up
+# at a consumer's terminal -- after the subtree pull has already committed.
+#
+# So these tests do the only thing that can see it: take the real released
+# tree, stand it up as a consumer's `.base/`, and let ITS scripts drive the
+# upgrade to a tree built out of this working copy.
+#
+# The released trees are materialised host-side by
+# script/test/prepare-prev-release.sh into /source/.prev-release/ (the
+# suite's container cannot reach the git object store of a worktree
+# checkout, whose `.git` is a file pointing outside the mount). Which
+# releases those are is resolved from upstream's tag listing every run,
+# never hardcoded: every stable release from the v0.43.0 floor below the
+# tree (base#1055, base#1729). The driver arms drive its two newest lines;
+# the rest is undriven until base#1948.
+#
+# The "next release" the consumer upgrades INTO is this working tree with
+# its .version rewritten to a synthetic version and tagged as such -- the
+# only two synthetic bytes in the fixture. Everything else on both sides is
+# the real thing.
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  export LOG_FORMAT=text
+  load "${BATS_TEST_DIRNAME}/../unit/test_helper"
+
+  PREV_RELEASE_DIR="/source/.prev-release"
+  TAGS_FILE="${PREV_RELEASE_DIR}/tags.txt"
+  # The version the working tree pretends to be released as. Must differ
+  # from every real tag so the upgrade is a real forward move, and it must
+  # match the tree's own .version or the released upgrade.sh's post-pull
+  # integrity check reports a version mismatch and rolls back.
+  NEXT_VER="v99.0.0"
+  # A second synthetic release beyond it, so "upgrade again" below is a real
+  # forward move rather than a no-op the driver could shortcut.
+  NEXT_VER_2="v99.0.1"
+
+  CUR_BARE="${BATS_TEST_TMPDIR}/current.git"
+  OLD_BARE="${BATS_TEST_TMPDIR}/released.git"
+  CONSUMER="${BATS_TEST_TMPDIR}/consumer"
+
+  # Declarations collected by _register_interval_migration, emptied per
+  # test so one arm's registry cannot leak into the next.
+  _INTERVAL_MIGRATIONS=()
+}
+
+# ── Version-bound migrations ────────────────────────────────────────────────
+#
+# A migration bound to the release it lands in can only be observed through
+# a real upgrade: what decides whether it runs is the pair (the version the
+# consumer came FROM, the version it is now ON), and the from half exists
+# only as the first parent of the subtree-pull merge the released driver
+# makes. Calling the runner directly would supply that pair by hand, which
+# is the one part of the mechanism nothing else can check.
+#
+# So the arms below declare migrations in the tree that gets PUBLISHED as
+# the next release, and read off the consumer whether each one ran. The
+# declaration is the third synthetic byte in this fixture, beside the two
+# `.version` rewrites, and it is the only way to get a migration bound to a
+# version inside the interval under test -- a real one would have to be
+# re-pointed at a synthetic version anyway.
+
+# Where a declared migration records that it ran, repo-root-relative. One
+# line per run, so "did not run", "ran once" and "ran twice" are all
+# readable off the same artifact.
+_PROBE=".interval-migration-probe"
+
+# _register_interval_migration <version> <marker>
+#   Declare a migration landing in <version> for the next release.
+#   Collected rather than written: the tree to write into does not exist
+#   until _seed_current_remote copies it, and the declaration has to be in
+#   place before its first commit so BOTH synthetic releases carry it -- a
+#   release never drops the migrations it shipped with.
+_register_interval_migration() {
+  local _version="${1:?BUG: _register_interval_migration expects a version}"
+  local _marker="${2:?BUG: _register_interval_migration expects a marker}"
+  _INTERVAL_MIGRATIONS+=("${_version} ${_marker}")
+}
+
+# _declare_interval_migrations <tree>
+#   Append every registered declaration to <tree>'s own migration registry.
+#   Fails loudly when the tree ships no registry to append to: that is the
+#   red these arms were written against, and a silent return would turn them
+#   into tests of nothing.
+_declare_interval_migrations() {
+  local _tree="${1:?BUG: _declare_interval_migrations expects a tree}"
+  (( ${#_INTERVAL_MIGRATIONS[@]} > 0 )) || return 0
+
+  local _lib="${_tree}/dist/script/docker/lib/version_migrate.sh"
+  [[ -f "${_lib}" ]] \
+    || fail "the tree being published carries no dist/script/docker/lib/version_migrate.sh -- nothing declares a version-bound migration"
+
+  local _entry _version _marker
+  for _entry in "${_INTERVAL_MIGRATIONS[@]}"; do
+    _version="${_entry%% *}"
+    _marker="${_entry#* }"
+    # The apply takes the repo root, so the probe lands in the consumer
+    # being upgraded wherever init.sh was invoked from. It APPENDS, so a
+    # migration that ran twice is distinguishable from one that ran once --
+    # the distinction the repeat arms below are made of.
+    # The record call is what a real migration has to make for its output to
+    # reach the caller's commit, so the fixture makes it: the probe is then
+    # also the answer to "did the resync stage what the migration wrote".
+    # Guarded, because the unit spec sources this registry without init.sh.
+    cat >> "${_lib}" <<EOF
+_VERSION_MIGRATIONS+=("${_version} ${_marker}")
+_vmigrate_${_marker}_apply() {
+  printf '%s\n' "${_marker}" >> "\${1}/${_PROBE}"
+  if declare -F _init_record_write >/dev/null 2>&1; then
+    _init_record_write "${_PROBE}"
+  fi
+}
+EOF
+  done
+}
+
+# _probe_runs <marker>
+#   How many times <marker>'s migration ran in the consumer.
+_probe_runs() {
+  local _marker="${1:?BUG: _probe_runs expects a marker}"
+  local _file="${CONSUMER}/${_PROBE}"
+  if [[ ! -f "${_file}" ]]; then
+    printf '0'
+    return 0
+  fi
+  awk -v m="${_marker}" '$0 == m { n++ } END { printf "%d", n + 0 }' "${_file}"
+}
+
+# ── Fixture helpers ─────────────────────────────────────────────────────────
+
+# _window_written
+#   Fail when tags.txt is missing. Each arm calls it as its own statement
+#   in the test body, BEFORE `_window_reaches`: bats-support `fail`
+#   returns 1, so a check inside `_window_reaches <n> || return 0` would
+#   be swallowed and a missing file would pass as a short window.
+_window_written() {
+  [[ -f "${TAGS_FILE}" ]] \
+    || fail "missing ${TAGS_FILE} -- run the suite through 'just test' (script/test/prepare-prev-release.sh populates it host-side)"
+}
+
+# _window_reaches <n>
+#   Succeed when the window holds at least <n> releases. Each arm calls
+#   it as `_window_reaches <n> || return 0` after `_window_written`. The
+#   window is every stable release from the v0.43.0 floor below the tree
+#   (base#1055, base#1729); one shorter than <n> is the rule's answer, not
+#   a lost tag, and the arm then runs zero cases. The driver arms read only
+#   lines 1 and 2 of it; any later line is undriven until base#1948, and
+#   the "every window release is one a driver arm reaches" arm fails on it.
+_window_reaches() {
+  local _n="${1:?BUG: _window_reaches expects a count}"
+  (( $(grep -c . "${TAGS_FILE}") >= _n ))
+}
+
+# _release_tag <n>
+#   The n-th newest stable release tag (1 = newest), as resolved on the
+#   host. Fails loudly rather than skipping: a silently empty tag list would
+#   turn both tests into no-ops, which is the exact failure shape this spec
+#   exists to prevent.
+_release_tag() {
+  local _n="${1:?BUG: _release_tag expects an index}"
+  [[ -f "${TAGS_FILE}" ]] \
+    || fail "missing ${TAGS_FILE} -- run the suite through 'just test' (script/test/prepare-prev-release.sh populates it host-side)"
+  local _tag
+  _tag="$(sed -n "${_n}p" "${TAGS_FILE}")"
+  [[ -n "${_tag}" ]] \
+    || fail "${TAGS_FILE} has no line ${_n} -- fewer release tags than the compatibility window claims"
+  printf '%s' "${_tag}"
+}
+
+# _copy_tree <src> <dest> [tar_exclude...]
+#   Copy a directory tree, preserving modes and symlinks but NOT ownership.
+#   `-o` (no-same-owner) is the load-bearing flag: the suite runs as root
+#   over a checkout owned by the host user, so a preserved uid makes every
+#   subsequent git command in the copy fail with "detected dubious
+#   ownership" -- a failure that has nothing to do with what is being
+#   tested.
+_copy_tree() {
+  local _src="${1:?BUG: _copy_tree expects a source}"
+  local _dest="${2:?BUG: _copy_tree expects a destination}"
+  shift 2
+  mkdir -p "${_dest}"
+  tar -C "${_src}" "$@" -cf - . | tar -C "${_dest}" -x -o -f -
+}
+
+# _git_init_repo <dir>
+#   A repo with an identity, so git-subtree's internal commit-tree works.
+_git_init_repo() {
+  local _dir="${1:?BUG: _git_init_repo expects a dir}"
+  mkdir -p "${_dir}"
+  git -C "${_dir}" init -q -b main
+  git -C "${_dir}" config user.email t@t
+  git -C "${_dir}" config user.name t
+}
+
+# _seed_current_remote
+#   Publish THIS working tree as the next release: a bare repo carrying one
+#   commit of the checkout, tagged NEXT_VER, served over file:// so nothing
+#   here touches the network.
+_seed_current_remote() {
+  local _work="${BATS_TEST_TMPDIR}/current"
+  # .git is a whole object store in CI and a dangling worktree pointer
+  # locally; .prev-release/ holds the released trees this very spec reads;
+  # coverage/ and log/ are run artifacts. None of them is part of what a
+  # consumer receives.
+  _copy_tree /source "${_work}" \
+    --exclude=./.git \
+    --exclude=./.prev-release \
+    --exclude=./coverage \
+    --exclude=./log
+  printf '%s\n' "${NEXT_VER}" > "${_work}/.version"
+  # Before the first commit, so both synthetic releases carry the registry
+  # the arms declared into.
+  _declare_interval_migrations "${_work}"
+
+  _git_init_repo "${_work}"
+  git -C "${_work}" add -A
+  git -C "${_work}" commit -q -m "${NEXT_VER}"
+  git -C "${_work}" tag "${NEXT_VER}"
+  # ... and the release after it, identical but for the version file. An
+  # upstream a consumer can upgrade to twice is what lets the repeatability
+  # arm below drive a second REAL upgrade; every other arm names its target
+  # explicitly and never sees this tag.
+  printf '%s\n' "${NEXT_VER_2}" > "${_work}/.version"
+  git -C "${_work}" commit -q -a -m "${NEXT_VER_2}"
+  git -C "${_work}" tag "${NEXT_VER_2}"
+  git init --bare -q "${CUR_BARE}"
+  git -C "${_work}" push -q "${CUR_BARE}" "${NEXT_VER}" "${NEXT_VER_2}"
+}
+
+# _seed_released_remote <tag>
+#   Same, for the released tree the consumer is sitting on. Its history is
+#   irrelevant -- only the tree the tag names ever reaches the consumer --
+#   so one commit is enough.
+_seed_released_remote() {
+  local _tag="${1:?BUG: _seed_released_remote expects a tag}"
+  local _work="${BATS_TEST_TMPDIR}/released"
+  local _src="${PREV_RELEASE_DIR}/${_tag}"
+  [[ -d "${_src}" ]] \
+    || fail "missing ${_src} -- script/test/prepare-prev-release.sh did not materialise ${_tag}"
+  _copy_tree "${_src}" "${_work}"
+  _git_init_repo "${_work}"
+  git -C "${_work}" add -A
+  git -C "${_work}" commit -q -m "${_tag}"
+  git -C "${_work}" tag "${_tag}"
+  git init --bare -q "${OLD_BARE}"
+  git -C "${_work}" push -q "${OLD_BARE}" "${_tag}"
+}
+
+# _seed_consumer <tag>
+#   A repo bootstrapped exactly the way the README tells a user to: empty
+#   commit, subtree add, run the template's init.sh. Which path init.sh
+#   lives at is the release's business, not ours -- probe both, because
+#   moving it is precisely what this spec is here to survive.
+_seed_consumer() {
+  local _tag="${1:?BUG: _seed_consumer expects a tag}"
+  _git_init_repo "${CONSUMER}"
+  git -C "${CONSUMER}" commit -q --allow-empty -m "chore: initial commit"
+  git -C "${CONSUMER}" subtree add -q --prefix=.base \
+    "file://${OLD_BARE}" "${_tag}" --squash
+
+  local _init
+  _init="$(_released_entry init.sh)"
+  ( cd "${CONSUMER}" && "${_init}" ) >/dev/null 2>&1 \
+    || fail "${_tag}: its own ${_init} failed to bootstrap a consumer"
+  # SEED_ENV_LOCAL=1 stands in for a release that already ships the
+  # .env/.env.local convention (v0.43.0 or newer): its init.sh leaves an
+  # .env.local behind (base#1950).
+  if [[ "${SEED_ENV_LOCAL:-}" == 1 ]]; then
+    printf '# seeded by the released init.sh\n' > "${CONSUMER}/.env.local"
+  fi
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q -m "chore: bootstrap at ${_tag}"
+}
+
+# _released_entry <script>
+#   Repo-root-relative path to one of the released tree's entry points,
+#   flat root first (pre-dist releases) then the dist/ location.
+_released_entry() {
+  local _name="${1:?BUG: _released_entry expects a script name}"
+  if [[ -x "${CONSUMER}/.base/${_name}" ]]; then
+    printf '%s' "./.base/${_name}"
+  else
+    printf '%s' "./.base/dist/script/base/${_name}"
+  fi
+}
+
+# ── Making the fixture consumer-shaped ──────────────────────────────────────
+#
+# _seed_consumer leaves a repo whose Dockerfile is base's OWN -- init.sh
+# copies it out of the release being seeded. Base ships both halves of
+# every `.base/` path in that file, so every COPY source in it resolves by
+# construction, and _assert_dockerfile_copy_sources_exist below can only
+# ever report what base already knows about itself.
+#
+# Real consumers do not have that Dockerfile. They have a DERIVATIVE, and
+# where base copied a subtree directory wholesale they hand-listed its
+# files -- two spellings are in the wild, one COPY per file and every file
+# on a single COPY. Those references break on a base file move exactly the
+# same way the wholesale one does, and nothing here was asking about them.
+#
+# So the fixture is re-spelled before the upgrade runs. Which statements
+# get re-spelled is DERIVED from the Dockerfile plus the vendored subtree,
+# never listed: a wholesale-directory COPY qualifies when hand-listing its
+# contents is EQUIVALENT to it, which Docker makes true exactly when the
+# destination ends in `/` (a multi-source COPY flattens into a destination
+# directory; without the trailing slash the hand-listed form is a
+# different statement, not a different spelling of the same one). A tree
+# that stops offering such a statement fails rather than quietly
+# consumerising nothing.
+
+# The tree the hand-listed smoke heal under repair acts on. Named
+# once because two things below have to agree about it: whether this arm's
+# release still ships it, and whether the re-spelling covered it.
+_RETIRED_SMOKE_TREE=".base/test/smoke"
+
+# _copy_expandable_source <line>
+#   The single `.base/`-rooted directory source of a one-line COPY whose
+#   destination ends in `/`. Non-zero when the line is not that shape.
+#   Quoted and `$`-bearing arguments are out by construction: their value
+#   exists only at build time, so neither side of the equivalence above
+#   can be checked against the tree.
+_copy_expandable_source() {
+  local _line="$1"
+  [[ "${_line}" =~ ^[[:space:]]*COPY[[:space:]] ]] || return 1
+  # A backslash-continued statement spans lines; re-spelling it in place
+  # would need the fold, and no shipped Dockerfile writes one. The
+  # "expanded nothing" failure below is what reports it if that changes.
+  [[ "${_line}" == *'\' ]] && return 1
+
+  local -a _args=()
+  read -r -a _args <<< "${_line}"
+  local -a _pos=()
+  local _a
+  for _a in "${_args[@]:1}"; do
+    [[ "${_a}" == --* ]] && continue
+    _pos+=("${_a}")
+  done
+  (( ${#_pos[@]} == 2 )) || return 1
+
+  local _src="${_pos[0]}" _dst="${_pos[1]}"
+  [[ "${_dst}" == */ ]] || return 1
+  [[ "${_src}" == .base/* ]] || return 1
+  [[ "${_src}" == *'$'* ]] && return 1
+  printf '%s' "${_src}"
+}
+
+# _consumerise_dir_copies
+#   Re-spell every qualifying wholesale-directory COPY in the seeded
+#   consumer's Dockerfile as the two hand-listed spellings real consumers
+#   wrote. Fails when it re-spelled nothing: a fixture that silently
+#   consumerises zero statements is the vacuous pass this exists to end.
+#
+#   A non-zero total is not by itself proof that the hand-listed HEAL runs
+#   in this arm. The heal only fires on the retired flat
+#   `.base/test/smoke` tree, and whether the seeded release ships one is a
+#   property of the release, not something to list here: the N-1 release
+#   (flat tree) does, the N release (already on `.base/dist/test/bats/smoke`)
+#   does not. So the retired tree is asked for on disk, and where it is
+#   present the re-spelling must have covered it -- otherwise this arm
+#   re-spells only statements the migration never touches while its counter
+#   still reads healthy. Where it is absent the heal is genuinely not
+#   exercised by that arm, and the arm still asserts what it can: that every
+#   hand-listed source survives the upgrade.
+_consumerise_dir_copies() {
+  local _df="${CONSUMER}/Dockerfile"
+  local _tmp="${BATS_TEST_TMPDIR}/Dockerfile.consumerised"
+  local _count=0
+  local _retired=0
+  : > "${_tmp}"
+
+  local _line _src _rel _all
+  local -a _files=()
+  while IFS= read -r _line; do
+    if ! _src="$(_copy_expandable_source "${_line}")" \
+      || [[ ! -d "${CONSUMER}/${_src%/}" ]]; then
+      printf '%s\n' "${_line}" >> "${_tmp}"
+      continue
+    fi
+    _files=()
+    mapfile -t _files < <(cd "${CONSUMER}" && find "${_src%/}" -type f | sort)
+    if (( ${#_files[@]} == 0 )); then
+      printf '%s\n' "${_line}" >> "${_tmp}"
+      continue
+    fi
+    # One COPY per file, then every file on one COPY. Substituting into
+    # the original line keeps that statement's own flags, destination and
+    # column alignment, so what changes is the spelling and nothing else.
+    for _rel in "${_files[@]}"; do
+      printf '%s\n' "${_line/"${_src}"/"${_rel}"}" >> "${_tmp}"
+    done
+    _all="${_files[*]}"
+    printf '%s\n' "${_line/"${_src}"/"${_all}"}" >> "${_tmp}"
+    _count=$(( _count + 1 ))
+    [[ "${_src%/}" == "${_RETIRED_SMOKE_TREE}" ]] && _retired=$(( _retired + 1 ))
+  done < "${_df}"
+
+  (( _count > 0 )) \
+    || fail "consumerised nothing: the seeded Dockerfile has no wholesale-directory .base/ COPY with a directory destination, so this arm would assert against the same shape base itself ships"
+  if [[ -d "${CONSUMER}/${_RETIRED_SMOKE_TREE}" ]]; then
+    (( _retired > 0 )) \
+      || fail "consumerised ${_count} statement(s) but none of ${_RETIRED_SMOKE_TREE}, which this release ships: the hand-listed smoke heal is what this arm exists to drive, and nothing here would reach it"
+  fi
+  mv "${_tmp}" "${_df}"
+}
+
+# _dangling_symlinks
+#   Every symlink in the consumer that resolves to nothing. This is the
+#   assertion that matters: it names no path, so it keeps working across
+#   any future layout, and a half-finished upgrade shows up here as the
+#   wrapper set the user actually types (justfile, script/*.sh) pointing
+#   into a tree that no longer has them.
+_dangling_symlinks() {
+  local _link
+  while IFS= read -r _link; do
+    [[ -e "${CONSUMER}/${_link}" ]] || printf '%s\n' "${_link}"
+  done < <(cd "${CONSUMER}" && find . -path ./.git -prune -o -type l -print)
+}
+
+# _dockerfile_copy_sources
+#   Every build-context path the consumer's post-upgrade Dockerfile hands to
+#   a COPY, one per line. Backslash continuations are folded first, so a
+#   hand-listed multi-line COPY is read as the one statement it is; a COPY
+#   with N sources contributes all N (the last argument is the destination).
+#
+#   Two classes are deliberately NOT emitted, because neither is a path in
+#   the build context:
+#     --from=<stage|image>  resolves inside another stage, not on disk
+#     an argument containing $  is a build ARG (ENTRYPOINT_FILE, CONFIG_SRC)
+#                               whose value only exists at build time
+_dockerfile_copy_sources() {
+  local _file="${1:?BUG: _dockerfile_copy_sources expects a Dockerfile}"
+  awk '
+    { line = line $0 }
+    /\\[[:space:]]*$/ { sub(/\\[[:space:]]*$/, " ", line); next }
+    { print line; line = "" }
+    END { if (line != "") print line }
+  ' "${_file}" \
+    | awk '
+        /^[[:space:]]*COPY[[:space:]]/ {
+          if ($0 ~ /--from=/) { next }
+          n = 0
+          for (i = 2; i <= NF; i++) {
+            if ($i ~ /^--/) { continue }
+            arg[++n] = $i
+          }
+          for (i = 1; i < n; i++) {
+            src = arg[i]
+            gsub(/^"|"$/, "", src)
+            if (src ~ /\$/) { continue }
+            print src
+          }
+        }
+      '
+}
+
+# _assert_dockerfile_copy_sources_exist
+#   Every COPY source the post-upgrade Dockerfile names must be present in
+#   the consumer. This is the assertion the rest of this spec structurally
+#   could not make: exit status, .version, dangling symlinks and
+#   `just --list` are all satisfied by a consumer whose Dockerfile still
+#   names the pre-move layout, and the first thing that notices is
+#   BuildKit refusing to compute a cache key -- at the user's terminal,
+#   after the subtree pull has already committed.
+#
+#   It names no path of its own: it reads whatever the Dockerfile ends up
+#   saying and asks the filesystem, so it keeps working across any future
+#   relocation instead of encoding today's one.
+_assert_dockerfile_copy_sources_exist() {
+  local _missing=()
+  local _src _ok
+  while IFS= read -r _src; do
+    [[ -n "${_src}" ]] || continue
+    # A glob source is satisfied by any match; a plain source by itself.
+    # `compgen -G` is used ONLY for real globs: handed a pattern with no
+    # metacharacter but a trailing slash it reports success for a path that
+    # does not exist, which is precisely how `.base/test/smoke/` would slip
+    # through the assertion written to catch it.
+    _ok=0
+    if [[ "${_src}" == *[*?[]* ]]; then
+      compgen -G "${CONSUMER}/${_src}" > /dev/null 2>&1 && _ok=1
+    elif [[ -e "${CONSUMER}/${_src%/}" ]]; then
+      _ok=1
+    fi
+    [[ "${_ok}" -eq 1 ]] || _missing+=("${_src}")
+  done < <(_dockerfile_copy_sources "${CONSUMER}/Dockerfile")
+
+  [[ "${#_missing[@]}" -eq 0 ]] \
+    || fail "post-upgrade Dockerfile COPYs sources that do not exist -- the consumer cannot build: ${_missing[*]}"
+}
+
+# ── The compatibility contract ──────────────────────────────────────────────
+
+# _assert_release_can_upgrade <tag>
+#   Drive the whole thing and assert the consumer is left WORKING, not just
+#   left with a bumped version file.
+_assert_release_can_upgrade() {
+  local _tag="${1:?BUG: _assert_release_can_upgrade expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  # Ask the delivery guard below about a shape a consumer actually has,
+  # not about base's own Dockerfile handed back to base.
+  _consumerise_dir_copies
+  git -C "${CONSUMER}" commit -q -a \
+    -m "chore: hand-list the subtree COPY sources"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  # The version claim is true.
+  [ "$(cat "${CONSUMER}/.base/.version")" = "${NEXT_VER}" ]
+
+  # Nothing the user types is broken. In the failure this spec was written
+  # for, .version already said the new version while justfile and all seven
+  # script/*.sh wrappers dangled.
+  run _dangling_symlinks
+  assert_output ""
+
+  # The single documented entry point still resolves.
+  run just --list
+  assert_success
+
+  # The repo can still be BUILT. Everything above is satisfied by a
+  # consumer whose Dockerfile names the layout the release just deleted.
+  _assert_dockerfile_copy_sources_exist
+}
+# NOTE: a clean `git status` is deliberately NOT asserted. A released
+# upgrade.sh stages only the specific paths it rewrites, so a genuine
+# layout change legitimately leaves the init.sh resync (re-pointed
+# wrappers, newly seeded files) uncommitted for the user to review. That
+# is review-able output, not damage. The failure this spec guards is the
+# opposite shape: a CLEAN tree whose version file claims a release the
+# upgrade never finished reaching.
+
+# _assert_release_migrates_env <tag>
+#   The consumer is sitting on a release whose rule was ".env is YOURS", so
+#   it has a hand-written, gitignored, unrecoverable .env. The upgrade that
+#   flips the rule is driven by THAT release's upgrade.sh, which knows
+#   nothing about the migration -- so the migration has to ride something
+#   the old driver still calls into on the new tree.
+_assert_release_migrates_env() {
+  local _tag="${1:?BUG: _assert_release_migrates_env expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  # base#1950: the arm models a consumer that has only a hand-written .env;
+  # a newer seed may already carry .env.local, which would mask the migration.
+  rm -f "${CONSUMER}/.env.local"
+
+  printf '# my machine\nROS_DOMAIN_ID=42\nAPI_TOKEN=secret\n' > "${CONSUMER}/.env"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  # The user's file survived, under the name that is now the user's.
+  assert [ -f "${CONSUMER}/.env.local" ]
+  run cat "${CONSUMER}/.env.local"
+  assert_output --partial "ROS_DOMAIN_ID=42"
+  assert_output --partial "API_TOKEN=secret"
+  # The name it vacated is ours again: init.sh's own `setup apply` has
+  # already regenerated `.env` by the time the upgrade returns, and that
+  # regeneration carries none of the user's values -- which is precisely
+  # the overwrite the migration exists to get ahead of.
+  assert [ -f "${CONSUMER}/.env" ]
+  run cat "${CONSUMER}/.env"
+  assert_output --partial "Auto-generated"
+  refute_output --partial "API_TOKEN=secret"
+}
+
+# _consumer_env_files <out_array>
+#   The env files the consumer's CURRENT compose.yaml loads, in the order it
+#   loads them.
+#
+#   Read off the emitted artifact rather than named. Which files carry an
+#   operator's env is `_emit_env_file_block`'s business, and
+#   ADR-00000037's output table has `.env.local` RENDERED from
+#   `env.local.toml` once those readers land (base#1168) -- at which point a
+#   caller naming `.env.local` by hand would either go quiet or refute the
+#   wrong file. What must not change across that move is that the value an
+#   operator wrote is still the value the container receives, so that is
+#   what the callers below assert and this is how they find out where to
+#   look.
+#
+#   Fails loudly on a list it could not parse. An unwritten compose.yaml, an
+#   unparsed block or a service that stopped carrying `env_file:` would all
+#   leave nothing to walk, and "the key is absent" would then be reported as
+#   the operator's value being gone rather than as this being blind. ONE
+#   entry is a legitimate shape, not a half-parse: every release the fixture
+#   window can supply predates base#868 and lists `.env` alone.
+_consumer_env_files() {
+  local -n _cef_out="${1:?BUG: _consumer_env_files expects an outvar}"
+  assert [ -f "${CONSUMER}/compose.yaml" ]
+  _cef_out=()
+  mapfile -t _cef_out < <(
+    awk '
+      /^[[:space:]]*env_file:[[:space:]]*$/ { in_blk = 1; next }
+      in_blk && /^[[:space:]]*-[[:space:]]*[^[:space:]]/ {
+        sub(/^[[:space:]]*-[[:space:]]*/, ""); print; next
+      }
+      in_blk { in_blk = 0 }
+    ' "${CONSUMER}/compose.yaml"
+  )
+  (( ${#_cef_out[@]} >= 1 )) \
+    || fail "compose.yaml carries no parseable env_file entry; there is no env chain to resolve against"
+}
+
+# _resolve_consumer_env <key> <out_var>
+#   Resolve <key> the way compose resolves it in the consumer: walk the
+#   `env_file:` list its compose.yaml carries, in that order, later file
+#   wins.
+#
+#   One layer of surrounding quotes is stripped: the generated `.env` emits
+#   `KEY='v'` through the dotenv quoting rules and a hand-written override
+#   is bare, and compose's own parser reads both as `v`.
+_resolve_consumer_env() {
+  local _key="${1:?BUG: _resolve_consumer_env expects a key}"
+  local -n _rce_out="${2:?BUG: _resolve_consumer_env expects an outvar}"
+  _rce_out=""
+
+  local -a _files=()
+  _consumer_env_files _files
+
+  local _f _line _val
+  for _f in "${_files[@]}"; do
+    [[ -f "${CONSUMER}/${_f}" ]] || continue
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+      [[ "${_line}" == "${_key}="* ]] || continue
+      _val="${_line#*=}"
+      if [[ ${#_val} -ge 2 && ( "${_val}" == \'*\' || "${_val}" == \"*\" ) ]]; then
+        _val="${_val:1:${#_val}-2}"
+      fi
+      _rce_out="${_val}"
+    done < "${CONSUMER}/${_f}"
+  done
+}
+
+# _assert_release_keeps_env_local_overrides <tag>
+#   An operator's env overrides, once in effect, stay in effect across
+#   EVERY later upgrade -- not just the one that first gave them their own
+#   file.
+#
+#   This is the end state init.sh's resync is otherwise only PROSE about:
+#   the comment where it declines to call `_migrate_env_local_to_toml`
+#   (base#1163) explains why calling it would discard those overrides, and
+#   nothing observed the outcome. Restoring the call regresses the
+#   operator-visible result with the rest of the suite green -- the
+#   converter's own unit arms assert its conversion, and the resync's
+#   protected-path arm is satisfied by the comment-only file the following
+#   apply re-scaffolds under the same name.
+#
+#   Two upgrades, because today's fixture window and tomorrow's put the
+#   operator's file in different places and the arm has to hold in both.
+#   Every release the window can currently supply predates the `.env` ->
+#   `.env.local` rule flip (base#868), so the file the seeded release loads is
+#   `.env`: `_migrate_env_to_local` moves it inside the FIRST resync
+#   (init.sh:1211) and the converter would take it away again further down
+#   that same resync, which is the arm that goes red today. Once the window
+#   slides onto a release past base#868 the seeded file is already the override
+#   file, the first upgrade stops being a migration, and the resync that
+#   runs with an override file simply sitting there -- the steady state
+#   every consumer is permanently in -- is the SECOND one. Asserting after
+#   both is what keeps this arm asking base#1163's question across that
+#   slide instead of going quiet, the way base#1084 records the base#1077 arms
+#   doing.
+#
+#   The sibling base#868 arm cannot stand in for either half: it reads
+#   `.env.local` by name and the loss recreates that name as a comment-only
+#   scaffold, so it is satisfied by the file whose emptiness is the defect.
+_assert_release_keeps_env_local_overrides() {
+  local _tag="${1:?BUG: _assert_release_keeps_env_local_overrides expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+
+  # Seeded into the override file the SEEDED release loads, taken off that
+  # release's own emitted compose: an operator can only have put their
+  # values where the release they are on reads them, and a hand-named file
+  # here would seed overrides into a file that was already inert.
+  local -a _seed_files=()
+  _consumer_env_files _seed_files
+  local _override="${_seed_files[-1]}"
+
+  printf '# my machine\nROS_DOMAIN_ID=42\nAPI_TOKEN=secret\n' \
+    > "${CONSUMER}/${_override}"
+
+  # In effect BEFORE any upgrade. Without this the arm would pass on a
+  # release that never loaded the file, and the upgrades below would be
+  # credited with preserving something that never applied.
+  local _resolved=""
+  _resolve_consumer_env ROS_DOMAIN_ID _resolved
+  assert_equal "${_resolved}" "42"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  # Still in effect through whatever file the upgraded tree's own compose
+  # now names. Asserted here too, so a second upgrade that preserves
+  # nothing because the first already lost everything reads as the first
+  # arm failing rather than the second.
+  _resolve_consumer_env ROS_DOMAIN_ID _resolved
+  assert_equal "${_resolved}" "42"
+
+  # The upgrade DID regenerate what is ours, so the arms around it are not
+  # passing because the apply never ran.
+  assert [ -f "${CONSUMER}/.env" ]
+  run cat "${CONSUMER}/.env"
+  assert_output --partial "Auto-generated"
+
+  # The resync legitimately leaves review-able output behind (see the NOTE
+  # further up), and `git subtree` refuses to start against a dirty tree.
+  # The fixture does what the upgrade's own closing instructions say.
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q -m "chore: commit the resync" || true
+
+  # The same command again, on the tree it just produced. THIS is the
+  # resync that runs with the operator's override file already there.
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER_2}"
+  assert_success
+  assert_equal "$(cat "${CONSUMER}/.base/.version")" "${NEXT_VER_2}"
+
+  _resolve_consumer_env ROS_DOMAIN_ID _resolved
+  assert_equal "${_resolved}" "42"
+  _resolve_consumer_env API_TOKEN _resolved
+  assert_equal "${_resolved}" "secret"
+}
+
+# ── The repo's own configuration ────────────────────────────────────────────
+
+# _seeded_repo_conf
+#   Repo-root-relative path of the per-repo setup.conf override the seeded
+#   release's OWN bootstrap wrote. Probed rather than named, the same way
+#   _released_entry probes the entry points and for the same reason: where
+#   that file lives is the release's business, and a release that moved it
+#   is exactly what this arm is here to survive. Root dotfile first (the
+#   post-relocation location), then the pre-relocation path under config/.
+_seeded_repo_conf() {
+  if [[ -f "${CONSUMER}/setup.toml" ]]; then
+    printf '%s' "setup.toml"
+  elif [[ -f "${CONSUMER}/.setup.conf" ]]; then
+    printf '%s' ".setup.conf"
+  else
+    printf '%s' "config/docker/setup.conf"
+  fi
+}
+
+# _assert_release_carries_its_config <tag>
+#   The consumer arrives carrying ITS OWN configuration, and is still
+#   running on it afterwards.
+#
+#   Every other arm here asks whether the upgraded repo WORKS -- exit
+#   status, `.version`, dangling symlinks, `just --list`, the Dockerfile's
+#   COPY sources, and downstream the consumer's own suite. A repo whose
+#   image has renamed itself after the directory it was cloned into and
+#   whose `[environment]` block is empty answers yes to all of them. That
+#   is base#1086: `_migrate_legacy_setup_conf` shipped in `upgrade.sh`, a
+#   cross-version upgrade is driven by the CONSUMER'S vendored copy, and
+#   the population the migration exists for is the population whose copy
+#   has never heard of it. The upgrade exited 0 with the repo's config
+#   gone, and nothing in this file was asking.
+#
+#   The values are ones no default can produce: `string:` short-circuits
+#   the `[image]` rule chain, so IMAGE_NAME can read back as this ONLY if
+#   the repo's own file was in effect, and the shipped template's
+#   `[environment]` is empty, so any key at all there is the repo's.
+#
+#   The values are written IN PLACE, over the file the release's own
+#   bootstrap seeded, rather than as a two-section file replacing it.
+#   `[image]` already carries `rule_1` and the chain takes the first rule
+#   that matches, so an APPENDED second `rule_1` would never be reached --
+#   an arm asserting against the seeded default while believing it had
+#   asserted against its own value. Replacing the whole file would fix
+#   that and cost more: section-replace (lib/conf.sh `_conf_load_layers`)
+#   means a two-section file also DELETES every other section the repo
+#   had, so a migration that dropped `[volumes]`, `[deploy]` or
+#   `[network]` on the floor would still satisfy an arm that only ever
+#   wrote `[image]` and `[environment]`. An edit in place is the shape a
+#   real repo has, and it is what lets the workspace-bind assertion below
+#   ask whether the rest of the file came through too.
+# _give_consumer_its_own_config <tag>
+#   Rewrite the two keys in place, over the file the release's own
+#   bootstrap seeded, and commit. Both spellings are then asserted to have
+#   landed: a `sed` that matched nothing would leave the caller testing
+#   the seeded default under its own name.
+_give_consumer_its_own_config() {
+  local _tag="${1:?BUG: _give_consumer_its_own_config expects a tag}"
+  local _conf
+  _conf="$(_seeded_repo_conf)"
+  [[ -f "${CONSUMER}/${_conf}" ]] \
+    || fail "${_tag}: its own bootstrap seeded no per-repo setup.conf, so this arm has no configuration to carry"
+
+  sed -i 's|^rule_1 = prefix:docker_$|rule_1 = string:base1086-carried-config|' \
+    "${CONSUMER}/${_conf}"
+  awk '{ print } /^\[environment\]$/ { print "env_1 = BASE1086_MARKER=carried" }' \
+    "${CONSUMER}/${_conf}" > "${BATS_TEST_TMPDIR}/conf.edited"
+  mv "${BATS_TEST_TMPDIR}/conf.edited" "${CONSUMER}/${_conf}"
+  grep -Fqx 'rule_1 = string:base1086-carried-config' "${CONSUMER}/${_conf}" \
+    || fail "${_tag}: its seeded ${_conf} has no '[image] rule_1 = prefix:docker_' to rewrite, so this arm would assert against the shipped default"
+  grep -Fqx 'env_1 = BASE1086_MARKER=carried' "${CONSUMER}/${_conf}" \
+    || fail "${_tag}: its seeded ${_conf} has no '[environment]' section to add a key to, so this arm would assert against the shipped default"
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q -m "chore: the repo's own configuration" || true
+}
+
+# _assert_consumer_still_on_its_own_config
+#   The repo is running on the file it arrived with, at the one path the
+#   current tree reads.
+_assert_consumer_still_on_its_own_config() {
+  # The derived interpolation cache is what names the image, and the image
+  # naming itself after the checkout directory is the loudest symptom of
+  # the loss.
+  run cat "${CONSUMER}/.env.generated"
+  assert_output --partial "IMAGE_NAME=base1086-carried-config"
+
+  # An `[environment]` entry lands in the container env file rather than
+  # the cache -- compose ranks `environment:` above `env_file`, so the
+  # entries are emitted there (write_container_env). Same question, the
+  # other half of the emitted output.
+  run cat "${CONSUMER}/.env"
+  assert_output --partial "BASE1086_MARKER="
+  assert_output --partial "carried"
+
+  # And the REST of the file came through with them. `[volumes] mount_1`
+  # is the one the repo cannot work without and the one nothing in these
+  # arms wrote: the seeded override carries the portable
+  # `${WS_PATH}:/home/${USER_NAME}/work` form, so a migration that
+  # replaced the file with a subset -- or replaced the section with the
+  # shipped default, which is empty -- takes the workspace bind out of
+  # `compose.yaml` while every assertion above still passes.
+  run cat "${CONSUMER}/compose.yaml"
+  assert_output --partial '${WS_PATH}:/home/${USER_NAME}/work'
+
+  # And the override is at the one path the CURRENT tree reads, with no
+  # orphan left behind at the old one for the next reader to trust.
+  assert [ -f "${CONSUMER}/setup.toml" ]
+  assert [ ! -e "${CONSUMER}/config/docker/setup.conf" ]
+}
+
+_assert_release_carries_its_config() {
+  local _tag="${1:?BUG: _assert_release_carries_its_config expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  _give_consumer_its_own_config "${_tag}"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  _assert_consumer_still_on_its_own_config
+}
+
+# _assert_reestablished_subtree_carries_its_config <tag>
+#   The other way a repo arrives at this tree: drop `.base/`, `git subtree
+#   add` at the new tag, run the init.sh that comes with it. No released
+#   `upgrade.sh` is involved at any point, which is what makes this arm
+#   worth its own seeding.
+#
+#   Every other arm in this file asks its question THROUGH a released
+#   driver, so what it can still see depends on which releases the
+#   compatibility window reaches. base#1086 is invisible to a driver that
+#   carries its own copy of the relocation, and both drivers in the window
+#   will carry one as soon as the window stops reaching back past it
+#   (base#1084) -- at which point those arms pass whatever `init.sh` does.
+#   This one drives `init.sh` directly and cannot go quiet that way.
+#
+#   It is also the only coverage the re-establish path has. A repo that
+#   re-establishes its subtree never runs `upgrade.sh`, so a relocation
+#   living there could never help it -- which is half of why the migration
+#   moved.
+_assert_reestablished_subtree_carries_its_config() {
+  local _tag="${1:?BUG: _assert_reestablished_subtree_carries_its_config expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  _give_consumer_its_own_config "${_tag}"
+
+  # The subtree goes away and comes back at the new tag. `git subtree add`
+  # refuses a prefix that already exists, so the removal is a real commit
+  # rather than an `rm -rf` the index still remembers.
+  git -C "${CONSUMER}" rm -r -q --cached .base
+  rm -rf "${CONSUMER:?}/.base"
+  git -C "${CONSUMER}" commit -q -m "chore: drop the vendored subtree"
+  git -C "${CONSUMER}" subtree add -q --prefix=.base \
+    "file://${CUR_BARE}" "${NEXT_VER}" --squash
+
+  # Probed rather than named, for the same reason the released entry
+  # points are: which path init.sh lives at is the TREE's business, and
+  # the tree under test here is the one whose layout is free to move.
+  local _init
+  _init="$(_released_entry init.sh)"
+  cd "${CONSUMER}"
+  run "${_init}"
+  assert_success
+
+  _assert_consumer_still_on_its_own_config
+}
+
+# _assert_release_stages_migrated_files <tag>
+#   The upgrade COMMITS what its migrations rewrote, and commits nothing
+#   else. The failure this arm exists for is not a broken tree: it is a
+#   tree that builds locally and pushes a lie -- the commit says
+#   "template references to <ver>" while the path migration that makes
+#   the repo buildable is still sitting unstaged, and the same run's last
+#   words are "git push".
+#
+#   Which release drives is the whole point. The consumer's own vendored
+#   upgrade.sh does the committing, and it stages a pair of filenames
+#   hardcoded when it shipped, so the run that rewrote the files is the
+#   only party that can stage them for every driver at once.
+#
+#   EVERY release in the window drives this, not just the oldest, and the
+#   difference matters because the obvious reading of the paragraph above
+#   is wrong. The oldest release is the only one whose Step 5 misses the
+#   DOCKERFILE -- v0.42.0's reaches it -- so an arm that asserted only
+#   "the Dockerfile is in the commit" really would go quiet as the window
+#   slides forward. What this arm asserts is the whole listing, and no
+#   released Step 5 stages `.dockerignore`, the re-pointed wrappers or the
+#   monitor workflow, whatever its vintage. Measured, not assumed:
+#   disabling the staging in `init.sh` and driving with the NEWEST release
+#   fails here on ` M .dockerignore`. Pinning both ends is what stops the
+#   next reader from narrowing this back to one tag on the premise the
+#   first paragraph suggests.
+_assert_release_stages_migrated_files() {
+  local _tag="${1:?BUG: _assert_release_stages_migrated_files expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  _consumerise_dir_copies
+
+  git -C "${CONSUMER}" commit -q -a \
+    -m "chore: hand-list the subtree COPY sources"
+
+  # A file of the user's own, sitting in the tree while they upgrade.
+  # Nothing migrates it, so nothing may stage it. Untracked rather than
+  # modified-and-tracked because `git subtree pull` refuses to run at all
+  # over unstaged changes -- an untracked file it does not mind, and a
+  # `git add -A` sweep would take it just the same.
+  printf 'notes I have not committed yet\n' > "${CONSUMER}/NOTES.md"
+
+  # And a file of the user's own that IS one of the paths the resync
+  # publishes. NOTES.md alone cannot see the difference between "stages
+  # its own output" and "stages the published list wholesale": it is
+  # outside that list either way, so a sweep of the list passes it. A hook
+  # stub is inside the list AND never overwritten -- init.sh seeds it once
+  # and leaves it alone forever after -- so whatever is in one is the
+  # user's. Dropped from the index rather than modified in place for the
+  # reason above: `git subtree pull` refuses to run over a modified
+  # tracked file, and untracked is the same shape to the staging step.
+  git -C "${CONSUMER}" rm -q --cached script/hooks/pre/build.sh
+  git -C "${CONSUMER}" commit -q -m "chore: take a hook stub back"
+  printf '# my own hook step\n' >> "${CONSUMER}/script/hooks/pre/build.sh"
+
+  local _before
+  _before="$(cat "${CONSUMER}/Dockerfile")"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  # This arm only says something where the migrations actually rewrote
+  # the Dockerfile; a release that stops migrating anything must fail
+  # here rather than pass with nothing to stage.
+  [[ "$(cat "${CONSUMER}/Dockerfile")" != "${_before}" ]] \
+    || fail "${_tag}: the upgrade rewrote nothing in the Dockerfile, so this arm asserts nothing about staging it"
+
+  # The rewrite is IN the commit the upgrade made ...
+  run git -C "${CONSUMER}" show --format= --name-only HEAD
+  assert_line "Dockerfile"
+  # ... and the working tree no longer disagrees with it.
+  run git -C "${CONSUMER}" status --porcelain -- Dockerfile
+  assert_output ""
+  # The user's own two files are still the user's to commit -- and they are
+  # the ONLY things the upgrade left behind. Everything else in that listing
+  # would be the resync's own output: re-pointed wrappers, the justfile
+  # layering, the monitor workflow. Mechanical output of the run the commit
+  # claims to be, so a commit that says "template references to <ver>" while
+  # they sit unstaged describes a tree that does not exist. Both directions
+  # are in this one assertion: too little staged adds a line, and the
+  # customised hook stub swept into the commit removes one.
+  run git -C "${CONSUMER}" status --porcelain
+  assert_output "?? NOTES.md
+?? script/hooks/pre/build.sh"
+}
+
+# _assert_upgrade_leaves_an_upgradable_tree <tag>
+#   Upgrade, then upgrade AGAIN -- driving the second run with the SAME
+#   command that drove the first.
+#
+#   Every other arm in this file asks whether ONE upgrade succeeds, and
+#   answers it about the tree the upgrade STARTED from. A frozen path that
+#   is missing from the tree the upgrade PRODUCES is invisible to all of
+#   them: the run exits 0, `.version` is true, no symlink dangles, the
+#   Dockerfile builds -- and the next time the user types the command their
+#   release documented, it is gone. `.base/upgrade.sh` was absent for two
+#   release candidates with this suite green for exactly that reason -- the
+#   same blindness that let the v0.42.0 `init.sh` breakage ship, and the
+#   arm names below carry the issue refs.
+#
+#   The command is RE-RUN, never re-resolved. Re-resolving asks "does the
+#   new tree have SOME upgrade entry point", which is true of the broken
+#   tree too; what a consumer holds is the one path their own release told
+#   them to type. So this names no file of its own -- the path comes from
+#   the release under test -- and a roster of "files that must exist" is
+#   exactly what it refuses to be: it goes stale the day a third frozen
+#   path appears, which is the failure this repo keeps repeating. "The tree
+#   an upgrade produces can be upgraded from" covers the next one for free.
+#
+#   The support window is the scope, and that is a real limit rather than a
+#   property to be pleased about. The window is every stable release from
+#   the v0.43.0 floor below the tree, read from upstream's tags (base#1055,
+#   base#1729), and these arms drive its two newest lines; the rest is
+#   undriven until base#1948. Every release in it names the `dist/` path,
+#   so NO arm here names either root forwarder: both could be deleted with
+#   every arm still green.
+#
+#   That is not the same thing as ADR-00000006 releasing the forwarders. The
+#   ADR ties them to "as long as a release that names it is supported", and
+#   base#919 made v0.42.0 a poisoned upgrade target, which is why consumers
+#   stayed on v0.41.0 in the first place. So the window going quiet is the
+#   guard losing sight of the path, and it has to be closed deliberately
+#   rather than read as permission. Tracked in base#1084.
+_assert_upgrade_leaves_an_upgradable_tree() {
+  local _tag="${1:?BUG: _assert_upgrade_leaves_an_upgradable_tree expects a tag}"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+
+  # Resolved ONCE, from the release the consumer is actually sitting on.
+  # Every invocation below is this same string.
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  # The resync legitimately leaves review-able output behind (see the NOTE
+  # above), and `git subtree` refuses to start against a dirty tree. So the
+  # fixture does what the upgrade's own closing instructions tell the user
+  # to do before they carry on.
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q -m "chore: commit the resync" || true
+
+  # The same command, on the tree it just produced.
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER_2}"
+  assert_success
+  [ "$(cat "${CONSUMER}/.base/.version")" = "${NEXT_VER_2}" ]
+}
+
+# why: The window is the set of releases a consumer may still be driving
+# (base#1055, base#1041): every stable release from the v0.43.0 floor up to,
+# but not including, the tree under test. A count-sliced window drops the
+# floor once enough releases follow it and keeps pre-floor releases before
+# the floor exists. This arm checks only the bounds and the order: no line
+# is a pre-release, below the floor, at or above the tree, or out of
+# newest-first order. It has no upstream listing, so it cannot see a
+# missing release; that half is pinned by prepare_prev_release_spec.bats,
+# which mocks upstream.
+@test "the window holds only stable releases from v0.43.0 below the tree, newest first (base#1729)" {
+  _window_written
+  local _tree
+  _tree="$(tr -d '[:space:]' < /source/.version)"
+  [[ "${_tree}" =~ ^v0\.([0-9]+)\.([0-9]+)(-rc[0-9]+)?$ ]] \
+    || fail "tree version '${_tree}' is not v0.Y.Z[-rcN]"
+  local -i _tmin="${BASH_REMATCH[1]}" _tpat="${BASH_REMATCH[2]}"
+
+  local _line _prev=""
+  local -i _min _pat
+  while IFS= read -r _line; do
+    [[ "${_line}" =~ ^v0\.([0-9]+)\.([0-9]+)$ ]] \
+      || fail "window line '${_line}' is not a stable v0.Y.Z tag"
+    _min="${BASH_REMATCH[1]}"
+    _pat="${BASH_REMATCH[2]}"
+    (( _min >= 43 )) \
+      || fail "window holds ${_line}, below the v0.43.0 floor (base#1055)"
+    (( _min < _tmin || (_min == _tmin && _pat < _tpat) )) \
+      || fail "window holds ${_line}, not below the tree ${_tree}"
+    if [[ -n "${_prev}" ]]; then
+      [[ "${_prev}" =~ ^v0\.([0-9]+)\.([0-9]+)$ ]]
+      (( BASH_REMATCH[1] > _min || (BASH_REMATCH[1] == _min && BASH_REMATCH[2] > _pat) )) \
+        || fail "window is not strictly newest first: ${_prev} then ${_line}"
+    fi
+    _prev="${_line}"
+  done < "${TAGS_FILE}"
+}
+
+# why: The driver arms below read only lines 1 and 2 of the window, so a
+# third release in it is materialised and driven by nothing: the suite
+# stays green while that release goes untested. This arm makes that gap
+# red the first release it bites. The 2 is the set of indices the arms
+# ask `_release_tag` for, counted by hand; base#1948 makes the arms drive
+# every window line and removes this arm.
+@test "every window release is one a driver arm reaches (base#1948)" {
+  _window_written
+  local -a _undriven=()
+  mapfile -t _undriven < <(sed -n '3,$p' "${TAGS_FILE}")
+  (( ${#_undriven[@]} == 0 )) \
+    || fail "window holds ${_undriven[*]}, which no driver arm drives: the arms read only lines 1 and 2 of ${TAGS_FILE} (base#1948)"
+}
+
+# why: An upgrade that deletes the command that performed it passes every
+# other arm here -- one successful run over a tree nobody asks to upgrade
+# again -- and fails at the consumer's terminal on their next release
+@test "the newest released upgrade.sh leaves a tree its own command can upgrade again (#1077)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_upgrade_leaves_an_upgradable_tree "${_tag}"
+}
+
+# why: The newest release is already on the path the current tree ships, so
+# only the older driver names a path that has to be kept alive by a
+# forwarder; pinning both ends is what stops this narrowing to one tag
+@test "the previous released upgrade.sh leaves a tree its own command can upgrade again (N-1, #1077)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_upgrade_leaves_an_upgradable_tree "${_tag}"
+}
+
+# why: The commit is made by the consumer's OWN released upgrade.sh, so
+# the only proof that the migrated Dockerfile lands in it is to let that
+# script drive; a unit test on the staging helper passes while the real
+# upgrade still leaves the file behind
+@test "the oldest supported upgrade.sh commits what the migrations rewrote (#1036)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_release_stages_migrated_files "${_tag}"
+}
+
+# why: The oldest driver is the only one whose own Step 5 misses the
+# Dockerfile, so an arm that ran only there would go quiet as the window
+# slides forward and the fix could be deleted with the suite green; the
+# newest driver still leaves the rest of the resync unstaged without it
+@test "the newest supported upgrade.sh commits what the migrations rewrote (#1036)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_release_stages_migrated_files "${_tag}"
+}
+
+@test "a released upgrade.sh still migrates a hand-written .env to .env.local (#868)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_release_migrates_env "${_tag}"
+}
+
+# why: base#1950 -- once a released init.sh seeds .env.local itself, the
+# #868 arm would find that seeded file instead of the migrated one and go red
+# on a consumer the migration handled correctly; this pins the arm's own
+# pre-migration seed so the release can be tagged.
+@test "the #868 .env arm holds with a seed that already carries .env.local (#1950)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  SEED_ENV_LOCAL=1 _assert_release_migrates_env "${_tag}"
+}
+
+# why: base#1163's loss was done BY the upgrade path, so it reached
+# operators who had only followed the documented procedure, and the only
+# thing holding it off since is a comment in init.sh saying why the
+# converter is not called -- a comment nothing refutes and a later change
+# can delete. The sibling base#868 arm cannot see it: it reads `.env.local` by
+# name, and the loss recreates that name as a comment-only scaffold, so the
+# file whose emptiness IS the defect satisfies it. This arm resolves the
+# value through the emitted compose's own env_file chain rather than reading
+# a named file, so it stays the same question when the env.local.toml
+# readers move which file carries it (base#1168). The newest
+# driver is the one an operator upgrading today runs, and the mechanism
+# lives in the resync of the tree being upgraded INTO, which every
+# supported driver reaches by the same route -- a second arm on an older
+# tag would re-ask the identical question.
+@test "a released upgrade.sh leaves an operator's existing env overrides in effect (base#1163)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_release_keeps_env_local_overrides "${_tag}"
+}
+
+# why: The oldest driver predates the setup.conf relocation, so its own
+# copy carries no migration for it -- this is the arm that fails when the
+# fix lives anywhere the old driver cannot reach, and the upgrade it
+# describes exits 0 with the repo's configuration gone
+@test "the oldest supported upgrade.sh leaves the consumer running on its own configuration (#1086)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_release_carries_its_config "${_tag}"
+}
+
+# why: The newest driver reaches the relocation through its own pre-pull
+# copy, so it answers the same question by a different route; pinning both
+# ends is what stops the guard being read as "only the old driver has to
+# carry a repo's config through an upgrade"
+@test "the newest supported upgrade.sh leaves the consumer running on its own configuration (#1086)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_release_carries_its_config "${_tag}"
+}
+
+# why: The arms above ask through a released driver, so they stop being
+# able to see #1086 the moment the compatibility window no longer reaches
+# back past the relocation (base#1084); this one drives init.sh directly,
+# and it is the only coverage the re-establish path -- which never runs
+# upgrade.sh at all -- has
+@test "a re-established subtree leaves the consumer running on its own configuration (#1086)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_reestablished_subtree_carries_its_config "${_tag}"
+}
+
+@test "the newest released upgrade.sh drives the current tree to a working consumer" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_release_can_upgrade "${_tag}"
+}
+
+@test "the previous released upgrade.sh drives the current tree to a working consumer (N-1)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_release_can_upgrade "${_tag}"
+}
+
+# ── The version interval an upgrade crosses ─────────────────────────────────
+
+# _assert_interval_selection <tag>
+#   Three migrations are declared in the release the consumer upgrades INTO:
+#   one landing at a version it was already past, one landing inside the
+#   interval the upgrade crosses, one landing beyond it. Exactly the middle
+#   one may run.
+#
+#   The two it must NOT run are what makes the arm say something. A runner
+#   that ignores the interval and applies everything it has satisfies "the
+#   migration ran" just as well, and so does one that applies the newest
+#   declaration unconditionally -- the shape every incident this mechanism
+#   replaces actually had.
+_assert_interval_selection() {
+  local _tag="${1:?BUG: _assert_interval_selection expects a tag}"
+
+  _register_interval_migration v0.0.1 below_the_interval
+  _register_interval_migration v98.0.0 inside_the_interval
+  _register_interval_migration v99.9.9 above_the_interval
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+
+  run _probe_runs inside_the_interval
+  assert_output "1"
+  run _probe_runs below_the_interval
+  assert_output "0"
+  run _probe_runs above_the_interval
+  assert_output "0"
+
+  # And what the migration wrote is in the commit the released driver just
+  # made. The resync is the only run that can stage it (ADR-00000006,
+  # 2026-09-04), and a migration's output is on no list written before the
+  # migration existed -- so the record it made is the whole of what put it
+  # there.
+  run git -C "${CONSUMER}" ls-files --error-unmatch -- "${_PROBE}"
+  assert_success
+}
+
+# _assert_interval_migration_not_repeated <tag>
+#   One migration, landing inside the first upgrade's interval, and then the
+#   two things that happen to a consumer afterwards: they run `just base
+#   init` (the standalone resync, no pull and no interval), and they take the
+#   next release (a new interval, which this migration's version is below).
+#   Neither may run it a second time.
+#
+#   Both are the hazard this mechanism carries and nothing else here can
+#   see. The standalone resync is the path `just base init` and a
+#   re-established subtree both take, where there is no upgrade to read a
+#   from-version out of at all; the second upgrade is the one a consumer
+#   reaches a release later, with the migration's version now behind them.
+_assert_interval_migration_not_repeated() {
+  local _tag="${1:?BUG: _assert_interval_migration_not_repeated expects a tag}"
+
+  _register_interval_migration v98.0.0 once_only
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+  run _probe_runs once_only
+  assert_output "1"
+
+  # What the upgrade's own closing instructions tell the user to do.
+  # --allow-empty is load-bearing: this commit is what moves HEAD off the
+  # subtree-pull merge, and the standalone arm below asks precisely what
+  # happens when there is no such merge to read.
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q --allow-empty -m "chore: commit the resync"
+  run git -C "${CONSUMER}" rev-list --parents -n 1 HEAD
+  assert_success
+  # "<head> <parent>" -- two fields, so HEAD is no longer a merge.
+  [ "$(printf '%s' "${output}" | wc -w)" -eq 2 ]
+
+  # `just base init` on that tree: a resync with no version interval. Named
+  # at the path the UPGRADED tree ships it at -- the pull has already
+  # replaced the vendored copy, so this is the current init.sh, which is the
+  # one the runner lives in.
+  run ./.base/dist/script/base/init.sh
+  assert_success
+  run _probe_runs once_only
+  assert_output "1"
+
+  # And the next release, whose interval this migration's version is below.
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q --allow-empty -m "chore: commit the standalone resync"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER_2}"
+  assert_success
+  [ "$(cat "${CONSUMER}/.base/.version")" = "${NEXT_VER_2}" ]
+  run _probe_runs once_only
+  assert_output "1"
+}
+
+# why: The interval is the whole mechanism, and the oldest supported driver
+# is the population it exists for -- its vendored copy knows nothing about
+# any migration, so the only code that can select one is the init.sh the
+# pull just landed. Measured on the unfixed tree the arm cannot even seed:
+# nothing in the published release declares a version-bound migration
+@test "a released upgrade.sh runs the migration the version interval covers, and only that one (base#1097)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_interval_selection "${_tag}"
+}
+
+# why: Running once is half the contract. Base cannot stop the consumer
+# re-running `just base init`, and it cannot stop them taking the next
+# release; both re-enter the same runner, and a mechanism that applied
+# everything it had on either would re-run work already done -- the
+# double-apply the declared-interval shape exists to make impossible
+@test "neither a standalone resync nor the next release re-runs a migration the interval already covered (base#1097)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+  _assert_interval_migration_not_repeated "${_tag}"
+}
+
+# _assert_interval_can_be_named_by_hand <tag>
+#   The recovery path, driven the way a consumer would have to drive it. The
+#   released driver commits at its own Step 4, so an interval whose migrations
+#   were skipped -- a migration that failed, a from-version that could not be
+#   read -- is already gone from HEAD by the time the user reads the warning
+#   about it. Naming the pair by hand is the only second chance there is, and
+#   it has to work through `init.sh` rather than through the runner, because
+#   `just base init` is what the warning tells the user to run.
+_assert_interval_can_be_named_by_hand() {
+  local _tag="${1:?BUG: _assert_interval_can_be_named_by_hand expects a tag}"
+
+  _register_interval_migration v98.0.0 owed
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" "${_upgrade}" "${NEXT_VER}"
+  assert_success
+  run _probe_runs owed
+  assert_output "1"
+
+  # Put the consumer where the released driver's Step 4 leaves them: the
+  # interval is no longer readable off HEAD.
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q --allow-empty -m "chore: commit the resync"
+  run ./.base/dist/script/base/init.sh
+  assert_success
+  run _probe_runs owed
+  assert_output "1"
+
+  # The second chance: the operator names the pair the history no longer has.
+  run env BASE_MIGRATION_FROM="${_tag}" ./.base/dist/script/base/init.sh
+  assert_success
+  run _probe_runs owed
+  assert_output "2"
+}
+
+# why: Every warning this runner emits leaves a consumer owed work, and until
+# the interval can be named by hand none of them could be acted on: the
+# released driver commits at Step 4, so the merge the interval was read from
+# is gone before the user has seen the message. The arm drives the recovery
+# through `just base init`, which is what the message tells them to run, on a
+# tree where the automatic path has already correctly declined
+@test "an interval the history can no longer supply can be named by hand and re-run (base#1097)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+  _assert_interval_can_be_named_by_hand "${_tag}"
+}
+
+# ── The restart-default migration, through a real released driver ───────────
+#
+# base#1110. The migration that retires the stale devel-scoped
+# `[lifecycle] restart = no` used to live in `upgrade.sh` gated on the
+# VENDORED template under `.base/` still carrying the old value -- the tree
+# the pull replaces. The function and the new template default shipped in
+# the same release, so the gate closed on every tag that had the function:
+# the migration returned 0, printed nothing, and changed nothing, on every
+# consumer there has ever been.
+#
+# The two arms below are the ones the old unit fixture could not be. It
+# built its own driver/template pair with the vendored template saying
+# `restart = no`, a pairing no release produces, and went green over a
+# migration that never fired. These drive the consumer's OWN released
+# driver over the release that genuinely ships `restart = no`, and read the
+# answer out of the file the readers use.
+#
+# They also use the REAL declared entry rather than
+# `_register_interval_migration`'s probe. A probe proves the runner selects
+# what it is given; only the real entry proves THIS migration is reachable,
+# which is the whole of what base#1110 was about.
+
+# _consumer_lifecycle_restart
+#   The consumer's `[lifecycle] restart` value, section-scoped, with the TOML
+#   quotes off. Section-scoped because a `[stage:*]` block may legitimately
+#   carry its own `restart`, and a whole-file grep would read that one.
+_consumer_lifecycle_restart() {
+  local _conf="${CONSUMER}/setup.toml"
+  [[ -f "${_conf}" ]] \
+    || fail "the upgraded consumer has no setup.toml -- nothing to read a restart policy out of"
+  awk '
+    /^[[:space:]]*\[/ { s = $0; gsub(/[][ "'"'"']/, "", s) }
+    s == "lifecycle" && /^[[:space:]]*restart[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^["'"'"']|["'"'"']$/, ""); print; exit
+    }' "${_conf}"
+}
+
+# _set_consumer_lifecycle_restart <value>
+#   Write `[lifecycle] restart = <value>` into whichever config file the
+#   release's own bootstrap seeded, and commit. <value> is the BARE value;
+#   the quoting is decided from the file's own format, because the two are
+#   not interchangeable. A `"no"` written into an INI file is the three
+#   characters `"no"` to the INI tokenizer, so it survives the resync's
+#   conversion as a TOML string whose content is `"no"` -- a value nothing in
+#   the schema has, read back by the arm as if it were the one it set. Which
+#   file a release seeds is the release's business, so the format is read off
+#   the name rather than assumed.
+#
+#   Asserts the key was there to rewrite: a sed that matched nothing would
+#   leave the arm asserting against the seeded default under its own name.
+_set_consumer_lifecycle_restart() {
+  local _bare="${1:?BUG: _set_consumer_lifecycle_restart expects a value}"
+  local _conf
+  _conf="$(_seeded_repo_conf)"
+  local _value="${_bare}"
+  [[ "${_conf}" == *.toml ]] && _value="\"${_bare}\""
+  [[ -f "${CONSUMER}/${_conf}" ]] \
+    || fail "its own bootstrap seeded no per-repo config, so this arm has nothing to set"
+  local _before
+  _before="$(grep -cE '^[[:space:]]*restart[[:space:]]*=' "${CONSUMER}/${_conf}")"
+  (( _before > 0 )) \
+    || fail "the seeded ${_conf} carries no 'restart =' line to rewrite, so this arm would assert against the shipped default"
+  sed -i -E "s|^([[:space:]]*)restart[[:space:]]*=.*$|\1restart = ${_value}|" \
+    "${CONSUMER}/${_conf}"
+  # And it landed. Checked HERE, in the file the release actually seeded,
+  # because the caller cannot: the resync relocates and converts that file,
+  # so before the upgrade there is no `setup.toml` to read the value back
+  # out of, and a caller that tried would be asserting against a path that
+  # does not exist yet rather than against the value it just wrote.
+  grep -qE "^[[:space:]]*restart[[:space:]]*=[[:space:]]*${_value}[[:space:]]*\$" \
+    "${CONSUMER}/${_conf}" \
+    || fail "writing '[lifecycle] restart = ${_value}' into ${_conf} did not take, so this arm would run against the value the release seeded"
+  git -C "${CONSUMER}" add -A
+  git -C "${CONSUMER}" commit -q -m "chore: the repo's own restart policy" || true
+}
+
+# ── Why these two arms NAME the interval ────────────────────────────────────
+#
+# `BASE_MIGRATION_FROM` rather than the window's own version. The
+# compatibility window is every STABLE release from the v0.43.0 floor below
+# the tree, resolved from upstream's tags every run
+# (script/test/prepare-prev-release.sh, base#1729), and these arms drive its
+# two newest lines (the rest waits on base#1948), so which versions they
+# get moves on its own. The migration's predicate is
+# `from < v0.42.0 <= to`, and no release in the window can supply a
+# pre-rescope arrival, so an arm reading the from-version out of the
+# history would fail over correct production behaviour. That is not a
+# condition a fixed tag escapes either: pinning v0.41.0 here pins a release
+# the window does not materialise.
+#
+# So the released DRIVER still comes from the window -- that half is what
+# makes these reachability arms rather than unit tests, and it is the half
+# that has to keep moving -- and the interval is named. The version the
+# consumer came from is supplied by exactly the escape hatch the lib
+# documents for the case where the history cannot supply it, and the stale
+# value is seeded by hand rather than taken from whatever the release
+# happened to ship.
+#
+# Nothing is lost by naming it: that a real released upgrade DERIVES the
+# interval from its own subtree-pull merge is what
+# `_assert_interval_selection` (base#1097) above already drives, through the
+# same released drivers.
+
+# why: The population base#1110's migration exists for is a repo arriving
+# from before the rescope, and the defect was that no such repo could reach
+# it. This is that repo, driven by its own released driver over a real pull,
+# reading the answer out of the file the readers use -- the one arm that was
+# impossible to write while the gate read the tree the pull replaces
+@test "a released upgrade.sh retires the stale devel-scoped restart default (base#1110)" {
+  _window_written
+  _window_reaches 2 || return 0
+  local _tag
+  _tag="$(_release_tag 2)"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  # The stale copied default, in whatever format and at whatever path this
+  # release seeds. Written rather than inherited: see the note above on why
+  # the release the window hands us cannot be relied on to carry it. The
+  # helper verifies its own write, which is the non-vacuity guard this arm
+  # needs -- a seed that silently did not take would leave the assertions
+  # below running against the release's own value.
+  _set_consumer_lifecycle_restart 'no'
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" \
+      BASE_MIGRATION_FROM=v0.41.0 "${_upgrade}" "${NEXT_VER}"
+  assert_success
+  # The consumer is TOLD, because the value is theirs to disagree with.
+  assert_output --partial "MIGRATION: [lifecycle] restart is now DEPLOY-scoped"
+
+  run _consumer_lifecycle_restart
+  assert_output "unless-stopped"
+
+  # And the rewrite is in the commit the released driver just made. The
+  # resync is the only run that can stage it, and a migration's output is on
+  # no list written before the migration existed -- so the record it made is
+  # the whole of what put it there.
+  run git -C "${CONSUMER}" status --porcelain -- setup.toml
+  assert_output ""
+
+  # Running the upgrade again must not re-announce it. The interval is named
+  # again on purpose, so the migration is RE-SELECTED and still has to be a
+  # no-op: the runner keeps no ledger, so idempotence is the migration's own
+  # job and this is the only place it is observable end to end.
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" \
+      BASE_MIGRATION_FROM=v0.41.0 "${_upgrade}" "${NEXT_VER_2}"
+  assert_success
+  refute_output --partial "MIGRATION: [lifecycle] restart is now DEPLOY-scoped"
+  run _consumer_lifecycle_restart
+  assert_output "unless-stopped"
+}
+
+# why: The fail-safe is the other half, and it is the half the old gate was
+# built to protect: past the rescope a `no` cannot be told from a choice
+# somebody made, so a repo whose interval STARTS at the rescope must keep
+# the value it arrived with. An arm that only proved the rewrite would pass
+# just as well over a migration that rewrote everybody's
+@test "a released upgrade.sh leaves a post-rescope restart = no alone (base#1110)" {
+  _window_written
+  _window_reaches 1 || return 0
+  local _tag
+  _tag="$(_release_tag 1)"
+
+  _seed_current_remote
+  _seed_released_remote "${_tag}"
+  _seed_consumer "${_tag}"
+  # A deliberate choice: `no`, chosen by a repo that is already past the
+  # rescope. That is exactly what the interval cannot tell from a copied
+  # default once it starts at or after v0.42.0, and so must not touch.
+  _set_consumer_lifecycle_restart 'no'
+
+  local _upgrade
+  _upgrade="$(_released_entry upgrade.sh)"
+  cd "${CONSUMER}"
+  # v0.42.0 names the BOUNDARY, which is the case worth pinning: the
+  # interval is half-open at the from end, so `from = v0.42.0` must NOT
+  # select a migration landing in v0.42.0. Naming it also means this arm
+  # stays the post-rescope case as the window moves, rather than becoming
+  # whichever version the newest release happens to be.
+  run env TEMPLATE_REMOTE="file://${CUR_BARE}" \
+      BASE_MIGRATION_FROM=v0.42.0 "${_upgrade}" "${NEXT_VER}"
+  assert_success
+  refute_output --partial "MIGRATION: [lifecycle] restart is now DEPLOY-scoped"
+
+  run _consumer_lifecycle_restart
+  assert_output "no"
+}

@@ -2,7 +2,7 @@
 
 **[English](README.md)** | **[繁體中文](doc/README.zh-TW.md)** | **[简体中文](doc/README.zh-CN.md)** | **[日本語](doc/README.ja.md)**
 
-A generic, Kit-agnostic browser-based WebRTC viewer sidecar for Omniverse Kit streaming applications (Isaac Sim, USD Viewer, etc.). Built on [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base), the image serves one of two static apps selected at boot by `VIEWER_UI_MODE`:
+A generic, Kit-agnostic browser-based WebRTC viewer sidecar for Omniverse Kit streaming applications (Isaac Sim, USD Viewer, etc.). Built on [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base), the image serves one of two static apps selected at boot by `VIEWER_UI_MODE`:
 
 - **`usd-viewer`** — NVIDIA's [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2, built UNMODIFIED. Provides the landing screen, the full USD Viewer UI, and any-app streaming — all reached interactively (click).
 - **`stream-only`** — our own full-screen, auto-connect app built over the `stream-core` package. Boots straight into the stream with no click; intended for Isaac Sim and any headless stream consumer.
@@ -44,14 +44,14 @@ just run -t runtime -d
 #    usd-viewer: click the landing screen to choose a view
 ```
 
-To override the default host IP or ports, edit `config/docker/setup.conf`:
+To override the default host IP or ports, edit `setup.toml`:
 
-```ini
+```toml
 [environment]
-env_1 = SIGNALING_SERVER=<host-ip>
-env_2 = SIGNALING_PORT=49100
-env_3 = SERVE_PORT=5173
-env_4 = VIEWER_UI_MODE=stream-only
+env_1 = "SIGNALING_SERVER=<host-ip>"
+env_2 = "SIGNALING_PORT=49100"
+env_3 = "SERVE_PORT=5173"
+env_4 = "VIEWER_UI_MODE=stream-only"
 ```
 
 The `env_N = KEY=VALUE` shape is the grammar, not a style: `setup.sh`
@@ -68,15 +68,17 @@ Then run `./script/setup.sh apply` to regenerate `compose.yaml`.
 Every git tag publishes a GitHub Release **and** a matching container image, from the same commit in the same CI run, so the two always exist as a pair — given an image you can find its source release, and given a release you can find its image:
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **Path change (2026-11-22):** the GitHub org was renamed from `ycpss91255-docker` to `ycpss91255-lab`. The image now lives at `ghcr.io/ycpss91255-lab/omniverse_web_viewer`; the old `ghcr.io/ycpss91255-docker/...` path is no longer pullable, so update any pinned references.
 
 The image tag is the release version with the leading `v` removed. CI derives it from the git tag; nobody types it in, which is what keeps a release and its image from drifting apart:
 
 | Git tag | Image |
 |---------|-------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 Release candidates are published as well, since the rc is what gets verified before the final tag is cut.
 
@@ -90,7 +92,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 Then open Chrome at `http://<host-ip>:5173`. The knobs are the environment variables documented below.
@@ -107,7 +109,7 @@ Then open Chrome at `http://<host-ip>:5173`. The knobs are the environment varia
 
 `VIEWER_UI_MODE` selects which app the entrypoint serves; it is not asset-injected. `SIGNALING_SERVER`, `SIGNALING_PORT`, and `MEDIA_PORT` are the injected sentinels: the build preserves each sentinel-bearing chunk as a `*.js.tmpl`, and the entrypoint re-renders `*.js.tmpl -> *.js` on every boot (idempotent — a restart or changed value is picked up next start). Validation is the escaping: an invalid value fails the container (`exit 1`) rather than baking malformed JS. Rejected: a `SIGNALING_SERVER` carrying anything outside `A-Za-z0-9.-`; and any of `SIGNALING_PORT`, `MEDIA_PORT` or `SERVE_PORT` that is not an integer 1..65535 written WITHOUT a leading zero — so `80x`, `0`, `99999` and `049100` all fail. The leading-zero rule is not pedantry: the port sentinel is substituted unquoted, so `049100` would render a bare `049100` token, which is a strict-mode `SyntaxError` that black-pages the viewer from a container that started fine. `SERVE_PORT` is checked only when set (the `example` stage serves on `EXAMPLE_PORT`) and may be either a bare port or a `serve -l` endpoint — `SERVE_PORT=tcp://127.0.0.1:5173` binds loopback only, which is the only way to stop the viewer listening on every interface. Exactly two forms are supported: `<port>` and `tcp://<host>:<port>`. `serve -l` documents two more, and both are refused by name rather than by accident: a UNIX socket (`unix:/path/to/socket.sock`) cannot be addressed by anything that consumes this container — the browser dials a URL, and the image's own serve smoke and both e2e runners curl `http://127.0.0.1:<port>` — and a Windows named pipe (`pipe:\\.\pipe\Name`) cannot exist in the linux/amd64 image that is published. The media sentinel exists ONLY in the `stream-only` bundle (its `streamTarget.json`); `usd-viewer` carries server + port only and negotiates media via SDP. The served bundle takes its target from that render ALONE: a `?server=`/`?port=`/`?media=` query string is a `npm run dev` convenience and is ignored by built bundles, so a link cannot repoint a running viewer at another host.
 
-Ports (`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`) are delivered via the `.env` mechanism (the `[environment]` table / `setup.conf`), not via `host.yaml` and not via hardcoded `-e`. `config/host.yaml` carries `public_ip` (and optionally `viewer.ui_mode`) only. Precedence: `public_ip` / `ui_mode` -> `host.yaml` > env > default; ports -> `.env`. See `config/host.yaml.example`. Both keys are read from THEIR OWN SECTION only (`network.public_ip`, `viewer.ui_mode`), because that file is by design shared with the other containers on the host — a key in someone else's section is left alone. A key written at column 0, outside any section, is not read either — and the two keys part company there. A column-0 `public_ip:` makes the entrypoint REFUSE to start, naming the section the key belongs in: a missing `network:` section is anomalous, because that section is the reason the file is read at all, and ignoring the key would mean booting on env/defaults against an address nobody chose. A column-0 `ui_mode:` is REPORTED on stderr and ignored: a missing `viewer:` section is the normal state (the mode usually arrives via `VIEWER_UI_MODE`), so refusing there would stop a properly configured viewer from booting over a key another container owns — and nothing in the file distinguishes "meant for us, mis-shaped" from "someone else's key". That line names the ignored key, the mode actually in effect, and where it came from.
+Ports (`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`) are delivered via the `.env` mechanism (the `[environment]` table / `setup.toml`), not via `host.yaml` and not via hardcoded `-e`. `config/host.yaml` carries `public_ip` (and optionally `viewer.ui_mode`) only. Precedence: `public_ip` / `ui_mode` -> `host.yaml` > env > default; ports -> `.env`. See `config/host.yaml.example`. Both keys are read from THEIR OWN SECTION only (`network.public_ip`, `viewer.ui_mode`), because that file is by design shared with the other containers on the host — a key in someone else's section is left alone. A key written at column 0, outside any section, is not read either — and the two keys part company there. A column-0 `public_ip:` makes the entrypoint REFUSE to start, naming the section the key belongs in: a missing `network:` section is anomalous, because that section is the reason the file is read at all, and ignoring the key would mean booting on env/defaults against an address nobody chose. A column-0 `ui_mode:` is REPORTED on stderr and ignored: a missing `viewer:` section is the normal state (the mode usually arrives via `VIEWER_UI_MODE`), so refusing there would stop a properly configured viewer from booting over a key another container owns — and nothing in the file distinguishes "meant for us, mis-shaped" from "someone else's key". That line names the ignored key, the mode actually in effect, and where it came from.
 
 ## Multi-instance
 

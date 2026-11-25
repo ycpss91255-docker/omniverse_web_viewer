@@ -2,7 +2,7 @@
 
 **[English](../README.md)** | **[繁體中文](README.zh-TW.md)** | **[简体中文](README.zh-CN.md)** | **[日本語](README.ja.md)**
 
-Omniverse Kit ストリーミングアプリケーション（Isaac Sim、USD Viewer など）向けの、汎用かつ Kit 非依存のブラウザベース WebRTC ビューアサイドカー。イメージは [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) 上に構築され、起動時に `VIEWER_UI_MODE` で次の 2 つの静的アプリのいずれかを選択して配信します:
+Omniverse Kit ストリーミングアプリケーション（Isaac Sim、USD Viewer など）向けの、汎用かつ Kit 非依存のブラウザベース WebRTC ビューアサイドカー。イメージは [`ycpss91255-lab/base`](https://github.com/ycpss91255-lab/base) 上に構築され、起動時に `VIEWER_UI_MODE` で次の 2 つの静的アプリのいずれかを選択して配信します:
 
 - **`usd-viewer`** — NVIDIA の [`web-viewer-sample`](https://github.com/NVIDIA-Omniverse/web-viewer-sample) v1.5.2 を未改変でビルド。ランディング画面、フル USD Viewer UI、任意アプリのストリーミングを提供し、すべてインタラクティブに（クリックで）到達します。
 - **`stream-only`** — `stream-core` パッケージ上に構築した自前のフルスクリーン自動接続アプリ。クリック不要でストリームへ直行します。Isaac Sim および任意のヘッドレスストリーム利用者向け。
@@ -44,14 +44,14 @@ just run -t runtime -d
 #    usd-viewer: click the landing screen to choose a view
 ```
 
-デフォルトのホスト IP やポートを変更するには、`config/docker/setup.conf` を編集してください:
+デフォルトのホスト IP やポートを変更するには、`setup.toml` を編集してください:
 
-```ini
+```toml
 [environment]
-env_1 = SIGNALING_SERVER=<host-ip>
-env_2 = SIGNALING_PORT=49100
-env_3 = SERVE_PORT=5173
-env_4 = VIEWER_UI_MODE=stream-only
+env_1 = "SIGNALING_SERVER=<host-ip>"
+env_2 = "SIGNALING_PORT=49100"
+env_3 = "SERVE_PORT=5173"
+env_4 = "VIEWER_UI_MODE=stream-only"
 ```
 
 `env_N = KEY=VALUE` は書式の好みではなく文法です。`setup.sh` が収集するのは
@@ -68,15 +68,17 @@ HTTP 200 を返し、映像は永遠に来ません。
 git tag を打つたびに、同じ commit から同じ CI run のなかで GitHub Release **と**対応するコンテナイメージの両方が公開されます。したがって両者は常に対で存在します — イメージからその元になった release をたどれますし、release からそのイメージも分かります：
 
 ```
-ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
+
+> **パス変更（2026-11-22）：** GitHub organization が `ycpss91255-docker` から `ycpss91255-lab` に改名されました。イメージの新しいパスは `ghcr.io/ycpss91255-lab/omniverse_web_viewer` です。旧 `ghcr.io/ycpss91255-docker/...` は取得できなくなったため、固定している参照を更新してください。
 
 イメージの tag は release のバージョンから先頭の `v` を除いたものです。この値は CI が git tag から導出するもので、人が入力することはありません。だからこそ release とイメージがずれることがありません：
 
 | Git tag | イメージ |
 |---------|----------|
-| `v0.3.0` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0` |
-| `v0.3.0-rc1` | `ghcr.io/ycpss91255-docker/omniverse_web_viewer:0.3.0-rc1` |
+| `v0.3.0` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0` |
+| `v0.3.0-rc1` | `ghcr.io/ycpss91255-lab/omniverse_web_viewer:0.3.0-rc1` |
 
 リリース候補も公開されます。正式な tag を切る前に実際に検証されるのは rc だからです。
 
@@ -90,7 +92,7 @@ docker run --rm -d --name owv \
   -e SIGNALING_PORT=49100 \
   -e VIEWER_UI_MODE=stream-only \
   -p 5173:5173 \
-  ghcr.io/ycpss91255-docker/omniverse_web_viewer:<version>
+  ghcr.io/ycpss91255-lab/omniverse_web_viewer:<version>
 ```
 
 そのうえで Chrome から `http://<host-ip>:5173` を開きます。設定できる項目は下記の環境変数の表のとおりです。
@@ -107,7 +109,7 @@ docker run --rm -d --name owv \
 
 `VIEWER_UI_MODE` は entrypoint がどのアプリを配信するかを選択するもので、アセットには注入されません。`SIGNALING_SERVER`、`SIGNALING_PORT`、`MEDIA_PORT` は注入されるセンチネルです: ビルドはセンチネルを含む各チャンクを `*.js.tmpl` として保存し、entrypoint は起動のたびに `*.js.tmpl -> *.js` を再レンダリングします（冪等 — 再起動や値の変更は次回起動時に反映）。バリデーションがエスケープそのものです: 無効な値はコンテナを失敗させ（`exit 1`）、壊れた JS を焼き込みません。拒否されるのは: `A-Za-z0-9.-` 以外の文字を含む `SIGNALING_SERVER`、および `SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT` のいずれかが「先頭ゼロなしの 1..65535 の整数」でない場合です — したがって `80x`、`0`、`99999`、`049100` はすべて失敗します。先頭ゼロの規則は些末ではありません: ポートのセンチネルは引用符なしで置換されるため、`049100` は裸の `049100` トークンとしてレンダリングされ、strict mode では `SyntaxError` となり、コンテナは正常に起動したのにビューアは真っ黒になります。`SERVE_PORT` は設定されている場合のみ検査されます（`example` ステージは `EXAMPLE_PORT` で配信します）。また、素のポート番号でも `serve -l` のエンドポイントでも構いません — `SERVE_PORT=tcp://127.0.0.1:5173` はループバックのみにバインドし、これがビューアを全インターフェースで待ち受けさせない唯一の方法です。対応する形式はちょうど 2 つ、`<port>` と `tcp://<host>:<port>` です。`serve -l` はさらに 2 形式を挙げていますが、どちらもうっかりではなく明示的に拒否します: UNIX ドメインソケット（`unix:/path/to/socket.sock`）はこのコンテナの利用者から到達できず（ブラウザは URL を叩き、イメージ自身の serve スモークも 2 つの e2e ランナーも `http://127.0.0.1:<port>` を curl します）、Windows の名前付きパイプ（`pipe:\\.\pipe\Name`）は公開される linux/amd64 イメージには存在し得ないためです。メディアセンチネルは `stream-only` バンドル（その `streamTarget.json`）にのみ存在し、`usd-viewer` は server + port のみを持ち、メディアは SDP でネゴシエーションします。配信されるバンドルはそのレンダリング結果のみをターゲットとします: `?server=`/`?port=`/`?media=` のクエリ文字列は `npm run dev` 用の利便機能であり、ビルドされたバンドルでは無視されるため、リンク 1 本で稼働中のビューアを別のホストへ向け直すことはできません。
 
-ポート（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）は `.env` メカニズム（`[environment]` テーブル / `setup.conf`）で配送され、`host.yaml` でもハードコードの `-e` でもありません。`config/host.yaml` は `public_ip`（および任意で `viewer.ui_mode`）のみを保持します。優先順位: `public_ip` / `ui_mode` -> `host.yaml` > env > デフォルト、ポート -> `.env`。`config/host.yaml.example` を参照。どちらのキーも「自分のセクション」からのみ読まれます（`network.public_ip`、`viewer.ui_mode`）。このファイルは設計上ホスト上の他のコンテナと共有されるため、他人のセクションにあるキーには手を出しません。列 0（どのセクションにも属さない位置）に書かれたキーも読まれません — そしてここで 2 つのキーの扱いが分かれます。列 0 の `public_ip:` は entrypoint が**起動を拒否**し、そのキーが属すべきセクション名を示します: `network:` セクションが無いこと自体が異常であり（そのセクションこそこのファイルを読む理由です）、無視すれば env / デフォルトのまま誰も選んでいないアドレスへ接続しにいくことになるからです。列 0 の `ui_mode:` は**標準エラー出力に報告したうえで無視**します: `viewer:` セクションが無いのは通常の状態であり（モードは通常 `VIEWER_UI_MODE` から与えられます）、ここで拒否すれば、他のコンテナが所有するキーのせいで正しく構成されたビューアが起動できなくなります — しかも「本来こちら宛てで書き方を誤った」のか「他人のキー」なのかを、ファイルの内容から区別する手がかりはありません。この 1 行は、無視されたキー、実際に有効なモード、そしてその出どころを示します。
+ポート（`SIGNALING_PORT` / `MEDIA_PORT` / `SERVE_PORT`）は `.env` メカニズム（`[environment]` テーブル / `setup.toml`）で配送され、`host.yaml` でもハードコードの `-e` でもありません。`config/host.yaml` は `public_ip`（および任意で `viewer.ui_mode`）のみを保持します。優先順位: `public_ip` / `ui_mode` -> `host.yaml` > env > デフォルト、ポート -> `.env`。`config/host.yaml.example` を参照。どちらのキーも「自分のセクション」からのみ読まれます（`network.public_ip`、`viewer.ui_mode`）。このファイルは設計上ホスト上の他のコンテナと共有されるため、他人のセクションにあるキーには手を出しません。列 0（どのセクションにも属さない位置）に書かれたキーも読まれません — そしてここで 2 つのキーの扱いが分かれます。列 0 の `public_ip:` は entrypoint が**起動を拒否**し、そのキーが属すべきセクション名を示します: `network:` セクションが無いこと自体が異常であり（そのセクションこそこのファイルを読む理由です）、無視すれば env / デフォルトのまま誰も選んでいないアドレスへ接続しにいくことになるからです。列 0 の `ui_mode:` は**標準エラー出力に報告したうえで無視**します: `viewer:` セクションが無いのは通常の状態であり（モードは通常 `VIEWER_UI_MODE` から与えられます）、ここで拒否すれば、他のコンテナが所有するキーのせいで正しく構成されたビューアが起動できなくなります — しかも「本来こちら宛てで書き方を誤った」のか「他人のキー」なのかを、ファイルの内容から区別する手がかりはありません。この 1 行は、無視されたキー、実際に有効なモード、そしてその出どころを示します。
 
 ## マルチインスタンス
 

@@ -1,0 +1,498 @@
+#!/usr/bin/env bats
+#
+# Tests for the per-service compose emitter and its shared leaf-emitter
+# sub-seams, extracted to top level from generate_compose_yaml.
+#
+# Before these emitters were nested closures inside
+# generate_compose_yaml, only reachable by running the whole ~900-line
+# function and grepping its YAML output. Hoisting them to top level lets
+# each one be exercised in isolation: build the inputs, call the emitter,
+# assert on the small fragment it returns.
+#
+# why: Covers the per-service compose emitter (`_emit_stage_service`) and
+# its shared leaf-emitter sub-seams, hoisted out of `generate_compose_yaml`
+# (#566). Each emitter is exercised in isolation -- build the inputs, call
+# the emitter, assert on the small fragment it returns -- instead of running
+# the whole ~900-line generator and grepping its YAML output.
+
+bats_require_minimum_version 1.5.0
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/../test_helper"
+  # shellcheck disable=SC1091
+  source /source/dist/script/docker/wrapper/setup.sh
+}
+
+# _assert_list_parses_back <yaml_file> <key> <want...>
+#
+# base#1651 -- the oracle for "a list item parses back as the exact
+# input string": `.s.<key>` has one item per <want>, and item i is tagged
+# `!!str` and equals want[i]. The tag check is what tells `null` the string
+# from `null` the null; the value check alone would pass both.
+_assert_list_parses_back() {
+  local _file="$1" _key="$2" _i
+  shift 2
+  local -a _want=("$@")
+  run yq ".s.${_key} | length" "${_file}"
+  assert_success
+  assert_output "${#_want[@]}"
+  for _i in "${!_want[@]}"; do
+    run yq ".s.${_key}[${_i}] | tag" "${_file}"
+    assert_success
+    assert_output '!!str'
+    run yq ".s.${_key}[${_i}]" "${_file}"
+    assert_success
+    assert_output "${_want[${_i}]}"
+  done
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _emit_gpu_deploy_block <gui> <count> <caps_yaml>
+# ════════════════════════════════════════════════════════════════════
+
+# why: GPU off
+@test "_emit_gpu_deploy_block: gui=false emits nothing" {
+  run _emit_gpu_deploy_block false 1 "[gpu]"
+  assert_success
+  assert_output ""
+}
+
+# why: GPU on
+@test "_emit_gpu_deploy_block: gui=true emits deploy reservation with count + caps" {
+  run _emit_gpu_deploy_block true 2 "[gpu, compute]"
+  assert_line --partial "deploy:"
+  assert_line --partial "count: 2"
+  assert_line --partial "capabilities: [gpu, compute]"
+  assert_line --partial "driver: nvidia"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _emit_caps_block <cap_add> <cap_drop> <sec_opt>
+# ════════════════════════════════════════════════════════════════════
+
+# why: caps off
+@test "_emit_caps_block: all empty emits nothing" {
+  run _emit_caps_block "" "" ""
+  assert_success
+  assert_output ""
+}
+
+# why: cap_add
+@test "_emit_caps_block: cap_add list emits cap_add block" {
+  run _emit_caps_block $'SYS_PTRACE\nNET_ADMIN' "" ""
+  assert_line "    cap_add:"
+  assert_line "      - SYS_PTRACE"
+  assert_line "      - NET_ADMIN"
+  refute_line "    cap_drop:"
+}
+
+# why: cap_drop/sec_opt
+@test "_emit_caps_block: cap_drop + security_opt emit their blocks" {
+  run _emit_caps_block "" $'MKNOD' $'no-new-privileges:true'
+  assert_line "    cap_drop:"
+  assert_line "      - MKNOD"
+  assert_line "    security_opt:"
+  assert_line "      - no-new-privileges:true"
+}
+
+# why: base#1651 -- a security_opt value with YAML syntax in it (`: `, ` #`,
+# a leading `*` / `&` / `#`, a `"`) must parse back as that exact string,
+# not as a map, a truncated value, an alias, an anchor or a comment.
+@test "_emit_caps_block: security_opt items with YAML syntax parse back as the exact input string (base#1651)" {
+  local -a _want=('label=a: b' 'x #y' '*anchor' '&ref' '#c' '"lead')
+  run _emit_caps_block "" "" "$(printf '%s\n' "${_want[@]}")"
+  assert_success
+  printf 's:\n%s\n' "${output}" > "${BATS_TEST_TMPDIR}/c.yaml"
+  _assert_list_parses_back "${BATS_TEST_TMPDIR}/c.yaml" security_opt "${_want[@]}"
+}
+
+# why: base#1651 -- a plain scalar also gets an implicit tag: `~` / `null`
+# resolve to null, `true` to bool, `0755` / `1e3` / `.inf` to numbers, and
+# compose-go then refuses the file ("security_opt.0 must be a string").
+# `yes` (bool) and `1:30` (sexagesimal) are YAML 1.1-only, so yq (1.2) cannot
+# tell; those two are checked against the spec's double-quoted form.
+@test "_emit_caps_block: security_opt items that resolve to a non-string type parse back as the exact input string (base#1651)" {
+  local -a _want=('~' 'null' 'true' '0755' '1e3' '.inf')
+  run _emit_caps_block "" "" "$(printf '%s\n' "${_want[@]}")"
+  assert_success
+  printf 's:\n%s\n' "${output}" > "${BATS_TEST_TMPDIR}/c.yaml"
+  _assert_list_parses_back "${BATS_TEST_TMPDIR}/c.yaml" security_opt "${_want[@]}"
+  run _emit_caps_block "" "" $'yes\n1:30'
+  assert_success
+  assert_line '      - "yes"'
+  assert_line '      - "1:30"'
+}
+
+# why: base#1651 -- cap_add and cap_drop are written by their own loops, so
+# the same values (YAML syntax and implicit non-string types) must parse back
+# as the exact input string in both lists, not only in security_opt.
+@test "_emit_caps_block: cap_add and cap_drop items parse back as the exact input string (base#1651)" {
+  local -a _want=('label=a: b' 'x #y' '*anchor' '&ref' '#c' '"lead'
+    '~' 'null' 'true' '0755' '1e3' '.inf')
+  local _in _key
+  _in="$(printf '%s\n' "${_want[@]}")"
+  run _emit_caps_block "${_in}" "${_in}" ""
+  assert_success
+  printf 's:\n%s\n' "${output}" > "${BATS_TEST_TMPDIR}/c.yaml"
+  for _key in cap_add cap_drop; do
+    _assert_list_parses_back "${BATS_TEST_TMPDIR}/c.yaml" "${_key}" "${_want[@]}"
+  done
+  run _emit_caps_block $'yes\n1:30' $'yes\n1:30' ""
+  assert_success
+  assert_equal "$(grep -c '^      - "yes"$' <<< "${output}")" 2
+  assert_equal "$(grep -c '^      - "1:30"$' <<< "${output}")" 2
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _emit_env_file_block  (constant)
+# ════════════════════════════════════════════════════════════════════
+
+@test "_emit_env_file_block: emits the generated .env then the operator's .env.local (#868)" {
+  run _emit_env_file_block
+  assert_success
+  assert_output - <<'EXPECTED'
+    env_file:
+      - .env
+      - .env.local
+EXPECTED
+}
+
+@test "_emit_env_file_block: 'own' drops the shared .env, keeping .env.local (#868)" {
+  run _emit_env_file_block own
+  assert_success
+  assert_output - <<'EXPECTED'
+    env_file:
+      - .env.local
+EXPECTED
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Single-value line/block emitters
+# ════════════════════════════════════════════════════════════════════
+
+@test "_emit_target_arch_line: empty omits the line; set emits literal TARGET_ARCH ref" {
+  run _emit_target_arch_line ""
+  assert_output ""
+  run _emit_target_arch_line "arm64"
+  assert_output '        TARGETARCH: ${TARGET_ARCH}'
+}
+
+# why: build.network
+@test "_emit_build_network_line: empty omits; set emits network line" {
+  run _emit_build_network_line ""
+  assert_output ""
+  run _emit_build_network_line "host"
+  assert_output "      network: host"
+}
+
+# why: runtime
+@test "_emit_runtime_line: empty omits; set emits runtime line" {
+  run _emit_runtime_line ""
+  assert_output ""
+  run _emit_runtime_line "nvidia"
+  assert_output "    runtime: nvidia"
+}
+
+# why: #478 restart
+@test "_emit_restart_line: 'no' omits; plain value plain; on-failure:N quoted" {
+  run _emit_restart_line "no"
+  assert_output ""
+  run _emit_restart_line "always"
+  assert_output "    restart: always"
+  run _emit_restart_line "on-failure:5"
+  assert_output '    restart: "on-failure:5"'
+}
+
+# why: base#1651 -- an invalid restart was dropped with no output at all.
+@test "_emit_restart_line: invalid value warns naming key and value, still omits the field (base#1651)" {
+  export LOG_FORMAT=text SETUP_LANG=en
+  _reset_inert_warnings
+  run --separate-stderr _emit_restart_line "alwayss"
+  assert_output ""
+  [[ "${stderr}" == *lifecycle* ]]
+  [[ "${stderr}" == *restart* ]]
+  [[ "${stderr}" == *alwayss* ]]
+}
+
+@test "_emit_init_line: default/true emits init: true; false omits (#792)" {
+  run _emit_init_line
+  assert_output "    init: true"
+  run _emit_init_line "true"
+  assert_output "    init: true"
+  run _emit_init_line "false"
+  assert_output ""
+}
+
+# why: base#1651 -- an invalid init was dropped with no output at all.
+@test "_emit_init_line: invalid value warns naming key and value, still omits the field (base#1651)" {
+  export LOG_FORMAT=text SETUP_LANG=en
+  _reset_inert_warnings
+  run --separate-stderr _emit_init_line "garbage"
+  assert_output ""
+  [[ "${stderr}" == *lifecycle* ]]
+  [[ "${stderr}" == *init* ]]
+  [[ "${stderr}" == *garbage* ]]
+}
+
+# why: base#1651 -- a repo with N stages calls the emitter N times; the
+# invalid-restart warning must print once per emit, and again after a reset.
+@test "_emit_restart_line: invalid value warns once per emit, again after reset (base#1651)" {
+  export LOG_FORMAT=text SETUP_LANG=en
+  _reset_inert_warnings
+  local _err="${BATS_TEST_TMPDIR}/1651-latch.err"
+  _emit_restart_line "alwayss" 2>"${_err}" >/dev/null
+  _emit_restart_line "alwayss" 2>>"${_err}" >/dev/null
+  [[ "$(grep -c alwayss "${_err}")" == "1" ]]
+  _reset_inert_warnings
+  _emit_restart_line "alwayss" 2>>"${_err}" >/dev/null
+  [[ "$(grep -c alwayss "${_err}")" == "2" ]]
+}
+
+# why: base#1660 -- _emit_init_line runs once per stage plus once for devel;
+# the invalid-init warning must print once per emit, and again after a reset.
+@test "_emit_init_line: invalid value warns once per emit, again after reset (base#1660)" {
+  export LOG_FORMAT=text SETUP_LANG=en
+  _reset_inert_warnings
+  local _err="${BATS_TEST_TMPDIR}/1660-latch.err"
+  _emit_init_line "garbage" 2>"${_err}" >/dev/null
+  _emit_init_line "garbage" 2>>"${_err}" >/dev/null
+  [[ "$(grep -c garbage "${_err}")" == "1" ]]
+  _reset_inert_warnings
+  _emit_init_line "garbage" 2>>"${_err}" >/dev/null
+  [[ "$(grep -c garbage "${_err}")" == "2" ]]
+}
+
+# why: additional_contexts
+@test "_emit_additional_contexts_block: empty omits; entries emit block" {
+  run _emit_additional_contexts_block ""
+  assert_output ""
+  run _emit_additional_contexts_block $'base=../base\nlib=./lib'
+  assert_line "      additional_contexts:"
+  assert_line "        base: ../base"
+  assert_line "        lib: ./lib"
+}
+
+# why: cgroup rules
+@test "_emit_cgroup_rules_block: empty omits; entries emit quoted rules" {
+  run _emit_cgroup_rules_block ""
+  assert_output ""
+  run _emit_cgroup_rules_block $'c 81:* rmw'
+  assert_line "    device_cgroup_rules:"
+  assert_line '      - "c 81:* rmw"'
+}
+
+# why: tmpfs
+@test "_emit_tmpfs_block: empty omits; entries emit tmpfs list" {
+  run _emit_tmpfs_block ""
+  assert_output ""
+  run _emit_tmpfs_block $'/run\n/tmp:size=64m'
+  assert_line "    tmpfs:"
+  assert_line "      - /run"
+  assert_line "      - /tmp:size=64m"
+}
+
+# why: base#1651 -- tmpfs items are written by their own loop, so a value with
+# YAML syntax in it or an implicit non-string type must also parse back as
+# the exact input string, not only the caps lists.
+@test "_emit_tmpfs_block: items parse back as the exact input string (base#1651)" {
+  local -a _want=('/x: y' '/t #c' '*a' '&b' '#d' '"e' 'null' '0755')
+  run _emit_tmpfs_block "$(printf '%s\n' "${_want[@]}")"
+  assert_success
+  printf 's:\n%s\n' "${output}" > "${BATS_TEST_TMPDIR}/c.yaml"
+  _assert_list_parses_back "${BATS_TEST_TMPDIR}/c.yaml" tmpfs "${_want[@]}"
+}
+
+# why: #496 group_add
+@test "_emit_group_add_block: gated on gui AND non-empty groups; emits quoted gids" {
+  run _emit_group_add_block false "44 video"
+  assert_output ""
+  run _emit_group_add_block true ""
+  assert_output ""
+  run _emit_group_add_block true "44 video"
+  assert_line "    group_add:"
+  assert_line '      - "44"'
+  assert_line '      - "video"'
+}
+
+# why: build args
+@test "_emit_user_build_args: empty omits; entries emit KEY: \${KEY} pairs" {
+  run _emit_user_build_args ""
+  assert_output ""
+  run _emit_user_build_args $'FOO=1\nBAR=two'
+  assert_line '        FOO: ${FOO}'
+  assert_line '        BAR: ${BAR}'
+}
+
+# ════════════════════════════════════════════════════════════════════
+# Logging family (hoisted): now take the [logging] strings + repo
+# name + base path explicitly instead of closing over them.
+#   _logging_svc_kv <svc> <out_assoc> <global_str> <per_svc_str>
+#   _emit_logging_block <svc> <global_str> <per_svc_str>
+#   _logging_svc_local_path_mount <svc> <out> <name> <base> <global> <per_svc>
+# ════════════════════════════════════════════════════════════════════
+
+# why: logging merge
+@test "_logging_svc_kv: seeds from global then overlays per-service (key-level merge)" {
+  local -A _kv=()
+  _logging_svc_kv test _kv $'driver=json-file\nmax_size=10m' $'test:driver=local'
+  [ "${_kv[driver]}" = "local" ]      # per-svc overlay wins
+  [ "${_kv[max_size]}" = "10m" ]      # global survives where not overridden
+}
+
+# why: svc keying
+@test "_logging_svc_kv: a different service does not pick up another svc overlay" {
+  local -A _kv=()
+  _logging_svc_kv devel _kv $'driver=json-file' $'test:driver=local'
+  [ "${_kv[driver]}" = "json-file" ]
+}
+
+# why: logging off
+@test "_emit_logging_block: empty global + per-svc emits nothing" {
+  run _emit_logging_block devel "" ""
+  assert_success
+  assert_output ""
+}
+
+# why: logging opts
+@test "_emit_logging_block: driver + rotation maps to compose options block" {
+  run _emit_logging_block devel $'driver=json-file\nmax_size=10m\nmax_file=3\ncompress=true' ""
+  assert_line "    logging:"
+  assert_line "      driver: json-file"
+  assert_line "      options:"
+  assert_line '        max-size: "10m"'
+  assert_line '        max-file: "3"'
+  assert_line '        compress: "true"'
+}
+
+# why: per-svc
+@test "_emit_logging_block: keys off the service name for per-svc overrides" {
+  run _emit_logging_block test $'driver=json-file' $'test:max_size=5m'
+  assert_line "      driver: json-file"
+  assert_line '        max-size: "5m"'
+}
+
+# why: #328 off
+@test "_logging_svc_local_path_mount: empty local_path yields empty mount" {
+  local _m="sentinel"
+  _logging_svc_local_path_mount devel _m myrepo /tmp/lpbase "" ""
+  [ -z "${_m}" ]
+}
+
+# why: rel path
+@test "_logging_svc_local_path_mount: relative path resolves against base, mounts /var/log/<name>" {
+  local _m=""
+  _logging_svc_local_path_mount devel _m myrepo /tmp/lpbase $'local_path=logs' ""
+  [ "${_m}" = "/tmp/lpbase/logs:/var/log/myrepo" ]
+}
+
+# why: abs path
+@test "_logging_svc_local_path_mount: absolute path passed verbatim (trailing slash stripped)" {
+  local _m=""
+  _logging_svc_local_path_mount devel _m myrepo /tmp/lpbase $'local_path=/srv/logs/' ""
+  [ "${_m}" = "/srv/logs:/var/log/myrepo" ]
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _emit_stage_service <ctx> <resolved> <svc> <emit_stage> <has_overrides>
+#
+# The per-service emitter: consumes a resolved-stage value (the
+# _dflags_eff record from _resolve_docker_flags) plus a shared static
+# context, and emits a single service YAML fragment. Replaces the inline
+# per-stage loop body of generate_compose_yaml. Tested here in isolation
+# instead of grepping the whole ~900-line emitter's output.
+# ════════════════════════════════════════════════════════════════════
+
+# A fully-populated static context (every key the emitter reads).
+_mk_ctx() {
+  local -n _c="$1"
+  _c=(
+    [name]=myrepo [setup_base]=/tmp/ess [additional_contexts]=""
+    [build_network]="" [target_arch]="" [user_build_args]=""
+    [devices]="" [cgroup_rule]="" [tmpfs]="" [shm_size]=""
+    [dri_groups]="" [logging_global]="" [logging_per_svc]=""
+    [net_mode]=host [ipc_mode]=host [pid_mode]=private
+    [any_prop_device]=false
+  )
+}
+
+# why: #215 zero-diff
+@test "_emit_stage_service: zero-diff stage emits the extends:devel shape" {
+  local -A _ctx=(); _mk_ctx _ctx
+  local -A _res=()
+  run _emit_stage_service _ctx _res test devel-test 0
+  assert_success
+  assert_line "  test:"
+  assert_line "    extends:"
+  assert_line "      service: devel"
+  assert_line "      target: devel-test"
+  assert_line '    image: ${DOCKER_HUB_USER:-local}/myrepo:test'
+  assert_line "    stdin_open: false"
+  assert_line "    profiles:"
+  assert_line "      - test"
+}
+
+# why: zero-diff logging
+@test "_emit_stage_service: zero-diff stage with per-svc logging override emits logging block" {
+  local -A _ctx=(); _mk_ctx _ctx
+  _ctx[logging_per_svc]=$'test:driver=local'
+  local -A _res=()
+  run _emit_stage_service _ctx _res test devel-test 0
+  assert_line "    extends:"
+  assert_line "      driver: local"
+}
+
+# why: #220 standalone
+@test "_emit_stage_service: stage with overrides emits a standalone block (no extends)" {
+  local -A _ctx=(); _mk_ctx _ctx
+  local -A _res=(
+    [gui]=false [gpu]=false [gpu_count]=0 [gpu_caps]=gpu [runtime]=""
+    [net_mode]=host [ipc_mode]=private [pid_mode]=private [net_name]=""
+    [privileged]=true [volumes]="./hl:/data" [environment]="HEADLESS=1"
+    [ports]="" [cap_add]="" [cap_drop]="" [security_opt]=""
+  )
+  run _emit_stage_service _ctx _res headless headless 1
+  assert_success
+  refute_line "    extends:"
+  assert_line "  headless:"
+  assert_line "      target: headless"
+  assert_line "    privileged: true"
+  assert_line "    ipc: private"
+  assert_line '      - "HEADLESS=1"'
+  assert_line "      - ./hl:/data"
+  assert_line "    profiles:"
+  assert_line "      - headless"
+}
+
+# why: standalone GPU
+@test "_emit_stage_service: override stage GPU resolution emits deploy reservation" {
+  local -A _ctx=(); _mk_ctx _ctx
+  local -A _res=(
+    [gui]=false [gpu]=true [gpu_count]=2 [gpu_caps]="gpu compute" [runtime]=""
+    [net_mode]=host [ipc_mode]=host [pid_mode]=private [net_name]=""
+    [privileged]="" [volumes]="" [environment]="" [ports]=""
+    [cap_add]="" [cap_drop]="" [security_opt]=""
+  )
+  run _emit_stage_service _ctx _res sim sim 1
+  assert_line "    deploy:"
+  assert_line "              count: 2"
+  assert_line "              capabilities: [gpu, compute]"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# _yaml_dq <value> <out>
+# ════════════════════════════════════════════════════════════════════
+
+# why: YAML scalar quoting
+@test "_yaml_dq wraps a value as a double-quoted scalar, escaping \\ then \" (#698)" {
+  # The compose environment: sink routes each entry through _yaml_dq so a
+  # value with YAML-structural chars survives the parse as one string. The
+  # escape order is backslash first, then double-quote (so an embedded \"
+  # is not double-escaped).
+  local _out=""
+  _yaml_dq 'MSG=a: b' _out
+  [ "${_out}" = '"MSG=a: b"' ]
+  _yaml_dq 'Q=a"b\c' _out
+  [ "${_out}" = '"Q=a\"b\\c"' ]
+  _yaml_dq 'GLOB=*' _out
+  [ "${_out}" = '"GLOB=*"' ]
+}

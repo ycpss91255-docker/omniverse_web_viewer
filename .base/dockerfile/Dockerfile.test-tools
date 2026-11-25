@@ -1,27 +1,202 @@
 # Dockerfile.test-tools - Pre-built test tools for Docker container repos
 #
-# Contains: ShellCheck, Hadolint, Bats (with bats-support + bats-assert + bats-mock)
+# Contains: ShellCheck, Hadolint, Bats (with bats-support + bats-assert),
+# kcov (coverage), yq (YAML queries for the spec suite)
 #
 # Usage:
 #   docker build -t test-tools:local -f .base/dockerfile/Dockerfile.test-tools .
 #   Then in repo Dockerfile:
 #     COPY --from=test-tools:local /usr/local/bin/shellcheck /usr/local/bin/shellcheck
 
+# Every version below carries a `tool-pin:` marker naming where the
+# upstream release lives. script/watch/ derives its whole table from those
+# markers -- there is no separate list of watched tools to fall behind --
+# and the pin-coverage lint fails the build on a version declared here
+# without one. See script/watch/lib.sh for the grammar.
+# tool-pin: bats dockerhub bats/bats pattern=^[0-9]+\.[0-9]+\.[0-9]+$
 ARG BATS_VERSION=1.13.0
-ARG ALPINE_VERSION=3.21
+# The alpine SERIES every stage below is built on. It is a series tag, not
+# a point release: it keeps moving within the series so security fixes
+# arrive without a commit here -- and it stops moving, silently, the day
+# the series goes end-of-life. Nothing about a build goes red on that day;
+# the image simply stops rebuilding onto anything maintained, and the ~20
+# apk packages the final stage installs inherit an unsupported base.
+#
+# So the expiry is written down here and asserted by
+# test/bats/unit/alpine_eol_spec.bats, which fails the suite 180 days
+# before the date -- the next expiry arrives as a red build with two
+# quarters of lead time instead of as an audit finding. Bump the marker
+# and the pin together; the spec fails if they disagree.
+# Date source: https://endoflife.date/alpine, cross-checked against
+# https://alpinelinux.org/releases.json.
+# alpine-eol: 3.23 2027-11-01
+# tool-pin: alpine dockerhub library/alpine pattern=^[0-9]+\.[0-9]+$
+ARG ALPINE_VERSION=3.23
+# On choosing the series: any supported series more than 180 days from
+# its end of life clears the alarm above; a later end of life buys more
+# room. 3.23 is the step taken here because it is the series the bash 5.3
+# instrument fix was measured on (base#1030). Moving to a newer series is
+# the same kind of bump and needs the same evidence: a full coverage run
+# compared against this one. What each series runs was measured INSIDE
+# images built from this file with nothing but ALPINE_VERSION varied, not
+# read off release notes:
+#
+#     3.21 -> bash 5.2.37      3.22 -> bash 5.2.37
+#     3.23 -> bash 5.3.3       3.24 -> bash 5.3.9
+#
+# The bash 5.2 -> 5.3 boundary is at 3.23, and crossing it is not free for
+# the coverage instrument. bash 5.3 writes xtrace values in ANSI-C quoting
+# -- one line, `$'a\nb'`, with an embedded quote written `\'` -- and kcov
+# v43's bash engine tracks single-quote parity across xtrace lines,
+# DISCARDING every line it reads (coverage markers included) while it
+# believes it is mid-quote. Each `\'` flips that parity, so an unpatched
+# kcov silently loses whole bursts of lines that did run. Measured on 3.24,
+# over one unchanged source tree, between two images differing only in
+# whether that parity reader had been patched: 84.77% (7058/8326) ->
+# 77.60% (6460/8325), with a green suite either way. A coverage floor
+# cannot tell that from a real regression.
+#
+# The boundary is carried by dockerfile/kcov-bash53-ansi-c.patch (below),
+# not by holding this pin back. `--bash-method=DEBUG`, the other lead
+# base#946 named, was costed for base#1030 and rejected: under bats it
+# wrote an empty report on both 3.22 and 3.23.
+#
+# kcov is v43 PLUS THREE PATCHES, applied in order in the kcov-builder stage:
+#
+#   dockerfile/kcov-76bf685.patch -- upstream commit 76bf685, backported.
+#   v43 writes every trace line that carries no `kcov@` marker to its own
+#   stderr: the continuation lines of a multi-line trace record, and the
+#   pieces of records torn apart by concurrent writers. On CI that stderr
+#   is the step output, and a coverage shard printed megabytes of it
+#   (base#1414). The commit is taken alone, NOT kcov master: master also
+#   carries d52c333, which mis-parses `$'...\'...'` and drops every later
+#   line of the file from the valid set. Drop it when a kcov release
+#   carries 76bf685 without that regression.
+#
+#   dockerfile/kcov-bash53-ansi-c.patch -- gives the parity reader a `$'`
+#   state in which a backslash consumes the next character (base#1030).
+#   Drop it when a kcov release reads bash 5.3's ANSI-C xtrace without it;
+#   test/bats/unit/kcov_bash_instrumentation_spec.bats is the check.
+#
+#   dockerfile/kcov-marker-resync.patch -- a line that starts a `kcov@`
+#   marker record ends an open single-quote state instead of being
+#   swallowed with the lines after a record holding a lone quote
+#   (base#1415). Drop it when a kcov release resyncs on a marker; the
+#   same spec is the check.
+#
+# All are `git apply`, which fails when its context moves, so a
+# KCOV_VERSION bump that invalidates any one fails the build.
+# tool-pin: kcov github-release SimonKagstrom/kcov
+ARG KCOV_VERSION=v43
+# The commit KCOV_VERSION must resolve to (the peeled commit of the annotated
+# tag, not the tag object). kcov-builder fails when the clone differs, so a
+# retagged upstream cannot change the image silently (base#1674).
+ARG KCOV_COMMIT=a39874f938ce13f7a65f253120d1ec946b349ffe
+# The Go release the config-gen-builder stage builds with (base#1847), the
+# same release as GO_IMAGE in Dockerfile.config-gen.
+# tool-pin: golang-test-tools dockerhub library/golang pattern=^1\.[0-9]+\.[0-9]+$
+ARG GOLANG_VERSION=1.27.2
+# THE declaration of the `just` runner version, for this image and for
+# every other path that installs it: script/ci/install-just.sh in each CI
+# job that installs just (fed JUST_VERSION by that job's just-pin step),
+# init.sh's install hint and its --bootstrap-just installer, all read this
+# value through dist/script/base/just-version.sh. It lives HERE, and not
+# in a data file of its own, because script/test/test.sh derives the local
+# test-tools tag from the sha256 of this Dockerfile alone -- a version
+# declared elsewhere would be invisible to that digest, so a bump would
+# leave the tag unchanged and silently reuse the previous image.
+# arch-literal-lint: allow-begin -- the checksum sources name the upstream
+# asset per arch, and just publishes x86_64 / aarch64 where TARGETARCH says
+# amd64 / arm64.
+# tool-pin: just github-release casey/just sha256=JUST_SHA256_AMD64@file:https://github.com/casey/just/releases/download/{version}/SHA256SUMS:just-{version}-x86_64-unknown-linux-musl.tar.gz sha256=JUST_SHA256_ARM64@file:https://github.com/casey/just/releases/download/{version}/SHA256SUMS:just-{version}-aarch64-unknown-linux-musl.tar.gz
+# arch-literal-lint: allow-end
+ARG JUST_VERSION=1.58.0
+# sha256 of the just release asset per arch (musl). Source: upstream's published
+# SHA256SUMS, https://github.com/casey/just/releases/download/1.58.0/SHA256SUMS
+# (base#1673). A version bump must update both, otherwise the build fails closed.
+ARG JUST_SHA256_AMD64=4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d
+ARG JUST_SHA256_ARM64=748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df
+
+# ── The alpine every package-installing stage below derives from ────────
+#
+# APK_MIRROR points apk at a different host. The default keeps the
+# upstream CDN, so a network that can reach it sees no change at all and
+# the rewrite is skipped entirely rather than running a sed that would
+# replace the host with itself.
+#
+# Networks a build cannot reach dl-cdn.alpinelinux.org from exist -- on
+# one of ours the general internet is fine while this one host resolves
+# in DNS and then HANGS at TCP connect, which is why the wait is minutes
+# rather than the microseconds a refusal would take, and why there is no
+# error line to recognise it by -- and what apk does there is spend 480s
+# across the two repository indexes and then report every package as
+# "no such package", because an unreachable index reads as an EMPTY one.
+# The reader is told the package list does not contain `bash`, not that
+# it could not be fetched, and goes looking for a packaging mistake that
+# does not exist. The Ubuntu half of this already exists as
+# APT_MIRROR_UBUNTU in dist/dockerfile/Dockerfile; this is the Alpine
+# spelling of it.
+#
+# It is ONE stage rather than an ARG repeated per stage because four
+# stages here install packages, and a knob wired into one of them leaves
+# the build dying in the next -- later, and with the same message. The
+# `just-runner` stage deliberately does NOT derive from it: it installs
+# nothing and so needs no package index at all, which is a property worth
+# keeping rather than a line worth sharing.
+#
+# An EMPTY value is refused rather than treated as "no override": it
+# would otherwise rewrite the host to nothing and hand back the very
+# "no such package" this arg exists to remove.
+FROM alpine:${ALPINE_VERSION} AS alpine-apk
+ARG APK_MIRROR="dl-cdn.alpinelinux.org"
+RUN if [ -z "${APK_MIRROR}" ]; then \
+      echo "APK_MIRROR is empty: name a mirror host, or leave the arg unset to use dl-cdn.alpinelinux.org" >&2; \
+      exit 1; \
+    elif [ "${APK_MIRROR}" != "dl-cdn.alpinelinux.org" ]; then \
+      sed -i "s@dl-cdn\.alpinelinux\.org@${APK_MIRROR}@g" /etc/apk/repositories; \
+    fi
+# Every package stage derives from this one, so the retry wrapper rides
+# along: a transient index failure (403 after a long stall, base#1422) is
+# retried with backoff and a lasting one fails with a clear message.
+# Stages call `apk-retry add ...`, never a bare `apk add`;
+# test/bats/unit/apk_retry_spec.bats holds the line.
+COPY dockerfile/apk-retry.sh /usr/local/bin/apk-retry
 
 FROM bats/bats:${BATS_VERSION} AS bats-src
 
-FROM alpine:${ALPINE_VERSION} AS bats-extensions
-RUN apk add --no-cache git && \
-    git clone --depth 1 -b v0.3.0 \
+FROM alpine-apk AS bats-extensions
+# The helper libraries were `git clone -b <tag>` literals buried in the
+# RUN. They are ARGs now for one reason: a marker's target is a line,
+# and a version inside a line-continued RUN has no line of its own to
+# carry one. Hoisting also makes a bump a single-line rewrite, which is
+# what lets the watch propose one mechanically.
+# tool-pin: bats-support github-release bats-core/bats-support
+ARG BATS_SUPPORT_VERSION=v0.3.0
+# base#1674: a tag is a mutable ref; each clone below must land on the commit
+# pinned next to its tag (BATS_SUPPORT_COMMIT, BATS_ASSERT_COMMIT) or the
+# build fails.
+ARG BATS_SUPPORT_COMMIT=24a72e14349690bcbf7c151b9d2d1cdd32d36eb1
+# tool-pin: bats-assert github-release bats-core/bats-assert
+ARG BATS_ASSERT_VERSION=v2.1.0
+ARG BATS_ASSERT_COMMIT=78fa631d1370562d2cd4a1390989e706158e7bf0
+RUN apk-retry add --no-cache git && \
+    git clone --depth 1 -b "${BATS_SUPPORT_VERSION}" \
         https://github.com/bats-core/bats-support /bats/bats-support && \
-    git clone --depth 1 -b v2.1.0 \
+    { [ "$(git -C /bats/bats-support rev-parse HEAD)" = "${BATS_SUPPORT_COMMIT}" ] || { \
+        echo "bats-support: commit mismatch: tag ${BATS_SUPPORT_VERSION} is $(git -C /bats/bats-support rev-parse HEAD), pinned ${BATS_SUPPORT_COMMIT}" >&2; \
+        exit 1; }; } && \
+    git clone --depth 1 -b "${BATS_ASSERT_VERSION}" \
         https://github.com/bats-core/bats-assert  /bats/bats-assert && \
-    git clone --depth 1 -b v1.2.5 \
-        https://github.com/jasonkarns/bats-mock   /bats/bats-mock
+    { [ "$(git -C /bats/bats-assert rev-parse HEAD)" = "${BATS_ASSERT_COMMIT}" ] || { \
+        echo "bats-assert: commit mismatch: tag ${BATS_ASSERT_VERSION} is $(git -C /bats/bats-assert rev-parse HEAD), pinned ${BATS_ASSERT_COMMIT}" >&2; \
+        exit 1; }; }
 
-FROM alpine:${ALPINE_VERSION} AS lint-tools
+FROM alpine-apk AS lint-tools
+# arch-literal-lint: allow-begin -- the TARGETARCH-to-upstream-asset mapping is
+# the one place both spellings legitimately meet: TARGETARCH speaks amd64 /
+# arm64, shellcheck publishes linux.x86_64 / linux.aarch64 and hadolint
+# publishes linux-x86_64 / linux-arm64. Everything outside this block builds
+# its architecture from ${TARGETARCH}.
 # TARGETARCH is auto-populated by BuildKit (docker 23+) with "amd64" /
 # "arm64" / etc. Do NOT set a default — a default value shadows
 # BuildKit's auto-inject (moby/buildkit#3403), which caused every
@@ -30,29 +205,151 @@ FROM alpine:${ALPINE_VERSION} AS lint-tools
 # (visible symptom: `shellcheck: Exec format error` on arm64 downstream
 # CI). If invoked outside BuildKit, pass `--build-arg TARGETARCH=<arch>`.
 ARG TARGETARCH
+# tool-pin: shellcheck github-release koalaman/shellcheck sha256=SHELLCHECK_SHA256_AMD64@asset:https://github.com/koalaman/shellcheck/releases/download/{version}/shellcheck-{version}.linux.x86_64.tar.xz sha256=SHELLCHECK_SHA256_ARM64@asset:https://github.com/koalaman/shellcheck/releases/download/{version}/shellcheck-{version}.linux.aarch64.tar.xz
+ARG SHELLCHECK_VERSION=v0.11.0
+# sha256 of the v0.11.0 release asset per arch. Upstream publishes no checksum
+# file, so these are self-computed from the asset (base#1648). A version bump
+# must update both, otherwise the build fails closed.
+ARG SHELLCHECK_SHA256_AMD64=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+ARG SHELLCHECK_SHA256_ARM64=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588
+# tool-pin: hadolint github-release hadolint/hadolint sha256=HADOLINT_SHA256_AMD64@asset:https://github.com/hadolint/hadolint/releases/download/{version}/hadolint-linux-x86_64 sha256=HADOLINT_SHA256_ARM64@asset:https://github.com/hadolint/hadolint/releases/download/{version}/hadolint-linux-arm64
+ARG HADOLINT_VERSION=v2.15.1
+# sha256 of the v2.15.1 raw binary per arch: the asset `digest` field from
+# `gh release view v2.15.1 -R hadolint/hadolint` (upstream publishes no
+# .sha256 file; curl returned 404), base#1672. `pins.sh --set hadolint`
+# regenerates both from the release assets the marker names (base#1676).
+ARG HADOLINT_SHA256_AMD64=c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+ARG HADOLINT_SHA256_ARM64=f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
+COPY dockerfile/verify-extract.sh /usr/local/bin/verify-extract
 # hadolint ignore=DL4006
-RUN apk add --no-cache curl xz && \
+RUN apk-retry add --no-cache curl xz && \
     case "${TARGETARCH}" in \
-      amd64)  sc_arch="x86_64";  hd_arch="x86_64" ;; \
-      arm64)  sc_arch="aarch64"; hd_arch="arm64"  ;; \
+      amd64)  sc_arch="x86_64";  hd_arch="x86_64"; sc_sha="${SHELLCHECK_SHA256_AMD64}"; hd_sha="${HADOLINT_SHA256_AMD64}" ;; \
+      arm64)  sc_arch="aarch64"; hd_arch="arm64";  sc_sha="${SHELLCHECK_SHA256_ARM64}"; hd_sha="${HADOLINT_SHA256_ARM64}" ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-        "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.${sc_arch}.tar.xz" \
-        | tar -xJ -C /tmp && \
-    mv "/tmp/shellcheck-v0.10.0/shellcheck" /usr/local/bin/shellcheck && \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o /tmp/sc.tar.xz \
+        "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.${sc_arch}.tar.xz" && \
+    verify-extract /tmp/sc.tar.xz "${sc_sha}" /tmp && \
+    rm /tmp/sc.tar.xz && \
+    mv "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck && \
     curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o /usr/local/bin/hadolint \
-        "https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-${hd_arch}" && \
+        "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-linux-${hd_arch}" && \
+    verify-extract --verify-only /usr/local/bin/hadolint "${hd_sha}" && \
     chmod +x /usr/local/bin/hadolint
+# arch-literal-lint: allow-end
 
-# Final stage: bash + bats + shellcheck + hadolint + bats-{support,assert,mock}
-# + parallel + git + ca-certificates.
+# `just` is this project's only control surface (ADR-00000005 /
+# ADR-00000010 / ADR-00000011): every container operation is a recipe. It
+# used to be an unpinned package install on the final stage, i.e.
+# whatever the pinned alpine series happens to carry -- measured 1.37.0 on 3.21
+# while the CI e2e job installed a floating latest (1.58.0) and a
+# developer host had whatever the just.systems installer last fetched.
+# Bumping alpine does not fix that (3.24 packages 1.48.1 and the line is
+# still unpinned); a spread across those paths is a spread across the
+# whole interface, because a recipe that works on one and fails on
+# another is indistinguishable from a broken recipe.
+#
+# So `just` is fetched from a PINNED upstream release, in its own builder
+# stage, exactly as shellcheck / hadolint are above. The musl asset is the
+# right one for alpine and needs no libc shim.
+FROM alpine:${ALPINE_VERSION} AS just-runner
+ARG JUST_VERSION
+ARG JUST_SHA256_AMD64
+ARG JUST_SHA256_ARM64
+COPY dockerfile/verify-extract.sh /usr/local/bin/verify-extract
+# arch-literal-lint: allow-begin -- the same TARGETARCH-to-upstream-asset
+# mapping the lint-tools stage above documents: TARGETARCH speaks
+# amd64 / arm64, the just project publishes x86_64-unknown-linux-musl /
+# aarch64-unknown-linux-musl. Everything outside this block builds its
+# architecture from ${TARGETARCH}.
+# TARGETARCH is auto-populated by BuildKit; do NOT give it a default (a
+# default shadows BuildKit's auto-inject, moby/buildkit#3403, which ships
+# the wrong binary inside every other platform's image).
+ARG TARGETARCH
+# busybox wget, not curl: alpine ships wget in the base image, so this
+# stage needs no `apk add` and therefore no package index at all -- one
+# fewer network dependency than the lint-tools stage above, which has to
+# reach the alpine CDN before it can reach GitHub. The retry loop is the
+# equivalent of curl's --retry there; the extract and the --version call
+# after it are what actually prove the download, so a loop that exhausted
+# its attempts cannot pass as success.
+RUN case "${TARGETARCH}" in \
+      amd64)  j_arch="x86_64";  j_sha="${JUST_SHA256_AMD64}" ;; \
+      arm64)  j_arch="aarch64"; j_sha="${JUST_SHA256_ARM64}" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    url="https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${j_arch}-unknown-linux-musl.tar.gz" && \
+    for attempt in 1 2 3 4 5; do \
+      wget -q -T 30 -O /tmp/just.tar.gz "${url}" && break; \
+      echo "just download attempt ${attempt} failed; retrying" >&2; \
+      sleep 3; \
+    done && \
+    mkdir /tmp/just-x && \
+    verify-extract /tmp/just.tar.gz "${j_sha}" /tmp/just-x && \
+    mv /tmp/just-x/just /usr/local/bin/just && \
+    rm -rf /tmp/just.tar.gz /tmp/just-x && \
+    chmod +x /usr/local/bin/just && \
+    /usr/local/bin/just --version
+# arch-literal-lint: allow-end
+
+# kcov is not packaged in any Alpine repository (main / community /
+# edge-testing all lack it -- verified), so it cannot be `apk add`ed like
+# the other tools. Compile it from source in a throwaway builder stage and
+# COPY only the binary into the final image; the final stage `apk add`s
+# just the runtime shared libs kcov links against (libstdc++ / libcurl /
+# libdw / libelf / zlib / libgcc), not the build toolchain. This keeps the
+# coverage path on the SAME pre-baked Alpine image as the rest of the
+# self-test suite (one image, one pull) instead of the old debian
+# kcov/kcov service that apt-installed ~24 packages on every coverage shard
+# of every PR. kcov-on-musl was spiked for accuracy + stability: line-rate
+# and per-file covered counts matched the debian kcov baseline within <0.1%
+# (codecov threshold is 1%) and were bit-stable across repeated runs.
+#
+# The apk line retries through apk-retry: the Alpine `main` index fetch has
+# failed intermittently on this stage (base#1414), and a toolchain this size
+# is the longest fetch in the file.
+FROM alpine-apk AS kcov-builder
+ARG KCOV_VERSION
+ARG KCOV_COMMIT
+COPY dockerfile/kcov-76bf685.patch /tmp/kcov-76bf685.patch
+COPY dockerfile/kcov-bash53-ansi-c.patch /tmp/kcov-bash53-ansi-c.patch
+COPY dockerfile/kcov-marker-resync.patch /tmp/kcov-marker-resync.patch
+RUN apk-retry add --no-cache \
+        cmake make g++ binutils-dev curl-dev elfutils-dev libdwarf-dev \
+        zlib-dev python3 git && \
+    git clone --depth 1 -b "${KCOV_VERSION}" \
+        https://github.com/SimonKagstrom/kcov /tmp/kcov && \
+    { [ "$(git -C /tmp/kcov rev-parse HEAD)" = "${KCOV_COMMIT}" ] || { \
+        echo "kcov: commit mismatch: tag ${KCOV_VERSION} is $(git -C /tmp/kcov rev-parse HEAD), pinned ${KCOV_COMMIT}" >&2; \
+        exit 1; }; } && \
+    git -C /tmp/kcov apply /tmp/kcov-76bf685.patch && \
+    git -C /tmp/kcov apply /tmp/kcov-bash53-ansi-c.patch && \
+    git -C /tmp/kcov apply /tmp/kcov-marker-resync.patch && \
+    cmake -S /tmp/kcov -B /tmp/kcov/build && \
+    make -C /tmp/kcov/build -j"$(nproc)" && \
+    make -C /tmp/kcov/build install
+
+# config-gen, the Go generator (ADR-00000039, base#1847). The module comes
+# out of the build context, so the digest and the CI path filters cover
+# dockerfile/config-gen/ through this COPY (script/ci/testtools_paths.sh).
+# The build is the one Dockerfile.config-gen's `build` stage runs.
+FROM golang:${GOLANG_VERSION}-alpine${ALPINE_VERSION} AS config-gen-builder
+WORKDIR /src
+COPY dockerfile/config-gen /src/
+# Stamped into `config-gen version` as main.contentDigest (base#2034); empty
+# stamp prints `digest unstamped`.
+ARG CONFIG_GEN_DIGEST=
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -X main.contentDigest=${CONFIG_GEN_DIGEST}" -o /out/config-gen ./cmd/config-gen
+
+# Final stage: bash + bats + shellcheck + hadolint + bats-{support,assert}
+# + parallel + git + ca-certificates + kcov.
 # bash is required because /opt/bats/bin/bats is a `#!/usr/bin/env bash` script
 # and alpine:latest only ships busybox ash. The /usr/local/bin/bats symlink
 # exposes bats on PATH (the upstream bats/bats:latest puts it there but the
 # symlink is not under /opt/bats so it is not picked up by the COPY above).
 # parallel (#168): bats --jobs N delegates to GNU parallel; without it bats
-# falls back to serial. ci.sh tolerates missing parallel for older images,
+# falls back to serial. test.sh tolerates missing parallel for older images,
 # but baking it in keeps the fast CI loop fast.
 # git + git-subtree + ca-certificates (#168): the test suite
 # (upgrade_spec.bats, init_new_repo_spec.bats,
@@ -67,20 +364,107 @@ RUN apk add --no-cache curl xz && \
 # overrides busybox's symlinks so init.sh / setup.sh / setup_drift
 # helpers behave the same on alpine as on the previous kcov/kcov
 # (debian) runner.
-# make (#175): integration tests exercise `make upgrade-check` end-to-end
-# to verify the Makefile recipe wraps upgrade.sh exit 1 (update available)
-# as success — busybox's ash has no `make`, so install GNU make.
-# docker-cli + docker-cli-buildx (#249): the behavioural test suite
-# (test/behavioural/*.bats) drives `docker buildx build --target
+# just: integration tests exercise `just base update` end-to-end to verify
+# the downstream justfile recipe wraps upgrade.sh exit 1 (update
+# available) as success, and `just` is the single runner (the Makefile /
+# make are retired). It is NOT on the apk line below: it is COPYed from
+# the just-runner stage above at the version ARG JUST_VERSION declares, so
+# this image, CI and a developer host all run one version. The apk package
+# it replaced was the one tool in this image whose version nothing named
+# at all.
+# docker-cli + docker-cli-buildx (#249): the system test suite
+# (test/bats/system/*.bats) drives `docker buildx build --target
 # runtime-test ...` against synthesized fixtures to assert the runtime
-# smoke gate actually gates. Only active when the ci-behavioural
+# smoke gate actually gates. Only active when the ci-system
 # compose service is invoked (it mounts the host docker.sock); the
 # default `ci` service ignores docker even when CLI is present.
-FROM alpine:${ALPINE_VERSION}
-RUN apk add --no-cache bash parallel git git-subtree ca-certificates grep coreutils make just docker-cli docker-cli-buildx
+FROM alpine-apk
+# mawk + gawk alongside the default busybox awk so the issueref awk
+# program is exercised under all three engines by its portability unit
+# test (issueref_lint_spec.bats). This closes a local==CI blind spot in
+# the issueref match() greediness (a mawk-only regression) by running the
+# awk program under mawk and gawk in-image rather than relying on a
+# separate runner to surface it.
+# libstdc++ / libcurl / libdw / libelf / zlib / libgcc are the runtime
+# shared libs the source-built kcov binary (copied below) links against;
+# they are the runtime counterparts of the -dev packages used in the
+# kcov-builder stage. Without them kcov would fail to load at runtime.
+# yq-go (#957): the spec suite's YAML derivations -- which job a
+# permission block belongs to, which workflow declares `on: workflow_call`
+# -- were hand-rolled awk over indentation, and every shape that awk could
+# not model made a job INVISIBLE rather than loud: a trailing comment on a
+# job key, a quoted permission level, a job id starting with an uppercase
+# letter, `"on":` in quotes. Invisible is the fail-open direction for a
+# guard whose whole assertion is "the scan came back empty". The package
+# name is `yq-go`, not `yq`: Alpine ships mikefarah's Go implementation
+# under that name and `apk add yq` fails outright with "yq (no such
+# package)". It is in community for BOTH architectures this image
+# publishes on this Alpine branch, so it needs no download-and-arch-map
+# builder stage of its own the way shellcheck / hadolint do.
+# docker-cli-compose + xz: the field-deploy system test
+# (test/bats/system/deploy_bundle_e2e_spec.bats) runs the generated
+# deploy.sh up (real `docker compose up -d`) and unxz's the bundled
+# image.tar.xz; the generator itself xz-compresses the saved image.
+# python3: the interpreter dockerfile/toml_bridge.py is written against.
+# It is NOT an optional extra of the COPY below -- it is what makes that
+# COPY a parser instead of an inert file. The bridge is a
+# `#!/usr/bin/env python3` script, and this stage carried no interpreter,
+# so the bundled copy answered `env: 'python3': No such file or
+# directory` on every published tag while the Dockerfile, ADR-37 and a
+# green spec all said downstream repos inherited a TOML parser here.
+# Alpine's python3 is 3.12, whose stdlib carries `tomllib` (PEP 680), so
+# the `tomli` backport the script falls back to on Python < 3.11 is never
+# reached and is not installed: the standalone
+# dockerfile/Dockerfile.toml-bridge keeps it for the runtimes that need
+# it. Measured cost of the package on alpine 3.22: 8.3 MB -> 49.2 MB for
+# a bare alpine, about +41 MB uncompressed on a 350 MB image.
+# util-linux-misc (base#1469): the config-gen output-failure spec
+# (test/bats/integration/config_gen_bridge_golden_spec.bats) needs
+# `prlimit --fsize` to make the binary's one stdout write take some bytes
+# and then fail with EFBIG (a partial write that is an error); /dev/full
+# only ever takes 0 bytes, with ENOSPC. Both reach the command's write
+# error branch; a short count with no error is reached only by the
+# in-process fault writer. busybox has no prlimit applet. The package
+# is `util-linux-misc`, not `util-linux`: it is the split package that owns
+# /usr/bin/prlimit in main on both architectures this image publishes on
+# this Alpine branch, while the `util-linux` meta package pulls the rest
+# of util-linux in with it. Measured cost on alpine 3.22: this image went
+# from 386,330,098 to 389,644,208 bytes, about +3.3 MB uncompressed.
+# jq: config_gen_redpath.sh reads the runner's JSON records with it (the
+# stale case's file and reason attributes, base#1465), and the redpath
+# spec runs that script inside this image as the host runs it outside.
+# tool-pin: unpinned alpine-packages -- an apk package resolves to whatever
+# the pinned alpine series ships, so it declares no version of its own;
+# ALPINE_VERSION is the bound. Recorded so the watch reports these ~20
+# dependencies on every run instead of leaving them unmentioned. The one
+# package that needed a version of its own -- just, the runner the whole
+# downstream contract is written in -- moved to a pinned upstream release
+# in the just-runner stage above.
+RUN apk-retry add --no-cache bash parallel git git-subtree ca-certificates grep coreutils yq-go docker-cli docker-cli-buildx docker-cli-compose xz mawk gawk python3 util-linux-misc jq \
+        libstdc++ libcurl libdw libelf zlib libgcc
 COPY --from=bats-src /opt/bats /opt/bats
 COPY --from=bats-src /usr/lib/bats /usr/lib/bats
 COPY --from=bats-extensions /bats /usr/lib/bats
 COPY --from=lint-tools /usr/local/bin/shellcheck /usr/local/bin/
 COPY --from=lint-tools /usr/local/bin/hadolint /usr/local/bin/
-RUN ln -s /opt/bats/bin/bats /usr/local/bin/bats
+COPY --from=kcov-builder /usr/local/bin/kcov /usr/local/bin/kcov
+COPY --from=just-runner /usr/local/bin/just /usr/local/bin/just
+COPY --from=config-gen-builder /out/config-gen /usr/local/bin/config-gen
+# The bridge comes straight out of the build context, not through a
+# `python:` stage of its own. That stage pulled a second Python image on
+# both architectures, pip-installed `tomli` into it and then contributed
+# exactly one file here -- the script, which the context already holds --
+# so it gave this image no interpreter while reading as though it did.
+# The mode is restored below because a context COPY preserves the
+# tracked 0644.
+COPY dockerfile/toml_bridge.py /usr/local/bin/toml-bridge
+# bats is 1.13.0 PLUS ONE PATCH (dockerfile/bats-timeout-killer.patch):
+# with BATS_TEST_TIMEOUT set -- the driver sets it on every run
+# (base#1413) -- a failing test leaves its watchdog alive, and the run
+# waits out the whole timeout before it ends. The patch file says why.
+# Applied here rather than in the bats/bats stage, which has no git.
+COPY dockerfile/bats-timeout-killer.patch /tmp/bats-timeout-killer.patch
+RUN git -C /opt/bats apply /tmp/bats-timeout-killer.patch && \
+    rm /tmp/bats-timeout-killer.patch && \
+    ln -s /opt/bats/bin/bats /usr/local/bin/bats && \
+    chmod +x /usr/local/bin/toml-bridge
