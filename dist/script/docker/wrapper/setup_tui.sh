@@ -1,0 +1,3431 @@
+#!/usr/bin/env bash
+#
+# setup_tui.sh — interactive setup.toml editor (dialog / whiptail front-end).
+#
+# Usage:
+#   ./setup_tui.sh                 # main menu
+#   ./setup_tui.sh <section>       # jump directly to one section editor
+#                            # image | build | network | deploy | gui | volumes
+#   ./setup_tui.sh -h | --help     # show help
+#   ./setup_tui.sh --lang <code>   # en | zh | zh-CN | ja
+#
+# The editor READS the whole conf layer chain merged (_setup_conf_layers:
+# template -> <repo>/setup.toml -> <repo>/setup.local.toml) so its menus
+# open on the values actually in force, and WRITES one layer of it,
+# <repo>/setup.toml, then execs setup.sh to regenerate
+# .env / .env.generated / compose.yaml. Cancel / Esc exits 0 without
+# saving.
+#
+# Style: Google Shell Style Guide.
+
+# Only set strict mode when running directly; when sourced, respect caller's
+# settings. Leaving nounset on for the caller is what made this file
+# unsourceable under the kcov-instrumented shell: kcov's PS4 expands
+# ${BASH_SOURCE}, which is empty at the top level of a `bash -c` string, so
+# the caller's next command aborted inside the instrumentation. Every
+# sibling sourceable script (setup.sh, init.sh, test.sh, ...) already
+# gates it this way.
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
+  set -euo pipefail
+fi
+
+# ── Script / template paths (resolve symlink to locate siblings) ───────────
+# FILE_PATH detection covers root-symlink, script/-subfolder
+# and direct invocation — see build.sh for the heuristic.
+_FILE_PATH_INVOKE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+if [[ -d "${_FILE_PATH_INVOKE_DIR}/.base" ]]; then
+  FILE_PATH="${_FILE_PATH_INVOKE_DIR}"
+elif [[ -d "${_FILE_PATH_INVOKE_DIR}/../.base" ]]; then
+  FILE_PATH="$(cd -- "${_FILE_PATH_INVOKE_DIR}/.." && pwd -P)"
+else
+  FILE_PATH="${_FILE_PATH_INVOKE_DIR}"
+fi
+unset _FILE_PATH_INVOKE_DIR
+readonly FILE_PATH
+
+_TUI_SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")"
+_TUI_SCRIPT_DIR="$(cd -- "$(dirname -- "${_TUI_SELF}")" && pwd -P)"
+_TUI_LIB_DIR="$(cd -- "${_TUI_SCRIPT_DIR}/../lib" && pwd -P)"
+_TUI_TPL_DIR="$(cd -- "${_TUI_SCRIPT_DIR}/../../.." && pwd -P)"
+
+# The repo whose configuration this editor edits. One spelling, and a
+# plain variable rather than a second read of the readonly FILE_PATH:
+# every conf path in this file is derived from it, so the base path the
+# menus load from, the one a save lands in and the one handed to
+# `setup.sh apply` cannot drift apart -- and a spec can point the whole
+# chain at its own scratch directory, which a readonly cannot.
+_TUI_BASE_PATH="${FILE_PATH}"
+
+# setup_tui.sh sources its libs directly (there is no _bootstrap here), so
+# the verb has to be exported before transcript.sh so its classification
+# resolves setup_tui as an interactive capture verb.
+export _WRAPPER_VERB=setup_tui
+
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/i18n.sh"
+# log.sh / transcript.sh / hook.sh back the _transcript_begin +
+# _transcript_detach + _run_{pre,post}_hook calls in main. They are safe to
+# source (transcript activation is explicit in _transcript_begin, never at
+# source time), and without them main dies on its very first statement.
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/log.sh"
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/transcript.sh"
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/hook.sh"
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/_tui_backend.sh"
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/_tui_conf.sh"
+# setup_conf.sh carries the conf LAYER CHAIN -- _setup_conf_layers and the
+# _setup_conf_handle / _setup_effective_full / _setup_conf_local_sections
+# accessors over it. The editor opens on the effective configuration and
+# has to name the per-worktree layer, and both answers have to be the ones
+# every other reader gets: a private walk of the same three files here is
+# exactly how the editor and the emitters came to disagree about what is
+# configured (base#1232). It is a leaf of function definitions with its
+# own double-source guard, so sharing it costs the TUI nothing at startup.
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/setup_conf.sh"
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/schema.sh"
+# stage.sh for _dockerfile_stage_from_line: the TUI is a reader of the
+# Dockerfile's stage list like the compose emitter and the deploy bake, and
+# a private copy of that matcher is exactly how the readers drifted apart
+# before. stage.sh is a leaf of function definitions with no source-time
+# side effects, so sharing it costs the TUI nothing at startup.
+# shellcheck disable=SC1091
+source "${_TUI_LIB_DIR}/stage.sh"
+
+# ── Messages (4 languages) ────────────────────────────────────────────────
+# Flat associative arrays per language. Key format: <ns>.<name>. Missing
+# keys fall back to English.
+
+declare -gA _TUI_MSG_EN=()
+_TUI_MSG_EN[title]="Docker Container Configuration"
+_TUI_MSG_EN[main.prompt]=""
+_TUI_MSG_EN[main.image]="IMAGE_NAME detection rules"
+_TUI_MSG_EN[main.build]="APT mirrors + Dockerfile build args"
+_TUI_MSG_EN[main.network]="mode / ipc / pid / name"
+_TUI_MSG_EN[main.deploy]="GPU reservation"
+_TUI_MSG_EN[main.gui]="display mode"
+_TUI_MSG_EN[main.volumes]="workspace + extra mounts"
+_TUI_MSG_EN[main.devices]="host device bindings"
+_TUI_MSG_EN[main.environment]="runtime env vars"
+_TUI_MSG_EN[main.tmpfs]="RAM-backed mounts"
+_TUI_MSG_EN[main.advanced]="Advanced"
+_TUI_MSG_EN[main.save]="Save & Exit"
+_TUI_MSG_EN[main.security]="privileged / cap_add / security_opt"
+_TUI_MSG_EN[main.additional_contexts]="Named build contexts (build.additional_contexts)"
+_TUI_MSG_EN[main.logging]="container log driver + rotation"
+_TUI_MSG_EN[main.runtime]="Runtime (network / GPU / display / env)"
+_TUI_MSG_EN[main.mounts]="Mounts (volumes / devices / tmpfs)"
+_TUI_MSG_EN[main.features]="Features (conditional / power-user)"
+_TUI_MSG_EN[runtime.title]="Runtime"
+_TUI_MSG_EN[runtime.menu]="Select a runtime section"
+_TUI_MSG_EN[runtime.back]="Back to main menu"
+_TUI_MSG_EN[mounts.title]="Mounts"
+_TUI_MSG_EN[mounts.menu]="Select a mount section"
+_TUI_MSG_EN[mounts.back]="Back to main menu"
+_TUI_MSG_EN[features.title]="Features"
+_TUI_MSG_EN[features.menu]="Conditional / power-user features"
+_TUI_MSG_EN[features.back]="Back to main menu"
+_TUI_MSG_EN[features.per_stage_enabled]="Per-stage overrides — enabled (%s stages)"
+_TUI_MSG_EN[features.per_stage_hidden]="Per-stage overrides — hidden (no non-baseline stages)"
+_TUI_MSG_EN[features.per_stage_hidden_info]=$'Per-stage overrides (#220)\n\nStatus: hidden\nReason: Dockerfile defines no non-baseline stage (sys, devel-base,\n        devel, devel-test, runtime-test are reserved baseline names;\n        legacy base / test still accepted during v0.21.x transition).\n\nEnable: add `FROM ... AS <stage>` for any custom name, then return\n        to this menu — the entry will activate automatically.'
+_TUI_MSG_EN[advanced.title]="Advanced"
+_TUI_MSG_EN[advanced.menu]="Select an advanced section"
+_TUI_MSG_EN[advanced.back]="Back to main menu"
+_TUI_MSG_EN[advanced.reset]="Reset to defaults"
+_TUI_MSG_EN[advanced.per_stage]="Per-stage overrides (#220)"
+_TUI_MSG_EN[per_stage.title]="Per-stage overrides"
+_TUI_MSG_EN[per_stage.menu]="Pick a stage to edit, or Back"
+_TUI_MSG_EN[per_stage.empty]=$'No non-baseline stages found in Dockerfile.\n\nPer-stage overrides apply to `FROM ... AS <name>` stages outside\nthe baseline blocklist {sys, devel-base, devel, runtime-test}\n(legacy {base, test} also accepted during v0.21.x transition;\ndevel-test is emitted as the test service, so it IS overridable). Add a stage to your Dockerfile first, then return here\nto override its runtime config.'
+_TUI_MSG_EN[per_stage.back]="Back"
+_TUI_MSG_EN[per_stage.overrides_set]="overrides set"
+_TUI_MSG_EN[per_stage.inherits_all]="(inherits all)"
+_TUI_MSG_EN[per_stage.one.menu]="Pick a section to edit, or Back"
+_TUI_MSG_EN[per_stage.scalar.menu]="Pick a key to edit, or Back"
+_TUI_MSG_EN[per_stage.scalar.prompt]=$'Override value\n  - Empty = inherit top-level (clear this override)\n  - For mode keys: auto / force / off (gui, gpu)\n  - For network mode: host / bridge / none\n  - For ipc: host / shareable / private\n  - For pid: host / private\n  - For privileged: true / false\n  - For gpu_runtime (legacy runtime): auto / nvidia / off'
+_TUI_MSG_EN[per_stage.list.menu]="Edit list entries, toggle inheritance, or Back"
+_TUI_MSG_EN[per_stage.list.entry_prompt]=$'List entry value\n  - Empty = delete this entry\n  - Format depends on the list (mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE)'
+_TUI_MSG_EN[per_stage.network.ports]="ports list (per-stage)"
+_TUI_MSG_EN[per_stage.inherit]="(inherit top-level — clear override)"
+_TUI_MSG_EN[per_stage.inherit_flag]="Inherit top-level entries"
+_TUI_MSG_EN[err.per_stage_invalid]=$'Invalid value -- nothing was stored.\n\nA per-stage override is the SAME setting as the top-level one, so it has\nto pass the same check. Correct the value, or leave the field empty to\ndrop the override and inherit the top-level value.'
+_TUI_MSG_EN[reset.title]="Reset to defaults"
+_TUI_MSG_EN[reset.confirm]=$'Reset ALL settings to template defaults?\n\n  - <repo>/setup.toml is replaced by the template baseline\n    (the file it replaces is archived as setup.toml.bak)\n  - setup.sh re-runs to regenerate from template\n  - Your current customizations will be LOST\n  - <repo>/setup.local.toml is yours and is NOT touched\n\nThis cannot be undone.'
+_TUI_MSG_EN[reset.done]="All settings reset to template defaults."
+_TUI_MSG_EN[security.title]="Security"
+_TUI_MSG_EN[security.menu]="Select: privileged / cap_add / cap_drop / security_opt"
+_TUI_MSG_EN[security.back]="Back to main menu"
+_TUI_MSG_EN[security.privileged.prompt]="Run container privileged?"
+_TUI_MSG_EN[security.cap_add]="cap_add"
+_TUI_MSG_EN[security.cap_add.menu]="Select a cap_add entry or Add one"
+_TUI_MSG_EN[security.cap_add.add]="Add cap_add"
+_TUI_MSG_EN[security.cap_add.prompt]=$'Capability to ADD\n  - Empty = delete this entry\n  - Common: SYS_ADMIN, NET_ADMIN, MKNOD, SYS_PTRACE'
+_TUI_MSG_EN[security.cap_drop]="cap_drop"
+_TUI_MSG_EN[security.cap_drop.menu]="Select a cap_drop entry or Add one"
+_TUI_MSG_EN[security.cap_drop.add]="Add cap_drop"
+_TUI_MSG_EN[security.cap_drop.prompt]=$'Capability to DROP\n  - Empty = delete this entry\n  - Example: ALL'
+_TUI_MSG_EN[security.security_opt]="security_opt"
+_TUI_MSG_EN[security.security_opt.menu]="Select a security_opt entry or Add one"
+_TUI_MSG_EN[security.security_opt.add]="Add security_opt"
+_TUI_MSG_EN[security.security_opt.prompt]=$'security_opt entry\n  - Empty = delete this entry\n  - Examples: seccomp:unconfined, apparmor:unconfined, label=disable'
+_TUI_MSG_EN[image.title]="Image"
+_TUI_MSG_EN[image.menu]="Select a rule to edit, or Add a new one"
+_TUI_MSG_EN[image.add]="Add rule"
+_TUI_MSG_EN[image.back]="Back to main menu"
+_TUI_MSG_EN[image.type.prompt]="Rule type"
+_TUI_MSG_EN[image.type.string]="string    (exact image name, skip path inference)"
+_TUI_MSG_EN[image.type.prefix]="prefix    (strip leading <value> from dirname)"
+_TUI_MSG_EN[image.type.suffix]="suffix    (strip trailing <value> from any path component)"
+_TUI_MSG_EN[image.type.basename]="@basename (use dirname as-is, last-resort fallback)"
+_TUI_MSG_EN[image.type.default]="@default  (use <value> when nothing else matches)"
+_TUI_MSG_EN[image.type.move_up]="Move up   (swap with previous rule)"
+_TUI_MSG_EN[image.type.move_down]="Move down (swap with next rule)"
+_TUI_MSG_EN[image.type.remove]="Remove    (delete this rule)"
+_TUI_MSG_EN[image.value.prompt]=$'Rule value\n  - Empty = cancel\n  - prefix / suffix / @default: strip or fall-back value\n  - string: exact image name (e.g. my_app)\n  - e.g. prefix:docker_ → enter: docker_'
+_TUI_MSG_EN[build.title]="Build configuration"
+_TUI_MSG_EN[build.menu]="Pick an item to edit"
+_TUI_MSG_EN[build.add]="Add build arg"
+_TUI_MSG_EN[build.back]="Back to main menu"
+_TUI_MSG_EN[build.arg.prompt]=$'Build arg (Dockerfile ARG override)\n  - Format: KEY=VALUE (KEY must match [A-Z_][A-Z0-9_]*)\n  - Empty = delete this entry\n  - Known keys (Dockerfile provides defaults when left empty here):\n      APT_MIRROR_UBUNTU   default archive.ubuntu.com\n      APT_MIRROR_DEBIAN   default deb.debian.org\n      TZ                  default Asia/Taipei\n  - User-added: any KEY that your Dockerfile declares with `ARG KEY`\n  - Example: APT_MIRROR_UBUNTU=tw.archive.ubuntu.com\n  - Example: PYTHON_VERSION=3.12'
+_TUI_MSG_EN[build.target_arch.label]="TARGETARCH override"
+_TUI_MSG_EN[build.target_arch.prompt]=$'Docker TARGETARCH override\n  - Empty = let BuildKit auto-fill from host / --platform (default)\n  - amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64\n  - Applies to the main image + the test-tools image\n  - Pin when you need cross-builds or explicit control'
+_TUI_MSG_EN[build.target_arch.auto]="(auto)"
+_TUI_MSG_EN[build.network.label]="Build network"
+_TUI_MSG_EN[build.network.prompt]=$'Docker build-time network (only the build stage; runtime is separate)\n  - auto = detect Jetson (/etc/nv_tegra_release) → host; desktop → Docker default (default)\n  - host = force host network stack. Required when bridge NAT is\n          unusable (stripped kernels, iptables: false, firewall-locked CI)\n  - bridge / none / default = explicit Docker modes\n  - off (or empty) = explicit opt-out; stay on Docker default bridge'
+_TUI_MSG_EN[build.network.default]="(default: auto)"
+_TUI_MSG_EN[build.args.label]="Extra build args"
+_TUI_MSG_EN[err.invalid_target_arch]="Invalid TARGETARCH. Use empty or amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64."
+_TUI_MSG_EN[err.invalid_build_network]="Invalid build network. Use auto / host / bridge / none / default / off (or empty)."
+_TUI_MSG_EN[network.title]="Network"
+_TUI_MSG_EN[network.mode.prompt]="Network mode"
+_TUI_MSG_EN[network.mode.host]="host (share host network stack)"
+_TUI_MSG_EN[network.mode.bridge]="bridge (isolated; can attach named network)"
+_TUI_MSG_EN[network.mode.none]="none (no networking)"
+_TUI_MSG_EN[network.ipc.prompt]="IPC namespace"
+_TUI_MSG_EN[network.ipc.host]="host (share host IPC / shared memory)"
+_TUI_MSG_EN[network.ipc.shareable]="shareable (own IPC, accessible to other containers)"
+_TUI_MSG_EN[network.ipc.private]="private (own IPC, isolated — Docker default)"
+_TUI_MSG_EN[network.pid.prompt]="PID namespace"
+_TUI_MSG_EN[network.pid.host]="host (share host PID namespace — required for multi-GPU-container NVIDIA driver mutex)"
+_TUI_MSG_EN[network.pid.private]="private (own PID namespace — Docker default)"
+_TUI_MSG_EN[network.priv.prompt]="Run container privileged?"
+_TUI_MSG_EN[network.name.prompt]=$'Bridge network name\n  - Empty = compose auto-creates <project>_default bridge each run\n  - Non-empty = compose creates a bridge with this name (auto-managed)\n      Example: my_bridge\n        → compose creates <project>_my_bridge on up\n        → removed on down'
+_TUI_MSG_EN[deploy.title]="Deploy"
+_TUI_MSG_EN[deploy.mode.prompt]="GPU mode"
+_TUI_MSG_EN[deploy.mode.auto]="auto (detect nvidia-container-toolkit)"
+_TUI_MSG_EN[deploy.mode.force]="force (always emit GPU block)"
+_TUI_MSG_EN[deploy.mode.off]="off (never emit GPU block)"
+_TUI_MSG_EN[deploy.count.prompt]=$'GPU count\n  - \'all\' = reserve all host GPUs\n  - <N> = reserve N GPUs (1, 2, ...)\n  - Detected on host: %s'
+_TUI_MSG_EN[deploy.caps.prompt]="GPU capabilities (Space to toggle)"
+_TUI_MSG_EN[deploy.caps.gpu]="gpu (basic)"
+_TUI_MSG_EN[deploy.caps.compute]="compute (CUDA compute)"
+_TUI_MSG_EN[deploy.caps.utility]="utility (nvidia-smi, monitoring)"
+_TUI_MSG_EN[deploy.caps.graphics]="graphics (OpenGL, Vulkan)"
+_TUI_MSG_EN[deploy.caps.all]="all (every capability the driver has)"
+_TUI_MSG_EN[deploy.caps.video]="video (NVENC / NVDEC encode, decode)"
+_TUI_MSG_EN[deploy.caps.display]="display (X11 / Wayland output)"
+_TUI_MSG_EN[deploy.caps.compat32]="compat32 (32-bit driver libraries)"
+_TUI_MSG_EN[deploy.caps.ngx]="ngx (NGX: DLSS, image enhancement)"
+_TUI_MSG_EN[deploy.runtime.prompt]="Docker runtime override (Jetson / csv-mode toolkit)"
+_TUI_MSG_EN[deploy.runtime.auto]="auto (emit runtime: nvidia on Jetson — /etc/nv_tegra_release)"
+_TUI_MSG_EN[deploy.runtime.nvidia]="nvidia (force emit on all hosts)"
+_TUI_MSG_EN[deploy.runtime.off]="off (no runtime override — Docker default runc)"
+# [deploy] runtime -> gpu_runtime migration suggestion (fast-follow of)
+_TUI_MSG_EN[deploy.runtime.migrate]=$'Your setup.toml still uses the legacy [deploy] runtime key.\n\nIt was renamed to gpu_runtime in #481 (the old name keeps working as a\npermanent alias). Saving here writes the new gpu_runtime key; you can\nthen remove the old runtime line from setup.toml. This page never edits\nthe legacy key for you.'
+_TUI_MSG_EN[deploy.mig.title]="Deploy — NVIDIA MIG detected"
+_TUI_MSG_EN[deploy.mig.warning]=$'NVIDIA MIG (Multi-Instance GPU) mode is enabled on this host.\n\nDocker\'s deploy `count=N` reservation addresses whole GPUs; it cannot pin a specific MIG slice. To target one slice, leave count as-is and add to the [environment] section:\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\nAvailable GPU / MIG instances:\n%s'
+_TUI_MSG_EN[gui.title]="GUI"
+_TUI_MSG_EN[gui.mode.prompt]="GUI mode"
+_TUI_MSG_EN[gui.mode.auto]="auto (detect \$DISPLAY / \$WAYLAND_DISPLAY)"
+_TUI_MSG_EN[gui.mode.force]="force (always emit GUI block)"
+_TUI_MSG_EN[gui.mode.off]="off (never emit GUI block)"
+_TUI_MSG_EN[volumes.title]="Volumes"
+_TUI_MSG_EN[volumes.menu]="Select a mount to edit, or Add a new one"
+_TUI_MSG_EN[volumes.add]="Add mount"
+_TUI_MSG_EN[volumes.edit.prompt]=$'Mount spec\n  - Format: <host>:<container>[:ro|rw]\n  - Empty = delete this entry\n  - Example: /data:/home/${USER_NAME}/data:rw'
+_TUI_MSG_EN[volumes.delete.confirm]="Delete mount \"%s\"?"
+_TUI_MSG_EN[volumes.back]="Back to main menu"
+_TUI_MSG_EN[devices.title]="Devices"
+_TUI_MSG_EN[devices.menu]="Pick which list to edit"
+_TUI_MSG_EN[devices.edit_devices]="Device bindings (devices:)"
+_TUI_MSG_EN[devices.edit_cgroup]="Cgroup rules (device_cgroup_rules:)"
+_TUI_MSG_EN[devices.add_device]="Add device binding"
+_TUI_MSG_EN[devices.add_cgroup]="Add cgroup rule"
+_TUI_MSG_EN[devices.back]="Back to main menu"
+_TUI_MSG_EN[devices.device.prompt]=$'Device binding\n  - Format: <host>[:<container>[:rwm]]\n  - Empty = delete this entry\n  - Example (whole tree): /dev:/dev\n  - Example (single): /dev/video0:/dev/video0'
+_TUI_MSG_EN[devices.cgroup.title]="Cgroup rules"
+_TUI_MSG_EN[devices.cgroup.menu]="Select an entry to edit, or Add a new cgroup rule"
+_TUI_MSG_EN[devices.cgroup.prompt]=$'Cgroup rule\n  - Format: <type> <major>:<minor|*> <perms>\n    type: c (char), b (block), a (all)\n    perms: any of r / w / m\n  - Empty = delete this entry\n  - Example (USB): c 189:* rwm\n  - Example (V4L2): c 81:* rwm'
+_TUI_MSG_EN[resources.title]="Resources"
+_TUI_MSG_EN[resources.shm_size.prompt]=$'/dev/shm size\n  - Empty = Docker default (64mb)\n  - Examples: 2gb, 512mb\n  - Only applies when [network] ipc != host'
+_TUI_MSG_EN[resources.shm_size.ignored]="Warning: [network] ipc is currently '%s'. Docker IGNORES shm_size unless ipc is 'private' or 'shareable'. Change ipc first if you need this value to take effect."
+_TUI_MSG_EN[environment.title]="Environment"
+_TUI_MSG_EN[environment.menu]="Select an env var to edit, or Add a new one"
+_TUI_MSG_EN[environment.add]="Add env var"
+_TUI_MSG_EN[environment.back]="Back to main menu"
+_TUI_MSG_EN[environment.entry.prompt]=$'Environment variable\n  - Format: KEY=VALUE\n  - Empty = delete this entry\n  - Example: ROS_DOMAIN_ID=7'
+_TUI_MSG_EN[tmpfs.title]="Tmpfs"
+_TUI_MSG_EN[tmpfs.menu]="Select a tmpfs entry to edit, or Add a new one"
+_TUI_MSG_EN[tmpfs.add]="Add tmpfs mount"
+_TUI_MSG_EN[tmpfs.back]="Back to main menu"
+_TUI_MSG_EN[tmpfs.entry.prompt]=$'Tmpfs mount\n  - Format: <path>[:size=<size>]\n  - Empty = delete this entry\n  - Example: /tmp:size=1g'
+_TUI_MSG_EN[ports.title]="Ports"
+_TUI_MSG_EN[ports.menu]="Select a port mapping to edit, or Add a new one"
+_TUI_MSG_EN[ports.add]="Add port mapping"
+_TUI_MSG_EN[ports.back]="Back to main menu"
+_TUI_MSG_EN[ports.entry.prompt]=$'Port mapping\n  - Format: <host>:<container>[/protocol]\n  - Empty = delete this entry\n  - Example: 8080:80 or 5000:5000/udp'
+_TUI_MSG_EN[ports.not_bridge]="Note: [network] mode is currently '%s'. Ports are only emitted into compose.yaml when mode=bridge."
+_TUI_MSG_EN[additional_contexts.title]="Additional build contexts"
+_TUI_MSG_EN[additional_contexts.menu]="Select a named context to edit, or Add a new one"
+_TUI_MSG_EN[additional_contexts.add]="Add named context"
+_TUI_MSG_EN[additional_contexts.back]="Back to main menu"
+_TUI_MSG_EN[additional_contexts.entry.prompt]=$'Named build context\n  - Format: <name>=<source>\n  - Empty = delete this entry\n  - <source> is anything BuildKit accepts: relative path, docker-image://, https://, oci-layout://\n  - Example (relative): repo=..\n  - Example (image): base=docker-image://debian:bookworm-slim'
+_TUI_MSG_EN[err.invalid_mount]="Invalid mount format (expected <host>:<container>[:ro|rw])"
+_TUI_MSG_EN[err.invalid_tmpfs]="Invalid tmpfs mount (expected <path>[:<option>[,<option>]], e.g. /tmp:size=64m)"
+_TUI_MSG_EN[err.invalid_cgroup_rule]="Invalid cgroup rule (expected: <c|b|a> <major>:<minor|*> <r|w|m>)"
+_TUI_MSG_EN[err.invalid_gpu_count]="Invalid GPU count (expected 'all' or a positive integer)"
+_TUI_MSG_EN[err.invalid_runtime]="Invalid runtime (expected 'auto', 'nvidia', or 'off')"
+_TUI_MSG_EN[err.unrepresentable_gpu_capabilities]=$'The GPU capability list was LEFT ALONE and this page did not edit it.\n\nYour configuration names a capability the validator does not accept, so\nthis screen has no row for it and confirming the checklist would replace\nyour list with whatever the rows said. Nothing was written.\n\nFix the value in setup.toml (or setup.local.toml) and reopen this page,\nor set it from the command line:\n  just docker setup set deploy.gpu_capabilities "<names>"'
+_TUI_MSG_EN[err.empty_gpu_capabilities]=$'No capability was selected, so the list was LEFT ALONE.\n\nAn empty capability list is not something the generator can carry: it\nreserves the GPU and requests nothing, and compose.yaml generation\naborts on it. Nothing was written, so your previous list still stands.\n\nTo stop reserving a GPU at all, set GPU mode to `off` on the first\nscreen of this page -- that is the setting that means "no GPU".'
+# [lifecycle] restart policy page (fast-follow of)
+_TUI_MSG_EN[main.lifecycle]="container restart policy"
+# runtime-env info page (info-only: points at the .env.local overrides)
+_TUI_MSG_EN[main.envinfo]="workload env (.env.local) -- how to set"
+_TUI_MSG_EN[envinfo.title]="Workload env (.env)"
+_TUI_MSG_EN[envinfo.info]=$'Volatile per-task env vars (ROS_DOMAIN_ID, LOG_LEVEL, tokens, ...)\nbelong in the gitignored .env.local -- edit that file directly. The\ntoolchain never touches it, and changes take effect with `just docker run`\nalone: no compose regenerate, no SETUP_CONF_HASH drift, no git churn.\n\nSet-once defaults that rarely change live in [environment] (this menu ->\n"runtime env vars"). apply writes them into the generated .env and bakes\nthem into the field image as ENV; .env.local is loaded after .env, so a\nkey in both resolves to yours.\n\nNaming rule: the standard name is ours (.env is regenerated), a suffix\nmarks the local variant (.env.local is yours).\n\nThis page is informational -- it does not edit .env.local.'
+_TUI_MSG_EN[lifecycle.title]="Lifecycle"
+_TUI_MSG_EN[lifecycle.restart.prompt]=$'Container restart policy.\n\nCaveat: always / unless-stopped restart on ANY exit -- a stage that\nextends devel and exits 0 (e.g. the test service) would loop. Prefer\non-failure for auto-retry.'
+_TUI_MSG_EN[lifecycle.restart.no]="no (never restart -- default; emits no restart: field)"
+_TUI_MSG_EN[lifecycle.restart.always]="always (restart on any exit, incl. manual stop)"
+_TUI_MSG_EN[lifecycle.restart.unless_stopped]="unless-stopped (restart on any exit unless manually stopped)"
+_TUI_MSG_EN[lifecycle.restart.on_failure]="on-failure (restart only on non-zero exit)"
+_TUI_MSG_EN[lifecycle.restart.n_prompt]="Max retry count for on-failure (integer >= 1; leave empty for unlimited bare on-failure)"
+_TUI_MSG_EN[err.invalid_restart]="Invalid restart policy (no / always / unless-stopped / on-failure / on-failure:N)"
+_TUI_MSG_EN[err.invalid_restart_n]="Invalid retry count (expected a positive integer, or empty for bare on-failure)"
+_TUI_MSG_EN[err.invalid_shm_size]=$'Invalid shm_size\n  - Expected: <num><unit>\n  - Units: b, k/kb, m/mb, g/gb (case-insensitive)\n  - Example: 2gb, 512mb'
+_TUI_MSG_EN[err.invalid_port_mapping]=$'Invalid port mapping\n  - Expected: <host>:<container>[/tcp|udp]\n  - Example: 8080:80, 5000:5000/udp'
+_TUI_MSG_EN[err.invalid_env_kv]=$'Invalid env var\n  - Expected: KEY=VALUE\n  - KEY must start with letter or _ and contain only [A-Za-z0-9_]'
+_TUI_MSG_EN[err.invalid_network_name]=$'Invalid network name\n  - Expected: start with [a-zA-Z0-9]\n  - Then letters/digits/[_.-]\n  - Example: my_bridge'
+_TUI_MSG_EN[err.invalid_capability]=$'Invalid capability name\n  - Expected: ALL_UPPERCASE with optional underscores\n  - Example: SYS_ADMIN, NET_ADMIN, ALL'
+_TUI_MSG_EN[err.invalid_additional_context]=$'Invalid named build context\n  - Expected: <name>=<source>\n  - <name>: starts with [A-Za-z0-9], then letters/digits/[_.-]\n  - <source>: must be non-empty\n  - Example: repo=..'
+_TUI_MSG_EN[logging.title]="Logging"
+_TUI_MSG_EN[logging.svc.title]="Logging [%s]"
+_TUI_MSG_EN[logging.top.menu]="Pick scope: global or per-service override"
+_TUI_MSG_EN[logging.top.global]="Global [logging] (applies to every service)"
+_TUI_MSG_EN[logging.top.devel]="Per-service: devel"
+_TUI_MSG_EN[logging.top.test]="Per-service: test"
+_TUI_MSG_EN[logging.top.runtime]="Per-service: runtime"
+_TUI_MSG_EN[logging.menu]="Select: driver / max_size / max_file / compress"
+_TUI_MSG_EN[logging.back]="Back to runtime menu"
+_TUI_MSG_EN[logging.driver.label]="driver"
+_TUI_MSG_EN[logging.driver.prompt]="Logging driver (json-file / journald / syslog / fluentd / none / ...)"
+_TUI_MSG_EN[logging.max_size.label]="max_size"
+_TUI_MSG_EN[logging.max_size.prompt]="Max size per log file (e.g. 10m, 1g)"
+_TUI_MSG_EN[logging.max_file.label]="max_file"
+_TUI_MSG_EN[logging.max_file.prompt]="Max number of rotated log files (positive integer)"
+_TUI_MSG_EN[logging.compress.label]="compress"
+_TUI_MSG_EN[logging.compress.prompt]="Compress rotated log files?"
+_TUI_MSG_EN[logging.local_path.label]="local_path"
+_TUI_MSG_EN[logging.local_path.prompt]=$'Host directory for container log tee (empty = off)\n  - Relative path: resolved against repo root (./logs/)\n  - Absolute path: used verbatim (/var/log/app/)\n  - ~ expansion supported (~/dir/)\n  - Mounts at /var/log/<repo> inside the container'
+_TUI_MSG_EN[err.invalid_log_driver]=$'Invalid log driver name\n  - Expected: start with a letter, then letters/digits/[._-]\n  - Example: json-file, journald, syslog'
+_TUI_MSG_EN[err.invalid_log_max_size]=$'Invalid max_size\n  - Expected: <num><unit>\n  - Units: b, k, m, g (case-insensitive)\n  - Example: 10m, 1g, 512k'
+_TUI_MSG_EN[err.invalid_log_max_file]=$'Invalid max_file\n  - Expected: positive integer (1, 2, 3, ...)'
+_TUI_MSG_EN[err.invalid_log_local_path]=$'Invalid local_path\n  - Must be non-empty and non-whitespace\n  - Cannot contain embedded newlines'
+_TUI_MSG_EN[err.no_backend]="Neither dialog nor whiptail is installed. Install with: sudo apt install dialog"
+_TUI_MSG_EN[err.reset_failed]=$'The reset FAILED and nothing was changed.\n\nsetup.sh reset could not replace <repo>/setup.toml with the template\nbaseline; its reason was printed to this terminal. Your pending edits\nare still here -- Save & Exit keeps them, Cancel discards them.'
+_TUI_MSG_EN[err.save_refused]=$'The save was DECLINED. <repo>/setup.toml is unchanged.\n\nThe writer refused this combination of changes and printed why to this\nterminal, just above. Nothing was written, so the repo is exactly as it\nwas and no pending edit is lost.'
+_TUI_MSG_EN[local.layer.title]="Per-worktree override in effect"
+_TUI_MSG_EN[local.layer.body]=$'%s is read on this machine, ABOVE <repo>/setup.toml.\n\nSections it defines: %s\n\nIn those sections it overrides the keys it names and replaces whole any\nlist it declares. The values this editor shows are the EFFECTIVE ones,\nthat layer included. A save still lands in <repo>/setup.toml -- the\ncommitted value CI and every other checkout of this repo uses -- so a\nchange to one of the sections above may not take effect here.'
+_TUI_MSG_EN[saved.shadowed]="These sections are also defined in %s, which wins here: %s"
+_TUI_MSG_EN[lang.invalid.title]="Language fallback"
+_TUI_MSG_EN[lang.invalid.body]=$'Invalid --lang value: \'%s\'\n\nFalling back to English (en).\n\nValid values:\n  en      English\n  zh-TW   Traditional Chinese (Taiwan)\n  zh-CN   Simplified Chinese\n  ja      Japanese'
+_TUI_MSG_EN[deploy.ambiguous.title]="Two meanings of 'deploy'"
+_TUI_MSG_EN[deploy.ambiguous.body]=$'You opened the [deploy] section editor.\n\n[deploy] configures GPU reservation ONLY -- the section is named after\nCompose\'s `deploy:` key, not after deployment.\n\nThe field-deploy bundle is a different command:\n  just docker setup deploy\n\nThe unambiguous name for THIS editor is `gpu`:\n  just docker setup-tui gpu'
+_TUI_MSG_EN[saved]="Saved to %s. Regenerating .env / .env.generated / compose.yaml..."
+
+
+declare -gA _TUI_MSG_ZH_TW=()
+_TUI_MSG_ZH_TW[title]="Docker 容器設定"
+_TUI_MSG_ZH_TW[main.prompt]=""
+_TUI_MSG_ZH_TW[main.image]="IMAGE_NAME 偵測規則"
+_TUI_MSG_ZH_TW[main.build]="APT 鏡像與 Dockerfile build args"
+_TUI_MSG_ZH_TW[main.network]="網路模式／IPC／名稱"
+_TUI_MSG_ZH_TW[main.deploy]="GPU 保留"
+_TUI_MSG_ZH_TW[main.gui]="顯示模式"
+_TUI_MSG_ZH_TW[main.volumes]="工作區與額外掛載"
+_TUI_MSG_ZH_TW[main.devices]="主機裝置綁定"
+_TUI_MSG_ZH_TW[main.environment]="執行時期環境變數"
+_TUI_MSG_ZH_TW[main.tmpfs]="RAM 掛載點"
+_TUI_MSG_ZH_TW[main.advanced]="進階"
+_TUI_MSG_ZH_TW[main.save]="儲存並結束"
+_TUI_MSG_ZH_TW[main.security]="privileged／cap_add／security_opt"
+_TUI_MSG_ZH_TW[main.additional_contexts]="具名 build context（build.additional_contexts）"
+_TUI_MSG_ZH_TW[main.logging]="container log driver + 輪轉"
+_TUI_MSG_ZH_TW[main.runtime]="執行時期（網路／GPU／顯示／環境變數）"
+_TUI_MSG_ZH_TW[main.mounts]="掛載（volumes／devices／tmpfs）"
+_TUI_MSG_ZH_TW[main.features]="功能（條件式／進階使用）"
+_TUI_MSG_ZH_TW[runtime.title]="執行時期"
+_TUI_MSG_ZH_TW[runtime.menu]="選擇執行時期區段"
+_TUI_MSG_ZH_TW[runtime.back]="回主選單"
+_TUI_MSG_ZH_TW[mounts.title]="掛載"
+_TUI_MSG_ZH_TW[mounts.menu]="選擇掛載區段"
+_TUI_MSG_ZH_TW[mounts.back]="回主選單"
+_TUI_MSG_ZH_TW[features.title]="功能"
+_TUI_MSG_ZH_TW[features.menu]="條件式／進階使用功能"
+_TUI_MSG_ZH_TW[features.back]="回主選單"
+_TUI_MSG_ZH_TW[features.per_stage_enabled]="Per-stage overrides — 已啟用（%s 個 stage）"
+_TUI_MSG_ZH_TW[features.per_stage_hidden]="Per-stage overrides — 隱藏（無非 baseline stage）"
+_TUI_MSG_ZH_TW[features.per_stage_hidden_info]=$'Per-stage overrides (#220)\n\n狀態：隱藏\n原因：Dockerfile 沒有非 baseline stage（sys、devel-base、devel、\n      devel-test、runtime-test 為保留的 baseline 名稱；舊名 base、\n      test 在 v0.21.x 過渡期仍被接受）。\n\n啟用方式：在 Dockerfile 加上 `FROM ... AS <stage>`（任意自訂\n         名稱），再回到此選單，項目會自動啟用。'
+_TUI_MSG_ZH_TW[advanced.title]="Advanced"
+_TUI_MSG_ZH_TW[advanced.menu]="選擇進階區段"
+_TUI_MSG_ZH_TW[advanced.back]="回主選單"
+_TUI_MSG_ZH_TW[advanced.reset]="重置為預設值"
+_TUI_MSG_ZH_TW[advanced.per_stage]="Per-stage overrides (#220)"
+_TUI_MSG_ZH_TW[per_stage.title]="Per-stage overrides"
+_TUI_MSG_ZH_TW[per_stage.menu]="選擇要編輯的 stage，或返回"
+_TUI_MSG_ZH_TW[per_stage.empty]=$'Dockerfile 中沒有非 baseline 的 stage。\n\nPer-stage overrides 套用於 baseline {sys, devel-base, devel,\nruntime-test}（v0.21.x 過渡期同時接受舊名 {base, test}；devel-test\n會以 test service 送出，因此可以 override）以外的 `FROM ... AS <name>` stage。請先在 Dockerfile 中加入額外\nstage，再回來這裡 override 該 stage 的 runtime 設定。'
+_TUI_MSG_ZH_TW[per_stage.back]="返回"
+_TUI_MSG_ZH_TW[per_stage.overrides_set]="個 override"
+_TUI_MSG_ZH_TW[per_stage.inherits_all]="(全部繼承)"
+_TUI_MSG_ZH_TW[per_stage.one.menu]="選擇要編輯的 section，或返回"
+_TUI_MSG_ZH_TW[per_stage.scalar.menu]="選擇要編輯的 key，或返回"
+_TUI_MSG_ZH_TW[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 繼承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（舊稱 runtime）：auto / nvidia / off'
+_TUI_MSG_ZH_TW[per_stage.list.menu]="編輯 list 項目、切換繼承、或返回"
+_TUI_MSG_ZH_TW[per_stage.list.entry_prompt]=$'List 項目值\n  - 空白 = 刪除此項目\n  - 格式依 list 不同（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
+_TUI_MSG_ZH_TW[per_stage.network.ports]="ports list (per-stage)"
+_TUI_MSG_ZH_TW[per_stage.inherit]="(繼承 top-level — 清除 override)"
+_TUI_MSG_ZH_TW[per_stage.inherit_flag]="繼承 top-level 項目"
+_TUI_MSG_ZH_TW[err.per_stage_invalid]=$'值不合法 —— 未寫入任何內容。\n\n分階段覆寫與 top-level 是「同一個」設定，因此必須通過同樣的\n檢查。請修正該值，或將欄位留空以取消覆寫、改用 top-level 的值。'
+_TUI_MSG_ZH_TW[reset.title]="重置為預設值"
+_TUI_MSG_ZH_TW[reset.confirm]=$'重置所有設定為 template 預設值？\n\n  - 以 template 基線取代 <repo>/setup.toml\n    （被取代的檔案會備份為 setup.toml.bak）\n  - 重跑 setup.sh 從 template 重建\n  - 你目前的客製化會遺失\n  - <repo>/setup.local.toml 屬於你，不會被動到\n\n無法復原。'
+_TUI_MSG_ZH_TW[reset.done]="所有設定已重置為預設值。"
+_TUI_MSG_ZH_TW[security.title]="Security"
+_TUI_MSG_ZH_TW[security.menu]="選擇：privileged／cap_add／cap_drop／security_opt"
+_TUI_MSG_ZH_TW[security.back]="回主選單"
+_TUI_MSG_ZH_TW[security.privileged.prompt]="以特權模式執行？"
+_TUI_MSG_ZH_TW[security.cap_add]="cap_add"
+_TUI_MSG_ZH_TW[security.cap_add.menu]="選擇 cap_add 項目或新增"
+_TUI_MSG_ZH_TW[security.cap_add.add]="新增 cap_add"
+_TUI_MSG_ZH_TW[security.cap_add.prompt]=$'要 ADD 的 Capability\n  - 留空 = 刪除此項目\n  - 常用：SYS_ADMIN、NET_ADMIN、MKNOD、SYS_PTRACE'
+_TUI_MSG_ZH_TW[security.cap_drop]="cap_drop"
+_TUI_MSG_ZH_TW[security.cap_drop.menu]="選擇 cap_drop 項目或新增"
+_TUI_MSG_ZH_TW[security.cap_drop.add]="新增 cap_drop"
+_TUI_MSG_ZH_TW[security.cap_drop.prompt]=$'要 DROP 的 Capability\n  - 留空 = 刪除此項目\n  - 範例：ALL'
+_TUI_MSG_ZH_TW[security.security_opt]="security_opt"
+_TUI_MSG_ZH_TW[security.security_opt.menu]="選擇 security_opt 項目或新增"
+_TUI_MSG_ZH_TW[security.security_opt.add]="新增 security_opt"
+_TUI_MSG_ZH_TW[security.security_opt.prompt]=$'security_opt 項目\n  - 留空 = 刪除此項目\n  - 範例：seccomp:unconfined、apparmor:unconfined、label=disable'
+_TUI_MSG_ZH_TW[image.title]="Image"
+_TUI_MSG_ZH_TW[image.menu]="選擇規則編輯或新增"
+_TUI_MSG_ZH_TW[image.add]="新增規則"
+_TUI_MSG_ZH_TW[image.back]="回主選單"
+_TUI_MSG_ZH_TW[image.type.prompt]="規則類型"
+_TUI_MSG_ZH_TW[image.type.string]="string    （直接用此值為 image 名稱，不解析路徑）"
+_TUI_MSG_ZH_TW[image.type.prefix]="prefix    （從目錄名剝除前綴 <value>）"
+_TUI_MSG_ZH_TW[image.type.suffix]="suffix    （從路徑中任一段剝除後綴 <value>）"
+_TUI_MSG_ZH_TW[image.type.basename]="@basename （直接使用目錄名，最後備用）"
+_TUI_MSG_ZH_TW[image.type.default]="@default  （全無匹配時使用 <value>）"
+_TUI_MSG_ZH_TW[image.type.move_up]="往上      （與前一條規則交換）"
+_TUI_MSG_ZH_TW[image.type.move_down]="往下      （與後一條規則交換）"
+_TUI_MSG_ZH_TW[image.type.remove]="移除      （刪除此規則）"
+_TUI_MSG_ZH_TW[image.value.prompt]=$'規則參數\n  - 留空 = 取消\n  - prefix / suffix / @default：剝除或預設值\n  - string：直接用做 image 名稱（例：my_app）\n  - 例：prefix:docker_ → 輸入 docker_'
+_TUI_MSG_ZH_TW[build.title]="Build 設定"
+_TUI_MSG_ZH_TW[build.menu]="選擇項目編輯"
+_TUI_MSG_ZH_TW[build.add]="新增 build arg"
+_TUI_MSG_ZH_TW[build.back]="回主選單"
+_TUI_MSG_ZH_TW[build.arg.prompt]=$'Build arg（Dockerfile ARG 覆蓋）\n  - 格式：KEY=VALUE（KEY 需符合 [A-Z_][A-Z0-9_]*）\n  - 留空 = 刪除此項目\n  - 已知 key（留空時 Dockerfile 預設生效）：\n      APT_MIRROR_UBUNTU   預設 archive.ubuntu.com\n      APT_MIRROR_DEBIAN   預設 deb.debian.org\n      TZ                  預設 Asia/Taipei\n  - 自訂：任何 Dockerfile 中 `ARG KEY` 宣告過的 key\n  - 範例：APT_MIRROR_UBUNTU=tw.archive.ubuntu.com\n  - 範例：PYTHON_VERSION=3.12'
+_TUI_MSG_ZH_TW[build.target_arch.label]="TARGETARCH 覆寫"
+_TUI_MSG_ZH_TW[build.target_arch.prompt]=$'Docker TARGETARCH 覆寫\n  - 留空 = 交給 BuildKit 依 host / --platform 自動填（預設）\n  - amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64\n  - 同時套用主 image 與 test-tools image\n  - 需要跨架構編譯或明確指定時才填'
+_TUI_MSG_ZH_TW[build.target_arch.auto]="（自動）"
+_TUI_MSG_ZH_TW[build.network.label]="Build 網路"
+_TUI_MSG_ZH_TW[build.network.prompt]=$'Docker build 階段使用的網路（不影響 runtime 容器的網路）\n  - auto = 自動偵測 Jetson（/etc/nv_tegra_release）→ host；桌機 → Docker 預設（預設）\n  - host = 強制 host 網路 stack。當主機的 bridge NAT 無法用時需要：\n          例如 kernel 缺 iptable_raw（Jetson L4T）、\n          daemon.json 有 iptables: false、或 CI runner 防火牆限制\n  - bridge / none / default = 其他明確 Docker 選項\n  - off（或留空）= 明確關閉；用 Docker 預設的 bridge'
+_TUI_MSG_ZH_TW[build.network.default]="（預設：auto）"
+_TUI_MSG_ZH_TW[build.args.label]="額外 build args"
+_TUI_MSG_ZH_TW[err.invalid_target_arch]="TARGETARCH 無效，請填空值或 amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64。"
+_TUI_MSG_ZH_TW[err.invalid_build_network]="Build 網路無效，請填 auto / host / bridge / none / default / off（或留空）。"
+_TUI_MSG_ZH_TW[network.title]="Network"
+_TUI_MSG_ZH_TW[network.mode.prompt]="網路模式"
+_TUI_MSG_ZH_TW[network.mode.host]="host（共用主機網路堆疊）"
+_TUI_MSG_ZH_TW[network.mode.bridge]="bridge（隔離；可指定具名網路）"
+_TUI_MSG_ZH_TW[network.mode.none]="none（無網路）"
+_TUI_MSG_ZH_TW[network.ipc.prompt]="IPC 命名空間"
+_TUI_MSG_ZH_TW[network.ipc.host]="host（共用主機 IPC／共享記憶體）"
+_TUI_MSG_ZH_TW[network.ipc.shareable]="shareable（獨立 IPC，其他容器可存取）"
+_TUI_MSG_ZH_TW[network.ipc.private]="private（獨立 IPC，Docker 預設）"
+_TUI_MSG_ZH_TW[network.pid.prompt]="PID 命名空間"
+_TUI_MSG_ZH_TW[network.pid.host]="host（共用主機 PID 命名空間 — 多 GPU 容器 NVIDIA 驅動 mutex 需要）"
+_TUI_MSG_ZH_TW[network.pid.private]="private（獨立 PID 命名空間 — Docker 預設）"
+_TUI_MSG_ZH_TW[network.priv.prompt]="以特權模式執行？"
+_TUI_MSG_ZH_TW[network.name.prompt]=$'Bridge 網路名稱\n  - 留空 = compose 每次自動建立 <project>_default bridge\n  - 填寫 = compose 建立以此為名的 bridge（仍由 compose 管理）\n      範例：my_bridge\n        → compose 啟動時建立 <project>_my_bridge\n        → 停止時自動移除'
+_TUI_MSG_ZH_TW[deploy.title]="Deploy"
+_TUI_MSG_ZH_TW[deploy.mode.prompt]="GPU 模式"
+_TUI_MSG_ZH_TW[deploy.mode.auto]="auto（偵測 nvidia-container-toolkit）"
+_TUI_MSG_ZH_TW[deploy.mode.force]="force（永遠輸出 GPU 區塊）"
+_TUI_MSG_ZH_TW[deploy.mode.off]="off（永遠不輸出 GPU 區塊）"
+_TUI_MSG_ZH_TW[deploy.count.prompt]=$'GPU 數量\n  - \'all\' = 保留主機所有 GPU\n  - <N> = 保留 N 張 GPU（1、2、...）\n  - 主機偵測到：%s'
+_TUI_MSG_ZH_TW[deploy.caps.prompt]="GPU 功能（Space 鍵切換勾選）"
+_TUI_MSG_ZH_TW[deploy.caps.gpu]="gpu（基本）"
+_TUI_MSG_ZH_TW[deploy.caps.compute]="compute（CUDA 運算）"
+_TUI_MSG_ZH_TW[deploy.caps.utility]="utility（nvidia-smi、監控）"
+_TUI_MSG_ZH_TW[deploy.caps.graphics]="graphics（OpenGL、Vulkan）"
+_TUI_MSG_ZH_TW[deploy.caps.all]="all（驅動的全部功能）"
+_TUI_MSG_ZH_TW[deploy.caps.video]="video（NVENC / NVDEC 編解碼）"
+_TUI_MSG_ZH_TW[deploy.caps.display]="display（X11 / Wayland 輸出）"
+_TUI_MSG_ZH_TW[deploy.caps.compat32]="compat32（32 位元驅動程式庫）"
+_TUI_MSG_ZH_TW[deploy.caps.ngx]="ngx（NGX：DLSS、影像強化）"
+_TUI_MSG_ZH_TW[deploy.runtime.prompt]="Docker runtime 覆寫（Jetson / csv 模式 toolkit）"
+_TUI_MSG_ZH_TW[deploy.runtime.auto]="auto（Jetson 自動輸出 runtime: nvidia — /etc/nv_tegra_release）"
+_TUI_MSG_ZH_TW[deploy.runtime.nvidia]="nvidia（所有主機強制輸出）"
+_TUI_MSG_ZH_TW[deploy.runtime.off]="off（不覆寫 — Docker 預設 runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (fast-follow of)
+_TUI_MSG_ZH_TW[deploy.runtime.migrate]=$'你的 setup.toml 仍使用舊的 [deploy] runtime key。\n\n#481 已將它更名為 gpu_runtime（舊名仍以永久 alias 形式可用）。在此\n儲存會寫入新的 gpu_runtime key；之後你可自行從 setup.toml 移除舊的\nruntime 那行。本頁不會替你改動舊 key。'
+_TUI_MSG_ZH_TW[deploy.mig.title]="Deploy — 偵測到 NVIDIA MIG"
+_TUI_MSG_ZH_TW[deploy.mig.warning]=$'此主機已啟用 NVIDIA MIG（Multi-Instance GPU）模式。\n\nDocker 的 deploy `count=N` 只能預留整張 GPU，無法指定特定 MIG slice。若要使用單一 slice，請維持 count 不變，並在 [environment] 區塊加入：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\n主機上的 GPU / MIG 實例：\n%s'
+_TUI_MSG_ZH_TW[gui.title]="GUI"
+_TUI_MSG_ZH_TW[gui.mode.prompt]="GUI 模式"
+_TUI_MSG_ZH_TW[gui.mode.auto]="auto（偵測 \$DISPLAY／\$WAYLAND_DISPLAY）"
+_TUI_MSG_ZH_TW[gui.mode.force]="force（永遠輸出 GUI 區塊）"
+_TUI_MSG_ZH_TW[gui.mode.off]="off（永遠不輸出 GUI 區塊）"
+_TUI_MSG_ZH_TW[volumes.title]="Volumes"
+_TUI_MSG_ZH_TW[volumes.menu]="選擇掛載點編輯或新增"
+_TUI_MSG_ZH_TW[volumes.add]="新增掛載"
+_TUI_MSG_ZH_TW[volumes.edit.prompt]=$'掛載規格\n  - 格式：<host>:<container>[:ro|rw]\n  - 留空 = 刪除此項目\n  - 範例：/data:/home/${USER_NAME}/data:rw'
+_TUI_MSG_ZH_TW[volumes.delete.confirm]="刪除掛載「%s」？"
+_TUI_MSG_ZH_TW[volumes.back]="回主選單"
+_TUI_MSG_ZH_TW[devices.title]="Devices"
+_TUI_MSG_ZH_TW[devices.menu]="選擇要編輯的清單"
+_TUI_MSG_ZH_TW[devices.edit_devices]="Device bindings（devices:）"
+_TUI_MSG_ZH_TW[devices.edit_cgroup]="Cgroup 規則（device_cgroup_rules:）"
+_TUI_MSG_ZH_TW[devices.add_device]="新增 device binding"
+_TUI_MSG_ZH_TW[devices.add_cgroup]="新增 cgroup rule"
+_TUI_MSG_ZH_TW[devices.back]="回主選單"
+_TUI_MSG_ZH_TW[devices.device.prompt]=$'Device 綁定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 刪除此項目\n  - 範例（整個 /dev）：/dev:/dev\n  - 範例（單一）：/dev/video0:/dev/video0'
+_TUI_MSG_ZH_TW[devices.cgroup.title]="Cgroup 規則"
+_TUI_MSG_ZH_TW[devices.cgroup.menu]="選擇項目編輯，或新增 cgroup 規則"
+_TUI_MSG_ZH_TW[devices.cgroup.prompt]=$'Cgroup 規則\n  - 格式：<type> <major>:<minor|*> <perms>\n    type: c（字元）、b（區塊）、a（全部）\n    perms: r / w / m 任意組合\n  - 留空 = 刪除此項目\n  - USB 範例：c 189:* rwm\n  - V4L2 範例：c 81:* rwm'
+_TUI_MSG_ZH_TW[resources.title]="Resources"
+_TUI_MSG_ZH_TW[resources.shm_size.prompt]=$'/dev/shm 大小\n  - 留空 = Docker 預設 64mb\n  - 範例：2gb、512mb\n  - 僅在 [network] ipc ≠ host 時生效'
+_TUI_MSG_ZH_TW[resources.shm_size.ignored]="注意：目前 [network] ipc = '%s'。Docker 會忽略 shm_size（只在 ipc 為 'private' 或 'shareable' 時生效）。"
+_TUI_MSG_ZH_TW[environment.title]="Environment"
+_TUI_MSG_ZH_TW[environment.menu]="選擇要編輯的環境變數，或新增"
+_TUI_MSG_ZH_TW[environment.add]="新增環境變數"
+_TUI_MSG_ZH_TW[environment.back]="回主選單"
+_TUI_MSG_ZH_TW[environment.entry.prompt]=$'環境變數\n  - 格式：KEY=VALUE\n  - 留空 = 刪除此項目\n  - 範例：ROS_DOMAIN_ID=7'
+_TUI_MSG_ZH_TW[tmpfs.title]="Tmpfs"
+_TUI_MSG_ZH_TW[tmpfs.menu]="選擇 tmpfs 項目編輯，或新增"
+_TUI_MSG_ZH_TW[tmpfs.add]="新增 tmpfs 掛載"
+_TUI_MSG_ZH_TW[tmpfs.back]="回主選單"
+_TUI_MSG_ZH_TW[tmpfs.entry.prompt]=$'Tmpfs 掛載\n  - 格式：<path>[:size=<size>]\n  - 留空 = 刪除此項目\n  - 範例：/tmp:size=1g'
+_TUI_MSG_ZH_TW[ports.title]="Ports"
+_TUI_MSG_ZH_TW[ports.menu]="選擇 port 映射編輯，或新增"
+_TUI_MSG_ZH_TW[ports.add]="新增 port 映射"
+_TUI_MSG_ZH_TW[ports.back]="回主選單"
+_TUI_MSG_ZH_TW[ports.entry.prompt]=$'Port 映射\n  - 格式：<host>:<container>[/protocol]\n  - 留空 = 刪除此項目\n  - 範例：8080:80 或 5000:5000/udp'
+_TUI_MSG_ZH_TW[ports.not_bridge]="注意：目前 [network] mode = '%s'。ports 只在 mode=bridge 時寫入 compose.yaml。"
+_TUI_MSG_ZH_TW[additional_contexts.title]="額外 build context"
+_TUI_MSG_ZH_TW[additional_contexts.menu]="選擇具名 context 編輯或新增"
+_TUI_MSG_ZH_TW[additional_contexts.add]="新增具名 context"
+_TUI_MSG_ZH_TW[additional_contexts.back]="回主選單"
+_TUI_MSG_ZH_TW[additional_contexts.entry.prompt]=$'具名 build context\n  - 格式：<name>=<source>\n  - 留空 = 刪除此項目\n  - <source> 可以是 BuildKit 接受的任意來源：相對路徑、docker-image://、https://、oci-layout://\n  - 範例（相對路徑）：repo=..\n  - 範例（image）：base=docker-image://debian:bookworm-slim'
+_TUI_MSG_ZH_TW[err.invalid_mount]="掛載格式錯誤（預期 <host>:<container>[:ro|rw]）"
+_TUI_MSG_ZH_TW[err.invalid_tmpfs]="tmpfs 掛載格式錯誤（預期 <path>[:<option>[,<option>]]，例如 /tmp:size=64m）"
+_TUI_MSG_ZH_TW[err.invalid_cgroup_rule]="Cgroup 規則格式錯誤（預期：<c|b|a> <major>:<minor|*> <r|w|m>）"
+_TUI_MSG_ZH_TW[err.invalid_gpu_count]="GPU 數量格式錯誤（預期 'all' 或正整數）"
+_TUI_MSG_ZH_TW[err.invalid_runtime]="runtime 值不合法（預期 'auto'、'nvidia' 或 'off'）"
+_TUI_MSG_ZH_TW[err.unrepresentable_gpu_capabilities]=$'GPU 功能清單「未被改動」，本頁沒有編輯它。\n\n你的設定中有一個驗證器不接受的功能名稱，因此本畫面沒有對應的選項；\n若確認這份勾選清單，你的清單會被畫面上的選項取代。目前未寫入任何\n內容。\n\n請修正 setup.toml（或 setup.local.toml）中的值後重新開啟本頁，或改\n用命令列設定：\n  just docker setup set deploy.gpu_capabilities "<names>"'
+_TUI_MSG_ZH_TW[err.empty_gpu_capabilities]=$'沒有勾選任何功能，因此功能清單「未被改動」。\n\n空的功能清單不是產生器能處理的設定：它會保留 GPU 卻不要求任何功能，\ncompose.yaml 的產生會因此中止。目前未寫入任何內容，你原本的清單仍然\n有效。\n\n若要完全不保留 GPU，請在本頁第一個畫面把 GPU 模式設為 `off` —— 那才\n是代表「不使用 GPU」的設定。'
+# [lifecycle] restart policy page (fast-follow of)
+_TUI_MSG_ZH_TW[main.lifecycle]="容器重啟策略"
+# runtime-env info page (info-only: points at the .env.local overrides)
+_TUI_MSG_ZH_TW[main.envinfo]="workload 環境變數（.env.local）-- 設定方式"
+_TUI_MSG_ZH_TW[envinfo.title]="Workload 環境變數（.env）"
+_TUI_MSG_ZH_TW[envinfo.info]=$'每個任務會變動的環境變數（ROS_DOMAIN_ID、LOG_LEVEL、token 等）\n應寫進 gitignore 的 .env.local —— 直接編輯該檔。\n工具鏈永不碰 .env.local，且改動只要 `just docker run` 即生效：不需重生\ncompose、不會動 SETUP_CONF_HASH、不產生 git 變更。\n\n極少變動的 set-once 預設值放在 [environment]（本選單 ->「執行時期\n環境變數」）。apply 會把它們寫進產生的 .env，並 bake 進 field image\n的 ENV；.env.local 在 .env 之後載入，同名 key 以 .env.local 為準。\n\n命名規則：標準名是我們的（.env 會被重新產生），加後綴才是本機變體\n（.env.local 是你的）。\n\n本頁僅供說明 —— 不會編輯 .env.local。'
+_TUI_MSG_ZH_TW[lifecycle.title]="生命週期"
+_TUI_MSG_ZH_TW[lifecycle.restart.prompt]=$'容器重啟策略。\n\n注意：always / unless-stopped 會在「任何」退出時重啟 —— 一個 extends\ndevel 且以 0 結束的 stage（例如 test service）會無限重啟。要自動重試\n請優先選 on-failure。'
+_TUI_MSG_ZH_TW[lifecycle.restart.no]="no（永不重啟 —— 預設；不輸出 restart: 欄位）"
+_TUI_MSG_ZH_TW[lifecycle.restart.always]="always（任何退出都重啟，含手動停止）"
+_TUI_MSG_ZH_TW[lifecycle.restart.unless_stopped]="unless-stopped（任何退出都重啟，除非手動停止）"
+_TUI_MSG_ZH_TW[lifecycle.restart.on_failure]="on-failure（僅非零退出時重啟）"
+_TUI_MSG_ZH_TW[lifecycle.restart.n_prompt]="on-failure 最大重試次數（整數 >= 1；留空 = 不限次數的純 on-failure）"
+_TUI_MSG_ZH_TW[err.invalid_restart]="restart 策略不合法（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_ZH_TW[err.invalid_restart_n]="重試次數不合法（預期正整數，或留空為純 on-failure）"
+_TUI_MSG_ZH_TW[err.invalid_shm_size]=$'shm_size 格式錯誤\n  - 預期：<數字><單位>\n  - 單位：b、k/kb、m/mb、g/gb（大小寫不限）\n  - 範例：2gb、512mb'
+_TUI_MSG_ZH_TW[err.invalid_port_mapping]=$'Port 映射格式錯誤\n  - 預期：<host>:<container>[/tcp|udp]\n  - 範例：8080:80、5000:5000/udp'
+_TUI_MSG_ZH_TW[err.invalid_env_kv]=$'環境變數格式錯誤\n  - 預期：KEY=VALUE\n  - KEY 需以字母或 _ 開頭，僅含 [A-Za-z0-9_]'
+_TUI_MSG_ZH_TW[err.invalid_network_name]=$'網路名稱格式錯誤\n  - 預期：開頭為 [a-zA-Z0-9]\n  - 後續含字母／數字／[_.-]\n  - 範例：my_bridge'
+_TUI_MSG_ZH_TW[err.invalid_capability]=$'Capability 名稱錯誤\n  - 預期：全大寫 ASCII + 底線\n  - 範例：SYS_ADMIN、NET_ADMIN、ALL'
+_TUI_MSG_ZH_TW[err.invalid_additional_context]=$'具名 build context 格式錯誤\n  - 預期：<name>=<source>\n  - <name>：以 [A-Za-z0-9] 開頭，僅含字母／數字／[_.-]\n  - <source>：不可為空\n  - 範例：repo=..'
+_TUI_MSG_ZH_TW[logging.title]="Logging"
+_TUI_MSG_ZH_TW[logging.svc.title]="Logging [%s]"
+_TUI_MSG_ZH_TW[logging.top.menu]="選擇範圍：global 或 per-service override"
+_TUI_MSG_ZH_TW[logging.top.global]="Global [logging]（套用到所有 service）"
+_TUI_MSG_ZH_TW[logging.top.devel]="Per-service：devel"
+_TUI_MSG_ZH_TW[logging.top.test]="Per-service：test"
+_TUI_MSG_ZH_TW[logging.top.runtime]="Per-service：runtime"
+_TUI_MSG_ZH_TW[logging.menu]="選擇：driver／max_size／max_file／compress"
+_TUI_MSG_ZH_TW[logging.back]="回 Runtime 選單"
+_TUI_MSG_ZH_TW[logging.driver.label]="driver"
+_TUI_MSG_ZH_TW[logging.driver.prompt]="Log driver（json-file / journald / syslog / fluentd / none / ...）"
+_TUI_MSG_ZH_TW[logging.max_size.label]="max_size"
+_TUI_MSG_ZH_TW[logging.max_size.prompt]="單一 log 檔大小上限（例如 10m、1g）"
+_TUI_MSG_ZH_TW[logging.max_file.label]="max_file"
+_TUI_MSG_ZH_TW[logging.max_file.prompt]="輪轉檔案數量（正整數）"
+_TUI_MSG_ZH_TW[logging.compress.label]="compress"
+_TUI_MSG_ZH_TW[logging.compress.prompt]="壓縮輪轉後的 log？"
+_TUI_MSG_ZH_TW[logging.local_path.label]="local_path"
+_TUI_MSG_ZH_TW[logging.local_path.prompt]=$'容器 log tee 到 host 端的目錄（留空＝關閉）\n  - 相對路徑：以 repo 根目錄為基準（./logs/）\n  - 絕對路徑：原樣使用（/var/log/app/）\n  - 支援 ~ 展開（~/dir/）\n  - 容器內掛載點為 /var/log/<repo>'
+_TUI_MSG_ZH_TW[err.invalid_log_driver]=$'log driver 名稱格式錯誤\n  - 預期：字母開頭，後接字母／數字／[._-]\n  - 範例：json-file、journald、syslog'
+_TUI_MSG_ZH_TW[err.invalid_log_max_size]=$'max_size 格式錯誤\n  - 預期：<數字><單位>\n  - 單位：b、k、m、g（不分大小寫）\n  - 範例：10m、1g、512k'
+_TUI_MSG_ZH_TW[err.invalid_log_max_file]=$'max_file 格式錯誤\n  - 預期：正整數（1、2、3、...）'
+_TUI_MSG_ZH_TW[err.invalid_log_local_path]=$'local_path 格式錯誤\n  - 不可為空或純空白\n  - 不可含換行字元'
+_TUI_MSG_ZH_TW[err.no_backend]="未安裝 dialog 或 whiptail，請執行：sudo apt install dialog"
+_TUI_MSG_ZH_TW[err.reset_failed]=$'重置失敗，沒有任何變更。\n\nsetup.sh reset 無法以 template 基線取代 <repo>/setup.toml，原因已輸出\n在本終端機。你尚未儲存的編輯仍然存在——選「儲存並離開」會保留它們，\n取消則會捨棄。'
+_TUI_MSG_ZH_TW[err.save_refused]=$'儲存已被拒絕，<repo>/setup.toml 未變更。\n\n寫入端拒絕了這組變更，原因已輸出在本終端機上方。沒有任何內容被寫入，\nrepo 維持原狀，待儲存的編輯也不會遺失。'
+_TUI_MSG_ZH_TW[local.layer.title]="工作樹層級覆寫生效中"
+_TUI_MSG_ZH_TW[local.layer.body]=$'本機會讀取 %s，其優先序高於 <repo>/setup.toml。\n\n它定義的區段：%s\n\n在這些區段中，它會覆寫自己列出的 key，並整體取代自己宣告的清單。\n本編輯器顯示的是「實際生效」的值，已包含該層。儲存仍然寫入\n<repo>/setup.toml（CI 與其他 checkout 使用的共用值），因此對上述\n區段的修改在本機可能不會生效。'
+_TUI_MSG_ZH_TW[saved.shadowed]="下列區段同時定義於 %s，在本機由該檔勝出：%s"
+_TUI_MSG_ZH_TW[deploy.ambiguous.title]="「deploy」的兩種意思"
+_TUI_MSG_ZH_TW[deploy.ambiguous.body]=$'你開啟的是 [deploy] section 編輯器。\n\n[deploy] 只設定 GPU 保留 —— 這個 section 名稱沿用 Compose 的\n`deploy:` key，與「部署」無關。\n\nfield-deploy bundle 是另一個指令：\n  just docker setup deploy\n\n本編輯器沒有歧義的名稱是 `gpu`：\n  just docker setup-tui gpu'
+_TUI_MSG_ZH_TW[saved]="已儲存至 %s，正在重新產生 .env / .env.generated / compose.yaml..."
+
+
+declare -gA _TUI_MSG_ZH_CN=()
+_TUI_MSG_ZH_CN[title]="Docker 容器配置"
+_TUI_MSG_ZH_CN[main.prompt]=""
+_TUI_MSG_ZH_CN[main.image]="IMAGE_NAME 检测规则"
+_TUI_MSG_ZH_CN[main.build]="APT 镜像与 Dockerfile build args"
+_TUI_MSG_ZH_CN[main.network]="网络模式／IPC／名称"
+_TUI_MSG_ZH_CN[main.deploy]="GPU 预留"
+_TUI_MSG_ZH_CN[main.gui]="显示模式"
+_TUI_MSG_ZH_CN[main.volumes]="工作区与额外挂载"
+_TUI_MSG_ZH_CN[main.devices]="主机设备绑定"
+_TUI_MSG_ZH_CN[main.environment]="运行时环境变量"
+_TUI_MSG_ZH_CN[main.tmpfs]="RAM 挂载点"
+_TUI_MSG_ZH_CN[main.advanced]="进阶"
+_TUI_MSG_ZH_CN[main.save]="保存并退出"
+_TUI_MSG_ZH_CN[main.security]="privileged／cap_add／security_opt"
+_TUI_MSG_ZH_CN[main.additional_contexts]="具名 build context（build.additional_contexts）"
+_TUI_MSG_ZH_CN[main.logging]="container log driver + 轮转"
+_TUI_MSG_ZH_CN[main.runtime]="运行时（网络／GPU／显示／环境变量）"
+_TUI_MSG_ZH_CN[main.mounts]="挂载（volumes／devices／tmpfs）"
+_TUI_MSG_ZH_CN[main.features]="功能（条件式／进阶使用）"
+_TUI_MSG_ZH_CN[runtime.title]="运行时"
+_TUI_MSG_ZH_CN[runtime.menu]="选择运行时区段"
+_TUI_MSG_ZH_CN[runtime.back]="回主菜单"
+_TUI_MSG_ZH_CN[mounts.title]="挂载"
+_TUI_MSG_ZH_CN[mounts.menu]="选择挂载区段"
+_TUI_MSG_ZH_CN[mounts.back]="回主菜单"
+_TUI_MSG_ZH_CN[features.title]="功能"
+_TUI_MSG_ZH_CN[features.menu]="条件式／进阶使用功能"
+_TUI_MSG_ZH_CN[features.back]="回主菜单"
+_TUI_MSG_ZH_CN[features.per_stage_enabled]="Per-stage overrides — 已启用（%s 个 stage）"
+_TUI_MSG_ZH_CN[features.per_stage_hidden]="Per-stage overrides — 隐藏（无非 baseline stage）"
+_TUI_MSG_ZH_CN[features.per_stage_hidden_info]=$'Per-stage overrides (#220)\n\n状态：隐藏\n原因：Dockerfile 没有非 baseline stage（sys、devel-base、devel、\n      devel-test、runtime-test 为保留的 baseline 名称；旧名 base、\n      test 在 v0.21.x 过渡期仍被接受）。\n\n启用方式：在 Dockerfile 加上 `FROM ... AS <stage>`（任意自定\n         名称），再回到此菜单，项目会自动启用。'
+_TUI_MSG_ZH_CN[advanced.title]="Advanced"
+_TUI_MSG_ZH_CN[advanced.menu]="选择进阶区段"
+_TUI_MSG_ZH_CN[advanced.back]="回主菜单"
+_TUI_MSG_ZH_CN[advanced.reset]="重置为默认值"
+_TUI_MSG_ZH_CN[advanced.per_stage]="Per-stage overrides (#220)"
+_TUI_MSG_ZH_CN[per_stage.title]="Per-stage overrides"
+_TUI_MSG_ZH_CN[per_stage.menu]="选择要编辑的 stage，或返回"
+_TUI_MSG_ZH_CN[per_stage.empty]=$'Dockerfile 中没有非 baseline 的 stage。\n\nPer-stage overrides 应用于 baseline {sys, devel-base, devel,\nruntime-test}（v0.21.x 过渡期同时接受旧名 {base, test}；devel-test\n会以 test service 送出，因此可以 override）以外的 `FROM ... AS <name>` stage。请先在 Dockerfile 中加入额外\nstage，再回来这里 override 该 stage 的 runtime 设定。'
+_TUI_MSG_ZH_CN[per_stage.back]="返回"
+_TUI_MSG_ZH_CN[per_stage.overrides_set]="个 override"
+_TUI_MSG_ZH_CN[per_stage.inherits_all]="(全部继承)"
+_TUI_MSG_ZH_CN[per_stage.one.menu]="选择要编辑的 section，或返回"
+_TUI_MSG_ZH_CN[per_stage.scalar.menu]="选择要编辑的 key，或返回"
+_TUI_MSG_ZH_CN[per_stage.scalar.prompt]=$'Override 值\n  - 空白 = 继承 top-level（清除此 override）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（旧称 runtime）：auto / nvidia / off'
+_TUI_MSG_ZH_CN[per_stage.list.menu]="编辑 list 项目、切换继承、或返回"
+_TUI_MSG_ZH_CN[per_stage.list.entry_prompt]=$'List 项目值\n  - 空白 = 删除此项目\n  - 格式依 list 不同（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
+_TUI_MSG_ZH_CN[per_stage.network.ports]="ports list (per-stage)"
+_TUI_MSG_ZH_CN[per_stage.inherit]="(继承 top-level — 清除 override)"
+_TUI_MSG_ZH_CN[per_stage.inherit_flag]="继承 top-level 项目"
+_TUI_MSG_ZH_CN[err.per_stage_invalid]=$'值不合法 —— 未写入任何内容。\n\n分阶段覆写与 top-level 是「同一个」设置，因此必须通过同样的\n检查。请修正该值，或将字段留空以取消覆写、改用 top-level 的值。'
+_TUI_MSG_ZH_CN[reset.title]="重置为默认值"
+_TUI_MSG_ZH_CN[reset.confirm]=$'重置所有设定为 template 默认值？\n\n  - 以 template 基线替换 <repo>/setup.toml\n    （被替换的文件会备份为 setup.toml.bak）\n  - 重跑 setup.sh 从 template 重建\n  - 你当前的定制会丢失\n  - <repo>/setup.local.toml 属于你，不会被改动\n\n无法撤销。'
+_TUI_MSG_ZH_CN[reset.done]="所有设定已重置为默认值。"
+_TUI_MSG_ZH_CN[security.title]="Security"
+_TUI_MSG_ZH_CN[security.menu]="选择：privileged／cap_add／cap_drop／security_opt"
+_TUI_MSG_ZH_CN[security.back]="回主菜单"
+_TUI_MSG_ZH_CN[security.privileged.prompt]="以特权模式运行？"
+_TUI_MSG_ZH_CN[security.cap_add]="cap_add"
+_TUI_MSG_ZH_CN[security.cap_add.menu]="选择 cap_add 项目或新增"
+_TUI_MSG_ZH_CN[security.cap_add.add]="新增 cap_add"
+_TUI_MSG_ZH_CN[security.cap_add.prompt]=$'要 ADD 的 Capability\n  - 留空 = 删除此项目\n  - 常用：SYS_ADMIN、NET_ADMIN、MKNOD、SYS_PTRACE'
+_TUI_MSG_ZH_CN[security.cap_drop]="cap_drop"
+_TUI_MSG_ZH_CN[security.cap_drop.menu]="选择 cap_drop 项目或新增"
+_TUI_MSG_ZH_CN[security.cap_drop.add]="新增 cap_drop"
+_TUI_MSG_ZH_CN[security.cap_drop.prompt]=$'要 DROP 的 Capability\n  - 留空 = 删除此项目\n  - 示例：ALL'
+_TUI_MSG_ZH_CN[security.security_opt]="security_opt"
+_TUI_MSG_ZH_CN[security.security_opt.menu]="选择 security_opt 项目或新增"
+_TUI_MSG_ZH_CN[security.security_opt.add]="新增 security_opt"
+_TUI_MSG_ZH_CN[security.security_opt.prompt]=$'security_opt 项目\n  - 留空 = 删除此项目\n  - 示例：seccomp:unconfined、apparmor:unconfined、label=disable'
+_TUI_MSG_ZH_CN[image.title]="Image"
+_TUI_MSG_ZH_CN[image.menu]="选择规则编辑或新增"
+_TUI_MSG_ZH_CN[image.add]="新增规则"
+_TUI_MSG_ZH_CN[image.back]="回主菜单"
+_TUI_MSG_ZH_CN[image.type.prompt]="规则类型"
+_TUI_MSG_ZH_CN[image.type.string]="string    （直接用此值为 image 名称，不解析路径）"
+_TUI_MSG_ZH_CN[image.type.prefix]="prefix    （从目录名剥除前缀 <value>）"
+_TUI_MSG_ZH_CN[image.type.suffix]="suffix    （从路径中任一段剥除后缀 <value>）"
+_TUI_MSG_ZH_CN[image.type.basename]="@basename （直接使用目录名，最后备用）"
+_TUI_MSG_ZH_CN[image.type.default]="@default  （全无匹配时使用 <value>）"
+_TUI_MSG_ZH_CN[image.type.move_up]="上移      （与前一条规则交换）"
+_TUI_MSG_ZH_CN[image.type.move_down]="下移      （与后一条规则交换）"
+_TUI_MSG_ZH_CN[image.type.remove]="移除      （删除此规则）"
+_TUI_MSG_ZH_CN[image.value.prompt]=$'规则参数\n  - 留空 = 取消\n  - prefix / suffix / @default：剥除或默认值\n  - string：直接作为 image 名称（例：my_app）\n  - 例：prefix:docker_ → 输入 docker_'
+_TUI_MSG_ZH_CN[build.title]="Build 配置"
+_TUI_MSG_ZH_CN[build.menu]="选择项目编辑"
+_TUI_MSG_ZH_CN[build.add]="新增 build arg"
+_TUI_MSG_ZH_CN[build.back]="回主菜单"
+_TUI_MSG_ZH_CN[build.arg.prompt]=$'Build arg（Dockerfile ARG 覆盖）\n  - 格式：KEY=VALUE（KEY 需符合 [A-Z_][A-Z0-9_]*）\n  - 留空 = 删除此项目\n  - 已知 key（留空时 Dockerfile 默认生效）：\n      APT_MIRROR_UBUNTU   默认 archive.ubuntu.com\n      APT_MIRROR_DEBIAN   默认 deb.debian.org\n      TZ                  默认 Asia/Taipei\n  - 自定：任何 Dockerfile 中 `ARG KEY` 声明过的 key\n  - 示例：APT_MIRROR_UBUNTU=tw.archive.ubuntu.com\n  - 示例：PYTHON_VERSION=3.12'
+_TUI_MSG_ZH_CN[build.target_arch.label]="TARGETARCH 覆盖"
+_TUI_MSG_ZH_CN[build.target_arch.prompt]=$'Docker TARGETARCH 覆盖\n  - 留空 = 交给 BuildKit 依 host / --platform 自动填（默认）\n  - amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64\n  - 同时应用于主 image 与 test-tools image\n  - 需要跨架构构建或明确指定时才填'
+_TUI_MSG_ZH_CN[build.target_arch.auto]="（自动）"
+_TUI_MSG_ZH_CN[build.network.label]="Build 网络"
+_TUI_MSG_ZH_CN[build.network.prompt]=$'Docker build 阶段使用的网络（不影响 runtime 容器的网络）\n  - auto = 自动检测 Jetson（/etc/nv_tegra_release）→ host；桌机 → Docker 默认（默认）\n  - host = 强制 host 网络 stack。当主机的 bridge NAT 无法用时需要：\n          例如 kernel 缺 iptable_raw（Jetson L4T）、\n          daemon.json 有 iptables: false、或 CI runner 防火墙限制\n  - bridge / none / default = 其他明确 Docker 选项\n  - off（或留空）= 明确关闭；用 Docker 默认的 bridge'
+_TUI_MSG_ZH_CN[build.network.default]="（默认：auto）"
+_TUI_MSG_ZH_CN[build.args.label]="额外 build args"
+_TUI_MSG_ZH_CN[err.invalid_target_arch]="TARGETARCH 无效，请填空值或 amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64。"
+_TUI_MSG_ZH_CN[err.invalid_build_network]="Build 网络无效，请填 auto / host / bridge / none / default / off（或留空）。"
+_TUI_MSG_ZH_CN[network.title]="Network"
+_TUI_MSG_ZH_CN[network.mode.prompt]="网络模式"
+_TUI_MSG_ZH_CN[network.mode.host]="host（共用主机网络栈）"
+_TUI_MSG_ZH_CN[network.mode.bridge]="bridge（隔离；可指定命名网络）"
+_TUI_MSG_ZH_CN[network.mode.none]="none（无网络）"
+_TUI_MSG_ZH_CN[network.ipc.prompt]="IPC 命名空间"
+_TUI_MSG_ZH_CN[network.ipc.host]="host（共用主机 IPC／共享内存）"
+_TUI_MSG_ZH_CN[network.ipc.shareable]="shareable（独立 IPC，其他容器可访问）"
+_TUI_MSG_ZH_CN[network.ipc.private]="private（独立 IPC，Docker 默认）"
+_TUI_MSG_ZH_CN[network.pid.prompt]="PID 命名空间"
+_TUI_MSG_ZH_CN[network.pid.host]="host（共用主机 PID 命名空间 — 多 GPU 容器 NVIDIA 驱动 mutex 需要）"
+_TUI_MSG_ZH_CN[network.pid.private]="private（独立 PID 命名空间 — Docker 默认）"
+_TUI_MSG_ZH_CN[network.priv.prompt]="以特权模式运行？"
+_TUI_MSG_ZH_CN[network.name.prompt]=$'Bridge 网络名称\n  - 留空 = compose 每次自动建立 <project>_default bridge\n  - 填写 = compose 建立以此为名的 bridge（仍由 compose 管理）\n      示例：my_bridge\n        → compose 启动时建立 <project>_my_bridge\n        → 停止时自动移除'
+_TUI_MSG_ZH_CN[deploy.title]="Deploy"
+_TUI_MSG_ZH_CN[deploy.mode.prompt]="GPU 模式"
+_TUI_MSG_ZH_CN[deploy.mode.auto]="auto（检测 nvidia-container-toolkit）"
+_TUI_MSG_ZH_CN[deploy.mode.force]="force（永远输出 GPU 区块）"
+_TUI_MSG_ZH_CN[deploy.mode.off]="off（永远不输出 GPU 区块）"
+_TUI_MSG_ZH_CN[deploy.count.prompt]=$'GPU 数量\n  - \'all\' = 保留主机所有 GPU\n  - <N> = 保留 N 张 GPU（1、2、...）\n  - 主机检测到：%s'
+_TUI_MSG_ZH_CN[deploy.caps.prompt]="GPU 功能（Space 键切换勾选）"
+_TUI_MSG_ZH_CN[deploy.caps.gpu]="gpu（基本）"
+_TUI_MSG_ZH_CN[deploy.caps.compute]="compute（CUDA 计算）"
+_TUI_MSG_ZH_CN[deploy.caps.utility]="utility（nvidia-smi、监控）"
+_TUI_MSG_ZH_CN[deploy.caps.graphics]="graphics（OpenGL、Vulkan）"
+_TUI_MSG_ZH_CN[deploy.caps.all]="all（驱动的全部功能）"
+_TUI_MSG_ZH_CN[deploy.caps.video]="video（NVENC / NVDEC 编解码）"
+_TUI_MSG_ZH_CN[deploy.caps.display]="display（X11 / Wayland 输出）"
+_TUI_MSG_ZH_CN[deploy.caps.compat32]="compat32（32 位驱动程序库）"
+_TUI_MSG_ZH_CN[deploy.caps.ngx]="ngx（NGX：DLSS、图像增强）"
+_TUI_MSG_ZH_CN[deploy.runtime.prompt]="Docker runtime 覆盖（Jetson / csv 模式 toolkit）"
+_TUI_MSG_ZH_CN[deploy.runtime.auto]="auto（Jetson 自动输出 runtime: nvidia — /etc/nv_tegra_release）"
+_TUI_MSG_ZH_CN[deploy.runtime.nvidia]="nvidia（所有主机强制输出）"
+_TUI_MSG_ZH_CN[deploy.runtime.off]="off（不覆盖 — Docker 默认 runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (fast-follow of)
+_TUI_MSG_ZH_CN[deploy.runtime.migrate]=$'你的 setup.toml 仍使用旧的 [deploy] runtime key。\n\n#481 已将它更名为 gpu_runtime（旧名仍以永久 alias 形式可用）。在此\n保存会写入新的 gpu_runtime key；之后你可自行从 setup.toml 移除旧的\nruntime 那行。本页不会替你改动旧 key。'
+_TUI_MSG_ZH_CN[deploy.mig.title]="Deploy — 检测到 NVIDIA MIG"
+_TUI_MSG_ZH_CN[deploy.mig.warning]=$'此主机已启用 NVIDIA MIG（Multi-Instance GPU）模式。\n\nDocker 的 deploy `count=N` 只能预留整张 GPU，无法指定特定 MIG slice。若要使用单一 slice，请保持 count 不变，并在 [environment] 区块加入：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\n主机上的 GPU / MIG 实例：\n%s'
+_TUI_MSG_ZH_CN[gui.title]="GUI"
+_TUI_MSG_ZH_CN[gui.mode.prompt]="GUI 模式"
+_TUI_MSG_ZH_CN[gui.mode.auto]="auto（检测 \$DISPLAY／\$WAYLAND_DISPLAY）"
+_TUI_MSG_ZH_CN[gui.mode.force]="force（永远输出 GUI 区块）"
+_TUI_MSG_ZH_CN[gui.mode.off]="off（永远不输出 GUI 区块）"
+_TUI_MSG_ZH_CN[volumes.title]="Volumes"
+_TUI_MSG_ZH_CN[volumes.menu]="选择挂载点编辑或新增"
+_TUI_MSG_ZH_CN[volumes.add]="新增挂载"
+_TUI_MSG_ZH_CN[volumes.edit.prompt]=$'挂载规格\n  - 格式：<host>:<container>[:ro|rw]\n  - 留空 = 删除此项目\n  - 示例：/data:/home/${USER_NAME}/data:rw'
+_TUI_MSG_ZH_CN[volumes.delete.confirm]="删除挂载「%s」？"
+_TUI_MSG_ZH_CN[volumes.back]="回主菜单"
+_TUI_MSG_ZH_CN[devices.title]="Devices"
+_TUI_MSG_ZH_CN[devices.menu]="选择要编辑的列表"
+_TUI_MSG_ZH_CN[devices.edit_devices]="Device bindings（devices:）"
+_TUI_MSG_ZH_CN[devices.edit_cgroup]="Cgroup 规则（device_cgroup_rules:）"
+_TUI_MSG_ZH_CN[devices.add_device]="新增 device binding"
+_TUI_MSG_ZH_CN[devices.add_cgroup]="新增 cgroup rule"
+_TUI_MSG_ZH_CN[devices.back]="回主菜单"
+_TUI_MSG_ZH_CN[devices.device.prompt]=$'Device 绑定\n  - 格式：<host>[:<container>[:rwm]]\n  - 留空 = 删除此项目\n  - 示例（整个 /dev）：/dev:/dev\n  - 示例（单一）：/dev/video0:/dev/video0'
+_TUI_MSG_ZH_CN[devices.cgroup.title]="Cgroup 规则"
+_TUI_MSG_ZH_CN[devices.cgroup.menu]="选择项目编辑，或新增 cgroup 规则"
+_TUI_MSG_ZH_CN[devices.cgroup.prompt]=$'Cgroup 规则\n  - 格式：<type> <major>:<minor|*> <perms>\n    type: c（字符）、b（块）、a（全部）\n    perms: r / w / m 任意组合\n  - 留空 = 删除此项目\n  - USB 示例：c 189:* rwm\n  - V4L2 示例：c 81:* rwm'
+_TUI_MSG_ZH_CN[resources.title]="Resources"
+_TUI_MSG_ZH_CN[resources.shm_size.prompt]=$'/dev/shm 大小\n  - 留空 = Docker 默认 64mb\n  - 示例：2gb、512mb\n  - 仅在 [network] ipc ≠ host 时生效'
+_TUI_MSG_ZH_CN[resources.shm_size.ignored]="注意：当前 [network] ipc = '%s'。Docker 会忽略 shm_size（仅在 ipc 为 'private' 或 'shareable' 时生效）。"
+_TUI_MSG_ZH_CN[environment.title]="Environment"
+_TUI_MSG_ZH_CN[environment.menu]="选择要编辑的环境变量，或新增"
+_TUI_MSG_ZH_CN[environment.add]="新增环境变量"
+_TUI_MSG_ZH_CN[environment.back]="回主菜单"
+_TUI_MSG_ZH_CN[environment.entry.prompt]=$'环境变量\n  - 格式：KEY=VALUE\n  - 留空 = 删除此项目\n  - 示例：ROS_DOMAIN_ID=7'
+_TUI_MSG_ZH_CN[tmpfs.title]="Tmpfs"
+_TUI_MSG_ZH_CN[tmpfs.menu]="选择 tmpfs 项目编辑，或新增"
+_TUI_MSG_ZH_CN[tmpfs.add]="新增 tmpfs 挂载"
+_TUI_MSG_ZH_CN[tmpfs.back]="回主菜单"
+_TUI_MSG_ZH_CN[tmpfs.entry.prompt]=$'Tmpfs 挂载\n  - 格式：<path>[:size=<size>]\n  - 留空 = 删除此项目\n  - 示例：/tmp:size=1g'
+_TUI_MSG_ZH_CN[ports.title]="Ports"
+_TUI_MSG_ZH_CN[ports.menu]="选择 port 映射编辑，或新增"
+_TUI_MSG_ZH_CN[ports.add]="新增 port 映射"
+_TUI_MSG_ZH_CN[ports.back]="回主菜单"
+_TUI_MSG_ZH_CN[ports.entry.prompt]=$'Port 映射\n  - 格式：<host>:<container>[/protocol]\n  - 留空 = 删除此项目\n  - 示例：8080:80 或 5000:5000/udp'
+_TUI_MSG_ZH_CN[ports.not_bridge]="注意：当前 [network] mode = '%s'。ports 仅在 mode=bridge 时写入 compose.yaml。"
+_TUI_MSG_ZH_CN[additional_contexts.title]="额外 build context"
+_TUI_MSG_ZH_CN[additional_contexts.menu]="选择具名 context 编辑或新增"
+_TUI_MSG_ZH_CN[additional_contexts.add]="新增具名 context"
+_TUI_MSG_ZH_CN[additional_contexts.back]="回主菜单"
+_TUI_MSG_ZH_CN[additional_contexts.entry.prompt]=$'具名 build context\n  - 格式：<name>=<source>\n  - 留空 = 删除此项目\n  - <source> 可以是 BuildKit 接受的任意来源：相对路径、docker-image://、https://、oci-layout://\n  - 示例（相对路径）：repo=..\n  - 示例（image）：base=docker-image://debian:bookworm-slim'
+_TUI_MSG_ZH_CN[err.invalid_mount]="挂载格式错误（预期 <host>:<container>[:ro|rw]）"
+_TUI_MSG_ZH_CN[err.invalid_tmpfs]="tmpfs 挂载格式错误（预期 <path>[:<option>[,<option>]]，例如 /tmp:size=64m）"
+_TUI_MSG_ZH_CN[err.invalid_additional_context]=$'具名 build context 格式错误\n  - 预期：<name>=<source>\n  - <name>：以 [A-Za-z0-9] 开头，仅含字母／数字／[_.-]\n  - <source>：不可为空\n  - 示例：repo=..'
+_TUI_MSG_ZH_CN[logging.title]="Logging"
+_TUI_MSG_ZH_CN[logging.svc.title]="Logging [%s]"
+_TUI_MSG_ZH_CN[logging.top.menu]="选择范围：global 或 per-service override"
+_TUI_MSG_ZH_CN[logging.top.global]="Global [logging]（套用到所有 service）"
+_TUI_MSG_ZH_CN[logging.top.devel]="Per-service：devel"
+_TUI_MSG_ZH_CN[logging.top.test]="Per-service：test"
+_TUI_MSG_ZH_CN[logging.top.runtime]="Per-service：runtime"
+_TUI_MSG_ZH_CN[logging.menu]="选择：driver／max_size／max_file／compress"
+_TUI_MSG_ZH_CN[logging.back]="回 Runtime 菜单"
+_TUI_MSG_ZH_CN[logging.driver.label]="driver"
+_TUI_MSG_ZH_CN[logging.driver.prompt]="Log driver（json-file / journald / syslog / fluentd / none / ...）"
+_TUI_MSG_ZH_CN[logging.max_size.label]="max_size"
+_TUI_MSG_ZH_CN[logging.max_size.prompt]="单一 log 文件大小上限（例如 10m、1g）"
+_TUI_MSG_ZH_CN[logging.max_file.label]="max_file"
+_TUI_MSG_ZH_CN[logging.max_file.prompt]="轮转文件数量（正整数）"
+_TUI_MSG_ZH_CN[logging.compress.label]="compress"
+_TUI_MSG_ZH_CN[logging.compress.prompt]="压缩轮转后的 log？"
+_TUI_MSG_ZH_CN[logging.local_path.label]="local_path"
+_TUI_MSG_ZH_CN[logging.local_path.prompt]=$'容器 log tee 到 host 端的目录（留空＝关闭）\n  - 相对路径：以 repo 根目录为基准（./logs/）\n  - 绝对路径：原样使用（/var/log/app/）\n  - 支援 ~ 展开（~/dir/）\n  - 容器内挂载点为 /var/log/<repo>'
+_TUI_MSG_ZH_CN[err.invalid_log_driver]=$'log driver 名称格式错误\n  - 预期：字母开头，后接字母／数字／[._-]\n  - 示例：json-file、journald、syslog'
+_TUI_MSG_ZH_CN[err.invalid_log_max_size]=$'max_size 格式错误\n  - 预期：<数字><单位>\n  - 单位：b、k、m、g（不分大小写）\n  - 示例：10m、1g、512k'
+_TUI_MSG_ZH_CN[err.invalid_log_max_file]=$'max_file 格式错误\n  - 预期：正整数（1、2、3、...）'
+_TUI_MSG_ZH_CN[err.invalid_log_local_path]=$'local_path 格式错误\n  - 不可为空或纯空白\n  - 不可含换行符'
+_TUI_MSG_ZH_CN[err.invalid_cgroup_rule]="Cgroup 规则格式错误（预期：<c|b|a> <major>:<minor|*> <r|w|m>）"
+_TUI_MSG_ZH_CN[err.invalid_gpu_count]="GPU 数量格式错误（预期 'all' 或正整数）"
+_TUI_MSG_ZH_CN[err.invalid_runtime]="runtime 值不合法（预期 'auto'、'nvidia' 或 'off'）"
+_TUI_MSG_ZH_CN[err.unrepresentable_gpu_capabilities]=$'GPU 功能清单「未被改动」，本页没有编辑它。\n\n你的配置中有一个验证器不接受的功能名称，因此本界面没有对应的选项；\n若确认这份勾选清单，你的清单会被界面上的选项取代。目前未写入任何\n内容。\n\n请修正 setup.toml（或 setup.local.toml）中的值后重新打开本页，或改\n用命令行设置：\n  just docker setup set deploy.gpu_capabilities "<names>"'
+_TUI_MSG_ZH_CN[err.empty_gpu_capabilities]=$'没有勾选任何功能，因此功能清单「未被改动」。\n\n空的功能清单不是生成器能处理的配置：它会预留 GPU 却不要求任何功能，\ncompose.yaml 的生成会因此中止。目前未写入任何内容，你原本的清单仍然\n有效。\n\n若要完全不预留 GPU，请在本页第一个界面把 GPU 模式设为 `off` —— 那才\n是代表「不使用 GPU」的设置。'
+# [lifecycle] restart policy page (fast-follow of)
+_TUI_MSG_ZH_CN[main.lifecycle]="容器重启策略"
+# runtime-env info page (info-only: points at the .env.local overrides)
+_TUI_MSG_ZH_CN[main.envinfo]="workload 环境变量（.env.local）-- 设置方式"
+_TUI_MSG_ZH_CN[envinfo.title]="Workload 环境变量（.env）"
+_TUI_MSG_ZH_CN[envinfo.info]=$'每个任务会变动的环境变量（ROS_DOMAIN_ID、LOG_LEVEL、token 等）\n应写进 gitignore 的 .env.local —— 直接编辑该文件。\n工具链永不碰 .env.local，且改动只要 `just docker run` 即生效：无需重新生成\ncompose、不会动 SETUP_CONF_HASH、不产生 git 变更。\n\n极少变动的 set-once 默认值放在 [environment]（本菜单 ->「运行时\n环境变量」）。apply 会把它们写进生成的 .env，并 bake 进 field image\n的 ENV；.env.local 在 .env 之后加载，同名 key 以 .env.local 为准。\n\n命名规则：标准名是我们的（.env 会被重新生成），加后缀才是本机变体\n（.env.local 是你的）。\n\n本页仅供说明 —— 不会编辑 .env.local。'
+_TUI_MSG_ZH_CN[lifecycle.title]="生命周期"
+_TUI_MSG_ZH_CN[lifecycle.restart.prompt]=$'容器重启策略。\n\n注意：always / unless-stopped 会在「任何」退出时重启 —— 一个 extends\ndevel 且以 0 结束的 stage（例如 test service）会无限重启。要自动重试\n请优先选 on-failure。'
+_TUI_MSG_ZH_CN[lifecycle.restart.no]="no（永不重启 —— 默认；不输出 restart: 字段）"
+_TUI_MSG_ZH_CN[lifecycle.restart.always]="always（任何退出都重启，含手动停止）"
+_TUI_MSG_ZH_CN[lifecycle.restart.unless_stopped]="unless-stopped（任何退出都重启，除非手动停止）"
+_TUI_MSG_ZH_CN[lifecycle.restart.on_failure]="on-failure（仅非零退出时重启）"
+_TUI_MSG_ZH_CN[lifecycle.restart.n_prompt]="on-failure 最大重试次数（整数 >= 1；留空 = 不限次数的纯 on-failure）"
+_TUI_MSG_ZH_CN[err.invalid_restart]="restart 策略不合法（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_ZH_CN[err.invalid_restart_n]="重试次数不合法（预期正整数，或留空为纯 on-failure）"
+_TUI_MSG_ZH_CN[err.no_backend]="未安装 dialog 或 whiptail，请执行：sudo apt install dialog"
+_TUI_MSG_ZH_CN[err.reset_failed]=$'重置失败，没有任何变更。\n\nsetup.sh reset 无法以 template 基线替换 <repo>/setup.toml，原因已输出\n在本终端。你尚未保存的编辑仍然存在——选「保存并退出」会保留它们，\n取消则会丢弃。'
+_TUI_MSG_ZH_CN[err.save_refused]=$'保存已被拒绝，<repo>/setup.toml 未变更。\n\n写入端拒绝了这组变更，原因已输出在本终端上方。没有任何内容被写入，\nrepo 保持原状，待保存的编辑也不会丢失。'
+_TUI_MSG_ZH_CN[local.layer.title]="工作树级覆写生效中"
+_TUI_MSG_ZH_CN[local.layer.body]=$'本机会读取 %s，其优先级高于 <repo>/setup.toml。\n\n它定义的区段：%s\n\n在这些区段中，它会覆写自己列出的 key，并整体替换自己声明的列表。\n本编辑器显示的是「实际生效」的值，已包含该层。保存仍然写入\n<repo>/setup.toml（CI 与其他 checkout 使用的共用值），因此对上述\n区段的修改在本机可能不会生效。'
+_TUI_MSG_ZH_CN[saved.shadowed]="下列区段同时定义于 %s，在本机由该文件胜出：%s"
+_TUI_MSG_ZH_CN[deploy.ambiguous.title]="「deploy」的两种意思"
+_TUI_MSG_ZH_CN[deploy.ambiguous.body]=$'你打开的是 [deploy] section 编辑器。\n\n[deploy] 只设置 GPU 预留 —— 这个 section 名称沿用 Compose 的\n`deploy:` key，与「部署」无关。\n\nfield-deploy bundle 是另一个命令：\n  just docker setup deploy\n\n本编辑器没有歧义的名称是 `gpu`：\n  just docker setup-tui gpu'
+_TUI_MSG_ZH_CN[saved]="已保存至 %s，正在重新生成 .env / .env.generated / compose.yaml..."
+
+
+declare -gA _TUI_MSG_JA=()
+_TUI_MSG_JA[title]="Docker コンテナ設定"
+_TUI_MSG_JA[main.prompt]=""
+_TUI_MSG_JA[main.image]="IMAGE_NAME 検出ルール"
+_TUI_MSG_JA[main.build]="APT ミラー / Dockerfile build args"
+_TUI_MSG_JA[main.network]="ネットワークモード／IPC／name"
+_TUI_MSG_JA[main.deploy]="GPU 予約"
+_TUI_MSG_JA[main.gui]="表示モード"
+_TUI_MSG_JA[main.volumes]="ワークスペースと追加マウント"
+_TUI_MSG_JA[main.devices]="ホストデバイスバインド"
+_TUI_MSG_JA[main.environment]="実行時環境変数"
+_TUI_MSG_JA[main.tmpfs]="RAM マウント"
+_TUI_MSG_JA[main.advanced]="詳細"
+_TUI_MSG_JA[main.save]="保存して終了"
+_TUI_MSG_JA[main.security]="privileged／cap_add／security_opt"
+_TUI_MSG_JA[main.additional_contexts]="名前付き build context（build.additional_contexts）"
+_TUI_MSG_JA[main.logging]="container log driver + ローテーション"
+_TUI_MSG_JA[main.runtime]="ランタイム（ネットワーク／GPU／表示／環境変数）"
+_TUI_MSG_JA[main.mounts]="マウント（volumes／devices／tmpfs）"
+_TUI_MSG_JA[main.features]="機能（条件付き／上級者向け）"
+_TUI_MSG_JA[runtime.title]="ランタイム"
+_TUI_MSG_JA[runtime.menu]="ランタイムセクションを選択"
+_TUI_MSG_JA[runtime.back]="メインメニューへ戻る"
+_TUI_MSG_JA[mounts.title]="マウント"
+_TUI_MSG_JA[mounts.menu]="マウントセクションを選択"
+_TUI_MSG_JA[mounts.back]="メインメニューへ戻る"
+_TUI_MSG_JA[features.title]="機能"
+_TUI_MSG_JA[features.menu]="条件付き／上級者向け機能"
+_TUI_MSG_JA[features.back]="メインメニューへ戻る"
+_TUI_MSG_JA[features.per_stage_enabled]="Per-stage overrides — 有効（%s ステージ）"
+_TUI_MSG_JA[features.per_stage_hidden]="Per-stage overrides — 非表示（非ベースライン stage なし）"
+_TUI_MSG_JA[features.per_stage_hidden_info]=$'Per-stage overrides (#220)\n\nステータス：非表示\n理由：Dockerfile に非ベースライン stage がありません（sys、devel-base、\n      devel、devel-test、runtime-test はベースラインの予約名です；\n      旧名 base / test も v0.21.x 移行期間中は受け付けます）。\n\n有効化：Dockerfile に `FROM ... AS <stage>` を追加（任意のカスタム名）\n        してからこのメニューに戻ると、項目が自動的に有効になります。'
+_TUI_MSG_JA[advanced.title]="Advanced"
+_TUI_MSG_JA[advanced.menu]="Advanced セクションを選択"
+_TUI_MSG_JA[advanced.back]="メインメニューへ戻る"
+_TUI_MSG_JA[advanced.reset]="デフォルトにリセット"
+_TUI_MSG_JA[advanced.per_stage]="Per-stage overrides (#220)"
+_TUI_MSG_JA[per_stage.title]="Per-stage overrides"
+_TUI_MSG_JA[per_stage.menu]="編集する stage を選択するか、戻る"
+_TUI_MSG_JA[per_stage.empty]=$'Dockerfile に非 baseline の stage がありません。\n\nPer-stage overrides は baseline {sys, devel-base, devel,\nruntime-test}（v0.21.x 移行期間中は旧名 {base, test} も受け付け。\ndevel-test は test service として出力されるため override 可能）以外\nの `FROM ... AS <name>` stage に適用されます。先に Dockerfile に\nstage を追加してから、このメニューで runtime 設定を override\nしてください。'
+_TUI_MSG_JA[per_stage.back]="戻る"
+_TUI_MSG_JA[per_stage.overrides_set]="件の override"
+_TUI_MSG_JA[per_stage.inherits_all]="(すべて継承)"
+_TUI_MSG_JA[per_stage.one.menu]="編集する section を選択するか、戻る"
+_TUI_MSG_JA[per_stage.scalar.menu]="編集する key を選択するか、戻る"
+_TUI_MSG_JA[per_stage.scalar.prompt]=$'Override 値\n  - 空白 = top-level を継承（この override をクリア）\n  - mode keys：auto / force / off (gui, gpu)\n  - network mode：host / bridge / none\n  - ipc：host / shareable / private\n  - pid：host / private\n  - privileged：true / false\n  - gpu_runtime（旧称 runtime）：auto / nvidia / off'
+_TUI_MSG_JA[per_stage.list.menu]="list 項目の編集、継承の切替、または戻る"
+_TUI_MSG_JA[per_stage.list.entry_prompt]=$'List 項目の値\n  - 空白 = この項目を削除\n  - 形式は list ごとに異なります（mount: host:container[:mode] / port: host:container[/proto] / env: KEY=VALUE）'
+_TUI_MSG_JA[per_stage.network.ports]="ports list (per-stage)"
+_TUI_MSG_JA[per_stage.inherit]="(top-level を継承 — override をクリア)"
+_TUI_MSG_JA[per_stage.inherit_flag]="top-level 項目を継承"
+_TUI_MSG_JA[err.per_stage_invalid]=$'値が不正です —— 何も書き込まれていません。\n\nステージ別の上書きは top-level と「同じ」設定なので、同じ検査を\n通る必要があります。値を修正するか、空欄にして上書きを解除し\ntop-level の値を継承してください。'
+_TUI_MSG_JA[reset.title]="デフォルトにリセット"
+_TUI_MSG_JA[reset.confirm]=$'全ての設定を template のデフォルトにリセット？\n\n  - <repo>/setup.toml を template のベースラインで置き換え\n    （置き換えられたファイルは setup.toml.bak として保存）\n  - setup.sh を再実行して template から再生成\n  - 現在のカスタマイズは失われます\n  - <repo>/setup.local.toml はあなたのもので、変更しません\n\n元に戻せません。'
+_TUI_MSG_JA[reset.done]="全ての設定がデフォルトにリセットされました。"
+_TUI_MSG_JA[security.title]="Security"
+_TUI_MSG_JA[security.menu]="選択：privileged／cap_add／cap_drop／security_opt"
+_TUI_MSG_JA[security.back]="メインメニューへ戻る"
+_TUI_MSG_JA[security.privileged.prompt]="特権モードで実行？"
+_TUI_MSG_JA[security.cap_add]="cap_add"
+_TUI_MSG_JA[security.cap_add.menu]="cap_add を選択、または追加"
+_TUI_MSG_JA[security.cap_add.add]="cap_add を追加"
+_TUI_MSG_JA[security.cap_add.prompt]=$'ADD する Capability\n  - 空 = この項目を削除\n  - よく使う: SYS_ADMIN、NET_ADMIN、MKNOD、SYS_PTRACE'
+_TUI_MSG_JA[security.cap_drop]="cap_drop"
+_TUI_MSG_JA[security.cap_drop.menu]="cap_drop を選択、または追加"
+_TUI_MSG_JA[security.cap_drop.add]="cap_drop を追加"
+_TUI_MSG_JA[security.cap_drop.prompt]=$'DROP する Capability\n  - 空 = この項目を削除\n  - 例: ALL'
+_TUI_MSG_JA[security.security_opt]="security_opt"
+_TUI_MSG_JA[security.security_opt.menu]="security_opt を選択、または追加"
+_TUI_MSG_JA[security.security_opt.add]="security_opt を追加"
+_TUI_MSG_JA[security.security_opt.prompt]=$'security_opt 項目\n  - 空 = この項目を削除\n  - 例: seccomp:unconfined、apparmor:unconfined、label=disable'
+_TUI_MSG_JA[image.title]="Image"
+_TUI_MSG_JA[image.menu]="編集または追加するルールを選択"
+_TUI_MSG_JA[image.add]="ルールを追加"
+_TUI_MSG_JA[image.back]="メインメニューへ戻る"
+_TUI_MSG_JA[image.type.prompt]="ルール種別"
+_TUI_MSG_JA[image.type.string]="string    （この値をそのまま image 名にする、パス解析なし）"
+_TUI_MSG_JA[image.type.prefix]="prefix    （ディレクトリ名の先頭から <value> を除去）"
+_TUI_MSG_JA[image.type.suffix]="suffix    （パス構成要素の末尾から <value> を除去）"
+_TUI_MSG_JA[image.type.basename]="@basename （ディレクトリ名をそのまま使用、最終手段）"
+_TUI_MSG_JA[image.type.default]="@default  （他のどれにも該当しない時 <value> を使用）"
+_TUI_MSG_JA[image.type.move_up]="上へ      （前のルールと入れ替え）"
+_TUI_MSG_JA[image.type.move_down]="下へ      （次のルールと入れ替え）"
+_TUI_MSG_JA[image.type.remove]="削除      （このルールを削除）"
+_TUI_MSG_JA[image.value.prompt]=$'ルール値\n  - 空 = キャンセル\n  - prefix / suffix / @default：除去または fallback 値\n  - string：そのまま image 名として使用（例：my_app）\n  - 例：prefix:docker_ → docker_ と入力'
+_TUI_MSG_JA[build.title]="Build 設定"
+_TUI_MSG_JA[build.menu]="編集する項目を選択"
+_TUI_MSG_JA[build.add]="build arg を追加"
+_TUI_MSG_JA[build.back]="メインメニューへ戻る"
+_TUI_MSG_JA[build.arg.prompt]=$'Build arg（Dockerfile ARG 上書き）\n  - 形式: KEY=VALUE (KEY は [A-Z_][A-Z0-9_]* に合致)\n  - 空 = この項目を削除\n  - 既知の key（空の場合は Dockerfile のデフォルトが効く）：\n      APT_MIRROR_UBUNTU   デフォルト archive.ubuntu.com\n      APT_MIRROR_DEBIAN   デフォルト deb.debian.org\n      TZ                  デフォルト Asia/Taipei\n  - ユーザ定義：Dockerfile で `ARG KEY` 宣言済みの任意の key\n  - 例：APT_MIRROR_UBUNTU=tw.archive.ubuntu.com\n  - 例：PYTHON_VERSION=3.12'
+_TUI_MSG_JA[build.target_arch.label]="TARGETARCH 上書き"
+_TUI_MSG_JA[build.target_arch.prompt]=$'Docker TARGETARCH 上書き\n  - 空 = BuildKit が host / --platform から自動補完（デフォルト）\n  - amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64\n  - メイン image と test-tools image の両方に適用\n  - クロスビルドや明示指定が必要なときのみ設定'
+_TUI_MSG_JA[build.target_arch.auto]="（自動）"
+_TUI_MSG_JA[build.network.label]="Build ネットワーク"
+_TUI_MSG_JA[build.network.prompt]=$'Docker build 時のネットワーク（runtime コンテナは別管理）\n  - auto = Jetson（/etc/nv_tegra_release）検出時は host、デスクトップは Docker 既定（既定）\n  - host = 強制的にホストネットワーク stack を使用。ホストの bridge NAT が\n          使えない場合に必要：kernel が iptable_raw 欠落（Jetson L4T）、\n          daemon.json に iptables: false、CI runner のファイアウォール制限など\n  - bridge / none / default = 明示指定（Docker の既知モード）\n  - off（または空）= 明示的にオプトアウト。Docker 既定の bridge を使用'
+_TUI_MSG_JA[build.network.default]="（デフォルト：auto）"
+_TUI_MSG_JA[build.args.label]="追加 build args"
+_TUI_MSG_JA[err.invalid_target_arch]="TARGETARCH が不正です。空、または amd64 / arm64 / arm / 386 / ppc64le / s390x / riscv64 を指定してください。"
+_TUI_MSG_JA[err.invalid_build_network]="Build ネットワークが不正です。auto / host / bridge / none / default / off（または空）を指定してください。"
+_TUI_MSG_JA[network.title]="Network"
+_TUI_MSG_JA[network.mode.prompt]="ネットワークモード"
+_TUI_MSG_JA[network.mode.host]="host（ホストネットワークスタックを共有）"
+_TUI_MSG_JA[network.mode.bridge]="bridge（分離；ネームドネットワークを指定可）"
+_TUI_MSG_JA[network.mode.none]="none（ネットワークなし）"
+_TUI_MSG_JA[network.ipc.prompt]="IPC 名前空間"
+_TUI_MSG_JA[network.ipc.host]="host（ホスト IPC／共有メモリを共有）"
+_TUI_MSG_JA[network.ipc.shareable]="shareable（独自 IPC、他コンテナから可）"
+_TUI_MSG_JA[network.ipc.private]="private（独自 IPC、Docker デフォルト）"
+_TUI_MSG_JA[network.pid.prompt]="PID 名前空間"
+_TUI_MSG_JA[network.pid.host]="host（ホスト PID 名前空間を共有 — マルチ GPU コンテナの NVIDIA ドライバ mutex に必要）"
+_TUI_MSG_JA[network.pid.private]="private（独自 PID 名前空間 — Docker デフォルト）"
+_TUI_MSG_JA[network.priv.prompt]="特権モードで実行？"
+_TUI_MSG_JA[network.name.prompt]=$'Bridge ネットワーク名\n  - 空 = compose が実行ごとに <project>_default bridge を自動作成\n  - 非空 = この名前の bridge を compose が作成 (compose が管理)\n      例: my_bridge\n        → 起動時 <project>_my_bridge を作成\n        → 停止時に自動削除'
+_TUI_MSG_JA[deploy.title]="Deploy"
+_TUI_MSG_JA[deploy.mode.prompt]="GPU モード"
+_TUI_MSG_JA[deploy.mode.auto]="auto（nvidia-container-toolkit を検出）"
+_TUI_MSG_JA[deploy.mode.force]="force（常に GPU ブロックを出力）"
+_TUI_MSG_JA[deploy.mode.off]="off（GPU ブロックを出力しない）"
+_TUI_MSG_JA[deploy.count.prompt]=$'GPU 数\n  - \'all\' = ホストの全 GPU を予約\n  - <N> = N 個の GPU を予約 (1、2、...)\n  - ホスト検出: %s'
+_TUI_MSG_JA[deploy.caps.prompt]="GPU ケイパビリティ（Space で切替）"
+_TUI_MSG_JA[deploy.caps.gpu]="gpu（基本）"
+_TUI_MSG_JA[deploy.caps.compute]="compute（CUDA 計算）"
+_TUI_MSG_JA[deploy.caps.utility]="utility（nvidia-smi、監視）"
+_TUI_MSG_JA[deploy.caps.graphics]="graphics（OpenGL、Vulkan）"
+_TUI_MSG_JA[deploy.caps.all]="all（ドライバの全ケイパビリティ）"
+_TUI_MSG_JA[deploy.caps.video]="video（NVENC / NVDEC エンコード、デコード）"
+_TUI_MSG_JA[deploy.caps.display]="display（X11 / Wayland 出力）"
+_TUI_MSG_JA[deploy.caps.compat32]="compat32（32 ビットドライバライブラリ）"
+_TUI_MSG_JA[deploy.caps.ngx]="ngx（NGX: DLSS、画質向上）"
+_TUI_MSG_JA[deploy.runtime.prompt]="Docker ランタイムオーバーライド（Jetson / csv モード toolkit）"
+_TUI_MSG_JA[deploy.runtime.auto]="auto（Jetson で自動的に runtime: nvidia を出力 — /etc/nv_tegra_release）"
+_TUI_MSG_JA[deploy.runtime.nvidia]="nvidia（全ホストで強制出力）"
+_TUI_MSG_JA[deploy.runtime.off]="off（オーバーライドなし — Docker 既定の runc）"
+# [deploy] runtime -> gpu_runtime migration suggestion (fast-follow of)
+_TUI_MSG_JA[deploy.runtime.migrate]=$'setup.toml がまだ旧来の [deploy] runtime キーを使用しています。\n\n#481 で gpu_runtime に改名されました（旧名は恒久エイリアスとして\n動作し続けます）。ここで保存すると新しい gpu_runtime キーを書き込み\nます。その後、setup.toml から旧 runtime 行を手動で削除できます。\nこのページが旧キーを書き換えることはありません。'
+_TUI_MSG_JA[deploy.mig.title]="Deploy — NVIDIA MIG を検出"
+_TUI_MSG_JA[deploy.mig.warning]=$'このホストでは NVIDIA MIG（Multi-Instance GPU）モードが有効です。\n\nDocker の deploy `count=N` は GPU 単位の予約であり、特定の MIG スライスを指定できません。特定スライスを使う場合は count を変更せず、[environment] セクションに次を追加してください：\n  NVIDIA_VISIBLE_DEVICES=<MIG-UUID>\n\nホストで利用可能な GPU / MIG インスタンス：\n%s'
+_TUI_MSG_JA[gui.title]="GUI"
+_TUI_MSG_JA[gui.mode.prompt]="GUI モード"
+_TUI_MSG_JA[gui.mode.auto]="auto（\$DISPLAY／\$WAYLAND_DISPLAY を検出）"
+_TUI_MSG_JA[gui.mode.force]="force（常に GUI ブロックを出力）"
+_TUI_MSG_JA[gui.mode.off]="off（GUI ブロックを出力しない）"
+_TUI_MSG_JA[volumes.title]="Volumes"
+_TUI_MSG_JA[volumes.menu]="編集または追加するマウントを選択"
+_TUI_MSG_JA[volumes.add]="マウントを追加"
+_TUI_MSG_JA[volumes.edit.prompt]=$'マウント指定\n  - 形式: <host>:<container>[:ro|rw]\n  - 空 = この項目を削除\n  - 例: /data:/home/${USER_NAME}/data:rw'
+_TUI_MSG_JA[volumes.delete.confirm]="マウント「%s」を削除？"
+_TUI_MSG_JA[volumes.back]="メインメニューへ戻る"
+_TUI_MSG_JA[devices.title]="Devices"
+_TUI_MSG_JA[devices.menu]="編集するリストを選択"
+_TUI_MSG_JA[devices.edit_devices]="Device bindings (devices:)"
+_TUI_MSG_JA[devices.edit_cgroup]="Cgroup ルール (device_cgroup_rules:)"
+_TUI_MSG_JA[devices.add_device]="device binding を追加"
+_TUI_MSG_JA[devices.add_cgroup]="cgroup rule を追加"
+_TUI_MSG_JA[devices.back]="メインメニューへ戻る"
+_TUI_MSG_JA[devices.device.prompt]=$'デバイスバインド\n  - 形式: <host>[:<container>[:rwm]]\n  - 空 = この項目を削除\n  - 例 (ツリー全体): /dev:/dev\n  - 例 (単一): /dev/video0:/dev/video0'
+_TUI_MSG_JA[devices.cgroup.title]="Cgroup ルール"
+_TUI_MSG_JA[devices.cgroup.menu]="編集する項目を選択、または cgroup ルールを追加"
+_TUI_MSG_JA[devices.cgroup.prompt]=$'Cgroup ルール\n  - 形式: <type> <major>:<minor|*> <perms>\n    type: c (文字)、b (ブロック)、a (全)\n    perms: r / w / m の任意組合せ\n  - 空 = この項目を削除\n  - USB 例: c 189:* rwm\n  - V4L2 例: c 81:* rwm'
+_TUI_MSG_JA[resources.title]="Resources"
+_TUI_MSG_JA[resources.shm_size.prompt]=$'/dev/shm サイズ\n  - 空 = Docker デフォルト 64mb\n  - 例: 2gb、512mb\n  - [network] ipc ≠ host のときのみ有効'
+_TUI_MSG_JA[resources.shm_size.ignored]="注意：現在 [network] ipc = '%s'。Docker は shm_size を無視します（ipc が 'private' または 'shareable' のときのみ有効）。"
+_TUI_MSG_JA[environment.title]="Environment"
+_TUI_MSG_JA[environment.menu]="編集する環境変数を選択、または追加"
+_TUI_MSG_JA[environment.add]="環境変数を追加"
+_TUI_MSG_JA[environment.back]="メインメニューへ戻る"
+_TUI_MSG_JA[environment.entry.prompt]=$'環境変数\n  - 形式: KEY=VALUE\n  - 空 = この項目を削除\n  - 例: ROS_DOMAIN_ID=7'
+_TUI_MSG_JA[tmpfs.title]="Tmpfs"
+_TUI_MSG_JA[tmpfs.menu]="編集する tmpfs 項目を選択、または追加"
+_TUI_MSG_JA[tmpfs.add]="tmpfs マウントを追加"
+_TUI_MSG_JA[tmpfs.back]="メインメニューへ戻る"
+_TUI_MSG_JA[tmpfs.entry.prompt]=$'Tmpfs マウント\n  - 形式: <path>[:size=<size>]\n  - 空 = この項目を削除\n  - 例: /tmp:size=1g'
+_TUI_MSG_JA[ports.title]="Ports"
+_TUI_MSG_JA[ports.menu]="編集する port マッピングを選択、または追加"
+_TUI_MSG_JA[ports.add]="port マッピングを追加"
+_TUI_MSG_JA[ports.back]="メインメニューへ戻る"
+_TUI_MSG_JA[ports.entry.prompt]=$'Port マッピング\n  - 形式: <host>:<container>[/protocol]\n  - 空 = この項目を削除\n  - 例: 8080:80 または 5000:5000/udp'
+_TUI_MSG_JA[ports.not_bridge]="注意：現在 [network] mode = '%s'。ports は mode=bridge のときのみ compose.yaml に書き込まれます。"
+_TUI_MSG_JA[additional_contexts.title]="追加 build context"
+_TUI_MSG_JA[additional_contexts.menu]="編集または追加する名前付き context を選択"
+_TUI_MSG_JA[additional_contexts.add]="名前付き context を追加"
+_TUI_MSG_JA[additional_contexts.back]="メインメニューへ戻る"
+_TUI_MSG_JA[additional_contexts.entry.prompt]=$'名前付き build context\n  - 形式: <name>=<source>\n  - 空 = この項目を削除\n  - <source> は BuildKit が受け付ける任意の形式: 相対パス、docker-image://、https://、oci-layout://\n  - 例（相対パス）: repo=..\n  - 例（image）: base=docker-image://debian:bookworm-slim'
+_TUI_MSG_JA[err.invalid_mount]="マウント形式が不正（<host>:<container>[:ro|rw] を期待）"
+_TUI_MSG_JA[err.invalid_tmpfs]="tmpfs マウント形式が不正（<path>[:<option>[,<option>]]、例: /tmp:size=64m を期待）"
+_TUI_MSG_JA[err.invalid_additional_context]=$'名前付き build context が不正\n  - 形式: <name>=<source>\n  - <name>: [A-Za-z0-9] で始まり、文字／数字／[_.-]\n  - <source>: 空にできません\n  - 例: repo=..'
+_TUI_MSG_JA[logging.title]="Logging"
+_TUI_MSG_JA[logging.svc.title]="Logging [%s]"
+_TUI_MSG_JA[logging.top.menu]="範囲を選択: global または per-service override"
+_TUI_MSG_JA[logging.top.global]="Global [logging]（全 service に適用）"
+_TUI_MSG_JA[logging.top.devel]="Per-service: devel"
+_TUI_MSG_JA[logging.top.test]="Per-service: test"
+_TUI_MSG_JA[logging.top.runtime]="Per-service: runtime"
+_TUI_MSG_JA[logging.menu]="選択: driver／max_size／max_file／compress"
+_TUI_MSG_JA[logging.back]="Runtime メニューに戻る"
+_TUI_MSG_JA[logging.driver.label]="driver"
+_TUI_MSG_JA[logging.driver.prompt]="Log driver（json-file / journald / syslog / fluentd / none / ...）"
+_TUI_MSG_JA[logging.max_size.label]="max_size"
+_TUI_MSG_JA[logging.max_size.prompt]="1 log ファイルの最大サイズ（例: 10m、1g）"
+_TUI_MSG_JA[logging.max_file.label]="max_file"
+_TUI_MSG_JA[logging.max_file.prompt]="ローテーションファイル数（正の整数）"
+_TUI_MSG_JA[logging.compress.label]="compress"
+_TUI_MSG_JA[logging.compress.prompt]="ローテーション後の log を圧縮しますか？"
+_TUI_MSG_JA[logging.local_path.label]="local_path"
+_TUI_MSG_JA[logging.local_path.prompt]=$'コンテナ log を host 側にバインドマウントするディレクトリ（空＝無効）\n  - 相対パス: repo ルートから解決（./logs/）\n  - 絶対パス: そのまま使用（/var/log/app/）\n  - ~ 展開対応（~/dir/）\n  - コンテナ内のマウント先は /var/log/<repo>'
+_TUI_MSG_JA[err.invalid_log_driver]=$'log driver 名が不正\n  - 形式: 文字で始まり、その後は文字／数字／[._-]\n  - 例: json-file、journald、syslog'
+_TUI_MSG_JA[err.invalid_log_max_size]=$'max_size が不正\n  - 形式: <数値><単位>\n  - 単位: b、k、m、g（大小文字区別なし）\n  - 例: 10m、1g、512k'
+_TUI_MSG_JA[err.invalid_log_max_file]=$'max_file が不正\n  - 形式: 正の整数（1、2、3、...）'
+_TUI_MSG_JA[err.invalid_log_local_path]=$'local_path が不正\n  - 空または空白のみは不可\n  - 改行を含めることはできません'
+_TUI_MSG_JA[err.invalid_cgroup_rule]="Cgroup ルール形式が不正（<c|b|a> <major>:<minor|*> <r|w|m> を期待）"
+_TUI_MSG_JA[err.invalid_gpu_count]="GPU 数が不正（'all' または正の整数を期待）"
+_TUI_MSG_JA[err.invalid_runtime]="無効な runtime（'auto'、'nvidia'、'off' のいずれか）"
+_TUI_MSG_JA[err.unrepresentable_gpu_capabilities]=$'GPU ケイパビリティ一覧は「変更されていません」。このページは編集\nしませんでした。\n\n設定にバリデータが受け付けないケイパビリティ名が含まれているため、\nこの画面には対応する行がありません。チェックリストを確定すると、\n一覧が画面の行の内容で置き換えられてしまいます。何も書き込んで\nいません。\n\nsetup.toml（または setup.local.toml）の値を修正してこのページを開き\n直すか、コマンドラインから設定してください:\n  just docker setup set deploy.gpu_capabilities "<names>"'
+_TUI_MSG_JA[err.empty_gpu_capabilities]=$'ケイパビリティが一つも選択されていないため、一覧は「変更されて\nいません」。\n\n空のケイパビリティ一覧はジェネレータが扱える設定ではありません。\nGPU を予約しながら何も要求しない状態になり、compose.yaml の生成が\n中断します。何も書き込んでいないので、以前の一覧がそのまま有効です。\n\nGPU の予約自体をやめる場合は、このページ最初の画面で GPU モードを\n`off` にしてください。それが「GPU を使わない」設定です。'
+# [lifecycle] restart policy page (fast-follow of)
+_TUI_MSG_JA[main.lifecycle]="コンテナ再起動ポリシー"
+# runtime-env info page (info-only: points at the .env.local overrides)
+_TUI_MSG_JA[main.envinfo]="ワークロード環境変数（.env.local）-- 設定方法"
+_TUI_MSG_JA[envinfo.title]="ワークロード環境変数（.env）"
+_TUI_MSG_JA[envinfo.info]=$'タスクごとに変わる環境変数（ROS_DOMAIN_ID、LOG_LEVEL、token など）\nは gitignore された .env.local に書きます —— そのファイルを直接編集\nします。ツールチェーンは .env.local に触れず、変更は `just docker run` だけ\nで反映されます：compose 再生成なし、SETUP_CONF_HASH のdrift なし、\ngit の変更なし。\n\nめったに変わらない set-once 既定値は [environment]（本メニュー ->\n「実行時環境変数」）に置きます。apply が生成する .env に書き出され、\nfield image に ENV として bake されます。.env.local は .env の後に\n読み込まれるので、同じキーは .env.local が優先します。\n\n命名規則：標準名は我々のもの（.env は再生成される）、サフィックスが\nローカル版（.env.local はあなたのもの）。\n\nこのページは情報提供のみ —— .env.local は編集しません。'
+_TUI_MSG_JA[lifecycle.title]="ライフサイクル"
+_TUI_MSG_JA[lifecycle.restart.prompt]=$'コンテナ再起動ポリシー。\n\n注意：always / unless-stopped は「あらゆる」終了で再起動します ——\ndevel を extends して 0 で終了する stage（例：test サービス）は\nループします。自動リトライには on-failure を推奨します。'
+_TUI_MSG_JA[lifecycle.restart.no]="no（再起動しない —— デフォルト；restart: フィールドを出力しない）"
+_TUI_MSG_JA[lifecycle.restart.always]="always（手動停止を含むあらゆる終了で再起動）"
+_TUI_MSG_JA[lifecycle.restart.unless_stopped]="unless-stopped（手動停止を除くあらゆる終了で再起動）"
+_TUI_MSG_JA[lifecycle.restart.on_failure]="on-failure（非ゼロ終了時のみ再起動）"
+_TUI_MSG_JA[lifecycle.restart.n_prompt]="on-failure の最大リトライ回数（整数 >= 1；空欄 = 回数無制限の素の on-failure）"
+_TUI_MSG_JA[err.invalid_restart]="無効な restart ポリシー（no / always / unless-stopped / on-failure / on-failure:N）"
+_TUI_MSG_JA[err.invalid_restart_n]="無効なリトライ回数（正の整数、または素の on-failure なら空欄）"
+_TUI_MSG_JA[err.no_backend]="dialog または whiptail がインストールされていません：sudo apt install dialog"
+_TUI_MSG_JA[err.reset_failed]=$'リセットは失敗し、何も変更されていません。\n\nsetup.sh reset は <repo>/setup.toml を template のベースラインで置き\n換えられませんでした。理由はこの端末に出力されています。未保存の編集\nはまだ残っています: 「保存して終了」で保持、キャンセルで破棄します。'
+_TUI_MSG_JA[err.save_refused]=$'保存は拒否され、<repo>/setup.toml は変更されていません。\n\n書き込み側がこの変更の組み合わせを拒否し、理由をこの端末の上方に\n出力しました。何も書き込まれていないため、repo は元のままで、保留中\nの編集も失われません。'
+_TUI_MSG_JA[local.layer.title]="ワークツリー単位の上書きが有効"
+_TUI_MSG_JA[local.layer.body]=$'このマシンでは %s が <repo>/setup.toml より優先して読まれます。\n\nそれが定義するセクション: %s\n\nこれらのセクションでは、記載された key を上書きし、宣言した配列は\n全体を置き換えます。このエディタが表示するのはその層を含む「実効」\n値です。保存先は <repo>/setup.toml（CI と他のチェックアウトが使う\n共有の値）なので、上記セクションへの変更はこのマシンでは効かない\nことがあります。'
+_TUI_MSG_JA[saved.shadowed]="次のセクションは %s にも定義されており、ここではそちらが優先されます: %s"
+_TUI_MSG_JA[deploy.ambiguous.title]="「deploy」の二つの意味"
+_TUI_MSG_JA[deploy.ambiguous.body]=$'開いたのは [deploy] セクションのエディタです。\n\n[deploy] が設定するのは GPU 予約だけです —— このセクション名は\nCompose の `deploy:` キーに由来し、デプロイとは関係ありません。\n\nfield-deploy バンドルは別のコマンドです:\n  just docker setup deploy\n\nこのエディタの曖昧でない名前は `gpu` です:\n  just docker setup-tui gpu'
+_TUI_MSG_JA[saved]="%s に保存しました。.env / .env.generated / compose.yaml を再生成中..."
+
+
+# _tui_msg <key>
+_tui_msg() {
+  local _key="${1}"
+  local -n _table="_TUI_MSG_${_TUI_LANG_UPPER}"
+  if [[ -n "${_table[${_key}]+x}" ]]; then
+    printf '%s' "${_table[${_key}]}"
+    return 0
+  fi
+  # fallback to English
+  printf '%s' "${_TUI_MSG_EN[${_key}]:-${_key}}"
+}
+
+_tui_init_lang() {
+  case "${_LANG}" in
+    zh-TW) _TUI_LANG_UPPER="ZH_TW" ;;
+    zh-CN) _TUI_LANG_UPPER="ZH_CN" ;;
+    ja)    _TUI_LANG_UPPER="JA" ;;
+    *)     _TUI_LANG_UPPER="EN" ;;
+  esac
+}
+
+# Source-time default so _tui_msg works even when setup_tui.sh is sourced
+# without going through main (e.g. bats tests that source + invoke a
+# specific section editor directly). main re-runs _tui_init_lang after
+# --lang parsing. Part B: i18n.sh no longer seeds _LANG at source
+# time, so resolve it explicitly before _tui_init_lang reads it.
+_resolve_lang _LANG
+_TUI_LANG_UPPER="${_TUI_LANG_UPPER:-EN}"
+_tui_init_lang 2>/dev/null || true
+
+# ── Usage ─────────────────────────────────────────────────────────────────
+
+usage() {
+  case "${_LANG}" in
+    zh-TW)
+      cat >&2 <<'EOF'
+用法: ./setup_tui.sh [-h] [--lang <en|zh-TW|zh-CN|ja>] [SECTION]
+
+互動式編輯 <repo>/setup.toml，完成後自動呼叫 setup.sh 重新產生
+.env.generated 與 compose.yaml。需要已安裝 dialog 或 whiptail。
+
+SECTION（可直接跳至特定區段）:
+  image     IMAGE_NAME 偵測規則
+  build     Dockerfile build args（APT mirror）
+  network   Network mode / IPC / privileged
+  gpu       GPU 保留設定（[deploy] section）
+  deploy    gpu 的別名；[deploy] 這個名稱沿用 Compose，與
+            field-deploy bundle（`./setup.sh deploy`）無關
+  gui       GUI 顯示模式
+  volumes   工作區與額外掛載
+EOF
+      ;;
+    zh-CN)
+      cat >&2 <<'EOF'
+用法: ./setup_tui.sh [-h] [--lang <en|zh-TW|zh-CN|ja>] [SECTION]
+
+交互式编辑 <repo>/setup.toml，完成后自动调用 setup.sh 重新生成
+.env.generated 和 compose.yaml。需要已安装 dialog 或 whiptail。
+
+SECTION（可直接跳至指定区段）:
+  image     IMAGE_NAME 检测规则
+  build     Dockerfile build args（APT mirror）
+  network   Network mode / IPC / privileged
+  gpu       GPU 预留设置（[deploy] section）
+  deploy    gpu 的别名；[deploy] 这个名称沿用 Compose，与
+            field-deploy bundle（`./setup.sh deploy`）无关
+  gui       GUI 显示模式
+  volumes   工作区与额外挂载
+EOF
+      ;;
+    ja)
+      cat >&2 <<'EOF'
+使用法: ./setup_tui.sh [-h] [--lang <en|zh-TW|zh-CN|ja>] [SECTION]
+
+<repo>/setup.toml を対話的に編集し、完了後 setup.sh を自動実行して
+.env.generated と compose.yaml を再生成します。dialog または whiptail が必要。
+
+SECTION（特定セクションへ直接移動）:
+  image     IMAGE_NAME 検出ルール
+  build     Dockerfile build args（APT ミラー）
+  network   Network mode / IPC / privileged
+  gpu       GPU 予約設定（[deploy] セクション）
+  deploy    gpu の別名。[deploy] という名前は Compose 由来で、
+            field-deploy bundle（`./setup.sh deploy`）とは無関係
+  gui       GUI 表示モード
+  volumes   ワークスペースと追加マウント
+EOF
+      ;;
+    *)
+      cat >&2 <<'EOF'
+Usage: ./setup_tui.sh [-h] [--lang <en|zh-TW|zh-CN|ja>] [SECTION]
+
+Interactively edit <repo>/setup.toml. On save, setup.sh is invoked
+automatically to regenerate .env.generated and compose.yaml. Requires
+dialog or whiptail.
+
+SECTION (jump directly to one section editor):
+  image     IMAGE_NAME detection rules
+  build     Dockerfile build args (APT mirrors)
+  network   Network mode / IPC / privileged
+  gpu       GPU reservation (the [deploy] section)
+  deploy    alias for gpu; the [deploy] name follows Compose and has
+            nothing to do with the field-deploy bundle, which is
+            `./setup.sh deploy`
+  gui       GUI display mode
+  volumes   Workspace + extra mounts
+EOF
+      ;;
+  esac
+  exit 0
+}
+
+# ── Overrides accumulator ────────────────────────────────────────────────
+#
+# Session state is stored in two parallel arrays used by _write_setup_conf:
+#   _TUI_OVR_KEYS[i]   = "<section>.<key>"
+#   _TUI_OVR_VALUES[i] = value
+#
+# _override_set appends or updates; _override_get returns current (falling
+# back to the effective value _load_current resolved from the chain).
+
+declare -ga _TUI_OVR_KEYS=()
+declare -ga _TUI_OVR_VALUES=()
+declare -ga _TUI_REMOVED=()    # namespaced keys to drop on save
+declare -gA _TUI_CURRENT=()    # baseline: the effective conf chain
+
+_mark_removed() {
+  local _nskey="${1}"
+  # Drop any pending override for the same key; it's going away
+  local i
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    if [[ "${_TUI_OVR_KEYS[i]}" == "${_nskey}" ]]; then
+      unset '_TUI_OVR_KEYS[i]' '_TUI_OVR_VALUES[i]'
+    fi
+  done
+  _TUI_OVR_KEYS=("${_TUI_OVR_KEYS[@]}")
+  _TUI_OVR_VALUES=("${_TUI_OVR_VALUES[@]}")
+  # Also wipe the baseline so the menu stops showing it
+  unset '_TUI_CURRENT[${_nskey}]'
+  local _x _found=0
+  for _x in "${_TUI_REMOVED[@]}"; do
+    [[ "${_x}" == "${_nskey}" ]] && _found=1 && break
+  done
+  (( _found )) || _TUI_REMOVED+=("${_nskey}")
+}
+
+_override_set() {
+  local _nskey="${1}"
+  local _value="${2}"
+  local i
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    if [[ "${_TUI_OVR_KEYS[i]}" == "${_nskey}" ]]; then
+      _TUI_OVR_VALUES[i]="${_value}"
+      return 0
+    fi
+  done
+  _TUI_OVR_KEYS+=("${_nskey}")
+  _TUI_OVR_VALUES+=("${_value}")
+}
+
+_override_get() {
+  local _nskey="${1}"
+  local _default="${2:-}"
+  local i
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    if [[ "${_TUI_OVR_KEYS[i]}" == "${_nskey}" ]]; then
+      printf '%s' "${_TUI_OVR_VALUES[i]}"
+      return 0
+    fi
+  done
+  printf '%s' "${_TUI_CURRENT[${_nskey}]:-${_default}}"
+}
+
+# _load_current <base_path> <template_dist_dir>
+#
+# Seed the menus' baseline with THE EFFECTIVE CONFIGURATION: the whole
+# layer chain merged, through the same accessor `setup.sh show` / `list`
+# and the emitters read.
+#
+# This used to select ONE file -- `<repo>` if it existed, else the
+# template -- and the config is an overlay chain, so the menus opened on
+# one layer's contents rather than on the values in force. An editor
+# whose baseline is one layer cannot show the user what is configured,
+# and cannot tell a value this repo supplied from one it inherits, which
+# is the distinction a write has to respect (base#1232).
+#
+# The baseline is REPLACED, not added to: a reload (after Reset) that
+# merged into the old map would keep showing keys the chain no longer
+# resolves.
+#
+# Non-zero when the merge itself failed -- the handle reports that rather
+# than returning an empty configuration as a loaded one, and an editor
+# that opened on an empty baseline would offer to save a file full of
+# blanks over the user's config.
+_load_current() {
+  local _base="${1:?"${FUNCNAME[0]}: missing base path"}"
+  local _dist="${2:?"${FUNCNAME[0]}: missing template dist dir"}"
+  local -a _sections=() _keys=() _values=()
+  _setup_effective_full "${_base}" _sections _keys _values "${_dist}" || return 1
+  _TUI_CURRENT=()
+  local i
+  for (( i=0; i<${#_keys[@]}; i++ )); do
+    _TUI_CURRENT[${_keys[i]}]="${_values[i]}"
+  done
+}
+
+# _tui_local_layer_notice <base_path>
+#
+# Name the per-worktree layer, with the sections it defines, before the
+# menus open -- when there is one. Nothing may be silently shadowed: the
+# editor shows the EFFECTIVE values, so without this the operator reads a
+# `setup.local.toml` value off the screen, saves a change to the same
+# section into the committed `setup.toml`, and sees no difference on this
+# machine.
+#
+# A msgbox and not stderr, for the reason `_warn_if_lang_rejected` uses
+# one: curses clears the terminal before the user could read a printed
+# line. Section-granular because that is the granularity
+# `_setup_conf_local_sections` answers at and the honest one for both
+# kinds of entry -- a local table overrides the keys it names, a local
+# array replaces the list whole.
+_tui_local_layer_notice() {
+  local _base="${1:?"${FUNCNAME[0]}: missing base path"}"
+  local -a _lln_sections=()
+  _setup_conf_local_sections "${_base}" _lln_sections
+  (( ${#_lln_sections[@]} > 0 )) || return 0
+  local _local
+  _local="$(_setup_conf_local_path "${_base}")"
+  # shellcheck disable=SC2059  # body is our own i18n template
+  _tui_msgbox "$(_tui_msg local.layer.title)" \
+    "$(printf "$(_tui_msg local.layer.body)" \
+      "${_local}" "${_lln_sections[*]}")"
+}
+
+# _tui_shadowed_sections <base_path> <outarray>
+#
+# The sections THIS SESSION writes to that the per-worktree layer also
+# defines -- the intersection, so the save-time notice names only what
+# the operator actually just changed rather than re-reading the whole
+# launch notice at them.
+#
+# The section of a key is asked of `_conf_split_nskey`, never derived by
+# cutting at a dot: `logging.web.driver` belongs to `[logging.web]` and a
+# prefix match binds it to `[logging]` as well.
+_tui_shadowed_sections() {
+  local _base="${1:?"${FUNCNAME[0]}: missing base path"}"
+  local -n _tss_out="${2:?"${FUNCNAME[0]}: missing outvar"}"
+  _tss_out=()
+  local -a _tss_local=()
+  _setup_conf_local_sections "${_base}" _tss_local
+  (( ${#_tss_local[@]} > 0 )) || return 0
+  local -A _tss_touched=()
+  local _k _s _key
+  for _k in "${_TUI_OVR_KEYS[@]+"${_TUI_OVR_KEYS[@]}"}" \
+            "${_TUI_REMOVED[@]+"${_TUI_REMOVED[@]}"}"; do
+    _conf_split_nskey "${_k}" _s _key || continue
+    _tss_touched["${_s}"]=1
+  done
+  for _s in "${_tss_local[@]}"; do
+    [[ -n "${_tss_touched[${_s}]+x}" ]] && _tss_out+=("${_s}")
+  done
+  return 0
+}
+
+# _tui_in_list <needle> [<haystack>...]
+#
+# Zero when <needle> is one of the remaining arguments, exactly. A
+# membership test over a bash array, spelled once rather than as another
+# inline loop: `[[ " ${arr[*]} " == *" ${x} "* ]]` is the shorter idiom
+# and it is wrong for a value carrying a space, which a mount or an env
+# entry does.
+_tui_in_list() {
+  local _needle="${1-}"
+  shift || return 1
+  local _x
+  for _x in "$@"; do
+    [[ "${_x}" == "${_needle}" ]] && return 0
+  done
+  return 1
+}
+
+# _tui_aot_families_touched <outarray>
+#
+# Every array-of-tables PATH this session wrote to or removed an entry
+# from, in first-touch order.
+#
+# WHY THE SAVE NEEDS THIS. An array is replaced ATOMICALLY by the highest
+# layer that declares it (ADR-00000037), so a `<repo>/setup.toml` that
+# declares `[[volumes]]` at all replaces the template's whole list. A
+# save that wrote only the slot the user edited would therefore declare a
+# one-entry array and silently drop every entry the list inherited -- add
+# a third mount to a template's two and the workspace bind disappears.
+# The scalar keys of a `[table]` merge key by key and have the opposite
+# requirement: writing one that was only inherited pins an inherited
+# value into this repo's committed file.
+#
+# So the two kinds of key are answered differently, and which kind a key
+# IS comes from `_conf_toml_aot_slot` -- a lookup over
+# `_conf_toml_aot_section`'s `<prefix>=<path>` table, THE answer to
+# "which array does this key belong to" in this tree. Derived rather than
+# listed: a family added to that table is covered here by having been
+# added there, and `[environment]`'s `env_N` is excluded by having no row
+# in it, which is the state base#1235 leaves open.
+_tui_aot_families_touched() {
+  local -n _taft_out="${1:?"${FUNCNAME[0]}: missing outvar"}"
+  _taft_out=()
+  local -A _taft_seen=()
+  local _k _s _key _p _n
+  for _k in "${_TUI_OVR_KEYS[@]+"${_TUI_OVR_KEYS[@]}"}" \
+            "${_TUI_REMOVED[@]+"${_TUI_REMOVED[@]}"}"; do
+    _conf_split_nskey "${_k}" _s _key || continue
+    _conf_toml_aot_slot "${_s}" "${_key}" _p _n || continue
+    [[ -n "${_taft_seen[${_p}]:-}" ]] && continue
+    _taft_seen["${_p}"]=1
+    _taft_out+=("${_p}")
+  done
+  return 0
+}
+
+# ── Section editors ──────────────────────────────────────────────────────
+
+_edit_section_image() {
+  while :; do
+    # Gather rule_N keys from baseline + overrides, dedupe, sort numerically.
+    local -a _rule_nums=()
+    local _k _n _x _found
+    # shellcheck disable=SC2154
+    for _k in "${!_TUI_CURRENT[@]}"; do
+      if [[ "${_k}" == image.rule_* ]]; then
+        _n="${_k#image.rule_}"
+        [[ "${_n}" =~ ^[0-9]+$ ]] && _rule_nums+=("${_n}")
+      fi
+    done
+    local i
+    for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+      if [[ "${_TUI_OVR_KEYS[i]}" == image.rule_* ]]; then
+        _n="${_TUI_OVR_KEYS[i]#image.rule_}"
+        if [[ "${_n}" =~ ^[0-9]+$ ]]; then
+          _found=0
+          for _x in "${_rule_nums[@]}"; do [[ "${_x}" == "${_n}" ]] && _found=1 && break; done
+          (( _found )) || _rule_nums+=("${_n}")
+        fi
+      fi
+    done
+    # shellcheck disable=SC2207
+    mapfile -t _rule_nums < <(printf '%s\n' "${_rule_nums[@]}" | sort -n | uniq)
+
+    local -a _menu_args=()
+    for _n in "${_rule_nums[@]}"; do
+      local _cur_v
+      _cur_v="$(_override_get "image.rule_${_n}" "")"
+      [[ -z "${_cur_v}" ]] && continue
+      _menu_args+=("rule_${_n}" "${_cur_v}")
+    done
+    _menu_args+=("add" "$(_tui_msg image.add)")
+    _menu_args+=("back" "$(_tui_msg image.back)")
+
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg image.title)" \
+      "$(_tui_msg image.menu)" "${_menu_args[@]}")" || return 0
+
+    case "${_choice}" in
+      back|"") return 0 ;;
+      add)
+        local _max=0 _x
+        for _x in "${_rule_nums[@]}"; do (( _x > _max )) && _max="${_x}"; done
+        _edit_image_rule "$(( _max + 1 ))" || true
+        ;;
+      rule_*)
+        _edit_image_rule "${_choice#rule_}" || true
+        ;;
+    esac
+  done
+}
+
+# _edit_image_rule <N>
+#
+# Two-step editor: select rule type (radiolist) → enter value (inputbox,
+# skipped for typeless rules). Empty value at any step = leave unchanged.
+_edit_image_rule() {
+  local _n="${1}"
+  local _cur _type _value
+  _cur="$(_override_get "image.rule_${_n}" "")"
+
+  # Derive current type + value from the stored string
+  local _cur_type="" _cur_value=""
+  if [[ "${_cur}" == prefix:* ]]; then _cur_type="prefix"; _cur_value="${_cur#prefix:}"
+  elif [[ "${_cur}" == suffix:* ]]; then _cur_type="suffix"; _cur_value="${_cur#suffix:}"
+  elif [[ "${_cur}" == string:* ]]; then _cur_type="string"; _cur_value="${_cur#string:}"
+  elif [[ "${_cur}" == "@basename" ]]; then _cur_type="basename"
+  elif [[ "${_cur}" == @default:* ]]; then _cur_type="default"; _cur_value="${_cur#@default:}"
+  fi
+
+  # Build radiolist dynamically: remove / move_up / move_down only
+  # make sense when editing an EXISTING rule (_cur non-empty). For
+  # "Add new rule" (_cur empty, N is max+1), hide them — there's
+  # nothing to remove or relocate yet. Also hide move_up when _n == 1
+  # (already at top, target would be < 1).
+  local -a _opts=(
+    string    "$(_tui_msg image.type.string)"   "$([[ "${_cur_type}" == string   ]] && echo ON || echo off)"
+    prefix    "$(_tui_msg image.type.prefix)"   "$([[ "${_cur_type}" == prefix   ]] && echo ON || echo off)"
+    suffix    "$(_tui_msg image.type.suffix)"   "$([[ "${_cur_type}" == suffix   ]] && echo ON || echo off)"
+    basename  "$(_tui_msg image.type.basename)" "$([[ "${_cur_type}" == basename ]] && echo ON || echo off)"
+    default   "$(_tui_msg image.type.default)"  "$([[ "${_cur_type}" == default  ]] && echo ON || echo off)"
+  )
+  if [[ -n "${_cur}" ]]; then
+    (( _n > 1 )) && _opts+=(__move_up   "$(_tui_msg image.type.move_up)"   "off")
+    _opts+=(__move_down "$(_tui_msg image.type.move_down)" "off")
+    _opts+=(__remove    "$(_tui_msg image.type.remove)"    "off")
+  fi
+  _type="$(_tui_select "rule" "$(_tui_msg image.type.prompt)" "${_opts[@]}")" \
+    || return 0
+
+  local _final=""
+  case "${_type}" in
+    __remove)
+      _compact_image_rules_after_remove "${_n}"
+      return 0
+      ;;
+    __move_up)
+      _swap_image_rule "${_n}" "$(( _n - 1 ))"
+      return 0
+      ;;
+    __move_down)
+      _swap_image_rule "${_n}" "$(( _n + 1 ))"
+      return 0
+      ;;
+    prefix|suffix|string|default)
+      _value="$(_tui_inputbox "rule" "$(_tui_msg image.value.prompt)" "${_cur_value}")" \
+        || return 0
+      if [[ "${_type}" == default ]]; then
+        _final="@default:${_value}"
+      else
+        _final="${_type}:${_value}"
+      fi
+      ;;
+    basename)
+      _final="@basename"
+      ;;
+  esac
+
+  # Dedupe: if the new rule string already exists at another slot,
+  # drop the old slot so we end up with a single entry at _n
+  # (adding a rule that already exists is treated as "move to this
+  # position" — the user's intent when re-adding is usually to bump
+  # the rule's priority, not to leave two identical copies).
+  local _m _other
+  for _m in "${!_TUI_CURRENT[@]}"; do
+    [[ "${_m}" == image.rule_* ]] || continue
+    [[ "${_m}" == "image.rule_${_n}" ]] && continue
+    _other="$(_override_get "${_m}" "")"
+    [[ "${_other}" == "${_final}" ]] && _mark_removed "${_m}"
+  done
+  local _i
+  for (( _i=0; _i<${#_TUI_OVR_KEYS[@]}; _i++ )); do
+    [[ "${_TUI_OVR_KEYS[_i]}" == image.rule_* ]] || continue
+    [[ "${_TUI_OVR_KEYS[_i]}" == "image.rule_${_n}" ]] && continue
+    [[ "${_TUI_OVR_VALUES[_i]}" == "${_final}" ]] && _mark_removed "${_TUI_OVR_KEYS[_i]}"
+  done
+
+  _override_set "image.rule_${_n}" "${_final}"
+}
+
+# _compact_image_rules_after_remove <n>
+#
+# Drop image.rule_${_n} and shift the values of higher-numbered rules
+# down by one slot, so the user always sees consecutive indices
+# (rule_1 .. rule_M) after a delete and the next "add" allocates
+# max+1 without leaving a gap. Also collapses any pre-existing
+# sparse slots above _n as a side effect, since the loop only walks
+# occupied slots in ascending order.
+_compact_image_rules_after_remove() {
+  local _removed_n="${1:?}"
+  local -a _nums=()
+  local _k _n _x _found _i
+  for _k in "${!_TUI_CURRENT[@]}"; do
+    if [[ "${_k}" == image.rule_* ]]; then
+      _n="${_k#image.rule_}"
+      [[ "${_n}" =~ ^[0-9]+$ ]] && _nums+=("${_n}")
+    fi
+  done
+  for (( _i=0; _i<${#_TUI_OVR_KEYS[@]}; _i++ )); do
+    if [[ "${_TUI_OVR_KEYS[_i]}" == image.rule_* ]]; then
+      _n="${_TUI_OVR_KEYS[_i]#image.rule_}"
+      if [[ "${_n}" =~ ^[0-9]+$ ]]; then
+        _found=0
+        for _x in "${_nums[@]}"; do [[ "${_x}" == "${_n}" ]] && _found=1 && break; done
+        (( _found )) || _nums+=("${_n}")
+      fi
+    fi
+  done
+  # shellcheck disable=SC2207
+  mapfile -t _nums < <(printf '%s\n' "${_nums[@]}" | sort -n | uniq)
+
+  local _slot="${_removed_n}"
+  local _val
+  for _n in "${_nums[@]}"; do
+    (( _n <= _removed_n )) && continue
+    _val="$(_override_get "image.rule_${_n}" "")"
+    [[ -z "${_val}" ]] && continue
+    _override_set "image.rule_${_slot}" "${_val}"
+    _slot="${_n}"
+  done
+  _mark_removed "image.rule_${_slot}"
+}
+
+# _swap_image_rule <n> <m>
+#
+# Swap image.rule_${_n} ↔ image.rule_${_m}. Used by Move up / Move
+# down. Out-of-range targets (m < 1, or m not occupied when moving
+# down) are silently no-ops: UI wise the user sees the list unchanged,
+# which matches the natural "already at top / bottom" expectation.
+_swap_image_rule() {
+  local _n="${1:?}"
+  local _m="${2:?}"
+  (( _m < 1 )) && return 0
+  local _a _b
+  _a="$(_override_get "image.rule_${_n}" "")"
+  _b="$(_override_get "image.rule_${_m}" "")"
+  # Both empty → nothing to do. One empty → treat as swap with empty
+  # (equivalent to moving the non-empty entry into the empty slot and
+  # removing the old one).
+  if [[ -z "${_a}" && -z "${_b}" ]]; then
+    return 0
+  fi
+  if [[ -z "${_b}" ]]; then
+    _mark_removed "image.rule_${_n}"
+    _override_set "image.rule_${_m}" "${_a}"
+    return 0
+  fi
+  if [[ -z "${_a}" ]]; then
+    _mark_removed "image.rule_${_m}"
+    _override_set "image.rule_${_n}" "${_b}"
+    return 0
+  fi
+  _override_set "image.rule_${_n}" "${_b}"
+  _override_set "image.rule_${_m}" "${_a}"
+}
+
+_edit_section_build() {
+  while true; do
+    local _arch_cur _arch_display _net_cur _net_display _args_cnt
+    _arch_cur="$(_override_get "build.target_arch" "")"
+    if [[ -n "${_arch_cur}" ]]; then
+      _arch_display="${_arch_cur}"
+    else
+      _arch_display="$(_tui_msg build.target_arch.auto)"
+    fi
+    _net_cur="$(_override_get "build.network" "")"
+    if [[ -n "${_net_cur}" ]]; then
+      _net_display="${_net_cur}"
+    else
+      _net_display="$(_tui_msg build.network.default)"
+    fi
+    # Count populated arg_N slots for the menu-item badge. Pulls from
+    # the pending override state (_TUI_CURRENT is the effective view
+    # after overrides + removals have been merged).
+    _args_cnt=0
+    local _ak
+    # shellcheck disable=SC2154
+    for _ak in "${!_TUI_CURRENT[@]}"; do
+      [[ "${_ak}" == build.arg_* ]] || continue
+      [[ -n "${_TUI_CURRENT[${_ak}]}" ]] && _args_cnt=$((_args_cnt + 1))
+    done
+
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg build.title)" "$(_tui_msg build.menu)" \
+      target_arch "$(_tui_msg build.target_arch.label) = ${_arch_display}" \
+      network     "$(_tui_msg build.network.label) = ${_net_display}" \
+      args        "$(_tui_msg build.args.label) (${_args_cnt})" \
+      __back      "$(_tui_msg build.back)")" || return 0
+
+    case "${_choice}" in
+      target_arch)
+        local _new
+        _new="$(_tui_inputbox "$(_tui_msg build.title)" \
+          "$(_tui_msg build.target_arch.prompt)" "${_arch_cur}")" || continue
+        if ! _schema_validate build target_arch "${_new}"; then
+          _tui_msgbox "$(_tui_msg build.title)" "$(_tui_msg err.invalid_target_arch)"
+          continue
+        fi
+        # Consistent with other scalar keys (e.g. resources.shm_size):
+        # empty value keeps the key present with "" in setup.toml, and
+        # setup.sh's `[[ -n $target_arch ]]` check handles the empty
+        # case by omitting TARGETARCH from .env.generated + compose.yaml.
+        _override_set "build.target_arch" "${_new}"
+        ;;
+      network)
+        local _new_net
+        _new_net="$(_tui_inputbox "$(_tui_msg build.title)" \
+          "$(_tui_msg build.network.prompt)" "${_net_cur}")" || continue
+        if ! _schema_validate build network "${_new_net}"; then
+          _tui_msgbox "$(_tui_msg build.title)" "$(_tui_msg err.invalid_build_network)"
+          continue
+        fi
+        _override_set "build.network" "${_new_net}"
+        ;;
+      args)
+        _edit_list_section build arg_
+        ;;
+      __back|"") return 0 ;;
+    esac
+  done
+}
+
+_edit_section_network() {
+  local _v _cur
+  _cur="$(_override_get "network.mode" "host")"
+  _v="$(_tui_select "$(_tui_msg network.title)" "$(_tui_msg network.mode.prompt)" \
+    host   "$(_tui_msg network.mode.host)"   "$([[ "${_cur}" == host ]]   && echo ON || echo off)" \
+    bridge "$(_tui_msg network.mode.bridge)" "$([[ "${_cur}" == bridge ]] && echo ON || echo off)" \
+    none   "$(_tui_msg network.mode.none)"   "$([[ "${_cur}" == none ]]   && echo ON || echo off)")" \
+    || return 0
+  _override_set "network.mode" "${_v}"
+  local _selected_mode="${_v}"
+
+  _cur="$(_override_get "network.ipc" "host")"
+  _v="$(_tui_select "$(_tui_msg network.title)" "$(_tui_msg network.ipc.prompt)" \
+    host      "$(_tui_msg network.ipc.host)"      "$([[ "${_cur}" == host ]]      && echo ON || echo off)" \
+    shareable "$(_tui_msg network.ipc.shareable)" "$([[ "${_cur}" == shareable ]] && echo ON || echo off)" \
+    private   "$(_tui_msg network.ipc.private)"   "$([[ "${_cur}" == private ]]   && echo ON || echo off)")" \
+    || return 0
+  _override_set "network.ipc" "${_v}"
+  local _selected_ipc="${_v}"
+
+  _cur="$(_override_get "network.pid" "private")"
+  _v="$(_tui_select "$(_tui_msg network.title)" "$(_tui_msg network.pid.prompt)" \
+    host    "$(_tui_msg network.pid.host)"    "$([[ "${_cur}" == host ]]    && echo ON || echo off)" \
+    private "$(_tui_msg network.pid.private)" "$([[ "${_cur}" == private ]] && echo ON || echo off)")" \
+    || return 0
+  _override_set "network.pid" "${_v}"
+
+  # mode=bridge triggers: network_name + ports list
+  if [[ "${_selected_mode}" == "bridge" ]]; then
+    _cur="$(_override_get "network.network_name" "")"
+    while :; do
+      _v="$(_tui_inputbox "$(_tui_msg network.title)" "$(_tui_msg network.name.prompt)" "${_cur}")" \
+        || return 0
+      # Empty is allowed (compose creates default bridge); the registry's
+      # empty-policy handles that.
+      if _schema_validate network network_name "${_v}"; then
+        _override_set "network.network_name" "${_v}"
+        break
+      fi
+      _tui_msgbox "$(_tui_msg network.title)" "$(_tui_msg err.invalid_network_name)"
+      _cur="${_v}"
+    done
+    _edit_section_ports || true
+  else
+    _override_set "network.network_name" ""
+  fi
+
+  # ipc != host triggers: shm_size prompt (empty leaves Docker default 64mb).
+  # Inline the inputbox so the dialog title says "shm_size" instead of the
+  # generic "Resources" (users reported missing this prompt otherwise).
+  if [[ "${_selected_ipc}" != "host" ]]; then
+    _cur="$(_override_get "resources.shm_size" "")"
+    while :; do
+      _v="$(_tui_inputbox "shm_size (ipc=${_selected_ipc})" \
+        "$(_tui_msg resources.shm_size.prompt)" "${_cur}")" || return 0
+      # Empty is allowed (Docker default 64mb); the registry's empty-policy
+      # handles that.
+      if _schema_validate resources shm_size "${_v}"; then
+        _override_set "resources.shm_size" "${_v}"
+        break
+      fi
+      _tui_msgbox "shm_size" "$(_tui_msg err.invalid_shm_size)"
+      _cur="${_v}"
+    done
+  fi
+}
+
+_edit_section_security() {
+  while :; do
+    local _priv_cur
+    _priv_cur="$(_override_get "security.privileged" "true")"
+    local _cap_add_cnt=0 _cap_drop_cnt=0 _sec_opt_cnt=0
+    local _k
+    # shellcheck disable=SC2154
+    for _k in "${!_TUI_CURRENT[@]}"; do
+      case "${_k}" in
+        security.cap_add_*)      _cap_add_cnt=$(( _cap_add_cnt + 1 )) ;;
+        security.cap_drop_*)     _cap_drop_cnt=$(( _cap_drop_cnt + 1 )) ;;
+        security.security_opt_*) _sec_opt_cnt=$(( _sec_opt_cnt + 1 )) ;;
+      esac
+    done
+
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg security.title)" "$(_tui_msg security.menu)" \
+      privileged   "privileged = ${_priv_cur}" \
+      cap_add      "$(_tui_msg security.cap_add) (${_cap_add_cnt})" \
+      cap_drop     "$(_tui_msg security.cap_drop) (${_cap_drop_cnt})" \
+      security_opt "$(_tui_msg security.security_opt) (${_sec_opt_cnt})" \
+      __back       "$(_tui_msg security.back)")" || return 0
+
+    case "${_choice}" in
+      privileged)
+        if _tui_yesno "$(_tui_msg security.title)" "$(_tui_msg security.privileged.prompt)"; then
+          _override_set "security.privileged" "true"
+        else
+          _override_set "security.privileged" "false"
+        fi
+        ;;
+      cap_add)
+        _edit_list_section security cap_add_
+        ;;
+      cap_drop)
+        _edit_list_section security cap_drop_
+        ;;
+      security_opt)
+        _edit_list_section security security_opt_
+        ;;
+      __back|"") return 0 ;;
+    esac
+  done
+}
+
+# _caps_keep_order <current> <selected>
+#
+# Print <selected> -- the capability names the checklist handed back, in
+# the order it rendered its ROWS -- reordered so the names <current>
+# already carried keep the order IT had, with newly checked names after
+# them.
+#
+# Without this the save rewrites an operator's own ordering of a list the
+# container runtime reads as a set: `video display ngx compat32` comes
+# back as `video display compat32 ngx` because that is the order of the
+# rows. It is a change to a value nobody touched, which is the shape of
+# the defect this screen is being fixed for (base#1177) -- so a name that
+# survives the screen survives it exactly as it was written.
+_caps_keep_order() {
+  local _cur="${1-}" _sel="${2-}"
+  local -a _cur_a=() _sel_a=() _out=()
+  local -A _want=() _taken=()
+  local _c
+  read -ra _cur_a <<< "${_cur}"
+  read -ra _sel_a <<< "${_sel}"
+  for _c in "${_sel_a[@]+"${_sel_a[@]}"}"; do _want["${_c}"]=1; done
+  # The configuration's own order first, for the names still selected.
+  for _c in "${_cur_a[@]+"${_cur_a[@]}"}"; do
+    [[ -n "${_want[${_c}]:-}" && -z "${_taken[${_c}]:-}" ]] || continue
+    _out+=("${_c}")
+    _taken["${_c}"]=1
+  done
+  # Then what the operator just added, in the order the rows offered it.
+  for _c in "${_sel_a[@]+"${_sel_a[@]}"}"; do
+    [[ -z "${_taken[${_c}]:-}" ]] || continue
+    _out+=("${_c}")
+    _taken["${_c}"]=1
+  done
+  printf '%s' "${_out[*]+"${_out[*]}"}"
+}
+
+_edit_section_deploy() {
+  local _v _cur
+  _cur="$(_override_get "deploy.gpu_mode" "auto")"
+  _v="$(_tui_select "$(_tui_msg deploy.title)" "$(_tui_msg deploy.mode.prompt)" \
+    auto  "$(_tui_msg deploy.mode.auto)"  "$([[ "${_cur}" == auto ]]  && echo ON || echo off)" \
+    force "$(_tui_msg deploy.mode.force)" "$([[ "${_cur}" == force ]] && echo ON || echo off)" \
+    off   "$(_tui_msg deploy.mode.off)"   "$([[ "${_cur}" == off ]]   && echo ON || echo off)")" \
+    || return 0
+  _override_set "deploy.gpu_mode" "${_v}"
+  # GPU disabled → count/capabilities are irrelevant; skip the rest.
+  [[ "${_v}" == "off" ]] && return 0
+
+  # MIG (Multi-Instance GPU) advisory. When the host has MIG enabled,
+  # Docker's `count=N` reservation addresses whole GPUs, not MIG slices.
+  # Warn the user and show available slice UUIDs so they can pin a
+  # specific slice via NVIDIA_VISIBLE_DEVICES=<MIG-UUID> in the
+  # [environment] section. Proceeds with the normal count/capabilities
+  # flow either way.
+  if _detect_mig; then
+    local _mig_fmt _mig_msg _mig_list
+    _mig_list="$(_list_gpu_instances)"
+    _mig_fmt="$(_tui_msg deploy.mig.warning)"
+    # shellcheck disable=SC2059  # msg source is our own i18n table
+    _mig_msg="$(printf "${_mig_fmt}" "${_mig_list}")"
+    _tui_msgbox "$(_tui_msg deploy.mig.title)" "${_mig_msg}"
+  fi
+
+  # Probe host for installed NVIDIA GPU count; surface in prompt so the
+  # user has a reference value when choosing "all" vs a specific integer.
+  local _host_gpu_count=0
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    _host_gpu_count="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+    [[ "${_host_gpu_count}" =~ ^[0-9]+$ ]] || _host_gpu_count=0
+  fi
+  local _count_fmt _count_prompt
+  _count_fmt="$(_tui_msg deploy.count.prompt)"
+  # shellcheck disable=SC2059  # format string sourced from our own i18n table
+  _count_prompt="$(printf "${_count_fmt}" "${_host_gpu_count}")"
+
+  while :; do
+    _cur="$(_override_get "deploy.gpu_count" "all")"
+    _v="$(_tui_inputbox "$(_tui_msg deploy.title)" "${_count_prompt}" "${_cur}")" \
+      || return 0
+    if _schema_validate deploy gpu_count "${_v}"; then
+      _override_set "deploy.gpu_count" "${_v}"
+      break
+    fi
+    _tui_msgbox "$(_tui_msg deploy.title)" "$(_tui_msg err.invalid_gpu_count)"
+  done
+
+  # [deploy] gpu_capabilities. The rows are DERIVED from _VALID_GPU_CAPABILITIES
+  # -- the allowlist `_validate_gpu_capabilities` itself reads -- and not
+  # written out here. Four of the nine accepted names used to be
+  # hand-written rows, and because this screen calls `_override_set` on
+  # every path that reaches it, a configuration carrying any of the other
+  # five rendered with nothing checked and was replaced by what the four
+  # checkboxes said: four capabilities became one, on a screen that
+  # showed the operator nothing to change (base#1177).
+  _cur="$(_override_get "deploy.gpu_capabilities" "gpu")"
+  if _schema_validate deploy gpu_capabilities "${_cur}"; then
+    local _cap
+    local -a _cap_rows=()
+    for _cap in "${_VALID_GPU_CAPABILITIES[@]}"; do
+      _cap_rows+=("${_cap}" "$(_tui_msg "deploy.caps.${_cap}")" \
+        "$([[ " ${_cur} " == *" ${_cap} "* ]] && echo ON || echo off)")
+    done
+    _v="$(_tui_checklist "$(_tui_msg deploy.title)" \
+      "$(_tui_msg deploy.caps.prompt)" "${_cap_rows[@]}")" \
+      || return 0
+    # checklist with --separate-output returns newline-separated; flatten to space
+    _v="$(echo "${_v}" | tr '\n' ' ' | sed -e 's/ *$//')"
+    # Row order is the screen's, not the configuration's; see the helper.
+    _v="$(_caps_keep_order "${_cur}" "${_v}")"
+    if [[ -z "${_v}" ]]; then
+      # An empty selection used to be rewritten to `gpu`, and that
+      # substitution is what turned "this screen cannot show your value"
+      # into "this screen replaced it" (base#1177). It is reported now,
+      # and the operator's list is left as it was.
+      #
+      # Reported rather than stored, although `_validate_gpu_capabilities`
+      # accepts the empty string, because the generator does not: measured,
+      # `generate_compose_yaml` takes the capability list as `"${6:?}"` and
+      # aborts with `parameter null or not set` on an empty one, so a save
+      # of "none" would hand back a configuration `setup.sh apply` then
+      # refuses to regenerate. This editor does not write a value the
+      # emitters cannot carry and call it saved. ("none" being accepted by
+      # the schema and refused by the generator is a hole on the `setup.sh
+      # set deploy.gpu_capabilities ""` path too, and it is not this
+      # screen's to close.)
+      _tui_msgbox "$(_tui_msg deploy.title)" \
+        "$(_tui_msg err.empty_gpu_capabilities)"
+    else
+      _override_set "deploy.gpu_capabilities" "${_v}"
+    fi
+  else
+    # Only reachable by hand-editing a layer of the conf chain: both this
+    # editor and `setup.sh set` gate writes through schema.sh. The rows
+    # cannot represent a name the validator rejects, so confirming the
+    # screen would rewrite the value to whatever the checkboxes said.
+    # Report it and write nothing -- the same posture this page already
+    # takes to the legacy `runtime` key below, and the rule this repo
+    # applies to any write that cannot do what it says.
+    _tui_msgbox "$(_tui_msg deploy.title)" \
+      "$(_tui_msg err.unrepresentable_gpu_capabilities)"
+  fi
+
+  # runtime override (Jetson / csv-mode nvidia-container-toolkit).
+  # renamed the conf key deploy.runtime -> deploy.gpu_runtime (permanent
+  # legacy alias).if the per-repo setup.toml still carries the
+  # legacy [deploy] runtime key (and no gpu_runtime), SUGGEST renaming it
+  # -- never silently rewrite. The read honours both keys; the write uses
+  # the canonical gpu_runtime.
+  if [[ -v '_TUI_CURRENT[deploy.runtime]' ]] && [[ ! -v '_TUI_CURRENT[deploy.gpu_runtime]' ]]; then
+    _tui_msgbox "$(_tui_msg deploy.title)" "$(_tui_msg deploy.runtime.migrate)"
+  fi
+  _cur="$(_override_get "deploy.gpu_runtime" "$(_override_get "deploy.runtime" "auto")")"
+  _v="$(_tui_select "$(_tui_msg deploy.title)" "$(_tui_msg deploy.runtime.prompt)" \
+    auto   "$(_tui_msg deploy.runtime.auto)"   "$([[ "${_cur}" == auto ]]   && echo ON || echo off)" \
+    nvidia "$(_tui_msg deploy.runtime.nvidia)" "$([[ "${_cur}" == nvidia ]] && echo ON || echo off)" \
+    off    "$(_tui_msg deploy.runtime.off)"    "$([[ "${_cur}" == off ]]    && echo ON || echo off)")" \
+    || return 0
+  if _schema_validate deploy gpu_runtime "${_v}"; then
+    _override_set "deploy.gpu_runtime" "${_v}"
+  else
+    _tui_msgbox "$(_tui_msg deploy.title)" "$(_tui_msg err.invalid_runtime)"
+  fi
+}
+
+# [lifecycle] restart policy page (fast-follow of). Radiolist of
+# the 4 docker policies; on-failure adds a two-step optional integer retry
+# count (>=1, empty -> bare on-failure). Validates via _schema_validate
+# (lifecycle.restart); the on-failure:N value is assembled here.
+_edit_section_lifecycle() {
+  local _v _cur _cur_base _n _cur_n
+  _cur="$(_override_get "lifecycle.restart" "no")"
+  _cur_base="${_cur%%:*}"
+  _v="$(_tui_select "$(_tui_msg lifecycle.title)" "$(_tui_msg lifecycle.restart.prompt)" \
+    no             "$(_tui_msg lifecycle.restart.no)"             "$([[ "${_cur_base}" == no ]]             && echo ON || echo off)" \
+    always         "$(_tui_msg lifecycle.restart.always)"         "$([[ "${_cur_base}" == always ]]         && echo ON || echo off)" \
+    unless-stopped "$(_tui_msg lifecycle.restart.unless_stopped)" "$([[ "${_cur_base}" == unless-stopped ]] && echo ON || echo off)" \
+    on-failure     "$(_tui_msg lifecycle.restart.on_failure)"     "$([[ "${_cur_base}" == on-failure ]]     && echo ON || echo off)")" \
+    || return 0
+
+  # on-failure: optional retry count. Empty input keeps the bare policy.
+  if [[ "${_v}" == "on-failure" ]]; then
+    _cur_n=""
+    [[ "${_cur}" == on-failure:* ]] && _cur_n="${_cur#on-failure:}"
+    while :; do
+      _n="$(_tui_inputbox "$(_tui_msg lifecycle.title)" "$(_tui_msg lifecycle.restart.n_prompt)" "${_cur_n}")" \
+        || return 0
+      if [[ -z "${_n}" ]]; then
+        _v="on-failure"
+        break
+      elif [[ "${_n}" =~ ^[1-9][0-9]*$ ]]; then
+        _v="on-failure:${_n}"
+        break
+      fi
+      _tui_msgbox "$(_tui_msg lifecycle.title)" "$(_tui_msg err.invalid_restart_n)"
+    done
+  fi
+
+  if _schema_validate lifecycle restart "${_v}"; then
+    _override_set "lifecycle.restart" "${_v}"
+  else
+    _tui_msgbox "$(_tui_msg lifecycle.title)" "$(_tui_msg err.invalid_restart)"
+  fi
+}
+
+_edit_section_gui() {
+  local _v _cur
+  _cur="$(_override_get "gui.mode" "auto")"
+  _v="$(_tui_select "$(_tui_msg gui.title)" "$(_tui_msg gui.mode.prompt)" \
+    auto  "$(_tui_msg gui.mode.auto)"  "$([[ "${_cur}" == auto ]]  && echo ON || echo off)" \
+    force "$(_tui_msg gui.mode.force)" "$([[ "${_cur}" == force ]] && echo ON || echo off)" \
+    off   "$(_tui_msg gui.mode.off)"   "$([[ "${_cur}" == off ]]   && echo ON || echo off)")" \
+    || return 0
+  _override_set "gui.mode" "${_v}"
+}
+
+_edit_section_volumes() {
+  _edit_list_section volumes mount_
+}
+
+_edit_section_resources() {
+  local _v _cur _ipc
+  _ipc="$(_override_get "network.ipc" "host")"
+  if [[ "${_ipc}" == "host" ]]; then
+    local _fmt _msg
+    _fmt="$(_tui_msg resources.shm_size.ignored)"
+    # shellcheck disable=SC2059  # msg source is our own i18n table
+    _msg="$(printf "${_fmt}" "${_ipc}")"
+    _tui_msgbox "$(_tui_msg resources.title)" "${_msg}"
+    # Still allow setting it (for when user later flips ipc to private).
+  fi
+  _cur="$(_override_get "resources.shm_size" "")"
+  _v="$(_tui_inputbox "$(_tui_msg resources.title)" \
+    "$(_tui_msg resources.shm_size.prompt)" "${_cur}")" || return 0
+  _override_set "resources.shm_size" "${_v}"
+}
+
+# ── The list editors' screen labels ──────────────────────────────────
+#
+# Every list editor below is the SAME screen -- a title, a menu prompt,
+# an Add row, a Back row, a per-entry prompt and the message shown when a
+# typed value is refused -- differing only in which six i18n keys fill
+# it. Those six used to travel as positional parameters, which made
+# `_edit_list_section` the widest signature in this file at eight
+# (base#994 measured it; the threshold is five), repeated at eleven call
+# sites.
+#
+# They are one table here, keyed by the `<section>.<prefix>` pair the
+# editor already receives, so a caller says WHAT it is editing and
+# nothing else. The keys are not derivable from the section -- `network`
+# labels its screen `ports.*`, volumes' per-entry prompt is
+# `volumes.edit.prompt` where environment's is `environment.entry.prompt`
+# -- which is exactly why they are data and not a naming convention.
+#
+# The eight positions were also demonstrably hard to fill: four call
+# sites in test/bats/unit/tui_spec.bats passed a validator name in the
+# error-key slot, silently mislabelling the error box. A table row cannot
+# be off by one.
+#
+# `err` is the one optional slot: two editors validate nothing, so they
+# have no message to show. Every other slot missing is a DEFECT and
+# `_tui_list_labels` says so rather than drawing a screen with blank
+# labels.
+declare -gA _TUI_LIST_LABELS=(
+  [build.arg_.title]=build.title
+  [build.arg_.menu]=build.menu
+  [build.arg_.add]=build.add
+  [build.arg_.back]=build.back
+  [build.arg_.entry]=build.arg.prompt
+  [build.arg_.err]=err.invalid_env_kv
+
+  [security.cap_add_.title]=security.title
+  [security.cap_add_.menu]=security.cap_add.menu
+  [security.cap_add_.add]=security.cap_add.add
+  [security.cap_add_.back]=security.back
+  [security.cap_add_.entry]=security.cap_add.prompt
+  [security.cap_add_.err]=err.invalid_capability
+
+  [security.cap_drop_.title]=security.title
+  [security.cap_drop_.menu]=security.cap_drop.menu
+  [security.cap_drop_.add]=security.cap_drop.add
+  [security.cap_drop_.back]=security.back
+  [security.cap_drop_.entry]=security.cap_drop.prompt
+  [security.cap_drop_.err]=err.invalid_capability
+
+  # No validator, so no error message: the security_opt list takes any
+  # string docker accepts.
+  [security.security_opt_.title]=security.title
+  [security.security_opt_.menu]=security.security_opt.menu
+  [security.security_opt_.add]=security.security_opt.add
+  [security.security_opt_.back]=security.back
+  [security.security_opt_.entry]=security.security_opt.prompt
+
+  [volumes.mount_.title]=volumes.title
+  [volumes.mount_.menu]=volumes.menu
+  [volumes.mount_.add]=volumes.add
+  [volumes.mount_.back]=volumes.back
+  [volumes.mount_.entry]=volumes.edit.prompt
+  [volumes.mount_.err]=err.invalid_mount
+
+  [environment.env_.title]=environment.title
+  [environment.env_.menu]=environment.menu
+  [environment.env_.add]=environment.add
+  [environment.env_.back]=environment.back
+  [environment.env_.entry]=environment.entry.prompt
+  [environment.env_.err]=err.invalid_env_kv
+
+  # Validated since base#1095, so the row needs an `err` slot like every
+  # other validated list: without one a rejected entry opened a message
+  # box with no message in it.
+  [tmpfs.tmpfs_.title]=tmpfs.title
+  [tmpfs.tmpfs_.menu]=tmpfs.menu
+  [tmpfs.tmpfs_.add]=tmpfs.add
+  [tmpfs.tmpfs_.back]=tmpfs.back
+  [tmpfs.tmpfs_.entry]=tmpfs.entry.prompt
+  [tmpfs.tmpfs_.err]=err.invalid_tmpfs
+
+  # The port list lives in [network] and labels its screen `ports.*`.
+  [network.port_.title]=ports.title
+  [network.port_.menu]=ports.menu
+  [network.port_.add]=ports.add
+  [network.port_.back]=ports.back
+  [network.port_.entry]=ports.entry.prompt
+  [network.port_.err]=err.invalid_port_mapping
+
+  [devices.device_.title]=devices.title
+  [devices.device_.menu]=devices.menu
+  [devices.device_.add]=devices.add_device
+  [devices.device_.back]=devices.back
+  [devices.device_.entry]=devices.device.prompt
+  [devices.device_.err]=err.invalid_mount
+
+  [devices.cgroup_rule_.title]=devices.cgroup.title
+  [devices.cgroup_rule_.menu]=devices.cgroup.menu
+  [devices.cgroup_rule_.add]=devices.add_cgroup
+  [devices.cgroup_rule_.back]=devices.back
+  [devices.cgroup_rule_.entry]=devices.cgroup.prompt
+  [devices.cgroup_rule_.err]=err.invalid_cgroup_rule
+
+  [additional_contexts.context_.title]=additional_contexts.title
+  [additional_contexts.context_.menu]=additional_contexts.menu
+  [additional_contexts.context_.add]=additional_contexts.add
+  [additional_contexts.context_.back]=additional_contexts.back
+  [additional_contexts.context_.entry]=additional_contexts.entry.prompt
+  [additional_contexts.context_.err]=err.invalid_additional_context
+)
+
+# _tui_list_labels <section> <prefix> <out-assoc> -- the six screen
+# labels for one list editor, read out of _TUI_LIST_LABELS into <out>
+# under the slot names `title menu add back entry err`.
+#
+# A row that is missing, or missing anything but `err`, FAILS here rather
+# than reaching the screen: a menu labelled with empty strings is a
+# defect that renders (PRD invariant 2).
+_tui_list_labels() {
+  local _section="${1}" _prefix="${2}"
+  local -n _tll_out="${3}"
+  local _row="${_section}.${_prefix}" _slot _missing=0
+  _tll_out=()
+  for _slot in title menu add back entry err; do
+    _tll_out["${_slot}"]="${_TUI_LIST_LABELS[${_row}.${_slot}]:-}"
+  done
+  for _slot in title menu add back entry; do
+    [[ -n "${_tll_out[${_slot}]}" ]] || _missing=1
+  done
+  (( _missing )) || return 0
+  _log_err setup_tui tui_list_labels_missing \
+    "display=no complete _TUI_LIST_LABELS row for '${_row}' -- the list editor has no screen to label. Add the row beside the others in setup_tui.sh; the labels are a table, not a call-site argument." \
+    "list=${_row}"
+  return 1
+}
+
+# _edit_list_section <section> <prefix>
+#
+# Generic list editor used by environment / tmpfs / ports. Mirrors the
+# volumes pattern: shows existing entries, Add creates the next numbered
+# slot, existing items go through Edit / Remove / Back sub-menu. The
+# screen's message keys come from _TUI_LIST_LABELS above, keyed by this
+# same (section, prefix) pair.
+_edit_list_section() {
+  local _section="${1}" _prefix="${2}"
+  local -A _labels=()
+  _tui_list_labels "${_section}" "${_prefix}" _labels || return 1
+  local _title_key="${_labels[title]}" _menu_key="${_labels[menu]}"
+  local _add_key="${_labels[add]}" _back_key="${_labels[back]}"
+  local _entry_key="${_labels[entry]}" _err_key="${_labels[err]}"
+
+  # Resolve the per-entry prompt key through the schema i18n-index
+  # when this list key is registered, so the menu string is the same key
+  # the coverage spec asserts across all four locales. The literal
+  # _entry_key remains the fallback for a list key with no registry row;
+  # every list key this file labels has one today (tmpfs_ was the last
+  # without, until base#1095), so the fallback is the path a NEW list
+  # takes before its row lands, not a standing arrangement.
+  _entry_key="$(_schema_i18n_key "${_section}" "${_prefix}1" "${_entry_key}")"
+
+  while :; do
+    local -a _nums=()
+    local _k _n _x _found
+    # shellcheck disable=SC2154
+    for _k in "${!_TUI_CURRENT[@]}"; do
+      if [[ "${_k}" == "${_section}.${_prefix}"* ]]; then
+        _n="${_k#"${_section}.${_prefix}"}"
+        [[ "${_n}" =~ ^[0-9]+$ ]] && _nums+=("${_n}")
+      fi
+    done
+    local i
+    for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+      if [[ "${_TUI_OVR_KEYS[i]}" == "${_section}.${_prefix}"* ]]; then
+        _n="${_TUI_OVR_KEYS[i]#"${_section}.${_prefix}"}"
+        if [[ "${_n}" =~ ^[0-9]+$ ]]; then
+          _found=0
+          for _x in "${_nums[@]}"; do [[ "${_x}" == "${_n}" ]] && _found=1 && break; done
+          (( _found )) || _nums+=("${_n}")
+        fi
+      fi
+    done
+    # shellcheck disable=SC2207
+    mapfile -t _nums < <(printf '%s\n' "${_nums[@]}" | sort -n | uniq)
+
+    local -a _menu_args=()
+    for _n in "${_nums[@]}"; do
+      local _cur_v
+      _cur_v="$(_override_get "${_section}.${_prefix}${_n}" "")"
+      # Skip empty entries — cleaner "new list" look (no dangling
+      # "<prefix>_N <empty>" rows the user cleared or never filled).
+      [[ -z "${_cur_v}" ]] && continue
+      _menu_args+=("${_prefix}${_n}" "${_cur_v}")
+    done
+    _menu_args+=("add"  "$(_tui_msg "${_add_key}")")
+    _menu_args+=("back" "$(_tui_msg "${_back_key}")")
+
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg "${_title_key}")" \
+      "$(_tui_msg "${_menu_key}")" "${_menu_args[@]}")" || return 0
+
+    case "${_choice}" in
+      back|"") return 0 ;;
+      add)
+        # Pick the lowest index >= 1 that is free — either the key does
+        # not exist, or its value is empty (user cleared it = opted out,
+        # safe to reuse). Prevents `mount_2` from appearing when the
+        # user cleared `mount_1`, which would leave a confusing hole.
+        local _next=1 _v
+        while :; do
+          _v="$(_override_get "${_section}.${_prefix}${_next}" "")"
+          [[ -z "${_v}" ]] && break
+          (( _next++ ))
+        done
+        _edit_list_entry "${_section}" "${_prefix}" "${_next}" \
+          "$(_tui_msg "${_entry_key}")" "${_err_key}" || true
+        ;;
+      "${_prefix}"*)
+        # Direct edit: click item -> inputbox. Empty value marks the key
+        # for removal (no separate Edit/Remove sub-menu).
+        _edit_list_entry "${_section}" "${_prefix}" "${_choice#"${_prefix}"}" \
+          "$(_tui_msg "${_entry_key}")" "${_err_key}" || true
+        ;;
+    esac
+  done
+}
+
+_edit_list_entry() {
+  local _section="${1}" _prefix="${2}" _n="${3}" _prompt="${4}"
+  local _err_key="${5:-}"
+  local _nskey="${_section}.${_prefix}${_n}"
+  # Dialog title strips the trailing underscore so "env_" becomes "env",
+  # "mount_" becomes "mount" — cleaner header without the per-entry index.
+  local _title="${_prefix%_}"
+  local _cur _v
+  _cur="$(_override_get "${_nskey}" "")"
+  while :; do
+    _v="$(_tui_inputbox "${_title}" "${_prompt}" "${_cur}")" || return 0
+    # Empty input = delete the entry (user opted out).
+    if [[ -z "${_v}" ]]; then
+      _mark_removed "${_nskey}"
+      return 0
+    fi
+    # Non-empty: validate through the shared registry, keyed by
+    # (section, key). Free-form keys (no registry entry) accept any value.
+    if _schema_validate "${_section}" "${_prefix}${_n}" "${_v}"; then
+      _override_set "${_nskey}" "${_v}"
+      return 0
+    fi
+    # Invalid → show error + preserve typed value for correction.
+    _tui_msgbox "${_prefix}${_n}" "$(_tui_msg "${_err_key}")"
+    _cur="${_v}"
+  done
+}
+
+_edit_section_environment() {
+  _edit_list_section environment env_
+}
+
+_edit_section_tmpfs() {
+  _edit_list_section tmpfs tmpfs_
+}
+
+_edit_section_ports() {
+  # Hint if current network mode is not bridge (ports will be dropped).
+  local _mode
+  _mode="$(_override_get "network.mode" "host")"
+  if [[ "${_mode}" != "bridge" ]]; then
+    local _fmt _msg
+    _fmt="$(_tui_msg ports.not_bridge)"
+    # shellcheck disable=SC2059
+    _msg="$(printf "${_fmt}" "${_mode}")"
+    _tui_msgbox "$(_tui_msg ports.title)" "${_msg}"
+  fi
+  _edit_list_section network port_
+}
+
+_edit_section_devices() {
+  while :; do
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg devices.title)" \
+      "$(_tui_msg devices.menu)" \
+      device       "$(_tui_msg devices.edit_devices)" \
+      cgroup_rule  "$(_tui_msg devices.edit_cgroup)" \
+      back         "$(_tui_msg devices.back)")" || return 0
+    case "${_choice}" in
+      back|"") return 0 ;;
+      device)
+        _edit_list_section devices device_
+        ;;
+      cgroup_rule)
+        _edit_list_section devices cgroup_rule_
+        ;;
+    esac
+  done
+}
+
+_edit_section_additional_contexts() {
+  _edit_list_section additional_contexts context_
+}
+
+# _edit_logging_keys <section>
+#
+# Generic editor for the four [logging] / [logging.<svc>] scalar keys.
+# Operates on whichever section name is passed (`logging`, `logging.devel`,
+# `logging.test`, `logging.runtime`, or a custom `logging.<svc>` typed
+# via the CLI). The same input shape, the same validators, the same
+# fall-through-on-empty semantics for every service — the only thing
+# that changes is the namespaced override key the value lands on.
+_edit_logging_keys() {
+  local _section="${1:?_edit_logging_keys: missing section}"
+  while :; do
+    local _drv _ms _mf _cp _lp
+    _drv="$(_override_get "${_section}.driver" "")"
+    _ms="$(_override_get "${_section}.max_size" "")"
+    _mf="$(_override_get "${_section}.max_file" "")"
+    _cp="$(_override_get "${_section}.compress" "")"
+    _lp="$(_override_get "${_section}.local_path" "")"
+
+    local _title
+    if [[ "${_section}" == "logging" ]]; then
+      _title="$(_tui_msg logging.title)"
+    else
+      local _fmt _svc="${_section#logging.}"
+      _fmt="$(_tui_msg logging.svc.title)"
+      # shellcheck disable=SC2059  # i18n format string from our table
+      printf -v _title "${_fmt}" "${_svc}"
+    fi
+
+    local _choice
+    _choice="$(_tui_menu "${_title}" "$(_tui_msg logging.menu)" \
+      driver     "$(_tui_msg logging.driver.label) = ${_drv:-(inherit)}" \
+      max_size   "$(_tui_msg logging.max_size.label) = ${_ms:-(inherit)}" \
+      max_file   "$(_tui_msg logging.max_file.label) = ${_mf:-(inherit)}" \
+      compress   "$(_tui_msg logging.compress.label) = ${_cp:-(inherit)}" \
+      local_path "$(_tui_msg logging.local_path.label) = ${_lp:-(off)}" \
+      __back     "$(_tui_msg logging.back)")" || return 0
+
+    case "${_choice}" in
+      driver)
+        local _new
+        _new="$(_tui_inputbox "${_title}" \
+          "$(_tui_msg logging.driver.prompt)" "${_drv}")" || continue
+        if ! _schema_validate "${_section}" driver "${_new}"; then
+          _tui_msgbox "${_title}" "$(_tui_msg err.invalid_log_driver)"
+          continue
+        fi
+        _override_set "${_section}.driver" "${_new}"
+        ;;
+      max_size)
+        local _new
+        _new="$(_tui_inputbox "${_title}" \
+          "$(_tui_msg logging.max_size.prompt)" "${_ms}")" || continue
+        if ! _schema_validate "${_section}" max_size "${_new}"; then
+          _tui_msgbox "${_title}" "$(_tui_msg err.invalid_log_max_size)"
+          continue
+        fi
+        _override_set "${_section}.max_size" "${_new}"
+        ;;
+      max_file)
+        local _new
+        _new="$(_tui_inputbox "${_title}" \
+          "$(_tui_msg logging.max_file.prompt)" "${_mf}")" || continue
+        if ! _schema_validate "${_section}" max_file "${_new}"; then
+          _tui_msgbox "${_title}" "$(_tui_msg err.invalid_log_max_file)"
+          continue
+        fi
+        _override_set "${_section}.max_file" "${_new}"
+        ;;
+      compress)
+        if _tui_yesno "${_title}" \
+            "$(_tui_msg logging.compress.prompt)"; then
+          _override_set "${_section}.compress" "true"
+        else
+          _override_set "${_section}.compress" "false"
+        fi
+        ;;
+      local_path)
+        local _new
+        _new="$(_tui_inputbox "${_title}" \
+          "$(_tui_msg logging.local_path.prompt)" "${_lp}")" || continue
+        if ! _schema_validate "${_section}" local_path "${_new}"; then
+          _tui_msgbox "${_title}" "$(_tui_msg err.invalid_log_local_path)"
+          continue
+        fi
+        _override_set "${_section}.local_path" "${_new}"
+        ;;
+      __back|"") return 0 ;;
+    esac
+  done
+}
+
+_edit_section_logging() {
+  while :; do
+    local _choice
+    # Per-service entries cover the three baseline services emitted by
+    # _emit_logging_block (devel at line 1804 / test at 2165 in setup.sh;
+    # `runtime` shows up when auto-emit picks up `FROM ... AS runtime` per
+    # ). Editing a per-service section without populating it leaves
+    # the global block as-is (compose key-level merge).
+    _choice="$(_tui_menu "$(_tui_msg logging.title)" "$(_tui_msg logging.top.menu)" \
+      global   "$(_tui_msg logging.top.global)" \
+      devel    "$(_tui_msg logging.top.devel)" \
+      test     "$(_tui_msg logging.top.test)" \
+      runtime  "$(_tui_msg logging.top.runtime)" \
+      __back   "$(_tui_msg logging.back)")" || return 0
+
+    case "${_choice}" in
+      global)            _edit_logging_keys "logging" ;;
+      devel|test|runtime) _edit_logging_keys "logging.${_choice}" ;;
+      __back|"") return 0 ;;
+    esac
+  done
+}
+
+# ── Main menu ────────────────────────────────────────────────────────────
+
+# ── Per-stage overrides ───────────────────────────────────────────
+
+# _list_dockerfile_stages_available <out_array_var> [<base_path>]
+#
+# Parses <base_path>/Dockerfile and returns non-baseline stages (the
+# same set _parse_dockerfile_stages emits). The baseline filter is
+# restated here because the TUI's is deliberately different — devel-test
+# stays offered as an editable stage — but the "is this a stage line"
+# question is answered by the shared _dockerfile_stage_from_line, so the
+# menu can never disagree with the compose emitter about which stages a
+# Dockerfile has.
+#
+# <base_path> defaults to ${FILE_PATH} (the repo's compose-yaml dir).
+# Test code overrides it to point at a temp Dockerfile, since
+# FILE_PATH is readonly in setup_tui.sh and cannot be reassigned in
+# the same shell.
+_list_dockerfile_stages_available() {
+  local -n _ldsa_out="${1:?}"
+  local _base="${2:-${FILE_PATH}}"
+  _ldsa_out=()
+  local _df="${_base}/Dockerfile"
+  [[ -f "${_df}" ]] || return 0
+  local _line _stage _seen=" "
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    _dockerfile_stage_from_line "${_line}" _stage || continue
+    case "${_stage}" in
+      # (A1'-b): devel-test is offered as an editable stage (the
+      # `test` service override surface); only the rest of the baseline
+      # and the legacy aliases stay hidden.
+      sys|devel-base|devel|runtime-test) continue ;;
+      base|test) continue ;;
+    esac
+    case "${_seen}" in
+      *" ${_stage} "*) continue ;;
+    esac
+    _seen+="${_stage} "
+    _ldsa_out+=("${_stage}")
+  done < "${_df}"
+}
+
+# _count_stage_overrides <stage> <out_var>
+#
+# Counts the number of non-empty override entries belonging to the
+# stage's [stage:NAME] section (across both _TUI_OVR_* and
+# _TUI_CURRENT, deduped). Used for the stage-list label.
+_count_stage_overrides() {
+  local _stage="${1}"
+  local -n _cso_out="${2:?}"
+  _cso_out=0
+  local _prefix="stage:${_stage}."
+  local -A _seen=()
+  local i
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    if [[ "${_TUI_OVR_KEYS[i]}" == "${_prefix}"* ]]; then
+      [[ -n "${_TUI_OVR_VALUES[i]}" ]] || continue
+      _seen[${_TUI_OVR_KEYS[i]}]=1
+    fi
+  done
+  local _k
+  for _k in "${!_TUI_CURRENT[@]}"; do
+    if [[ "${_k}" == "${_prefix}"* ]]; then
+      [[ -n "${_TUI_CURRENT[${_k}]}" ]] || continue
+      _seen[${_k}]=1
+    fi
+  done
+  _cso_out="${#_seen[@]}"
+}
+
+# _edit_section_per_stage
+#
+# Top-level "Per-stage overrides" entry — shows the stage list with
+# per-stage override-counts; click into one stage opens the section
+# submenu (_edit_per_stage_one).
+_edit_section_per_stage() {
+  while :; do
+    local -a _stages=()
+    _list_dockerfile_stages_available _stages
+    if (( ${#_stages[@]} == 0 )); then
+      _tui_msgbox "$(_tui_msg per_stage.title)" "$(_tui_msg per_stage.empty)"
+      return 0
+    fi
+    local -a _menu_args=()
+    local _stage _count _label
+    for _stage in "${_stages[@]}"; do
+      _count_stage_overrides "${_stage}" _count
+      if (( _count > 0 )); then
+        # shellcheck disable=SC2059  # message source is our own i18n table
+        _label="$(printf '%d %s' "${_count}" "$(_tui_msg per_stage.overrides_set)")"
+      else
+        _label="$(_tui_msg per_stage.inherits_all)"
+      fi
+      _menu_args+=("${_stage}" "${_label}")
+    done
+    _menu_args+=("__back" "$(_tui_msg per_stage.back)")
+
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg per_stage.title)" \
+      "$(_tui_msg per_stage.menu)" "${_menu_args[@]}")" || return 0
+    case "${_choice}" in
+      __back|"") return 0 ;;
+      *) _edit_per_stage_one "${_choice}" ;;
+    esac
+  done
+}
+
+# _edit_per_stage_one <stage>
+#
+# Submenu for one stage: the 5 sections we expose for per-stage
+# override (gui / deploy / network / volumes / environment).
+_edit_per_stage_one() {
+  local _stage="${1}"
+  while :; do
+    local _choice
+    _choice="$(_tui_menu "stage: ${_stage}" \
+      "$(_tui_msg per_stage.one.menu)" \
+      gui         "$(_tui_msg main.gui)" \
+      deploy      "$(_tui_msg main.deploy)" \
+      network     "$(_tui_msg main.network)" \
+      volumes     "$(_tui_msg main.volumes)" \
+      environment "$(_tui_msg main.environment)" \
+      __back      "$(_tui_msg per_stage.back)")" || return 0
+    case "${_choice}" in
+      gui)         _edit_stage_gui "${_stage}" ;;
+      deploy)      _edit_stage_deploy "${_stage}" ;;
+      network)     _edit_stage_network "${_stage}" ;;
+      volumes)     _edit_stage_volumes "${_stage}" ;;
+      environment) _edit_stage_environment "${_stage}" ;;
+      __back|"")   return 0 ;;
+    esac
+  done
+}
+
+# _edit_stage_scalar <stage> <dotted_key>
+#
+# Generic scalar editor — text input. Empty input clears the override
+# (the stage falls back to inheriting top-level); any other value is put
+# to `_schema_validate` under the stage's own section and re-prompted,
+# with the typed text preserved, until it passes or the user cancels.
+#
+# This editor made no validation call at all until base#1268, so every
+# per-stage scalar — gpu_mode, gpu_count, gpu_capabilities, runtime,
+# network mode / ipc / network_name, privileged — was stored verbatim and
+# read back by an emitter that had no idea it was unchecked. The TUI is
+# the only writer of these keys (`setup.sh set stage:dev.network.mode`
+# exits 2 on the section name), so there was no second place the check
+# could have been happening instead. The resolution half of the fix is in
+# `_schema_canonical_key`: adding this call without it would have changed
+# nothing, because `stage:<name>.<section>` resolved to no key and the
+# gate returned 0 on its free-form branch.
+_edit_stage_scalar() {
+  local _stage="${1}" _dotted="${2}"
+  local _nskey="stage:${_stage}.${_dotted}"
+  local _section="stage:${_stage}.${_dotted%.*}"
+  local _key="${_dotted##*.}"
+  local _cur _v
+  _cur="$(_override_get "${_nskey}" "")"
+  while :; do
+    _v="$(_tui_inputbox "stage:${_stage} / ${_dotted}" \
+      "$(_tui_msg per_stage.scalar.prompt)" "${_cur}")" || return 0
+    # Empty input = hand the key back to the top level. That gesture is
+    # the editor's, not the schema's, so it is answered before the gate:
+    # a key whose empty-value policy is `validate` (deploy.gpu_capabilities)
+    # must still be clearable per-stage.
+    if [[ -z "${_v}" ]]; then
+      _mark_removed "${_nskey}"
+      return 0
+    fi
+    if _schema_validate "${_section}" "${_key}" "${_v}"; then
+      _override_set "${_nskey}" "${_v}"
+      return 0
+    fi
+    # Invalid -> report, keep the existing override untouched, and offer
+    # the typed value back for correction (the shape _edit_list_entry
+    # already uses).
+    _tui_msgbox "${_dotted}" "$(_tui_msg err.per_stage_invalid)"
+    _cur="${_v}"
+  done
+}
+
+# _edit_stage_gui <stage>
+#
+# gui.mode override: radio for auto/force/off plus an explicit
+# __inherit option (clears the override so the stage inherits
+# top-level gui resolution).
+_edit_stage_gui() {
+  local _stage="${1}"
+  local _nskey="stage:${_stage}.gui.mode"
+  local _cur _v
+  _cur="$(_override_get "${_nskey}" "")"
+  _v="$(_tui_select "stage:${_stage} / gui" \
+    "$(_tui_msg gui.mode.prompt)" \
+    auto      "$(_tui_msg gui.mode.auto)"      "$([[ "${_cur}" == auto ]]   && echo ON || echo off)" \
+    force     "$(_tui_msg gui.mode.force)"     "$([[ "${_cur}" == force ]]  && echo ON || echo off)" \
+    off       "$(_tui_msg gui.mode.off)"       "$([[ "${_cur}" == off ]]    && echo ON || echo off)" \
+    __inherit "$(_tui_msg per_stage.inherit)"  "$([[ -z "${_cur}" ]]        && echo ON || echo off)")" \
+    || return 0
+  if [[ "${_v}" == "__inherit" || -z "${_v}" ]]; then
+    _mark_removed "${_nskey}"
+  else
+    _override_set "${_nskey}" "${_v}"
+  fi
+}
+
+# _edit_stage_deploy <stage>
+#
+# Deploy section: gpu_mode + gpu_count + gpu_capabilities + runtime.
+# Each currently goes through _edit_stage_scalar (free-form input);
+# v1 ships with that for simplicity. Future polish (menu work)
+# can swap each into a typed editor (radio for gpu_mode, etc.).
+_edit_stage_deploy() {
+  local _stage="${1}"
+  while :; do
+    local _gm _gc _gcaps _rt _ph
+    _gm="$(_override_get "stage:${_stage}.deploy.gpu_mode" "")"
+    _gc="$(_override_get "stage:${_stage}.deploy.gpu_count" "")"
+    _gcaps="$(_override_get "stage:${_stage}.deploy.gpu_capabilities" "")"
+    _rt="$(_override_get "stage:${_stage}.deploy.runtime" "")"
+    _ph="$(_tui_msg per_stage.inherits_all)"
+    local _choice
+    _choice="$(_tui_menu "stage:${_stage} / deploy" \
+      "$(_tui_msg per_stage.scalar.menu)" \
+      gpu_mode         "${_gm:-${_ph}}" \
+      gpu_count        "${_gc:-${_ph}}" \
+      gpu_capabilities "${_gcaps:-${_ph}}" \
+      runtime          "${_rt:-${_ph}}" \
+      __back           "$(_tui_msg per_stage.back)")" || return 0
+    case "${_choice}" in
+      __back|"") return 0 ;;
+      *) _edit_stage_scalar "${_stage}" "deploy.${_choice}" ;;
+    esac
+  done
+}
+
+# _edit_stage_network <stage>
+#
+# Network section: mode / ipc / network_name / privileged + the ports
+# sublist. privileged lives in the [security] section in setup.toml
+# but is bundled here for the user since it's network-adjacent in the
+# top-level menu structure.
+_edit_stage_network() {
+  local _stage="${1}"
+  while :; do
+    local _m _ipc _nn _pri _ph
+    _m="$(_override_get "stage:${_stage}.network.mode" "")"
+    _ipc="$(_override_get "stage:${_stage}.network.ipc" "")"
+    _nn="$(_override_get "stage:${_stage}.network.network_name" "")"
+    _pri="$(_override_get "stage:${_stage}.security.privileged" "")"
+    _ph="$(_tui_msg per_stage.inherits_all)"
+    local _choice
+    _choice="$(_tui_menu "stage:${_stage} / network" \
+      "$(_tui_msg per_stage.scalar.menu)" \
+      mode         "${_m:-${_ph}}" \
+      ipc          "${_ipc:-${_ph}}" \
+      network_name "${_nn:-${_ph}}" \
+      privileged   "${_pri:-${_ph}}" \
+      ports        "$(_tui_msg per_stage.network.ports)" \
+      __back       "$(_tui_msg per_stage.back)")" || return 0
+    case "${_choice}" in
+      __back|"") return 0 ;;
+      mode|ipc|network_name) _edit_stage_scalar "${_stage}" "network.${_choice}" ;;
+      privileged) _edit_stage_scalar "${_stage}" "security.privileged" ;;
+      ports) _edit_stage_list "${_stage}" "network" "port_" "network.port_inherit" ;;
+    esac
+  done
+}
+
+# _edit_stage_volumes <stage>
+#   _edit_stage_environment <stage>
+#
+# Thin wrappers over _edit_stage_list with section-specific args.
+_edit_stage_volumes() {
+  _edit_stage_list "${1}" "volumes" "mount_" "volumes.mount_inherit"
+}
+_edit_stage_environment() {
+  _edit_stage_list "${1}" "environment" "env_" "environment.env_inherit"
+}
+
+# _edit_stage_list <stage> <section> <prefix> <inherit_dotted>
+#
+# Generic list editor for per-stage list fields (volumes.mount_*,
+# network.port_*, environment.env_*). Mirrors the top-level
+# _edit_list_section (numeric-suffix add/edit/remove) plus an inherit
+# toggle row that flips `<list>_inherit` between true (default) and
+# false (replace mode — drop top-level entries entirely).
+#
+# Args:
+#   stage           Stage name (becomes part of the namespace prefix)
+#   section         Top-level section name (volumes / environment / network)
+#   prefix          List item key prefix (mount_ / env_ / port_)
+#   inherit_dotted  Dotted meta-key path inside the stage section
+#                   (e.g. volumes.mount_inherit)
+_edit_stage_list() {
+  local _stage="${1}" _section="${2}" _prefix="${3}" _inherit_dotted="${4}"
+  local _ns="stage:${_stage}.${_section}"
+  while :; do
+    local -a _nums=()
+    local _k _n _x _found
+    for _k in "${!_TUI_CURRENT[@]}"; do
+      if [[ "${_k}" == "${_ns}.${_prefix}"* ]]; then
+        _n="${_k#"${_ns}.${_prefix}"}"
+        [[ "${_n}" =~ ^[0-9]+$ ]] && _nums+=("${_n}")
+      fi
+    done
+    local i
+    for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+      if [[ "${_TUI_OVR_KEYS[i]}" == "${_ns}.${_prefix}"* ]]; then
+        _n="${_TUI_OVR_KEYS[i]#"${_ns}.${_prefix}"}"
+        if [[ "${_n}" =~ ^[0-9]+$ ]]; then
+          _found=0
+          for _x in "${_nums[@]}"; do [[ "${_x}" == "${_n}" ]] && _found=1 && break; done
+          (( _found )) || _nums+=("${_n}")
+        fi
+      fi
+    done
+    # shellcheck disable=SC2207
+    mapfile -t _nums < <(printf '%s\n' "${_nums[@]}" | sort -n | uniq)
+
+    local -a _menu_args=()
+    for _n in "${_nums[@]}"; do
+      local _cur_v
+      _cur_v="$(_override_get "${_ns}.${_prefix}${_n}" "")"
+      [[ -z "${_cur_v}" ]] && continue
+      _menu_args+=("${_prefix}${_n}" "${_cur_v}")
+    done
+    # Inherit toggle row — display current state in the label.
+    local _inherit_v _inherit_label
+    _inherit_v="$(_override_get "stage:${_stage}.${_inherit_dotted}" "true")"
+    [[ -z "${_inherit_v}" ]] && _inherit_v="true"
+    _inherit_label="$(_tui_msg per_stage.inherit_flag): ${_inherit_v}"
+    _menu_args+=("__inherit" "${_inherit_label}")
+    _menu_args+=("add"       "$(_tui_msg volumes.add)")
+    _menu_args+=("__back"    "$(_tui_msg per_stage.back)")
+
+    local _choice
+    _choice="$(_tui_menu "stage:${_stage} / ${_section}" \
+      "$(_tui_msg per_stage.list.menu)" "${_menu_args[@]}")" || return 0
+    case "${_choice}" in
+      __back|"") return 0 ;;
+      __inherit)
+        # Toggle the inherit flag. true is the default — clearing the
+        # override is equivalent to true. false = explicit replace mode.
+        if [[ "${_inherit_v}" == "false" ]]; then
+          _mark_removed "stage:${_stage}.${_inherit_dotted}"
+        else
+          _override_set "stage:${_stage}.${_inherit_dotted}" "false"
+        fi
+        ;;
+      add)
+        local _next=1 _v
+        while :; do
+          _v="$(_override_get "${_ns}.${_prefix}${_next}" "")"
+          [[ -z "${_v}" ]] && break
+          (( _next++ ))
+        done
+        _edit_list_entry "${_ns}" "${_prefix}" "${_next}" \
+          "$(_tui_msg per_stage.list.entry_prompt)" err.per_stage_invalid || true
+        ;;
+      "${_prefix}"*)
+        _edit_list_entry "${_ns}" "${_prefix}" "${_choice#"${_prefix}"}" \
+          "$(_tui_msg per_stage.list.entry_prompt)" err.per_stage_invalid || true
+        ;;
+    esac
+  done
+}
+
+_render_main_menu() {
+  # Footer button labels are NOT i18n'd — keep a stable English
+  # "Enter / Cancel" row across all locales so users never see a mix
+  # of English widget chrome and translated buttons, and so
+  # screenshots / docs stay consistent.
+  # Plain shell variables, not exported: _tui_run reads them in this same
+  # process (a $(...) subshell inherits them), and the leading underscore
+  # is _tui_backend.sh's private-name convention -- these are internal
+  # parameterisation, not a knob the environment may set.
+  _TUI_OK_LABEL="Enter"
+  _TUI_CANCEL_LABEL="Cancel"
+  # Save & Exit lives in the menu body for both backends.
+  # whiptail has no `--extra-button` equivalent at all (newt limit),
+  # and using dialog's `--extra-button` made the same repo render with
+  # different button rows on dialog vs whiptail hosts — breaking shared
+  # screenshots / docs. Standardizing on a synthetic `__save` entry
+  # gives identical layout regardless of backend; the small extra
+  # navigation step on dialog is acceptable for the consistency win.
+  # Main menu structure:
+  #   image / build           — top-level (frequently tweaked when wiring a repo)
+  #   runtime / mounts        — sub-menu groupers (lifecycle-stage groupings)
+  #   advanced                — power-user sections (security / contexts / per-stage)
+  #   features                — discoverability for conditional / power-user features
+  #   Save & Exit             — synthetic entry, note above
+  while :; do
+    local _choice _rc
+    _choice="$(_tui_menu "$(_tui_msg title)" "$(_tui_msg main.prompt)" \
+      image     "$(_tui_msg main.image)" \
+      build     "$(_tui_msg main.build)" \
+      runtime   "$(_tui_msg main.runtime)" \
+      mounts    "$(_tui_msg main.mounts)" \
+      advanced  "$(_tui_msg main.advanced)" \
+      features  "$(_tui_msg main.features)" \
+      __save    "$(_tui_msg main.save)")"
+    _rc=$?
+    case "${_rc}" in
+      0)
+        case "${_choice}" in
+          image|build) "_edit_section_${_choice}" ;;
+          runtime)  _render_runtime_menu ;;
+          mounts)   _render_mounts_menu ;;
+          advanced) _render_advanced_menu ;;
+          features) _render_features_menu ;;
+          __save)   _TUI_OK_LABEL=""; _TUI_CANCEL_LABEL=""; return 0 ;;
+          "")       _TUI_OK_LABEL=""; _TUI_CANCEL_LABEL=""; return 1 ;;
+        esac
+        ;;
+      *)  _TUI_OK_LABEL=""; _TUI_CANCEL_LABEL=""; return 1 ;;   # Cancel / Esc
+    esac
+  done
+}
+
+# Runtime-env info page. Info-only: explains where volatile workload
+# env vars belong (the gitignored .env.local, edited by hand) versus the
+# set-once [environment] defaults. The S2 invariant is that setup.sh
+# / the TUI never write .env, so this is a guidance msgbox, not an editor.
+_show_runtime_env_info() {
+  _tui_msgbox "$(_tui_msg envinfo.title)" "$(_tui_msg envinfo.info)"
+}
+
+_render_runtime_menu() {
+  # Runtime grouper: network / GPU / display / env vars / logging
+  # — all the things that take effect when the container actually runs.
+  # Logging joined the menu in to close the [logging] UX orphan
+  # left by (compose-emit shipped without TUI / CLI reach).
+  while :; do
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg runtime.title)" "$(_tui_msg runtime.menu)" \
+      network     "$(_tui_msg main.network)" \
+      deploy      "$(_tui_msg main.deploy)" \
+      gui         "$(_tui_msg main.gui)" \
+      environment "$(_tui_msg main.environment)" \
+      logging     "$(_tui_msg main.logging)" \
+      lifecycle   "$(_tui_msg main.lifecycle)" \
+      envinfo     "$(_tui_msg main.envinfo)" \
+      __back      "$(_tui_msg runtime.back)")" || break
+    case "${_choice}" in
+      network|deploy|gui|environment|logging|lifecycle) "_edit_section_${_choice}" ;;
+      envinfo) _show_runtime_env_info ;;
+      __back|"") break ;;
+    esac
+  done
+}
+
+_render_mounts_menu() {
+  # Mounts grouper: volumes / devices / tmpfs — host->container
+  # resource bindings.
+  while :; do
+    local _choice
+    _choice="$(_tui_menu "$(_tui_msg mounts.title)" "$(_tui_msg mounts.menu)" \
+      volumes "$(_tui_msg main.volumes)" \
+      devices "$(_tui_msg main.devices)" \
+      tmpfs   "$(_tui_msg main.tmpfs)" \
+      __back  "$(_tui_msg mounts.back)")" || break
+    case "${_choice}" in
+      volumes|devices|tmpfs) "_edit_section_${_choice}" ;;
+      __back|"") break ;;
+    esac
+  done
+}
+
+# _render_features_menu [base_path]
+#
+# Always-visible discoverability surface for conditional / power-user
+# features (acceptance for the third sub-question of the issue).
+# Each feature row shows current status — "enabled (N ...)" when the
+# preconditions are satisfied, "hidden (...)" when not. Clicking a
+# disabled row pops an msgbox explaining how to enable; clicking an
+# enabled row drills into the same editor the conditional Advanced
+# entry uses (per_stage is the only such feature today).
+#
+# The optional base_path arg threads through to the
+# _list_dockerfile_stages_available probe (FILE_PATH is readonly, so
+# tests pass an alternate base_path here to stage a fake Dockerfile).
+# shellcheck disable=SC2120  # production callers pass no args; tests pass base_path
+_render_features_menu() {
+  local _base_path="${1:-}"
+  while :; do
+    local _choice
+    local -a _stages=()
+    if [[ -n "${_base_path}" ]]; then
+      _list_dockerfile_stages_available _stages "${_base_path}"
+    else
+      _list_dockerfile_stages_available _stages
+    fi
+    local _per_stage_label
+    if (( ${#_stages[@]} > 0 )); then
+      # shellcheck disable=SC2059  # format string sourced from our own i18n table
+      printf -v _per_stage_label "$(_tui_msg features.per_stage_enabled)" "${#_stages[@]}"
+    else
+      _per_stage_label="$(_tui_msg features.per_stage_hidden)"
+    fi
+    _choice="$(_tui_menu "$(_tui_msg features.title)" "$(_tui_msg features.menu)" \
+      per_stage "${_per_stage_label}" \
+      __back    "$(_tui_msg features.back)")" || break
+    case "${_choice}" in
+      per_stage)
+        if (( ${#_stages[@]} > 0 )); then
+          _edit_section_per_stage
+        else
+          _tui_msgbox "$(_tui_msg features.title)" \
+            "$(_tui_msg features.per_stage_hidden_info)"
+        fi
+        ;;
+      __back|"") break ;;
+    esac
+  done
+}
+
+_render_advanced_menu() {
+  # Slimmed forimage / build promoted to main; devices / tmpfs
+  # moved to Mounts. What's left here is truly advanced — security
+  # capabilities, named build contexts, per-stage overrides (still
+  # conditional so 17 baseline-only repos see no noise here; Features
+  # menu surfaces it for everyone), and Reset.
+  while :; do
+    local _choice
+    local -a _stages_check=()
+    _list_dockerfile_stages_available _stages_check
+    local -a _menu_args=(
+      security             "$(_tui_msg main.security)"
+      additional_contexts  "$(_tui_msg main.additional_contexts)"
+    )
+    if (( ${#_stages_check[@]} > 0 )); then
+      _menu_args+=(per_stage "$(_tui_msg advanced.per_stage)")
+    fi
+    _menu_args+=(
+      reset                "$(_tui_msg advanced.reset)"
+      __back               "$(_tui_msg advanced.back)"
+    )
+    _choice="$(_tui_menu "$(_tui_msg advanced.title)" "$(_tui_msg advanced.menu)" \
+      "${_menu_args[@]}")" || break
+    case "${_choice}" in
+      security|additional_contexts) "_edit_section_${_choice}" ;;
+      per_stage) _edit_section_per_stage ;;
+      reset)    _do_reset ;;
+      __back|"") break ;;
+    esac
+  done
+}
+
+# _do_reset
+#
+# Drop this repo's overrides and go back to the template baseline, then
+# clear all TUI session state so the reloaded values are what the user
+# sees on the next menu.
+#
+# The layer it drops is `<repo>/setup.toml` -- the repo's own committed
+# layer, which is what "this repo's overrides" means under the chain.
+# `<repo>/setup.local.toml` is the operator's file and is NOT touched by
+# a reset, so the values the menus show afterwards can still carry it;
+# the launch notice is what keeps that from being a surprise.
+#
+# Delegated to `setup.sh reset --yes` rather than spelled as an `rm -f`
+# here. That subcommand IS "overwrite the repo's setup.toml with the
+# template baseline", it archives the prior file as `setup.toml.bak`
+# first, and it is what `build.sh --reset-conf` runs -- so the TUI's
+# Reset and the CLI's cannot come to mean two different things, and the
+# destructive step has one implementation to be careful in.
+# A FAILED RESET IS NOT A RESET. The status is checked and the session is
+# left intact: swallowed with `|| true` the editor went on to throw away
+# every pending edit, reload the configuration that had not changed, and
+# report that all settings were reset -- the same shape of misleading
+# success this whole rebuild exists to end, with the operator's unsaved
+# work gone as well. On failure the edits are still there to be saved.
+_do_reset() {
+  _tui_yesno "$(_tui_msg reset.title)" "$(_tui_msg reset.confirm)" || return 0
+  # --quiet so the confirmation lines don't double-print after the TUI's
+  # own `[tui] saved` line. stderr is kept: the reason a reset failed is
+  # the only actionable thing about it, and the msgbox below says where
+  # to look for it.
+  if ! "${_TUI_SCRIPT_DIR}/setup.sh" reset --yes --quiet \
+      --base-path "${_TUI_BASE_PATH}" --lang "${_LANG}" >/dev/null; then
+    _tui_msgbox "$(_tui_msg reset.title)" "$(_tui_msg err.reset_failed)"
+    return 2
+  fi
+  "${_TUI_SCRIPT_DIR}/setup.sh" apply --quiet \
+    --base-path "${_TUI_BASE_PATH}" --lang "${_LANG}" \
+    >/dev/null 2>&1 || true
+  _TUI_OVR_KEYS=()
+  _TUI_OVR_VALUES=()
+  _TUI_REMOVED=()
+  _load_current "${_TUI_BASE_PATH}" "${_TUI_TPL_DIR}" || return 1
+  _tui_msgbox "$(_tui_msg reset.title)" "$(_tui_msg reset.done)"
+}
+
+# ── Commit & trigger setup.sh ────────────────────────────────────────────
+
+# _commit_and_setup <repo_conf> <tpl_conf>
+#
+# Write the session's edits into <repo_conf> -- this repo's own layer of
+# the chain -- and re-run `setup.sh apply` so the derived artifacts
+# (.env / .env.generated / compose.yaml) follow.
+#
+# WHAT THE SAVE CARRIES, and why it is not simply "everything the menus
+# showed". The baseline is now the EFFECTIVE configuration, so writing
+# all of it would copy every inherited value down into this repo's
+# committed file and the repo would stop tracking the template. What the
+# user CHANGED is `_TUI_OVR_*` plus `_TUI_REMOVED`, and for a `[table]`
+# scalar that is exactly enough: key-level merge leaves every key this
+# file does not name inheriting as before.
+#
+# An ARRAY entry is the exception, and the whole list goes with it. An
+# array is replaced atomically by the highest layer that declares it, so
+# a file that names one `[[volumes]]` entry replaces the inherited list
+# with that single mount. Writing only the edited slot would delete the
+# rest of the list without saying so -- adding a third mount to a
+# template's two would drop the workspace bind. So every family this
+# session touched is written WHOLE, from the effective baseline, which is
+# the list the menus actually showed. `_tui_aot_families_touched` decides
+# which keys those are, off `_conf_toml_aot_section`'s table.
+#
+# A REFUSED write is reported, not swallowed. `_write_setup_conf` declines
+# a save it cannot make faithfully -- an index with no slot, or a removal
+# that would hand slot 1 of `[volumes]` to another mount -- and leaves
+# <repo_conf> untouched. Under `set -e` that would abort the editor on
+# the spot with only the writer's log line, mid-curses. So the screen is
+# released FIRST, the status is checked, and the refusal's own message
+# (already on the terminal by then) is pointed at rather than restated
+# here: one wording of why a write was declined, in the function that
+# declines it.
+_commit_and_setup() {
+  local _repo_conf="${1:?"${FUNCNAME[0]}: missing repo conf"}"
+  local _tpl_conf="${2:?"${FUNCNAME[0]}: missing template conf"}"
+
+  # The keys the user changed, overrides last so an edit wins over the
+  # baseline copy of the same key its family pulled in.
+  local -a _final_keys=() _final_values=()
+  local -A _seen=()
+  local _k _s _key _p _n _fam _row
+  local -a _families=()
+  _tui_aot_families_touched _families
+  for _fam in "${_families[@]+"${_families[@]}"}"; do
+    # `_TUI_CURRENT` is an associative array, so iterating it straight
+    # walks a HASH order: a family's entries would reach the save in a
+    # different sequence from one run to the next, and the writer appends
+    # a family the destination has no block of in the order the caller
+    # named it. Sorted by index here, so one save of one configuration
+    # rewrites the file one way.
+    local -a _slots=()
+    for _k in "${!_TUI_CURRENT[@]}"; do
+      _conf_split_nskey "${_k}" _s _key || continue
+      _conf_toml_aot_slot "${_s}" "${_key}" _p _n || continue
+      [[ "${_p}" == "${_fam}" ]] || continue
+      _slots+=("${_n} ${_k}")
+    done
+    (( ${#_slots[@]} > 0 )) || continue
+    while IFS= read -r _row; do
+      _k="${_row#* }"
+      [[ -n "${_seen[${_k}]:-}" ]] && continue
+      _seen["${_k}"]=1
+      _final_keys+=("${_k}")
+      _final_values+=("${_TUI_CURRENT[${_k}]}")
+    done < <(printf '%s\n' "${_slots[@]}" | sort -n -k1,1)
+  done
+  local i j _found
+  for (( i=0; i<${#_TUI_OVR_KEYS[@]}; i++ )); do
+    _k="${_TUI_OVR_KEYS[i]}"
+    _found=0
+    for (( j=0; j<${#_final_keys[@]}; j++ )); do
+      if [[ "${_final_keys[j]}" == "${_k}" ]]; then
+        _final_values[j]="${_TUI_OVR_VALUES[i]}"
+        _found=1
+        break
+      fi
+    done
+    (( _found )) || { _final_keys+=("${_k}"); _final_values+=("${_TUI_OVR_VALUES[i]}"); }
+  done
+
+  # The destination's own lines are the template to copy when it exists,
+  # so every comment, every untouched key and every untouched array block
+  # survives the rewrite; the shipped template supplies the structure only
+  # on a first run that had nothing to bootstrap from.
+  local _template_src="${_tpl_conf}"
+  [[ -f "${_repo_conf}" ]] && _template_src="${_repo_conf}"
+
+  # TRIM A TOUCHED FAMILY TO THE LIST THE MENUS SHOWED. The writer
+  # addresses an array by SLOT -- it replaces block N, drops a removed
+  # one, appends past the end -- so it never shortens a family nobody
+  # removed from. A destination holding MORE blocks of a touched family
+  # than the effective list therefore keeps its own extras, which is
+  # reachable whenever a HIGHER layer declares a shorter array:
+  # `setup.local.toml` with one `[[build.args]]` entry over a committed
+  # file with two makes the effective list one entry long, and saving an
+  # edit to it left the committed file carrying the edited entry followed
+  # by its own leftover -- a list no layer ever wrote and no screen ever
+  # showed. The surplus slots are removed by index as part of the same
+  # save.
+  #
+  # THE SURPLUS IS AN ARITHMETIC, NOT A COUNT OF SURVIVORS. The keys the
+  # save carries are slot-ADDRESSED, so a list the user shortened by
+  # removing its first entry carries one survivor at INDEX 2 -- and the
+  # writer compacts, so it already produces a one-entry family. Trimming
+  # to "as many slots as there are survivors" would have removed index 2
+  # as well and emptied the list the operator only shortened. What the
+  # rewrite will produce is counted instead: the destination's slots,
+  # less the ones this save removes, plus the ones it appends past the
+  # end. Only the difference from the on-screen length is surplus.
+  #
+  # The destination's slots are counted off its own parse, not off
+  # `_TUI_CURRENT` -- the baseline is the merge, and the question here is
+  # what THIS FILE still has -- and over the parse's rows rather than a
+  # list reader that skips empty values, because an entry cleared to the
+  # empty string is still a slot.
+  #
+  # Trimmed from the TOP down. Slot 1 of `[volumes]` is the workspace
+  # bind by position, and a save that would hand it to another mount is
+  # declined by `_wsc_refuse_ws_slot_move` (base#1233 carries how that
+  # bind should be identified); taking the highest slots first means the
+  # trim reaches slot 1 only when the whole list is going, which is the
+  # one case that refusal deliberately allows.
+  local -a _removed_now=("${_TUI_REMOVED[@]+"${_TUI_REMOVED[@]}"}")
+  if [[ -f "${_repo_conf}" && "${_repo_conf}" == *.toml ]] \
+     && (( ${#_families[@]} > 0 )) \
+     && _conf_load "${_repo_conf}" _CAS_DST; then
+    local -n _cas_es=_CAS_DST__es
+    local -n _cas_k=_CAS_DST__keys
+    local _dst_n _want _rm_n _appended _surplus _prefix _nskey _idx _slot
+    for _fam in "${_families[@]}"; do
+      _conf_toml_aot_nskey "${_fam}" 1 _nskey || continue
+      _conf_split_nskey "${_nskey}" _s _key || continue
+      _prefix="${_key%_*}_"
+      _dst_n=0
+      for (( i=0; i<${#_cas_k[@]}; i++ )); do
+        [[ "${_cas_es[i]}" == "${_s}" ]] || continue
+        [[ "${_cas_k[i]}" == "${_prefix}"* ]] || continue
+        [[ "${_cas_k[i]#"${_prefix}"}" =~ ^[0-9]+$ ]] || continue
+        _dst_n=$(( _dst_n + 1 ))
+      done
+      # The on-screen length, and how much of it the writer appends.
+      _want=0
+      _appended=0
+      for (( i=0; i<${#_final_keys[@]}; i++ )); do
+        _conf_split_nskey "${_final_keys[i]}" _p _n || continue
+        [[ "${_p}" == "${_s}" && "${_n}" == "${_prefix}"* ]] || continue
+        _slot="${_n#"${_prefix}"}"
+        [[ "${_slot}" =~ ^[0-9]+$ ]] || continue
+        _want=$(( _want + 1 ))
+        (( _slot > _dst_n )) && _appended=$(( _appended + 1 ))
+      done
+      # Destination slots this save already removes.
+      _rm_n=0
+      for _nskey in "${_TUI_REMOVED[@]+"${_TUI_REMOVED[@]}"}"; do
+        _conf_split_nskey "${_nskey}" _p _n || continue
+        [[ "${_p}" == "${_s}" && "${_n}" == "${_prefix}"* ]] || continue
+        _slot="${_n#"${_prefix}"}"
+        [[ "${_slot}" =~ ^[0-9]+$ ]] || continue
+        (( _slot <= _dst_n )) && _rm_n=$(( _rm_n + 1 ))
+      done
+      _surplus=$(( _dst_n - _rm_n + _appended - _want ))
+      (( _surplus > 0 )) || continue
+      for (( _idx=_dst_n; _idx >= 1 && _surplus > 0; _idx-- )); do
+        _conf_toml_aot_nskey "${_fam}" "${_idx}" _nskey || continue
+        _tui_in_list "${_nskey}" "${_removed_now[@]+"${_removed_now[@]}"}" \
+          && continue
+        _removed_now+=("${_nskey}")
+        _surplus=$(( _surplus - 1 ))
+      done
+    done
+  fi
+
+  # Which sections of this save the per-worktree layer also defines --
+  # asked BEFORE the screen is released, so the answer is reported with
+  # the save rather than after it.
+  local -a _shadowed=()
+  _tui_shadowed_sections "${_TUI_BASE_PATH}" _shadowed
+
+  _tui_clear
+  if ! _write_setup_conf "${_repo_conf}" "${_template_src}" \
+      _final_keys _final_values \
+      "${_removed_now[*]:-}"; then
+    printf '[tui] %s\n' "$(_tui_msg err.save_refused)" >&2
+    return 2
+  fi
+  # The `saved` message contains a %s placeholder that we feed _repo_conf
+  # into. SC2059 warns about format-from-variable — acceptable here because
+  # the message source is our own i18n table, not external input.
+  local _saved_fmt
+  _saved_fmt="$(_tui_msg saved)"
+  # shellcheck disable=SC2059
+  printf "[tui] ${_saved_fmt}\n" "${_repo_conf}"
+  if (( ${#_shadowed[@]} > 0 )); then
+    local _local_path _shadow_fmt
+    _local_path="$(_setup_conf_local_path "${_TUI_BASE_PATH}")"
+    _shadow_fmt="$(_tui_msg saved.shadowed)"
+    # shellcheck disable=SC2059
+    printf "[tui] ${_shadow_fmt}\n" "${_local_path}" "${_shadowed[*]}" >&2
+  fi
+  # --quiet so apply's confirmation lines don't double-print after the
+  # TUI's own `[tui] saved` line.
+  "${_TUI_SCRIPT_DIR}/setup.sh" apply --quiet \
+    --base-path "${_TUI_BASE_PATH}" --lang "${_LANG}"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────
+
+# _warn_if_lang_rejected <bad_input>
+#
+# When _sanitize_lang had to fall back to "en" because --lang was an
+# unknown value, open a TUI msgbox to tell the user. The stderr
+# warning from _sanitize_lang is useless here since dialog/whiptail's
+# curses rendering clears it before the user can read it.
+#
+# <bad_input> is the original string the user passed; empty = no-op.
+_warn_if_lang_rejected() {
+  local _bad="${1:-}"
+  [[ -z "${_bad}" ]] && return 0
+  # shellcheck disable=SC2059  # body is our own i18n template
+  _tui_msgbox "$(_tui_msg lang.invalid.title)" \
+    "$(printf "$(_tui_msg lang.invalid.body)" "${_bad}")"
+}
+
+# _tui_known_subcommand <arg>
+#
+# Returns 0 when <arg> is a valid direct-jump subcommand: any schema
+# section (derived from SCHEMA_SECTIONS so adding a section makes it a
+# valid subcommand automatically,) or the `ports` pseudo-section
+# (a [network] sub-editor with no section of its own). Used by main's
+# argument parser as the single validity gate for `setup_tui.sh <name>`.
+_tui_known_subcommand() {
+  local _arg="${1-}"
+  # A name is dispatchable only if the editor main jumps to actually
+  # exists. Being a schema section is not enough: `project` is one, with
+  # a deliberate no-editor opt-out (see schema.sh's SCHEMA_I18N note --
+  # the project name belongs in the gitignored setup.local.toml, a
+  # layer the menu has no concept of), and accepting it on the section
+  # list alone sent main into `_edit_section_project`, a bash
+  # command-not-found raised after the backend probe and the seeding
+  # `setup.sh apply` run had already happened. Read off the function
+  # table rather than an exclusion list, so a section that gains or
+  # loses an editor needs no edit here.
+  declare -F "_edit_section_$(_tui_canonical_section "${_arg}")" >/dev/null \
+    || return 1
+  _schema_is_section "${_arg}" && return 0
+  [[ "${_arg}" == "ports" ]] && return 0
+  [[ "${_arg}" == "gpu" ]] && return 0
+  return 1
+}
+
+# _tui_canonical_section <arg>
+#
+# Print the section editor <arg> reaches. Everything is its own name except
+# `gpu`, the unambiguous spelling of the `[deploy]` section: that section
+# configures GPU reservation only and is named after Compose's `deploy:`
+# key, which collides head-on with `setup.sh deploy` (the field-deploy
+# bundle). Renaming the section is off the table -- it follows Compose --
+# so the editor gains a second, non-colliding name instead and `deploy`
+# stays a working alias.
+_tui_canonical_section() {
+  local _arg="${1-}"
+  if [[ "${_arg}" == "gpu" ]]; then
+    printf 'deploy'
+  else
+    printf '%s' "${_arg}"
+  fi
+}
+
+# _warn_if_deploy_word_ambiguous <raw_subcommand>
+#
+# Say which of the two `deploy` things the user just got, but only when
+# they used the colliding word. Reaching the same editor through `gpu` is
+# unambiguous by construction and stays silent -- so the notice is
+# escapable by learning the better name, not by suppressing a warning.
+#
+# A msgbox rather than stderr for the same reason _warn_if_lang_rejected
+# uses one: curses clears the terminal before the user could read it.
+_warn_if_deploy_word_ambiguous() {
+  [[ "${1-}" == "deploy" ]] || return 0
+  _tui_msgbox "$(_tui_msg deploy.ambiguous.title)" \
+    "$(_tui_msg deploy.ambiguous.body)"
+}
+
+main() {
+  _transcript_begin  # capture pre-launch phase; detach before the TUI
+  local _subcmd=""
+  # What the user actually typed, kept so the deploy-word notice can fire
+  # on the ambiguous spelling and stay silent on the unambiguous one.
+  local _subcmd_raw=""
+  # Remember the raw --lang value if sanitize rejects it, so we can
+  # surface the warning INSIDE the TUI (the stderr message from
+  # _sanitize_lang gets hidden by curses once dialog takes over).
+  local _bad_lang_input=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      -h|--help) usage ;;
+      --lang)
+        _LANG="${2:?"--lang requires a value"}"
+        local _lang_before="${_LANG}"
+        # Silence sanitize's stderr — the TUI msgbox below replaces it.
+        _sanitize_lang _LANG "tui" 2>/dev/null
+        if [[ "${_LANG}" != "${_lang_before}" ]]; then
+          _bad_lang_input="${_lang_before}"
+        fi
+        shift 2
+        ;;
+      *)
+        if _tui_known_subcommand "${1}"; then
+          _subcmd_raw="${1}"
+          _subcmd="$(_tui_canonical_section "${1}")"
+          shift
+        elif _schema_is_section "${1}"; then
+          # A real section the TUI does not edit -- reported as itself
+          # rather than as an unknown argument, because the name IS
+          # valid everywhere else (`setup.sh set`, the conf file) and
+          # "unknown argument" would send the reader looking for a typo.
+          printf "[tui] %s has no TUI editor; set it with just docker setup set %s.<key> <value>\n" \
+            "${1}" "${1}" >&2
+          exit 2
+        else
+          printf "[tui] unknown argument: %s\n" "${1}" >&2
+          usage
+        fi
+        ;;
+    esac
+  done
+
+  _tui_init_lang
+
+  if ! _backend_detect; then
+    printf "[tui] %s\n" "$(_tui_msg err.no_backend)" >&2
+    exit 2
+  fi
+
+  # Surface the --lang rejection before the main menu opens.
+  _warn_if_lang_rejected "${_bad_lang_input}"
+
+  # `setup_tui.sh deploy` and `setup.sh deploy` are unrelated; say which
+  # one this is before the GPU editor opens.
+  _warn_if_deploy_word_ambiguous "${_subcmd_raw}"
+
+  # The editor's save target is this repo's own layer of the conf chain,
+  # `<repo>/setup.toml`; the template layer supplies the file's structure
+  # on a first run. The menus' baseline is a different question -- the
+  # whole chain merged -- and _load_current answers it.
+  local _repo_conf="${_TUI_BASE_PATH}/setup.toml"
+  local _tpl_conf="${_TUI_TPL_DIR}/setup.toml"
+  # First-run bootstrap: when no per-repo setup.toml exists yet, run
+  # setup.sh apply so mount_1 detection seeds the file before the TUI
+  # opens its menus.
+  if [[ ! -f "${_repo_conf}" ]]; then
+    # --quiet so apply's confirmation lines don't double-print after the
+    # TUI's own `[tui] saved` line.
+    "${_TUI_SCRIPT_DIR}/setup.sh" apply --quiet \
+      --base-path "${_TUI_BASE_PATH}" --lang "${_LANG}" \
+      >/dev/null 2>&1 || true
+  fi
+  _load_current "${_TUI_BASE_PATH}" "${_TUI_TPL_DIR}" || exit 2
+
+  # A per-worktree layer is named before anything opens: the menus below
+  # show the EFFECTIVE values, that layer included, and a save goes to the
+  # committed one.
+  _tui_local_layer_notice "${_TUI_BASE_PATH}"
+
+  # pre-tui hook fires before TUI launches. Skipped under
+  # --dry-run.
+  _run_pre_hook setup_tui "$@" || exit $?
+
+  # pre-launch phase captured; detach before dialog/whiptail takes
+  # over the terminal (the TUI body + post-commit are not captured).
+  _transcript_detach
+
+  if [[ -n "${_subcmd}" ]]; then
+    "_edit_section_${_subcmd}"
+  else
+    if ! _render_main_menu; then
+      # Cancelled
+      _tui_clear
+      exit 0
+    fi
+  fi
+
+  _commit_and_setup "${_repo_conf}" "${_tpl_conf}"
+
+  # post-tui hook fires after commit (.env / compose.yaml
+  # regenerated by setup.sh apply).
+  _run_post_hook setup_tui "$@"
+}
+
+# Guard: only run main when executed directly, not when sourced (for testing)
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
+  main "$@"
+fi

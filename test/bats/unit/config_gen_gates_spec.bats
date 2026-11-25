@@ -1,0 +1,2935 @@
+#!/usr/bin/env bats
+#
+# config_gen_gates_spec.bats -- the Go gates of the config generator and the
+# two scripts that run them (base#1462).
+#
+# why: ADR-00000039 makes the config generator one typed Go program, and S1b
+# lands its skeleton. Nothing runs Go gates anywhere before this slice:
+# `just test go` is not a recipe, no Dockerfile builds the module and no CI
+# job calls it. This spec pins the pieces that make one command, `just test
+# go`, run the same gates in every environment:
+#
+#   dockerfile/Dockerfile.config-gen  build, test and final (scratch) stages;
+#                                     the test stage runs fmt, vet, lint,
+#                                     race and coverage, one RUN each, in
+#                                     that order.
+#   script/test/config_gen_gates.sh   the runner: steps seam, named build
+#                                     contexts, the docker build, the gate id
+#                                     re-emitted, and the binary contract.
+#   script/test/config_gen_redpath.sh one planted defect per gate plus an
+#                                     unmodified copy run twice as rerun,
+#                                     each through the runner on a scratch
+#                                     copy.
+#   `go` recipe in justfile.test      the runner, then the redpath.
+#
+# docker, just and the runner are stubbed here; the real `just test go` is
+# the end-to-end proof that the planted defects go red.
+
+bats_require_minimum_version 1.5.0
+
+# The canned runner answers depend only on /source and the row table, so
+# they are made once per file and _redpath_repo copies them (base#1555).
+setup_file() {
+  local S
+  S="$(_canned_template)"
+  mkdir -p "${S}"
+  _canned_correct
+}
+
+# _canned_template -- where setup_file builds the file's one set of canned
+# answers (under it, canned/), which every _redpath_repo copies (base#1555).
+_canned_template() {
+  printf '%s\n' "${BATS_FILE_TMPDIR}/canned-template"
+}
+
+setup() {
+  load "${BATS_TEST_DIRNAME}/test_helper"
+  RUNNER="/source/script/test/config_gen_gates.sh"
+  REDPATH="/source/script/test/config_gen_redpath.sh"
+  DOCKERFILE="/source/dockerfile/Dockerfile.config-gen"
+  S="${BATS_TEST_TMPDIR}"
+  mkdir -p "${S}/bin"
+}
+
+# ── fixtures ────────────────────────────────────────────────────────────────
+
+# _root -- a minimal --root tree for the runner at ${S}/root: the Dockerfile
+# path it checks, the module context and an empty steps directory.
+_root() {
+  mkdir -p "${S}/root/dockerfile/config-gen" "${S}/root/script/test/config_gen_steps"
+  printf 'FROM scratch\n' > "${S}/root/dockerfile/Dockerfile.config-gen"
+}
+
+# _gate_log <gate>... -- the plain-progress lines a test-stage build prints
+# when each named gate passed.
+_gate_log() {
+  local _g _n=7
+  for _g in "$@"; do
+    printf '#%s [test %s/6] RUN echo\n#%s 0.41 gate=%s ok\n' "${_n}" "${_n}" "${_n}" "${_g}"
+    _n=$(( _n + 1 ))
+  done
+}
+
+# _stub_docker -- a `docker` first on PATH. Each call writes its argv one
+# argument per line to ${S}/docker.<n>.argv. `build --target test` prints
+# ${S}/build_test.err on stderr (BuildKit plain progress goes there) and
+# exits ${S}/build_test.rc. Any other build writes the image id to an
+# --iidfile and, under -q, prints it. `run` prints ${S}/run.out with no
+# newline and exits ${S}/run.rc.
+_stub_docker() {
+  _gate_log fmt vet lint race coverage > "${S}/build_test.err"
+  printf '0\n' > "${S}/build_test.rc"
+  printf '' > "${S}/run.out"
+  printf '2\n' > "${S}/run.rc"
+  cat > "${S}/bin/docker" <<EOF
+#!$(command -v bash)
+n=\$(( \$(cat "${S}/docker.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "\${n}" > "${S}/docker.n"
+printf '%s\n' "\$@" > "${S}/docker.\${n}.argv"
+case "\${1:-}" in
+  build)
+    target="" iid="" quiet=0 prev=""
+    for a in "\$@"; do
+      [[ "\${prev}" == --target ]] && target="\${a}"
+      [[ "\${prev}" == --iidfile ]] && iid="\${a}"
+      [[ "\${a}" == --target=* ]] && target="\${a#--target=}"
+      [[ "\${a}" == --iidfile=* ]] && iid="\${a#--iidfile=}"
+      [[ "\${a}" == -q || "\${a}" == --quiet ]] && quiet=1
+      prev="\${a}"
+    done
+    if [[ "\${target}" == test ]]; then
+      cat "${S}/build_test.err" >&2
+      exit "\$(cat "${S}/build_test.rc")"
+    fi
+    [[ -n "\${iid}" ]] && printf 'sha256:stubiid' > "\${iid}"
+    [[ "\${quiet}" -eq 1 ]] && printf 'sha256:stubiid\n'
+    exit 0 ;;
+  run)
+    printf '%s' "\$(cat "${S}/run.out")"
+    exit "\$(cat "${S}/run.rc")" ;;
+esac
+exit 0
+EOF
+  chmod +x "${S}/bin/docker"
+}
+
+# _docker_calls -- how many times the docker stub ran.
+_docker_calls() {
+  cat "${S}/docker.n" 2>/dev/null || echo 0
+}
+
+# _argv_with <a> <b> -- the docker.<n>.argv file in which argument <a> is
+# directly followed by <b>; nothing when no call had that pair.
+_argv_with() {
+  local _f
+  for _f in "${S}"/docker.*.argv; do
+    [[ -f "${_f}" ]] || continue
+    awk -v a="${1}" -v b="${2}" 'p == a && $0 == b {f=1} {p=$0} END {exit !f}' "${_f}" \
+      && { printf '%s\n' "${_f}"; return 0; }
+  done
+  return 1
+}
+
+# _run_runner [args...] -- the runner against ${S}/root with the stubs first
+# on PATH, JSON logging, stdout and stderr judged apart.
+_run_runner() {
+  run --separate-stderr env PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+      bash "${RUNNER}" --root "${S}/root" "$@"
+}
+
+# ── the Dockerfile ──────────────────────────────────────────────────────────
+
+# _df_instructions -- the Dockerfile's instructions, continuation lines
+# joined, comments dropped, one per line, each prefixed with the stage it
+# sits in ("<stage>\t<instruction>").
+_df_instructions() {
+  awk '
+    /^[[:space:]]*#/ {next}
+    {
+      line = line $0
+      if (line ~ /\\$/) { sub(/\\$/, " ", line); next }
+      if (line ~ /^[[:space:]]*$/) { line = ""; next }
+      if (line ~ /^FROM /) {
+        n = split(line, w, /[[:space:]]+/)
+        stage = (n >= 4 && tolower(w[n-1]) == "as") ? w[n] : ""
+      }
+      print stage "\t" line
+      line = ""
+    }' "${DOCKERFILE}"
+}
+
+# why: Each gate is its own RUN so a red names its gate: one RUN running all
+# five would leave the first id as the only record and stop the later gates
+# from reading as "never reached" rather than "passed". The order is the one
+# the redpath's earlier_gate_missing check reads.
+@test "Dockerfile.config-gen: the test stage runs fmt, vet, lint, race, coverage, one RUN each, in that order (base#1462)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  local _gates
+  _gates="$(_df_instructions | awk -F'\t' '$1 == "test" && $2 ~ /^RUN / {print $2}' \
+      | grep -oE 'gate=[a-z]+ ok' | sed -E 's/^gate=([a-z]+) ok$/\1/' | paste -sd' ')"
+  assert_equal "${_gates}" "fmt vet lint race coverage"
+  # One gate per RUN: no test-stage RUN carries two ok lines.
+  _df_instructions > "${S}/df"
+  run awk -F'\t' '$1 == "test" && $2 ~ /^RUN / { n = gsub(/gate=[a-z]+ ok/, "&"); if (n > 1) print }' "${S}/df"
+  assert_success
+  assert_output ""
+}
+
+# why: The coverage gate is a script so the >= 90% rule and its refusals can
+# be tested on the host with a stub go; an inline awk in the RUN could not be.
+# It runs from the mutation context, where 01-admit installs it from the
+# host checkout: a copy inside the module would be a module file no mapping
+# rule of the mutation gate covers, so every change to it, and every run
+# from an empty base, would be refused as unmapped (base#1467).
+@test "Dockerfile.config-gen: the coverage RUN runs the coverage.sh 01-admit installs in the mutation context (base#1467)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  _df_instructions > "${S}/df"
+  run awk -F'\t' '$1 == "test" && $2 ~ /^RUN / && /gate=coverage ok/' "${S}/df"
+  assert_success
+  [[ -n "${output}" ]] || fail "no test-stage RUN prints gate=coverage ok"
+  assert_output --partial 'bash /mutation/coverage.sh --measure'
+  run grep -cxF 'install -m 0644 "${_root}/script/test/config_gen_coverage.sh" "${_dst}/coverage.sh"' \
+    /source/script/test/config_gen_steps/01-admit.sh
+  assert_success
+  assert_output 1
+}
+
+# why: The race RUN and coverage.sh each ran go test over every package, so
+# the tests ran twice per build (base#1547). Now the race RUN's go test is
+# the only one in the test stage: it runs under -race and writes one
+# atomic profile, and the coverage RUN, which comes after it, hands that
+# same profile to coverage.sh --profile and runs no go test of its own.
+@test "Dockerfile.config-gen: the race RUN's one go test writes the atomic profile the coverage RUN hands to coverage.sh --profile (base#1547)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  _df_instructions > "${S}/df"
+  awk -F'\t' '$1 == "test" && $2 ~ /^RUN /' "${S}/df" > "${S}/runs"
+  assert_equal "$(grep -c 'go test ' "${S}/runs")" 1
+  local _race _cov _prof
+  _race="$(grep -n 'gate=race ok' "${S}/runs" | cut -d: -f1)"
+  _cov="$(grep -n 'gate=coverage ok' "${S}/runs" | cut -d: -f1)"
+  [[ -n "${_race}" && -n "${_cov}" ]] || fail "no race or no coverage RUN in the test stage"
+  (( _race < _cov )) || fail "the race RUN is not before the coverage RUN"
+  grep 'gate=race ok' "${S}/runs" > "${S}/race"
+  grep -q 'go test ' "${S}/race" || fail "the one go test is not the race RUN's: $(grep 'go test ' "${S}/runs")"
+  grep -qE 'go test [^;]*-race' "${S}/race" || fail "the race RUN's go test runs without -race"
+  grep -qE 'go test [^;]*-covermode=atomic' "${S}/race" || fail "the race RUN's go test writes no atomic profile"
+  _prof="$(grep -oE -- '-coverprofile=[^ ;"]+' "${S}/race" | sed 's/^-coverprofile=//')"
+  [[ -n "${_prof}" ]] || fail "the race RUN's go test writes no -coverprofile"
+  grep 'gate=coverage ok' "${S}/runs" | grep -qF -- "--profile ${_prof}" \
+    || fail "the coverage RUN does not hand ${_prof} to coverage.sh --profile"
+}
+
+# why: The shipped stage holds only the binary; the runner's binary contract
+# runs that stage, so a final stage built on the toolchain would let the
+# contract pass on a binary nobody ships.
+@test "Dockerfile.config-gen: declares build, test and a final stage FROM scratch (base#1462)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  _df_instructions > "${S}/df"
+  run awk -F'\t' '$2 ~ /^FROM / {print $2}' "${S}/df"
+  assert_success
+  assert_line --regexp '^FROM goenv (AS|as) build$'
+  assert_line --regexp '^FROM goenv (AS|as) test$'
+  assert_line --regexp '^FROM scratch (AS|as) final$'
+}
+
+# why: The pin-coverage lint and the tool-pin watch read the marker on the
+# line above each version ARG; a pin with no marker is a version nothing
+# watches. The race gate needs cgo and gcc, which the trixie image carries
+# and alpine does not.
+@test "Dockerfile.config-gen: the golang trixie image and golangci-lint are tool-pin marked ARGs (base#1462)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  run awk '
+    /^ARG GO[A-Z_]*=golang:[^ ]*-trixie/ { if (p ~ /^# tool-pin: .*library\/golang/) go = 1 }
+    /^ARG GOLANGCI_LINT_VERSION=[^ ]+/ { if (p ~ /^# tool-pin: .*golangci\/golangci-lint/) lint = 1 }
+    {p = $0}
+    END { if (!go) print "golang"; if (!lint) print "golangci-lint" }' "${DOCKERFILE}"
+  assert_success
+  assert_output ""
+}
+
+# ── the runner ──────────────────────────────────────────────────────────────
+
+# why: The runner is the one command every environment calls; its whole
+# green path is the test-stage build with the gates uncached, the final
+# build and the binary contract, with each gate's ok line handed back.
+@test "config_gen_gates.sh: a green run builds test then final, re-prints every gate ok and passes the binary contract (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  _run_runner
+  assert_success
+  run grep -E '^gate=[a-z]+ ok$' <<<"${output}"
+  assert_output "$(printf 'gate=%s ok\n' fmt vet lint race coverage)"
+  # f. argv is read as an array: the gates run uncached, on the test target,
+  # from the config-gen Dockerfile and module context under --root.
+  local _test
+  _test="$(_argv_with --target test)" || fail "no docker call built --target test"
+  _argv_with --no-cache-filter admit,test >/dev/null || fail "the test build does not pass --no-cache-filter admit,test"
+  run cat "${_test}"
+  assert_line 'build'
+  assert_line '--progress=plain'
+  assert_line "${S}/root/dockerfile/config-gen"
+  awk -v d="${S}/root/dockerfile/Dockerfile.config-gen" 'p == "-f" && $0 == d {f=1} {p=$0} END {exit !f}' "${_test}" \
+    || fail "the test build does not read -f ${S}/root/dockerfile/Dockerfile.config-gen: $(cat "${_test}")"
+  _argv_with --target final >/dev/null || fail "no docker call built --target final"
+  # The binary run is of the final image, removed after.
+  run grep -lx 'sha256:stubiid' "${S}"/docker.*.argv
+  assert_success
+  run cat "${output}"
+  assert_line 'run'
+  assert_line '--rm'
+}
+
+# why: Without this a later slice's inputs would need a runner edit; the
+# steps seam and named contexts are what keep the runner closed to them.
+@test "config_gen_gates.sh: a step's context directory becomes a named build context, and none without one (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  _run_runner
+  assert_success
+  run grep -lx -- '--build-context' "${S}"/docker.*.argv
+  assert_failure
+  rm -f "${S}"/docker.*
+  printf 'printf "%%s" "${CONFIG_GEN_CTX}" > "%s/ctx"\nmkdir -p "${CONFIG_GEN_CTX}/corpus"\n' "${S}" \
+    > "${S}/root/script/test/config_gen_steps/10-a.sh"
+  _run_runner
+  assert_success
+  _argv_with --build-context "$(cat "${S}/ctx")/corpus" >/dev/null && fail "the context was passed without its name"
+  _argv_with --build-context "corpus=$(cat "${S}/ctx")/corpus" >/dev/null \
+    || fail "no build passed --build-context corpus=<ctx>/corpus: $(cat "${S}"/docker.*.argv)"
+}
+
+# why: A step that failed and was carried past would build an image from
+# inputs that were never prepared, and report its gates as if they were.
+@test "config_gen_gates.sh: a failing step stops the run with its status before docker, in lexical order (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps"
+  # Created out of lexical order: the run must not follow creation order.
+  printf 'echo 30-c >> "%s/steps"\n' "${S}" > "${_d}/30-c.sh"
+  printf 'echo 20-b >> "%s/steps"\nexit 3\n' "${S}" > "${_d}/20-b.sh"
+  printf 'echo 10-a >> "%s/steps"\n' "${S}" > "${_d}/10-a.sh"
+  _run_runner
+  assert_refusal 3 config_gen_step_failed step=20-b status=3
+  assert_equal "$(paste -sd' ' "${S}/steps")" "10-a 20-b"
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: The config-gen job spent its time where no log said (base#1547): the
+# runner printed nothing that named a stage and how long it took. Each
+# stage the runner reaches now streams one stderr line, `config-gen
+# stage=<step|gates|contract> start= end= secs= status=`, steps included,
+# so a time spent before docker is shown too. 10-a sleeps 1 s, so a secs
+# written down instead of measured fails; 20-b exits 3, so its line carries
+# that status and no stage after it has a line.
+@test "config_gen_gates.sh: each step it reaches streams a timed stage line with its status, and no later stage has one (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps"
+  printf 'sleep 1\n' > "${_d}/10-a.sh"
+  printf 'exit 3\n' > "${_d}/20-b.sh"
+  printf 'true\n' > "${_d}/30-c.sh"
+  _run_runner
+  assert_failure 3
+  local _lines _l _num='^[0-9]+(\.[0-9]+)?$'
+  _lines="$(grep -E '^config-gen stage=' <<<"${stderr}" || true)"
+  assert_equal "$(sed -E 's/^config-gen stage=([^ ]+) .*status=([0-9]+)$/\1 \2/' <<<"${_lines}" | paste -sd' ')" \
+    "10-a 0 20-b 3"
+  for _l in 10-a 20-b; do
+    local _line _start _end _secs
+    _line="$(grep -E "^config-gen stage=${_l} " <<<"${_lines}")"
+    _start="$(sed -nE 's/.* start=([^ ]+).*/\1/p' <<<"${_line}")"
+    _end="$(sed -nE 's/.* end=([^ ]+).*/\1/p' <<<"${_line}")"
+    _secs="$(sed -nE 's/.* secs=([^ ]+).*/\1/p' <<<"${_line}")"
+    [[ "${_start}" =~ ${_num} && "${_end}" =~ ${_num} && "${_secs}" =~ ${_num} ]] \
+      || fail "${_l}'s stage line has no numeric start, end and secs: ${_line}"
+    awk -v s="${_start}" -v e="${_end}" -v d="${_secs}" \
+      'BEGIN { x = e - s - d; exit !(x <= 0.5 && x >= -0.5) }' \
+      || fail "${_l}'s secs is not end minus start: ${_line}"
+  done
+  awk -v d="$(sed -nE 's/^config-gen stage=10-a .* secs=([^ ]+).*/\1/p' <<<"${_lines}")" 'BEGIN { exit !(d >= 1) }' \
+    || fail "10-a slept 1 s, its stage line says less: ${_lines}"
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: The redpath ran 20-gomod-oracle and 30-watch-gosum again in every
+# one of its 75 runner calls, on inputs no plant touches (base#1547). A
+# step named in CONFIG_GEN_STEPS_REUSED has a verdict its caller already
+# holds, so the runner skips it and logs config_gen_step_reused with
+# step=<n>; every other step still runs, in order. 20-x declares its
+# inputs (20-x.inputs), which is what makes it reusable at all.
+@test "config_gen_gates.sh: a step named in CONFIG_GEN_STEPS_REUSED is skipped and logged as reused, the others run (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps"
+  printf 'echo 00-a >> "%s/steps"\n' "${S}" > "${_d}/00-a.sh"
+  printf 'echo 20-x >> "%s/steps"\n' "${S}" > "${_d}/20-x.sh"
+  printf 'script/test/config_gen_steps/20-x.sh\n' > "${_d}/20-x.inputs"
+  printf 'echo 99-z >> "%s/steps"\n' "${S}" > "${_d}/99-z.sh"
+  CONFIG_GEN_STEPS_REUSED=20-x _run_runner
+  assert_success
+  assert_equal "$(paste -sd' ' "${S}/steps")" "00-a 99-z"
+  assert_logged_event config_gen_step_reused step=20-x
+}
+
+# why: CONFIG_GEN_STEPS_REUSED is matched against step names, so a typo in
+# it (20-nope for 20-x) would match nothing and every step would run while
+# the caller believed one was reused (base#1547). A name that is no step in
+# config_gen_steps is a usage refusal: status 2, the name in the record,
+# and no step or docker reached.
+@test "config_gen_gates.sh: a CONFIG_GEN_STEPS_REUSED name that is no step is refused as usage before any step (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps"
+  printf 'echo 00-a >> "%s/steps"\n' "${S}" > "${_d}/00-a.sh"
+  printf 'echo 20-x >> "%s/steps"\n' "${S}" > "${_d}/20-x.sh"
+  printf 'script/test/config_gen_steps/20-x.sh\n' > "${_d}/20-x.inputs"
+  CONFIG_GEN_STEPS_REUSED='20-x 20-nope' _run_runner
+  assert_refusal 2 config_gen_usage_invalid arg=CONFIG_GEN_STEPS_REUSED step=20-nope
+  [[ ! -e "${S}/steps" ]] || fail "a step ran before the refusal: $(paste -sd' ' "${S}/steps")"
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: A step's verdict may be reused only when the caller can prove its
+# inputs unchanged, and the inputs it proves are the ones the step lists
+# in <step>.inputs (base#1547). A step with no .inputs declares nothing a
+# digest could cover, so reusing it would skip a check on inputs nobody
+# compared. Naming such a step in CONFIG_GEN_STEPS_REUSED is a usage
+# refusal: status 2, the step in the record, and no step or docker reached.
+@test "config_gen_gates.sh: a CONFIG_GEN_STEPS_REUSED step with no .inputs is refused as usage before any step (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps"
+  printf 'echo 00-a >> "%s/steps"\n' "${S}" > "${_d}/00-a.sh"
+  printf 'echo 30-y >> "%s/steps"\n' "${S}" > "${_d}/30-y.sh"
+  CONFIG_GEN_STEPS_REUSED=30-y _run_runner
+  assert_refusal 2 config_gen_usage_invalid arg=CONFIG_GEN_STEPS_REUSED step=30-y
+  [[ ! -e "${S}/steps" ]] || fail "a step ran before the refusal: $(paste -sd' ' "${S}/steps")"
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: `just test go` runs the runner and then the redpath, and both ran
+# steps 20 and 30 on the same checkout: the runner's steps, then the
+# redpath's shared pass (base#1547 review round 1 finding 4). With
+# CONFIG_GEN_STEPS_VERDICT_OUT=<file>, the runner writes, once its steps
+# pass, `digest=<D> steps=<s>,... status=0`, where the steps are the ones
+# with a .inputs that ran and D is _cg_inputs_digest over them on <root>,
+# the line the redpath's CONFIG_GEN_STEPS_VERDICT accepts in place of its
+# shared pass. A step with no .inputs is not named: nothing could show its
+# verdict still holds. A red step writes no file, so no verdict outlives
+# the steps that failed.
+@test "config_gen_gates.sh: CONFIG_GEN_STEPS_VERDICT_OUT gets the digest of the declared steps once they pass, and nothing on a red step (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  local _d="${S}/root/script/test/config_gen_steps" _want
+  printf 'true\n' > "${_d}/00-a.sh"
+  printf 'true\n' > "${_d}/20-x.sh"
+  printf 'script/test/config_gen_steps/00-a.sh\n' > "${_d}/20-x.inputs"
+  printf 'true\n' > "${_d}/30-y.sh"
+  printf 'dockerfile\n' > "${_d}/30-y.inputs"
+  printf 'true\n' > "${_d}/99-z.sh"
+  _digest_of "${S}/root" 20-x 30-y
+  assert_success
+  [[ "${output}" =~ ^[0-9a-f]{64}$ ]] || fail "no digest of the fixture's declared steps: '${output}'"
+  _want="digest=${output} steps=20-x,30-y status=0"
+  CONFIG_GEN_STEPS_VERDICT_OUT="${S}/steps.verdict" _run_runner --steps-only
+  assert_success
+  [[ -f "${S}/steps.verdict" ]] || fail "the runner wrote no steps verdict"
+  assert_equal "$(cat "${S}/steps.verdict")" "${_want}"
+  rm -f "${S}/steps.verdict"
+  CONFIG_GEN_STEPS_VERDICT_OUT="${S}/steps.verdict" _run_runner
+  assert_success
+  assert_equal "$(cat "${S}/steps.verdict")" "${_want}"
+  rm -f "${S}/steps.verdict"
+  printf 'exit 3\n' > "${_d}/30-y.sh"
+  CONFIG_GEN_STEPS_VERDICT_OUT="${S}/steps.verdict" _run_runner
+  assert_equal "${status}" 3
+  [[ ! -e "${S}/steps.verdict" ]] || fail "a red step still wrote a verdict: $(cat "${S}/steps.verdict")"
+}
+
+# _digest_tree <dir> -- a fixture tree for _cg_inputs_digest at <dir>: step
+# 20-x with its .inputs listing the file lib/a.sh and the directory fix
+# (fix/one.txt, fix/sub/two.txt), and other.txt, which nothing declares.
+_digest_tree() {
+  local _d="${1}/script/test/config_gen_steps"
+  mkdir -p "${_d}" "${1}/lib" "${1}/fix/sub"
+  printf 'echo x\n' > "${_d}/20-x.sh"
+  printf 'lib/a.sh\nfix\n' > "${_d}/20-x.inputs"
+  printf 'a\n' > "${1}/lib/a.sh"
+  printf '1\n' > "${1}/fix/one.txt"
+  printf '2\n' > "${1}/fix/sub/two.txt"
+  printf 'o\n' > "${1}/other.txt"
+}
+
+# _digest_of <dir> <step>... -- _cg_inputs_digest run from <dir>, the
+# runner sourced; the argument after the path keeps an unguarded main from
+# reaching a step or docker.
+_digest_of() {
+  run --separate-stderr bash -c 'r="$1" d="$2"; shift 2; source "$r" --digest-probe; cd "$d"; _cg_inputs_digest "$@"' \
+    _ "${RUNNER}" "$@"
+}
+
+# why: A step's verdict is reused only while its digest D is unchanged
+# (base#1547). D must cover the step's own script, its .inputs and every
+# file that .inputs lists, a listed directory expanded to each file under
+# it, so editing the step, shrinking its declaration, adding a file to a
+# declared fixture directory or renaming one there (same content) each
+# change D, while a file nothing declares does not. The literals are
+# sha256 over `<relpath>\0<sha256 of content>\n` per file in C-sorted path
+# order, the design's definition, worked out apart from the runner.
+@test "config_gen_gates.sh: _cg_inputs_digest covers the step script, its .inputs and every declared file, nothing else (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  local _base=2e75b8e63b65729e0019b8d07c8a35be9d1bee28a81408b3d42078e89d25f698
+  local _s=script/test/config_gen_steps
+  _digest_tree "${S}/t0"
+  _digest_of "${S}/t0" 20-x
+  assert_success
+  assert_output "${_base}"
+  _digest_tree "${S}/t1"
+  printf 'echo y\n' > "${S}/t1/${_s}/20-x.sh"
+  _digest_of "${S}/t1" 20-x
+  assert_success
+  assert_output 35edbd7b65dfcdba6f615ae0eaddaf80f313cd31292566fee65e40423b695f0a
+  _digest_tree "${S}/t2"
+  printf 'lib/a.sh\n' > "${S}/t2/${_s}/20-x.inputs"
+  _digest_of "${S}/t2" 20-x
+  assert_success
+  assert_output 916e2398fc49c392076f832b690b7b326d2f6c2d3447ba4fc889c14aaf4211ec
+  _digest_tree "${S}/t3"
+  printf '3\n' > "${S}/t3/fix/sub/three.txt"
+  _digest_of "${S}/t3" 20-x
+  assert_success
+  assert_output 22b7de88b7a9568255433b8cbea649cb7e17b91cd96976ef8e1a854d78a1eccf
+  _digest_tree "${S}/t4"
+  mv "${S}/t4/fix/one.txt" "${S}/t4/fix/uno.txt"
+  _digest_of "${S}/t4" 20-x
+  assert_success
+  assert_output 49a16c4d3d6cd98c779847dcef8f945f37e708f0b6e24b3ae88b254eef61caa0
+  _digest_tree "${S}/t5"
+  printf 'changed\n' > "${S}/t5/other.txt"
+  _digest_of "${S}/t5" 20-x
+  assert_success
+  assert_output "${_base}"
+}
+
+# why: D proves a reused step's inputs unchanged only over the files its
+# .inputs names (base#1547). A listed path that does not exist (a renamed
+# fixture, a typo) would add nothing to D, so the declaration would cover
+# less than it says while D still matched. _cg_inputs_digest refuses it as
+# usage: status 2, the step and the missing path in the record, no digest
+# on stdout.
+@test "config_gen_gates.sh: _cg_inputs_digest refuses a .inputs path that does not exist as usage (base#1547)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _digest_tree "${S}/t0"
+  printf 'lib/a.sh\nlib/gone.sh\nfix\n' > "${S}/t0/script/test/config_gen_steps/20-x.inputs"
+  _digest_of "${S}/t0" 20-x
+  assert_refusal 2 config_gen_usage_invalid step=20-x path=lib/gone.sh
+}
+
+# why: The runner's stdout is its verdict: the ok lines it re-prints, which
+# the redpath compares byte for byte (an unchanged rerun must print exactly
+# the six ok lines, a refusal nothing at all; base#1465). A step's own
+# report (20-gomod-oracle prints `gomod-oracle: <n> fixture(s) agree ...`,
+# base#1463) is a log line, so it goes to stderr with the build log.
+@test "config_gen_gates.sh: a step's stdout goes to stderr, so stdout holds only the ok lines (base#1465)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  printf 'echo step-report\n' > "${S}/root/script/test/config_gen_steps/10-a.sh"
+  _run_runner
+  assert_success
+  assert_equal "${output}" "$(printf 'gate=%s ok\n' fmt vet lint race coverage)"
+  assert_stderr_contains step-report
+}
+
+# why: A context name is spliced into `--build-context <name>=<path>`; a name
+# carrying `=` or a path separator would name another context or path.
+@test "config_gen_gates.sh: a context name outside [a-z0-9-] is refused before docker (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  printf 'mkdir -p "${CONFIG_GEN_CTX}/a=b"\n' > "${S}/root/script/test/config_gen_steps/10-a.sh"
+  _run_runner
+  assert_refusal 1 config_gen_context_invalid context=a=b
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: A --root that is not a config-gen tree would build whatever sits
+# there, or nothing, and still read as a verdict on the generator.
+@test "config_gen_gates.sh: a --root that is missing or holds no Dockerfile.config-gen is refused (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _stub_docker
+  run --separate-stderr env PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+      bash "${RUNNER}" --root "${S}/nope"
+  assert_refusal 2 config_gen_root_invalid "root=${S}/nope"
+  mkdir -p "${S}/empty"
+  run --separate-stderr env PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+      bash "${RUNNER}" --root "${S}/empty"
+  assert_refusal 2 config_gen_root_invalid "root=${S}/empty"
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: A --root with no directory after it, or an argument the runner does
+# not know, would otherwise run the gates on a tree the caller did not name
+# and report that verdict as theirs. Each is a usage refusal: status 2,
+# nothing on stdout, the argument named, and docker never reached.
+@test "config_gen_gates.sh: --root without a directory is refused as usage before docker (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  run --separate-stderr env PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+      bash "${RUNNER}" --root
+  assert_refusal 2 config_gen_usage_invalid arg=--root
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: The catch-all branch is the one a typo reaches; a runner that
+# ignored an unknown flag would report on the default tree as if the
+# caller had asked for that run.
+@test "config_gen_gates.sh: an unknown argument is refused as usage before docker (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  _run_runner --bogus
+  assert_refusal 2 config_gen_usage_invalid arg=--bogus
+  assert_equal "$(_docker_calls)" 0
+}
+
+# why: The build's own log is long and plain; without the id re-emitted as
+# an event the redpath, CI and a reader all have to scrape BuildKit output to
+# learn which gate went red, and docker's status is the run's verdict.
+@test "config_gen_gates.sh: a red gate propagates docker's status and re-emits the gate's id (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  { _gate_log fmt; printf '#8 0.52 config_gen_gate_vet_failed\n'; } > "${S}/build_test.err"
+  printf '7\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 7
+  assert_logged_event config_gen_gate_vet_failed gate=vet
+  assert_line 'gate=fmt ok'
+  refute_line 'gate=vet ok'
+  _argv_with --target final >/dev/null && fail "the final stage was built after a red gate"
+  true
+}
+
+# why: A coverage RUN that never got the corpus root record refuses with
+# reason=corpus_root_missing and an empty pkg (base#1468). The runner must
+# name the coverage gate from that printed refusal line, not from the RUN
+# line BuildKit echoes, whose command text names coverage.sh too: the
+# echoed line alone is a build that failed before any gate.
+@test "config_gen_gates.sh: a coverage refusal for a missing corpus root names the coverage gate, the echoed RUN line alone does not (base#1468)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  { _gate_log fmt vet lint race
+    printf '#12 [test 5/6] RUN bash /mutation/coverage.sh /tmp/config-gen-corpus-root\n'
+    printf '#12 0.52 config_gen_gate_coverage_failed reason=corpus_root_missing pkg=\n'; } > "${S}/build_test.err"
+  printf '1\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_gate_coverage_failed gate=coverage
+  { _gate_log fmt vet lint race
+    printf '#12 [test 5/6] RUN bash /mutation/coverage.sh /tmp/config-gen-corpus-root\n'; } > "${S}/build_test.err"
+  _run_runner
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_build_failed status=1
+  grep -qF '"body":"config_gen_gate_coverage_failed"' <<<"${stderr}" \
+    && fail "the echoed RUN line was read as the coverage gate's refusal: ${stderr}"
+  true
+}
+
+# why: The coverage ratchet prints one cg_event line per refusal, and one
+# red build can carry several (a dropped fragment leaves a dropped and a
+# missing package); each must reach the runner's records, in log order,
+# before the gate's own, and an id outside the allowlist or a word outside
+# file|reason|pkg|other|line|floor|measured|base must not, so the build log
+# can never put an arbitrary body or attribute into them (base#1465).
+@test "config_gen_gates.sh: a red build re-emits every allowlisted cg_event line in log order with only its allowed words, then the gate id (base#1465)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  { _gate_log admission fmt vet lint race
+    printf '#12 [test 8/8] RUN g=coverage; bash /mutation/coverage.sh --measure /tmp/measured\n'
+    printf '#12 1.069 cg_event config_gen_coverage_floor_dropped pkg=internal/testcorpus x=1\n'
+    printf '#12 1.069 cg_event config_gen_coverage_floor_missing pkg=a%%20b\n'
+    printf '#12 1.069 cg_event config_gen_coverage_floor_bogus pkg=z\n'
+    printf '#12 1.069 cg_event config_gen_coverage_floor_below pkg=c measured=90.0 floor=95.0 display=spoof\n'
+    printf '#12 1.069 config_gen_gate_coverage_failed\n'; } > "${S}/build_test.err"
+  printf '1\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  [[ "${stderr}" != *"unregistered log body"* ]] || fail "unregistered log body: ${stderr}"
+  assert_equal "$(jq -rR 'fromjson? | select(.attributes."service.name" == "config-gen")
+    | [.body, (.attributes | del(."service.name", ."service.lang", ."code.filepath", ."code.lineno",
+      ."thread.id", .display, .status) | to_entries | map(.key + "=" + .value) | join(" "))] | join(" ")' <<<"${stderr}")" \
+    "$(printf '%s\n' 'config_gen_coverage_floor_dropped pkg=internal/testcorpus' \
+      'config_gen_coverage_floor_missing pkg=a%20b' \
+      'config_gen_coverage_floor_below pkg=c measured=90.0 floor=95.0' \
+      'config_gen_gate_coverage_failed gate=coverage')"
+}
+
+# why: cg-gates sensitivity refuses a testcorpus with no top-level func
+# Glob by printing `cg_event config_gen_corpus_sensitivity_invalid
+# reason=glob_not_found` on stdout (cmd/cg-gates TestSensitivity holds
+# that exact line). Its only way into the JSON log is this runner, and the
+# test above feeds every listed id a file= only: a runner that dropped
+# reason= from its attributes, or skipped the event, would leave the
+# refusal with no cause in the records (base#1467).
+@test "config_gen_gates.sh: a corpus_sensitivity refusal reaches the runner's records with its reason (base#1467)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  { _gate_log admission fmt vet lint race coverage
+    printf '#30 1.00 cg_event config_gen_corpus_sensitivity_invalid reason=glob_not_found\n'
+    printf '#30 1.00 config_gen_gate_corpus_sensitivity_failed\n'; } > "${S}/build_test.err"
+  printf '1\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  [[ "${stderr}" != *"unregistered log body"* ]] || fail "unregistered log body: ${stderr}"
+  assert_equal "$(jq -rR 'fromjson? | select(.attributes."service.name" == "config-gen")
+    | .body + " " + (.attributes.reason // ("gate=" + .attributes.gate))' <<<"${stderr}")" \
+    "$(printf '%s\n' 'config_gen_corpus_sensitivity_invalid glob_not_found' \
+      'config_gen_gate_corpus_sensitivity_failed gate=corpus_sensitivity')"
+}
+
+# why: cg-gates mutation prints one `cg_event
+# config_gen_mutation_package_failed pkg= reason= [measured=]` line on
+# stderr, the writer gremlins shares, for each package it fails
+# (cmd/cg-gates TestMutation holds those exact lines; base#1546). The issue's gremlins criterion is that any per-package
+# failure fails the gate with pkg=; the build log reaches the JSON log
+# only through this runner, so its record must keep the package, the
+# reason and the measured efficacy, then the gate's own record (base#1467).
+@test "config_gen_gates.sh: a per-package mutation failure reaches the runner's records with its pkg, reason and measured (base#1467)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  local _p=github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/locate
+  _root
+  _stub_docker
+  { _gate_log admission fmt vet lint race coverage
+    printf '#30 1.00 cg_event config_gen_mutation_package_failed pkg=%s reason=below measured=80.4\n' "${_p}"
+    printf '#30 1.00 cg_event config_gen_mutation_package_failed pkg=%s/internal/schema reason=gremlins_failed\n' "${_p%/internal/locate}"
+    printf '#30 1.00 config_gen_gate_mutation_failed\n'; } > "${S}/build_test.err"
+  printf '1\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  [[ "${stderr}" != *"unregistered log body"* ]] || fail "unregistered log body: ${stderr}"
+  assert_equal "$(jq -rR 'fromjson? | select(.attributes."service.name" == "config-gen")
+    | [.body, .attributes.pkg // "-", .attributes.reason // "-", .attributes.measured // "-",
+      .attributes.gate // "-"] | join(" ")' <<<"${stderr}")" \
+    "$(printf '%s\n' "config_gen_mutation_package_failed ${_p} below 80.4 -" \
+      "config_gen_mutation_package_failed ${_p%/internal/locate}/internal/schema gremlins_failed - -" \
+      'config_gen_gate_mutation_failed - - - mutation')"
+}
+
+# why: The ids the build may print are one table,
+# dockerfile/config-gen/internal/buildgate/testdata/build-events.txt, which
+# buildgate's own test holds every ev() id to. A runner with a second,
+# hand-kept list dropped the mutation gate's unmapped, manifest_invalid
+# and no_such_package refusals, so a notes.txt refusal reached the runner's
+# records with no file= (base#1467). Every listed id must be re-emitted
+# with its file=, and be registered with the logger.
+@test "config_gen_gates.sh: every id build-events.txt lists is re-emitted with its file= and registered with the logger (base#1467)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  local _table=/source/dockerfile/config-gen/internal/buildgate/testdata/build-events.txt _id
+  local -a _ids=()
+  mapfile -t _ids < <(grep -vE '^(#|$)' "${_table}")
+  (( ${#_ids[@]} >= 20 )) || fail "build-events.txt lists ${#_ids[@]} ids"
+  for _id in "${_ids[@]}"; do
+    grep -qxF -- "${_id}" /source/dist/script/docker/lib/log-events.txt \
+      || fail "${_id} is not registered in log-events.txt"
+  done
+  _root
+  _stub_docker
+  { _gate_log admission fmt vet lint race coverage
+    for _id in "${_ids[@]}"; do
+      printf '#30 1.00 cg_event %s file=dockerfile/config-gen/%s\n' "${_id}" "${_id}"
+    done
+    printf '#30 1.00 config_gen_gate_mutation_failed\n'; } > "${S}/build_test.err"
+  printf '1\n' > "${S}/build_test.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  [[ "${stderr}" != *"unregistered log body"* ]] || fail "unregistered log body: ${stderr}"
+  assert_equal "$(jq -rR 'fromjson? | select(.attributes."service.name" == "config-gen")
+    | .body + " " + (.attributes.file // .attributes.gate)' <<<"${stderr}")" \
+    "$(for _id in "${_ids[@]}"; do printf '%s dockerfile/config-gen/%s\n' "${_id}" "${_id}"; done
+      printf 'config_gen_gate_mutation_failed mutation\n')"
+}
+
+# why: The final image is what ships. A binary that exits 0 with no
+# arguments, or writes usage to stdout, breaks the rc 2 / empty stdout
+# contract callers rely on, whatever the gates said.
+@test "config_gen_gates.sh: the built binary must exit 2 with empty stdout on no arguments (base#1462)" {
+  assert_spec_subject "${RUNNER}" "the config-gen gates runner (base#1462)"
+  _root
+  _stub_docker
+  printf '0\n' > "${S}/run.rc"
+  _run_runner
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_binary_contract_failed status=0 stdout_bytes=0
+  printf '2\n' > "${S}/run.rc"
+  printf 'x' > "${S}/run.out"
+  _run_runner
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_binary_contract_failed status=2 stdout_bytes=1
+  printf '' > "${S}/run.out"
+  _run_runner
+  assert_success
+}
+
+# ── the redpath ─────────────────────────────────────────────────────────────
+
+# _redpath_rows -- every case the redpath is required to run, one
+# `<kind>|<case>|<want>` line each in the order it runs them (gate,
+# refusal, stale, green, after, coverage). Written out here, not read from the
+# redpath's own tables: a case dropped from the redpath must still get its
+# canned answer and its expected runner call, so the full run below fails
+# on it (base#1465). <want> is the gate (and, for a mutation case the
+# redpath's _RP_MUTATION_FAILED names,
+# `||config_gen_mutation_package_failed|<pkg>|<reason>|<measured>` of its
+# one package failure record; for a sensitivity case its _RP_WEAK names,
+# `|<line, may be empty>|<pkg>|<file>` of its one weak record; for a
+# mutation case its _RP_MUTATION_EVENTS names, `|<line, may be
+# empty>|<event>|<file>` of its one event record),
+# the event id, `<file>|<reason>`,
+# a green case's line (empty when _RP_GREEN_LINES names none, base#1467)
+# and `|<pkg>` when _RP_GREEN_SCOPE names its one package (base#1615),
+# `<gate>|<event>|<file>` (an after-admit case, base#1467), or
+# `<event>|<pkg>|<file>` (file empty when the event names none).
+_redpath_rows() {
+  cat <<'EOF'
+gate|fmt|fmt
+gate|vet|vet
+gate|lint|lint
+gate|race|race
+gate|race-fuzz|race
+gate|coverage|coverage
+gate|fmt-parse|fmt
+gate|corpus-join|race
+gate|corpus-helper|race
+gate|corpus-var|race
+gate|mut-unstaged|mutation||config_gen_mutation_package_failed|github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzmut|below|0.0
+gate|mut-staged|mutation||config_gen_mutation_package_failed|github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzmut|below|0.0
+gate|mut-timeout|mutation||config_gen_mutation_package_failed|github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzloop|below|75.0
+gate|mut-untracked-lived|mutation||config_gen_mutation_package_failed|github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzlive|below|0.0
+gate|corpus|mutation||config_gen_mutation_package_failed|github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzweak|below|0.0
+gate|notes|mutation||config_gen_mutation_unmapped|dockerfile/config-gen/notes.txt
+gate|sens-per-golden|corpus_sensitivity||github.com/ycpss91255-lab/base/dockerfile/config-gen/internal/zzglob|golden/s1/zz.golden
+refusal|no-context|config_gen_manifest_missing
+stale|stale-edit|dockerfile/config-gen/cmd/config-gen/main.go|sha_mismatch
+stale|stale-edit-locale|dockerfile/config-gen/cmd/config-gen/main.go|sha_mismatch
+stale|stale-new-pkg|dockerfile/config-gen/internal/zznew/zznew.go|unlisted
+stale|stale-delete|dockerfile/config-gen/cmd/config-gen/main_test.go|missing
+stale|stale-symlink|dockerfile/config-gen/cmd/config-gen/zz.go|unlisted
+stale|stale-dangling|dockerfile/config-gen/zz-dangling|not_regular
+stale|stale-gomod|dockerfile/config-gen/go.mod|sha_mismatch
+stale|stale-checker|dockerfile/config-gen/internal/buildgate/zz.go|unlisted
+stale|stale-names|dockerfile/config-gen/cmd/config-gen/testdata/zznames/a%20b.txt|sha_mismatch
+stale|stale-header|manifest|header
+stale|no-checker|admit.sh|absent
+stale|no-lib|config_gen_mutation_lang.sh|absent
+stale|tamper-r-garbage|manifest|record
+stale|tamper-r999|manifest|record
+stale|tamper-r101|manifest|record
+stale|tamper-copy|manifest|record
+stale|tamper-arity|manifest|record
+stale|tamper-rename-self|manifest|presence
+stale|tamper-ghost|manifest|presence
+stale|tamper-delete-listed|manifest|presence
+stale|tamper-add-twice|manifest|duplicate
+stale|tamper-src-twice|manifest|presence
+stale|tamper-modify-over-src|manifest|presence
+stale|tamper-header-mixed|manifest|header
+stale|tamper-header-dirty|manifest|header
+stale|tamper-header-context|manifest|header
+stale|tamper-marker-twice|manifest|none_marker
+stale|tamper-header-only|manifest|body_empty
+stale|tamper-manifest-unterminated|manifest|malformed
+stale|tamper-visible-unterminated|visible.sha256|malformed
+stale|tamper-ignored-unterminated|ignored.sha256|malformed
+stale|tamper-crlf|manifest|header
+stale|tamper-dotdot|manifest|path
+stale|tamper-outside|manifest|path
+stale|tamper-visible-dup|visible.sha256|duplicate
+stale|tamper-dual|ignored.sha256|dual
+green|names||cmd/config-gen
+green|rename-recreate||cmd/config-gen
+green|untrack||cmd/config-gen
+green|rename-move||cmd/config-gen
+green|copies||cmd/config-gen
+green|typechange||cmd/config-gen
+green|ign-excluded|
+green|ign-excluded-go|
+green|docs-only|mutation targets none
+after|ign|ignored|config_gen_mutation_ignored_input|dockerfile/config-gen/cmd/config-gen/zz_ign.go
+after|untrack-ignored|ignored|config_gen_mutation_ignored_input|dockerfile/config-gen/cmd/config-gen/testdata/zzg/a.txt
+coverage|cov-drop|config_gen_coverage_floor_below|cmd/config-gen|
+coverage|cov-lowered|config_gen_coverage_floor_lowered|internal/buildgate|
+coverage|cov-stale|config_gen_coverage_floor_stale|internal/buildgate|
+coverage|cov-missing|config_gen_coverage_floor_missing|internal/zzmiss|
+coverage|cov-duplicate|config_gen_coverage_floor_duplicate|internal/testcorpus|s1g.txt
+coverage|cov-dropped|config_gen_coverage_floor_dropped|internal/testcorpus|
+EOF
+}
+
+# _redpath_sequence -- the case each runner call of one full redpath run
+# is told, in call order: every row but mut-timeout, then mut-timeout,
+# which runs alone once the pool drains (base#1547), rerun twice, retro
+# (base#1467). There is no control call: rerun's first call is the
+# control (base#1547).
+_redpath_sequence() {
+  _redpath_rows | cut -d'|' -f2 | grep -vx mut-timeout
+  printf '%s\n' mut-timeout rerun rerun retro
+}
+
+# _ran_cases -- the case each runner call was told, in call order.
+_ran_cases() {
+  local _n
+  for (( _n = 1; _n <= $(cat "${S}/runner.n" 2>/dev/null || echo 0); _n++ )); do
+    cat "${S}/runner.${_n}.case"
+  done
+}
+
+# _redpath_call <case> -- the 1-based runner call that ran <case> (its
+# first, for rerun), read from the stub's records after a run.
+_redpath_call() {
+  local _f
+  for _f in "${S}"/runner.*.case; do
+    [[ "$(cat "${_f}")" == "${1}" ]] || continue
+    _f="${_f#"${S}/runner."}"
+    echo "${_f%.case}"
+    return 0
+  done
+  echo "_redpath_call: no call ran ${1}" >&2
+  return 1
+}
+
+# _redpath_repo -- a scratch copy of what the redpath reads, at ${S}/repo,
+# with a recording stub in place of the runner. Call <n> of the stub
+# writes its argv to ${S}/runner.<n>.argv and its CONFIG_GEN_REDPATH_CASE
+# to ${S}/runner.<n>.case, records whether its --root held a config-gen
+# tree and the LOG_FORMAT it was handed (${S}/runner.formats), appends the
+# argv of every `timeout` process between it and REDPATH_TOP (the test's
+# shell) to ${S}/runner.bounds, and answers
+# from ${S}/canned/<case>.<k>.{out,err,rc} for the k-th call of that case
+# when one exists, else ${S}/canned/<case>.{out,err,rc}. Before it exits,
+# a call sleeps the seconds in ${S}/canned/<case>.sleep when that exists,
+# and copies what the outermost redpath process has written to its stderr
+# so far to ${S}/runner.<n>.snap when ${S}/canned/<case>.snap exists
+# (base#1547), first waiting for the cases named in ${S}/canned/<case>.await
+# to have their timed lines there (base#1547); it logs its start and end times to ${S}/runner.spans when
+# ${S}/canned/<case>.span exists (base#1547). The retro call
+# also prints the manifest header naming the base it was handed, dirty=no,
+# or dirty=yes when ${S}/canned/retro.dirty exists. ${S}/canned is a
+# private copy of setup_file's template; a missing template fails, naming
+# base#1555, and is never rebuilt here, which would bring back the per-call
+# cost.
+_redpath_repo() {
+  local _r="${S}/repo" _t
+  _t="$(_canned_template)"
+  mkdir -p "${_r}/script/test" "${_r}/dist/script/docker"
+  cp -a /source/dockerfile "${_r}/"
+  cp -a /source/dist/script/docker/lib "${_r}/dist/script/docker/"
+  cp -a /source/script/test/. "${_r}/script/test/"
+  cp -a /source/script/watch "${_r}/script/"
+  mkdir -p "${_r}/test/fixtures"
+  cp -a /source/test/fixtures/gomod "${_r}/test/fixtures/"
+  _redpath_runner_stub "${_r}/script/test/config_gen_gates.sh"
+  # A just or docker reached from the redpath would be a nested run.
+  printf '#!%s\necho "$0 $*" >> "%s/nested"\nexit 0\n' "$(command -v bash)" "${S}" > "${S}/bin/just"
+  cp "${S}/bin/just" "${S}/bin/docker"
+  chmod +x "${S}/bin/just" "${S}/bin/docker"
+  [[ -d "${_t}/canned" ]] \
+    || fail "_redpath_repo: no canned template under ${BATS_FILE_TMPDIR}; setup_file builds it once per file (base#1555)"
+  cp -a "${_t}/canned" "${S}/"
+}
+
+# _redpath_runner_stub <path> -- write _redpath_repo's recording runner
+# stub to <path>, executable.
+_redpath_runner_stub() {
+  cat > "${1}" <<EOF
+#!$(command -v bash)
+root=""; prev=""
+for a in "\$@"; do [[ "\${prev}" == --root ]] && root="\${a}"; prev="\${a}"; done
+# fp -- one sha256 over the copy's files (outside .git), its index, its
+# HEAD tree and its status: what a plant changes, in any of them.
+fp() {
+  ( cd "\${root}" || exit 1
+    find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+    git ls-files -s; git rev-parse 'HEAD^{tree}'; git status --porcelain
+  ) 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+# A --steps-only call is the redpath's shared pass (base#1547): it is
+# logged in runner.order, start and end, and is no case call; the
+# fingerprint of its pristine copy goes to runner.pristine.fp.
+for a in "\$@"; do
+  [[ "\${a}" == --steps-only ]] || continue
+  echo 'steps-only start' >> "${S}/runner.order"
+  fp > "${S}/runner.pristine.fp"
+  echo 'steps-only end' >> "${S}/runner.order"
+  exit "\$(cat "${S}/canned/steps-only.rc" 2>/dev/null || echo 0)"
+done
+printf 'case %s\n' "\${CONFIG_GEN_REDPATH_CASE:-unset}" >> "${S}/runner.order"
+# Cases may run in parallel (base#1547): the call counter is taken under
+# a mkdir lock, so two calls never get one n.
+until mkdir "${S}/runner.lock" 2>/dev/null; do sleep 0.01; done
+n=\$(( \$(cat "${S}/runner.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "\${n}" > "${S}/runner.n"
+rmdir "${S}/runner.lock"
+printf '%s\n' "\$@" > "${S}/runner.\${n}.argv"
+c="\${CONFIG_GEN_REDPATH_CASE:-unset}"
+# A case with a canned <case>.span logs '<case> start|end <epoch>' to
+# runner.spans as its call begins and just before it exits (base#1547).
+[[ ! -e "${S}/canned/\${c}.span" ]] || printf '%s start %s\n' "\${c}" "\$(date +%s.%N)" >> "${S}/runner.spans"
+printf '%s\n' "\${c}" > "${S}/runner.\${n}.case"
+fp > "${S}/runner.\${n}.fp"
+k=\$(( \$(cat "${S}/calls.\${c}" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "\${k}" > "${S}/calls.\${c}"
+[[ -f "\${root}/dockerfile/Dockerfile.config-gen" ]] && echo tree >> "${S}/runner.trees"
+printf '%s\n' "\${LOG_FORMAT:-unset}" >> "${S}/runner.formats"
+printf '%s|%s\n' "\${LC_ALL-unset}" "\${LOCPATH-unset}" > "${S}/runner.\${n}.locale"
+printf '%s\n' "\${CONFIG_GEN_STEPS_REUSED-unset}" > "${S}/runner.\${n}.reused"
+for p in script/watch/lib.sh dist/script/docker/lib/log.sh test/fixtures/gomod; do
+  [[ -e "\${root}/\${p}" ]] && printf '%s\n' "\${p}" >> "${S}/runner.\${n}.copied"
+done
+printf 'ctx=%s base=%s\n' "\${CONFIG_GEN_MUTATION_CONTEXT-unset}" "\${CONFIG_GEN_MUTATION_BASE+set}" >> "${S}/runner.mutenv"
+git -C "\${root}" rev-parse --verify -q 'refs/remotes/origin/main^{commit}' >> "${S}/runner.git" 2>/dev/null || echo nogit >> "${S}/runner.git"
+[[ -d "\${root}/dockerfile/config-gen" ]] && cp -a "\${root}/dockerfile/config-gen" "${S}/runner.\${n}.mod"
+[[ -d "\${root}/script/test/config_gen_steps" ]] && cp -a "\${root}/script/test/config_gen_steps" "${S}/runner.\${n}.steps"
+q="\${PPID}"; rp=''
+while [[ "\${q}" =~ ^[0-9]+\$ ]] && (( q > 1 )) && [[ "\${q}" != "\${REDPATH_TOP:-}" ]]; do
+  w=(); st=''
+  mapfile -d '' -t w < "/proc/\${q}/cmdline" 2>/dev/null
+  [[ "\${w[0]:-}" == timeout || "\${w[0]:-}" == */timeout ]] && printf '%s\n' "\${w[*]}" >> "${S}/runner.bounds"
+  [[ "\${w[*]:-}" == *config_gen_redpath.sh* ]] && rp="\${q}"
+  IFS= read -r st < "/proc/\${q}/stat" 2>/dev/null
+  st="\${st##*) }"; st="\${st#* }"; q="\${st%% *}"
+done
+a="${S}/canned/\${c}"
+[[ -e "\${a}.\${k}.rc" ]] && a="\${a}.\${k}"
+cat "\${a}.out" 2>/dev/null
+cat "\${a}.err" >&2 2>/dev/null
+d=no; [[ -e "${S}/canned/retro.dirty" ]] && d=yes
+[[ "\${c}" != retro ]] || printf 'config-gen redpath manifest: base=%s head=%s dirty=%s context=pr\n' \
+  "\${CONFIG_GEN_MUTATION_BASE-}" "\$(git -C "\${root}" rev-parse HEAD)" "\${d}" >&2
+[[ ! -e "${S}/canned/\${c}.sleep" ]] || sleep "\$(cat "${S}/canned/\${c}.sleep")"
+# A case with a canned <case>.barrier marks itself arrived, then waits up
+# to 30 s of wall clock for every barrier case to arrive; one that never
+# sees them all records barrier.missed.<case> and exits 9 (base#1547).
+# Only cases that run at the same time get past it: a serial loop leaves
+# the first alone. The bound is wide because parallel cases reach the
+# stub seconds apart on a loaded host (each first builds its own copy),
+# and only a case left alone ever waits it out.
+if [[ -e "${S}/canned/\${c}.barrier" ]]; then
+  : > "${S}/barrier.arrived.\${c}"
+  want=\$(find "${S}/canned" -maxdepth 1 -name '*.barrier' | wc -l)
+  for (( t = SECONDS + 30; SECONDS < t; )); do
+    (( \$(find "${S}" -maxdepth 1 -name 'barrier.arrived.*' | wc -l) >= want )) && break
+    sleep 0.1
+  done
+  (( \$(find "${S}" -maxdepth 1 -name 'barrier.arrived.*' | wc -l) >= want )) \
+    || { : > "${S}/barrier.missed.\${c}"; exit 9; }
+fi
+# A case with a canned <case>.await waits up to 20 s for the redpath's
+# stderr to hold a timed line for every case named in it, and records
+# await.missed.<case> when one never shows (base#1547). A redpath that
+# prints a case's line only behind an older case still running never
+# shows it while this case runs.
+if [[ -e "${S}/canned/\${c}.await" && -n "\${rp}" ]]; then
+  for (( t = 0; t < 200; t++ )); do
+    miss=0
+    for w in \$(cat "${S}/canned/\${c}.await"); do
+      grep -qE "^config-gen redpath case=\${w} " "/proc/\${rp}/fd/2" 2>/dev/null || miss=1
+    done
+    (( miss == 0 )) && break
+    sleep 0.1
+  done
+  (( miss == 0 )) || : > "${S}/await.missed.\${c}"
+fi
+[[ ! -e "${S}/canned/\${c}.snap" || -z "\${rp}" ]] || cat "/proc/\${rp}/fd/2" > "${S}/runner.\${n}.snap" 2>/dev/null
+[[ ! -e "${S}/canned/\${c}.span" ]] || printf '%s end %s\n' "\${c}" "\$(date +%s.%N)" >> "${S}/runner.spans"
+exit "\$(cat "\${a}.rc" 2>/dev/null || echo 9)"
+EOF
+  chmod +x "${1}"
+}
+
+# _gate_record <id> [attr=value...] -- the JSON log record the real runner
+# writes on stderr for <id>, made by the real logger.
+_gate_record() {
+  LOG_FORMAT=json bash -c 'source "$1"; shift; _log_err config-gen "$@"' _ \
+    /source/dist/script/docker/lib/log.sh "$@" 2>&1
+}
+
+# _ok_lines <gate> -- the ok lines of every gate before <gate> (all six
+# when <gate> is empty), admission first.
+_ok_lines() {
+  local _g
+  for _g in admission fmt vet lint race coverage; do
+    [[ "${_g}" == "${1}" ]] && break
+    printf 'gate=%s ok\n' "${_g}"
+  done
+}
+
+# _canned_correct -- the runner answers each case as a correct build
+# would: a gate case is every earlier gate ok, the build log line naming
+# the case's gate, the runner's record of that gate id, rc 1; a refusal
+# case (base#1465) is an empty stdout, the runner's record of its event and
+# rc 1; a stale case is an empty stdout, the runner's records of
+# config_gen_manifest_stale (the row's file and reason) and
+# config_gen_gate_admission_failed, rc 1; a green case and both rerun
+# calls are the six ok lines and rc 0; an after-admit case
+# (base#1467) is the six ok lines, the runner's records of the row's gate
+# id and of its event naming the row's file, rc 1; a coverage case is the
+# five pre-coverage ok lines, the runner's records of the row's event
+# (naming the row's pkg, and its file when it has one) and
+# config_gen_gate_coverage_failed, rc 1.
+_canned_correct() {
+  local _kind _case _want _file _reason _extra _c
+  # One line per generation, naming where it wrote, so a test can count
+  # them (base#1555).
+  printf '%s\n' "${S}" >> "${BATS_FILE_TMPDIR}/canned.generations"
+  mkdir -p "${S}/canned"
+  while IFS='|' read -r _kind _case _want _reason _extra; do
+    _c="${S}/canned/${_case}"
+    case "${_kind}" in
+      gate)
+        _ok_lines "${_want}" > "${_c}.out"
+        printf '#9 0.31 config_gen_gate_%s_failed\n' "${_want}" > "${_c}.err"
+        # Made from a registered gate id, so a gate the logger does not
+        # list yet (corpus_sensitivity, base#1467) still gets a record;
+        # only the body is the case's gate's.
+        _gate_record config_gen_gate_fmt_failed "gate=${_want}" status=1 \
+          "display=config-gen gate ${_want} failed (docker exited 1)" \
+          | sed "s/\"body\":\"config_gen_gate_fmt_failed\"/\"body\":\"config_gen_gate_${_want}_failed\"/" >> "${_c}.err"
+        # A mutation case's planted step prints the dirty manifest header
+        # (base#1467).
+        [[ "${_want}" != mutation ]] \
+          || printf 'config-gen redpath manifest: base=%s head=%s dirty=yes context=pr\n' \
+            "$(printf 'a%.0s' {1..40})" "$(printf 'b%.0s' {1..40})" >> "${_c}.err"
+        # A gate row's fourth field is the line its gate prints, streamed
+        # by the build log (base#1467).
+        [[ -z "${_reason}" ]] || printf '#12 3.21 %s\n' "${_reason}" >> "${_c}.err"
+        # Its fifth and sixth fields are the pkg and file of the one weak
+        # record the sensitivity gate logs for it, or the event and file of
+        # the one record the mutation gate's refusal leaves; a package
+        # failure's are its event, pkg, reason and measured (base#1467).
+        if [[ -n "${_extra}" && "${_want}" == corpus_sensitivity ]]; then
+          _gate_record config_gen_corpus_sensitivity_weak "pkg=${_extra%%|*}" "file=${_extra#*|}" status=1 \
+            "display=weak" >> "${_c}.err"
+        elif [[ "${_extra}" == config_gen_mutation_package_failed\|* ]]; then
+          IFS='|' read -r _ _file _reason _extra <<<"${_extra}"
+          _gate_record config_gen_mutation_package_failed "pkg=${_file}" "reason=${_reason}" \
+            "measured=${_extra}" status=1 "display=package failed" >> "${_c}.err"
+        elif [[ -n "${_extra}" ]]; then
+          _gate_record "${_extra%%|*}" "file=${_extra#*|}" status=1 "display=refused" >> "${_c}.err"
+        fi
+        ;;
+      refusal)
+        : > "${_c}.out"
+        # Made from a registered id, so the logger writes a record and not
+        # its unregistered-body notice; only the body is the refusal's.
+        _gate_record config_gen_build_failed status=1 "display=refused" \
+          | sed "s/\"body\":\"config_gen_build_failed\"/\"body\":\"${_want}\"/" > "${_c}.err"
+        ;;
+      stale)
+        _file="${_want}"
+        : > "${_c}.out"
+        { _gate_record config_gen_manifest_stale "file=${_file}" "reason=${_reason}" status=1 "display=stale"
+          _gate_record config_gen_gate_admission_failed gate=admission status=1 "display=admission"
+        } > "${_c}.err"
+        ;;
+      green)
+        _ok_lines "" > "${_c}.out"
+        # A green row's third field is a line its build log must stream
+        # (base#1467).
+        : > "${_c}.err"
+        [[ -z "${_want}" ]] || printf '#30 1.00 %s\n' "${_want}" > "${_c}.err"
+        # Its fourth field is the one package, under the module, its
+        # mutation gate passes (base#1615).
+        [[ -z "${_reason}" ]] \
+          || printf '#30 1.00 %s/%s ok efficacy=100.0\n' \
+            "$(awk '$1 == "module" {print $2; exit}' /source/dockerfile/config-gen/go.mod)" "${_reason}" >> "${_c}.err"
+        printf '0\n' > "${_c}.rc"
+        continue
+        ;;
+      after)
+        # Made from registered ids, as a gate case's are: only the bodies
+        # are the row's gate id and event (base#1467).
+        _ok_lines "" > "${_c}.out"
+        { _gate_record config_gen_build_failed "file=${_extra}" status=1 "display=ignored" \
+            | sed "s/\"body\":\"config_gen_build_failed\"/\"body\":\"${_reason}\"/"
+          _gate_record config_gen_gate_fmt_failed "gate=${_want}" status=1 "display=after admit" \
+            | sed "s/\"body\":\"config_gen_gate_fmt_failed\"/\"body\":\"config_gen_gate_${_want}_failed\"/"
+        } > "${_c}.err"
+        ;;
+      coverage)
+        _ok_lines coverage > "${_c}.out"
+        { _gate_record "${_want}" "pkg=${_reason}" ${_extra:+"file=${_extra}"} status=1 "display=coverage event"
+          _gate_record config_gen_gate_coverage_failed gate=coverage status=1 "display=coverage"
+        } > "${_c}.err"
+        ;;
+    esac
+    printf '1\n' > "${_c}.rc"
+  done < <(_redpath_rows)
+  _ok_lines "" > "${S}/canned/rerun.out"
+  : > "${S}/canned/rerun.err"
+  printf '0\n' > "${S}/canned/rerun.rc"
+  # retro (base#1467): the six ok lines, one passing mutation line per
+  # package of the module (each directory holding a .go file outside
+  # testdata/), rc 0; the stub runner adds the manifest header naming the
+  # base it was handed.
+  local _mod
+  _mod="$(awk '$1 == "module" {print $2; exit}' /source/dockerfile/config-gen/go.mod)"
+  _ok_lines "" > "${S}/canned/retro.out"
+  (cd /source/dockerfile/config-gen && find . -name '*.go' -not -path '*/testdata/*') \
+    | sed -E 's#^\./##; s#/?[^/]*$##' | LC_ALL=C sort -u \
+    | awk -v m="${_mod}" '{ printf "#30 1.00 %s%s ok efficacy=100.0\n", m, ($0 == "" ? "" : "/" $0) }' \
+    > "${S}/canned/retro.err"
+  printf '0\n' > "${S}/canned/retro.rc"
+}
+
+# _redpath_exec [VAR=value...] -- run the scratch redpath once, as bats
+# `run --separate-stderr`, with the stubs first on PATH, LOG_FORMAT=json,
+# no inherited CONFIG_GEN_REDPATH_ACTIVE or CONFIG_GEN_REDPATH_ONLY, and the
+# given VAR=value words on top. Every redpath call in this spec goes through
+# here. Each driver scales the bats per-test bound to its load (120 x jobs
+# under mutation-required, x3 under kcov), so the run is then held to
+# _redpath_bounds_check against that bound (base#1527).
+_redpath_exec() {
+  run --separate-stderr env -u CONFIG_GEN_REDPATH_ACTIVE -u CONFIG_GEN_REDPATH_ONLY \
+      REDPATH_TOP="${BASHPID}" PATH="${S}/bin:${PATH}" LOG_FORMAT=json "$@" \
+      bash "${S}/repo/script/test/config_gen_redpath.sh"
+  _redpath_bounds_check "${BATS_TEST_TIMEOUT:-}"
+}
+
+# _redpath_seconds <duration> -- a coreutils `timeout` DURATION (a number,
+# optional s, m, h or d) in seconds; non-zero when it is not one.
+_redpath_seconds() {
+  [[ "${1}" =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)([smhd]?)$ ]] || return 1
+  awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+    'BEGIN { m = (u == "m") ? 60 : (u == "h") ? 3600 : (u == "d") ? 86400 : 1; print n * m }'
+}
+
+# _redpath_bounds_check <per-test-bound> -- fail when a runner call ran
+# under a `timeout` (${S}/runner.bounds) whose duration is shorter than
+# <per-test-bound> seconds: that bound would stop the run before the one
+# the driver chose (base#1527). A bound at or above it, or a duration of 0
+# (no limit), passes; an empty <per-test-bound> (bats run with no driver)
+# checks nothing.
+_redpath_bounds_check() {
+  local _bound="${1}" _line _d _secs
+  local -a _w
+  [[ -n "${_bound}" && -s "${S}/runner.bounds" ]] || return 0
+  while IFS= read -r _line; do
+    read -r -a _w <<<"${_line}"
+    _d=''
+    set -- "${_w[@]:1}"
+    while (( $# > 0 )); do
+      case "${1}" in
+        -k | -s | --kill-after | --signal) shift; (( $# == 0 )) || shift; continue ;;
+        -*) shift; continue ;;
+        *) _d="${1}"; break ;;
+      esac
+    done
+    _secs="$(_redpath_seconds "${_d}")" \
+      || fail "the redpath ran under '${_line}', whose duration '${_d}' this check cannot read (base#1527)"
+    awk -v d="${_secs}" -v b="${_bound}" 'BEGIN { exit !(d > 0 && d < b) }' || continue
+    fail "the redpath ran under '${_line}' (${_secs}s), shorter than the per-test bound of ${_bound}s, which stops the run first (base#1527)"
+  done < "${S}/runner.bounds"
+}
+
+# _assert_case_failed <case> [<attribution>...] -- assert_logged_event
+# config_gen_redpath_case_failed on <case>'s own record. Cases run in
+# parallel and print as each finishes (base#1547), so with two failing
+# cases the first record in ${stderr} may be either one's.
+_assert_case_failed() {
+  local _case="${1}" _all="${stderr}"
+  shift
+  local stderr
+  stderr="$(grep -F '"body":"config_gen_redpath_case_failed"' <<<"${_all}" \
+    | grep -F "\"case\":\"${_case}\"" || true)"
+  assert_logged_event config_gen_redpath_case_failed "case=${_case}" "$@"
+}
+
+# _run_redpath [VAR=value...] <case>... -- the scratch redpath run on only
+# the named cases (CONFIG_GEN_REDPATH_ONLY) and rerun, which runs whether
+# named or not (base#1547), then held to exactly that: the runner was told
+# each named case once and rerun twice, and nothing else. A whole redpath
+# per test overran the per-test bound under parallel mutation probes;
+# `just test go` and the one full run below keep every case (base#1465).
+# Leading VAR=value words go to the redpath's environment. RERUN_CALLS
+# (default 2) is how many rerun calls the test expects when it names
+# rerun: 1 when its first call is the one that fails.
+_run_redpath() {
+  local -a _env=()
+  while [[ "${1:-}" =~ ^[A-Z_]+= ]]; do _env+=("${1}"); shift; done
+  (( $# > 0 )) || fail "_run_redpath: name the case(s) this test asserts"
+  _redpath_exec "${_env[@]}" CONFIG_GEN_REDPATH_ONLY="$*"
+  local _want _got
+  local _calls=2 _c
+  [[ " $* " == *" rerun "* ]] && _calls="${RERUN_CALLS:-2}"
+  _want="$( { for _c in "$@"; do [[ "${_c}" == rerun ]] || echo "${_c}"; done
+    for (( _c = 0; _c < _calls; _c++ )); do echo rerun; done; } | LC_ALL=C sort)"
+  _got="$(_ran_cases | LC_ALL=C sort)"
+  [[ "${_got}" == "${_want}" ]] \
+    || fail "_run_redpath $*: the runner was told $(paste -sd' ' <<<"${_got}"), not $(paste -sd' ' <<<"${_want}")"
+}
+
+# _run_redpath_all [VAR=value...] -- the scratch redpath on every case, as
+# `just test go` runs it, bounded only by the per-test bound (base#1527).
+_run_redpath_all() {
+  _redpath_exec "$@"
+}
+
+# _redpath_all_shared -- point ${S} at the file's one unsharded run of the
+# scratch redpath on every case, as _run_redpath_all runs it, and load
+# its status, output and stderr; read it, never write under it
+# (base#1547). The four tests that only read such a run share it rather
+# than each running its own: under mutation-required (four specs at once
+# on a four-core runner, 32 bats jobs each) the file's whole-table runs
+# starved one another and the spec's other tests past the 480 s per-test
+# bound. The first caller runs it under BATS_FILE_TMPDIR, the mkdir lock
+# making it the only one, in a subshell with errexit on, so any failed
+# step, a failed bound check included, ends it before its status is
+# written; it then writes the done marker whatever the run's fate. Every
+# other caller waits for that marker, and each fails with the run's own
+# messages when the run recorded no status.
+_redpath_all_shared() {
+  local _d="${BATS_FILE_TMPDIR}/redpath-all"
+  if mkdir "${_d}" 2>/dev/null; then
+    set +e
+    (
+      set -e
+      S="${_d}/S"
+      mkdir -p "${S}/bin"
+      _redpath_repo
+      _run_redpath_all
+      printf '%s' "${output}" > "${_d}/output"
+      printf '%s' "${stderr}" > "${_d}/stderr"
+      printf '%s\n' "${status}" > "${_d}/status"
+    ) > "${_d}/log" 2>&1
+    set -e
+    : > "${_d}/done"
+  fi
+  until [[ -e "${_d}/done" ]]; do sleep 0.2; done
+  [[ -s "${_d}/status" ]] || fail "the shared whole-table redpath run recorded no status: $(cat "${_d}/log")"
+  S="${_d}/S"
+  status="$(cat "${_d}/status")"
+  output="$(cat "${_d}/output")"
+  stderr="$(cat "${_d}/stderr")"
+}
+
+# _case_failures -- every config_gen_redpath_case_failed record in
+# ${stderr} as `<case>|<reason>`, one per line.
+_case_failures() {
+  jq -rR 'fromjson? | select(.body == "config_gen_redpath_case_failed")
+    | .attributes.case + "|" + .attributes.reason' <<<"${stderr}"
+}
+
+# why: Sourced, the redpath only defines its tables and functions (the case
+# tables are read that way); a caller that sources it must not come back
+# with nounset or errexit turned on, the #869 contract (base#1465).
+@test "config_gen_redpath.sh: sourced, it leaves its caller's nounset, errexit and pipefail as they were (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  run bash -c 'source "$1"
+    case $- in *u*) printf "nounset " ;; esac
+    case $- in *e*) printf "errexit " ;; esac
+    case :${SHELLOPTS}: in *:pipefail:*) printf "pipefail " ;; esac
+    printf "END\n"' _ "${REDPATH}"
+  assert_success
+  assert_output END
+}
+
+# why: The pool drains with `while (( ${#_RP_PIDS[@]} > 0 )); do _rp_reap;
+# done` (base#1547). When `wait -n -p` hands back no pid in _RP_PIDS (a pid
+# that is no child of this shell, so rc 127 and an empty name), no case
+# leaves the pool; a reap that returned anyway would spin that loop
+# forever and count no status. It must refuse with
+# config_gen_redpath_reap_lost and exit 1, so the caller never resumes.
+@test "config_gen_redpath.sh: a reap whose wait names no running case is refused as reap_lost and exits 1 (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  run --separate-stderr env LOG_FORMAT=json bash -c 'source "$1"
+    _RP_PIDS=(2147483646) _RP_ERRS=(/dev/null)
+    _rp_reap
+    printf "returned\n"' _ "${REDPATH}"
+  assert_equal "${status}" 1
+  assert_equal "${output}" ""
+  [[ "${stderr}" == *'"body":"config_gen_redpath_reap_lost"'* ]] \
+    || fail "want a config_gen_redpath_reap_lost event on stderr, got: ${stderr}"
+}
+
+# One case of each kind, the rerun among them: what a copy-level property
+# (each scratch root's contents, its git state, its environment) is checked
+# on. Every kind reaches the runner through the same _rp_copy and
+# _rp_gates.
+_ONE_PER_KIND='vet no-context stale-edit rename-move cov-lowered rerun'
+
+# why: The redpath proves each gate CAN fail; calling `just test go` from it
+# would recurse into itself, and reusing one scratch tree would let one
+# case's defect leak into the next. rerun's first call, the control, proves
+# the reds come from the defects and not from the copy (base#1547). Each call is told its case. The case
+# list is this spec's own, so a case dropped from the redpath's tables is
+# a missing call here, and the canned answers (built from this spec's
+# wants) pass only when the redpath judges each case by the same want
+# (base#1465).
+@test "config_gen_redpath.sh: runs the runner once per case and twice for rerun on one copy, each other case on its own copy (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # One case at a time, so the calls reach the runner in run order
+  # (base#1547: cases otherwise run in parallel).
+  _run_redpath_all CONFIG_GEN_REDPATH_JOBS=1
+  assert_success
+  assert_equal "$(_ran_cases)" "$(_redpath_sequence)"
+  assert_equal "$(grep -c . "${S}/runner.trees")" "$(_redpath_sequence | grep -c .)"
+  local _roots
+  _roots="$(for _f in "${S}"/runner.*.argv; do awk 'p == "--root" {print} {p=$0}' "${_f}"; done)"
+  # The two rerun calls share one copy; every other call has its own.
+  assert_equal "$(sort -u <<<"${_roots}" | grep -c .)" "$(( $(_redpath_sequence | grep -c .) - 1 ))"
+  run grep -Fx "${S}/repo" <<<"${_roots}"
+  assert_failure
+  [[ ! -s "${S}/nested" ]] || fail "the redpath reached just or docker itself: $(cat "${S}/nested")"
+}
+
+# why: Each driver scales the per-test bound to its load (base#1413), and
+# a redpath call held to a shorter wall-clock bound is stopped before the
+# one the driver chose (base#1527). The runner stub records every
+# `timeout` between it and the test; _redpath_bounds_check, which every
+# redpath call in this spec passes through, refuses one shorter than the
+# per-test bound by name. 480 s is mutation-required's bound at 4 jobs.
+# A bound at the per-test bound, or none, passes, so a wrapper derived
+# from the driver's bound is not refused.
+@test "config_gen_redpath.sh: a redpath call under a timeout shorter than the per-test bound is refused by name (base#1527)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _runner="${S}/runner-stub.sh"
+  _redpath_runner_stub "${_runner}"
+  REDPATH_TOP="${BASHPID}" timeout 120 "${_runner}" >/dev/null 2>&1 || true
+  run _redpath_bounds_check 480
+  assert_failure
+  assert_output --partial "the redpath ran under 'timeout 120 ${_runner}' (120s), shorter than the per-test bound of 480s"
+  rm -f "${S}/runner.bounds"
+  REDPATH_TOP="${BASHPID}" timeout -k 5 --foreground 2m "${_runner}" >/dev/null 2>&1 || true
+  run _redpath_bounds_check 480
+  assert_failure
+  assert_output --partial "(120s), shorter than the per-test bound of 480s"
+  run _redpath_bounds_check 120
+  assert_success
+  rm -f "${S}/runner.bounds"
+  REDPATH_TOP="${BASHPID}" timeout 480 "${_runner}" >/dev/null 2>&1 || true
+  assert_equal "$(cat "${S}/runner.bounds")" "timeout 480 ${_runner}"
+  run _redpath_bounds_check 480
+  assert_success
+  rm -f "${S}/runner.bounds"
+  REDPATH_TOP="${BASHPID}" "${_runner}" >/dev/null 2>&1 || true
+  [[ ! -e "${S}/runner.bounds" ]] || fail "an unbounded runner call recorded a bound: $(cat "${S}/runner.bounds")"
+}
+
+# why: Each redpath test runs only the cases it asserts, so the spec stays
+# inside the per-test bound under parallel mutation probes (base#1465).
+# CONFIG_GEN_REDPATH_ONLY is what scopes a run: the named cases in the
+# redpath's own order, whatever order they are named in, rerun twice in
+# its own place (base#1547), and no other call.
+@test "config_gen_redpath.sh: CONFIG_GEN_REDPATH_ONLY runs only the named cases and rerun, in run order (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # One case at a time, so the calls reach the runner in run order
+  # (base#1547: cases otherwise run in parallel).
+  _redpath_exec CONFIG_GEN_REDPATH_JOBS=1 CONFIG_GEN_REDPATH_ONLY='rerun cov-lowered stale-edit lint'
+  assert_success
+  assert_equal "$(_ran_cases | paste -sd' ')" 'lint stale-edit cov-lowered rerun rerun'
+}
+
+# _case_line <case> -- the redpath's timed line for <case> in ${stderr},
+# `config-gen redpath case=<case> start= end= secs= result=` (base#1547).
+_case_line() {
+  grep -E "^config-gen redpath case=${1} " <<<"${stderr}" || true
+}
+
+# _case_field <line> <field> -- the value of <field>= in <line>.
+_case_field() {
+  tr ' ' '\n' <<<"${1}" | sed -n "s/^${2}=//p"
+}
+
+# why: The redpath took 91 min in CI with no word of which case took the
+# time (base#1547). Each case streams one line the moment it finishes,
+# naming when it started and ended and how long it took, and its pool
+# slot goes to the next case at once. With two slots, fmt starts first
+# and stays running until the redpath's stderr holds vet's and lint's
+# lines; vet and lint, second and third in run order, sleep 1 s each. A
+# pool that waits on its oldest case (fmt) starts lint only after fmt
+# ends and prints vet's line only then, so fmt waits in vain and the run
+# fails; a secs written down instead of measured fails the secs checks.
+@test "config_gen_redpath.sh: streams a timed line for each case as it finishes (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf 'vet lint\n' > "${S}/canned/fmt.await"
+  printf '1\n' > "${S}/canned/vet.sleep"
+  printf '1\n' > "${S}/canned/lint.sleep"
+  : > "${S}/canned/fmt.snap"
+  _redpath_exec CONFIG_GEN_REDPATH_JOBS=2 CONFIG_GEN_REDPATH_ONLY='fmt vet lint'
+  assert_success
+  local _c _line _start _end _secs _num='^[0-9]+(\.[0-9]+)?$'
+  for _c in fmt vet lint; do
+    _line="$(_case_line "${_c}")"
+    [[ "$(grep -c . <<<"${_line}")" == 1 ]] \
+      || fail "the redpath printed $(grep -c . <<<"${_line}") timed lines for ${_c}, not 1: ${_line}"
+    _start="$(_case_field "${_line}" start)"
+    _end="$(_case_field "${_line}" end)"
+    _secs="$(_case_field "${_line}" secs)"
+    [[ "${_start}" =~ ${_num} && "${_end}" =~ ${_num} && "${_secs}" =~ ${_num} ]] \
+      || fail "${_c}'s line has no numeric start, end and secs: ${_line}"
+    [[ -n "$(_case_field "${_line}" result)" ]] || fail "${_c}'s line names no result: ${_line}"
+    awk -v s="${_start}" -v e="${_end}" -v d="${_secs}" \
+      'BEGIN { x = e - s - d; exit !(x <= 0.5 && x >= -0.5) }' \
+      || fail "${_c}'s secs is not end minus start: ${_line}"
+  done
+  [[ ! -e "${S}/await.missed.fmt" ]] \
+    || fail "vet's and lint's lines never reached the redpath's stderr while fmt ran: lines wait behind the oldest case"
+  for _c in vet lint; do
+    awk -v d="$(_case_field "$(_case_line "${_c}")" secs)" 'BEGIN { exit !(d >= 1) }' \
+      || fail "${_c}'s stub slept 1 s, its line says less: $(_case_line "${_c}")"
+  done
+  awk -v s="$(_case_field "$(_case_line lint)" start)" -v e="$(_case_field "$(_case_line fmt)" end)" \
+    'BEGIN { exit !(s < e) }' \
+    || fail "lint started only once fmt ended: the pool slot vet freed sat idle behind fmt"
+  local _snap
+  _snap="${S}/runner.$(_redpath_call fmt).snap"
+  [[ -f "${_snap}" ]] || fail "fmt's stub found no redpath stderr to copy"
+  for _c in vet lint; do
+    grep -qE "^config-gen redpath case=${_c} " "${_snap}" \
+      || fail "${_c}'s line was not on the redpath's stderr when fmt ended: it is printed in start order, not as it finishes"
+  done
+  run grep -qE '^config-gen redpath case=fmt ' "${_snap}"
+  assert_failure
+}
+
+# why: The redpath hands each case's runner the verdict of 20-gomod-oracle
+# and 30-watch-gosum instead of running them again (base#1547). That verdict
+# holds only while no plant touches what those steps read, so each case
+# recomputes their digest on its planted copy first. Here vet's plant also
+# appends a line to script/watch/lib.sh, a file 30-watch-gosum reads: vet
+# fails reused_input_changed, and lint, whose plant leaves those inputs as
+# they were, does not.
+@test "config_gen_redpath.sh: a case whose plant changes an input of a reused step fails reused_input_changed (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _rp="${S}/repo/script/test/config_gen_redpath.sh"
+  cat > "${S}/plant-extra.sh" <<'EOF'
+eval "_rp_plant_real () $(declare -f _rp_plant | tail -n +2)"
+_rp_plant() {
+  _rp_plant_real "$@"
+  [[ "${1}" != vet ]] || printf '# zz base#1547\n' >> "${2}/script/watch/lib.sh"
+}
+EOF
+  # The wrapper goes in once, before the last BASH_SOURCE guard (the main
+  # guard): the redpath has an earlier one, above _rp_plant's definition,
+  # where the wrapper would wrap nothing and be overwritten by the real plant.
+  local _main _def _wrap
+  _main="$(grep -nE '^if \[\[ "\$\{BASH_SOURCE\[0\]' "${_rp}" | tail -n 1 | cut -d: -f1)"
+  [[ -n "${_main}" ]] || fail "no main guard found in the scratch redpath"
+  awk -v f="${S}/plant-extra.sh" -v n="${_main}" 'NR == n { while ((getline l < f) > 0) print l; close(f) } { print }' \
+    "${_rp}" > "${_rp}.new"
+  mv "${_rp}.new" "${_rp}"
+  _def="$(grep -nE '^_rp_plant ?\(\)' "${_rp}" | head -n 1 | cut -d: -f1)"
+  _wrap="$(grep -nF '_rp_plant_real "$@"' "${_rp}" | cut -d: -f1)"
+  [[ -n "${_def}" ]] || fail "no _rp_plant definition found in the scratch redpath"
+  [[ "$(grep -cF '_rp_plant_real "$@"' "${_rp}")" == 1 ]] \
+    || fail "the plant wrapper was not inserted exactly once into the scratch redpath"
+  (( _wrap > _def )) || fail "the plant wrapper sits above _rp_plant's definition, so it wraps nothing"
+  _redpath_exec CONFIG_GEN_REDPATH_ONLY='vet lint'
+  assert_failure
+  assert_equal "$(_case_failures)" 'vet|reused_input_changed'
+}
+
+# why: 20-gomod-oracle and 30-watch-gosum read the same files in every
+# copy, so the redpath runs them once per job, on a pristine copy, through
+# the runner's --steps-only, and finishes that shared pass before any case
+# starts (base#1547). On the whole table the runner sees --steps-only
+# exactly once, and its start and end are the first two entries of the
+# order log, ahead of every case call.
+@test "config_gen_redpath.sh: runs the shared --steps-only pass exactly once, before the first case call (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_all_shared
+  assert_success
+  [[ -s "${S}/runner.order" ]] || fail "the runner was never called"
+  assert_equal "$(grep -cx 'steps-only start' "${S}/runner.order")" 1
+  assert_equal "$(sed -n '1,2p' "${S}/runner.order")" $'steps-only start\nsteps-only end'
+  assert_equal "$(grep -c '^case ' "${S}/runner.order")" "$(_redpath_sequence | grep -c .)"
+}
+
+# why: The shared pass already ran 20-gomod-oracle and 30-watch-gosum on a
+# pristine copy, and each case's reuse check proves its plant left their
+# inputs unchanged, so a case call that runs them again repeats work whose
+# verdict is known: 75 serial reruns of them made most of the redpath's
+# 91 min (base#1547). Every case call, both rerun calls included, tells the
+# runner CONFIG_GEN_STEPS_REUSED='20-gomod-oracle 30-watch-gosum', the two
+# names typed from the issue.
+@test "config_gen_redpath.sh: every case call, both rerun calls included, tells the runner the shared steps are reused (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_all_shared
+  assert_success
+  local _n _calls
+  _calls="$(cat "${S}/runner.n" 2>/dev/null || echo 0)"
+  assert_equal "${_calls}" "$(_redpath_sequence | grep -c .)"
+  for (( _n = 1; _n <= _calls; _n++ )); do
+    assert_equal "$(cat "${S}/runner.${_n}.case"):$(cat "${S}/runner.${_n}.reused")" \
+      "$(cat "${S}/runner.${_n}.case"):20-gomod-oracle 30-watch-gosum"
+  done
+}
+
+# why: `just test go` runs the gates first, and their 20-gomod-oracle and
+# 30-watch-gosum already passed on the same tree, so the redpath reuses
+# that verdict instead of running its shared pass again (base#1547). A
+# CONFIG_GEN_STEPS_VERDICT file naming status 0 and the digest D that a
+# pristine copy gives means no --steps-only call, and the redpath says so
+# on stderr as shared=reused-from-gates. D is taken on the scratch repo,
+# whose reused-step inputs every copy carries unchanged, by
+# _cg_inputs_digest, whose output the digest test pins to worked literals.
+@test "config_gen_redpath.sh: a CONFIG_GEN_STEPS_VERDICT with the pristine digest and status 0 skips the shared pass (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _d
+  _d="$(cd "${S}/repo" && bash -c 'source "$1"; source "$2"; _cg_inputs_digest 20-gomod-oracle 30-watch-gosum' \
+    _ /source/dist/script/docker/lib/log.sh /source/script/test/config_gen_inputs.sh)"
+  [[ "${_d}" =~ ^[0-9a-f]{64}$ ]] || fail "no digest of the scratch repo's reused-step inputs: '${_d}'"
+  printf 'digest=%s steps=20-gomod-oracle,30-watch-gosum status=0\n' "${_d}" > "${S}/steps.verdict"
+  _run_redpath CONFIG_GEN_STEPS_VERDICT="${S}/steps.verdict" vet
+  assert_success
+  if grep -qx 'steps-only start' "${S}/runner.order"; then
+    fail "the runner was called with --steps-only although the verdict file matched"
+  fi
+  grep -qF 'shared=reused-from-gates' <<<"${stderr}" \
+    || fail "the redpath did not log shared=reused-from-gates; stderr: ${stderr}"
+}
+
+# why: A CONFIG_GEN_STEPS_VERDICT is the gates' verdict on the tree they
+# saw; when its digest is not the one a pristine copy gives, the inputs
+# of 20-gomod-oracle and 30-watch-gosum changed since, and that verdict
+# says nothing about them (base#1547). The redpath then runs its shared
+# pass itself, exactly once, and says why on stderr as shared=ran
+# reason=digest_mismatch. The file's digest is 64 zeros, which no
+# sha256 over the scratch repo's inputs gives.
+@test "config_gen_redpath.sh: a CONFIG_GEN_STEPS_VERDICT with another digest runs the shared pass once, as digest_mismatch (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf 'digest=%s steps=20-gomod-oracle,30-watch-gosum status=0\n' \
+    0000000000000000000000000000000000000000000000000000000000000000 > "${S}/steps.verdict"
+  _run_redpath CONFIG_GEN_STEPS_VERDICT="${S}/steps.verdict" vet
+  assert_success
+  assert_equal "$(grep -cx 'steps-only start' "${S}/runner.order")" 1
+  grep -qF 'shared=ran reason=digest_mismatch' <<<"${stderr}" \
+    || fail "the redpath did not log shared=ran reason=digest_mismatch; stderr: ${stderr}"
+}
+
+# why: A CONFIG_GEN_STEPS_VERDICT that names no file is a caller's mistake
+# (a wrong tmp path, a gates run that never wrote it), not a reason to
+# rerun the shared pass quietly as if nothing had been asked (base#1547).
+# The redpath refuses it as usage, exit 2, naming the variable, before the
+# runner is called at all.
+@test "config_gen_redpath.sh: a CONFIG_GEN_STEPS_VERDICT naming no file is refused as usage before any runner call (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _redpath_exec CONFIG_GEN_STEPS_VERDICT="${S}/no-such.verdict" CONFIG_GEN_REDPATH_ONLY=vet
+  assert_refusal 2 config_gen_usage_invalid arg=CONFIG_GEN_STEPS_VERDICT
+  if [[ -s "${S}/runner.order" ]]; then
+    fail "the runner was called although the verdict file is missing: $(paste -sd' ' "${S}/runner.order")"
+  fi
+}
+
+# _unplanted_cases -- the case each runner call was told whose copy's
+# fingerprint (files, index, HEAD tree, status) equals that of the shared
+# pass's pristine copy, in call order.
+_unplanted_cases() {
+  local _n _p
+  _p="$(cat "${S}/runner.pristine.fp")" || fail "_unplanted_cases: no shared pass recorded a pristine fingerprint"
+  for (( _n = 1; _n <= $(cat "${S}/runner.n" 2>/dev/null || echo 0); _n++ )); do
+    [[ "$(cat "${S}/runner.${_n}.fp")" == "${_p}" ]] || continue
+    cat "${S}/runner.${_n}.case"
+  done
+}
+
+# why: The unmodified copy's verdict is one value per commit, but a control
+# run on every redpath invocation repeats it once per way the run is split;
+# rerun's first call already holds that copy to rc 0 and exactly the six ok
+# lines, a stronger check than the control's (base#1547). So rerun is the
+# only check on the unmodified copy: an unsharded run calls the runner on
+# an unplanted copy exactly twice, both told rerun, and no call is told
+# control.
+@test "config_gen_redpath.sh: an unsharded run calls the runner on the unmodified copy twice, both as rerun, and never as control (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_all_shared
+  assert_success
+  assert_equal "$(_unplanted_cases | paste -sd' ')" 'rerun rerun'
+  assert_equal "$(_ran_cases | grep -cx control)" 0
+}
+
+# _redpath_reset -- clear the stub runner's records from ${S}, so the next
+# redpath run's calls are counted from 1. The canned answers and the repo
+# copy stay.
+_redpath_reset() {
+  rm -rf "${S}"/runner.* "${S}"/calls.* "${S}"/barrier.*
+}
+
+# why: The config-gen job's redpath is split into shards so each job ends
+# inside its bound (base#1547). A split may not drop a case, run one
+# twice, or repeat the unmodified copy's check once per shard: that check
+# is one value per commit, and rerun has one row in
+# script/test/config_gen_redpath_shards.tsv like every other case. So the
+# N shards the tsv's header names, run one after another, ran exactly the
+# cases the unsharded run ran, each once, rerun in exactly one shard, two
+# calls on the unmodified copy in all, and no shard ran nothing. Each
+# shard's success line says where the control ran: rerun call 1 in the
+# shard that ran it, the shard holding rerun's row in every other.
+@test "config_gen_redpath.sh: the tsv's shards partition the unsharded run, rerun in one shard, two unmodified-copy calls in all (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _tsv="${S}/repo/script/test/config_gen_redpath_shards.tsv"
+  [[ -f "${_tsv}" ]] || fail "no shard table at script/test/config_gen_redpath_shards.tsv"
+  local _n _k _i _u _c _all='' _ran _unplanted=0 _holders=0
+  _n="$(sed -n '1s/^# shards=\([1-9][0-9]*\)$/\1/p' "${_tsv}")"
+  [[ -n "${_n}" ]] || fail "the shard table's first line is not '# shards=<N>': $(head -n 1 "${_tsv}")"
+  _k="$(awk -F'\t' '$1 == "rerun" { print $2 }' "${_tsv}")"
+  [[ "${_k}" =~ ^[1-9][0-9]*$ ]] || fail "the shard table gives rerun no single shard: '${_k}'"
+  # The unsharded run is the file's shared one, read under its own ${S};
+  # the shards then run on this test's scratch repo.
+  _redpath_all_shared
+  assert_success
+  _u="$(_ran_cases | LC_ALL=C sort)"
+  assert_equal "$(_unplanted_cases | paste -sd' ')" 'rerun rerun'
+  S="${BATS_TEST_TMPDIR}"
+  for (( _i = 1; _i <= _n; _i++ )); do
+    _redpath_reset
+    _redpath_exec CONFIG_GEN_REDPATH_SHARD="${_i}/${_n}"
+    (( status == 0 )) || fail "shard ${_i}/${_n} exited ${status}: $(grep -v '^config-gen redpath case=' <<<"${stderr}" | head -n 5)"
+    _ran="$(_ran_cases)"
+    [[ -n "${_ran}" ]] || fail "shard ${_i}/${_n} ran no case"
+    _all+="${_ran}"$'\n'
+    # grep -c exits 1 on a zero count, which every shard but rerun's has.
+    _c="$(_unplanted_cases)"
+    _unplanted=$(( _unplanted + $(grep -c . <<<"${_c}" || true) ))
+    if grep -qx rerun <<<"${_ran}"; then
+      _holders=$(( _holders + 1 ))
+      assert_output --partial 'the control passed (rerun call 1)'
+    else
+      assert_output --partial "the control runs in shard ${_k}/${_n}"
+    fi
+  done
+  assert_equal "$(grep . <<<"${_all}" | LC_ALL=C sort)" "${_u}"
+  assert_equal "$(grep . <<<"${_all}" | grep -vx rerun | LC_ALL=C sort | uniq -d | paste -sd' ')" ''
+  assert_equal "unplanted:${_unplanted}" 'unplanted:2'
+  assert_equal "holders:${_holders}" 'holders:1'
+}
+
+# why: CONFIG_GEN_REDPATH_SHARD=<n>/<N> picks one of the N shards the
+# shard table's header names (base#1547). A value that is not two positive
+# integers, or whose n is past N, names no shard: read as a filter it
+# would select nothing, or the wrong rows, and the job would pass having
+# checked nothing. So the redpath refuses each such value as usage, exit
+# 2, naming the variable, before the runner is called at all, the shared
+# pass included. N is read from the real table's header so the values stay
+# malformed when the table is rebalanced.
+@test "config_gen_redpath.sh: a malformed CONFIG_GEN_REDPATH_SHARD is refused as usage before any runner call (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _n _v
+  _n="$(sed -n '1s/^# shards=\([1-9][0-9]*\)$/\1/p' "${S}/repo/script/test/config_gen_redpath_shards.tsv")"
+  [[ -n "${_n}" ]] || fail "the shard table's first line is not '# shards=<N>'"
+  for _v in "0/${_n}" "$(( _n + 1 ))/${_n}" 1/0 x 1/ "1/${_n}/"; do
+    rm -f "${S}/runner.order"
+    run --separate-stderr timeout 30 env -u CONFIG_GEN_REDPATH_ACTIVE -u CONFIG_GEN_REDPATH_ONLY \
+        REDPATH_TOP="${BASHPID}" PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+        CONFIG_GEN_REDPATH_SHARD="${_v}" \
+        bash "${S}/repo/script/test/config_gen_redpath.sh"
+    (( status == 2 )) || fail "SHARD=${_v}: exited ${status}, not 2: $(tail -n 1 <<<"${output}")"
+    assert_refusal 2 config_gen_usage_invalid arg=CONFIG_GEN_REDPATH_SHARD
+    if [[ -s "${S}/runner.order" ]]; then
+      fail "SHARD=${_v}: the runner was called: $(paste -sd' ' "${S}/runner.order")"
+    fi
+  done
+}
+
+# _redpath_plan_refused <label> <attr> [VAR=value...] -- run the scratch
+# redpath with the VAR=value words under `timeout 30`; fail unless it exits
+# 2 with a config_gen_usage_invalid record naming <attr>, and the runner
+# was never called, the shared pass included.
+_redpath_plan_refused() {
+  local _label="${1}" _attr="${2}"
+  shift 2
+  rm -f "${S}/runner.order" "${S}/runner.n"
+  run --separate-stderr timeout 30 env -u CONFIG_GEN_REDPATH_ACTIVE -u CONFIG_GEN_REDPATH_ONLY \
+      REDPATH_TOP="${BASHPID}" PATH="${S}/bin:${PATH}" LOG_FORMAT=json "$@" \
+      bash "${S}/repo/script/test/config_gen_redpath.sh"
+  (( status == 2 )) || fail "${_label}: exited ${status}, not 2: $(tail -n 3 <<<"${stderr}")"
+  assert_refusal 2 config_gen_usage_invalid "${_attr}"
+  if [[ -s "${S}/runner.order" || -s "${S}/runner.n" ]]; then
+    fail "${_label}: the runner was called: $(cat "${S}/runner.order" "${S}/runner.n" 2>/dev/null | paste -sd' ')"
+  fi
+}
+
+# why: The shard table is the plan's only record of which job runs which
+# case (base#1547). A CONFIG_GEN_REDPATH_SHARD whose N is not the table's
+# `# shards=<N>` names a split the workflow does not run: a 1..3 matrix
+# against a table of N > 3 shards would silently skip shards 4..N, rerun
+# among them (base#1547 review round 1 finding 5). A table that drops a
+# case, gives rerun no row or two, names a case that does not exist, gives
+# a row a shard outside 1..N or leaves a shard 1..N with no row splits the
+# run into something other than a partition of it. Each one, and SHARD
+# together with ONLY, or an ONLY that names no case, is refused as usage,
+# exit 2, naming what is wrong, before the runner is called at all. Every
+# table here is the real one with one edit, so a rebalance keeps each edit
+# meaningful.
+@test "config_gen_redpath.sh: a SHARD or shard table that does not partition the run is refused as usage before any runner call (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _tsv="${S}/repo/script/test/config_gen_redpath_shards.tsv" _real _n
+  _real="$(cat "${_tsv}")"
+  _n="$(sed -n '1s/^# shards=\([1-9][0-9]*\)$/\1/p' "${_tsv}")"
+  [[ -n "${_n}" ]] || fail "the shard table's first line is not '# shards=<N>'"
+  _redpath_plan_refused "SHARD=1/$(( _n + 1 )) against shards=${_n}" arg=CONFIG_GEN_REDPATH_SHARD \
+    CONFIG_GEN_REDPATH_SHARD="1/$(( _n + 1 ))"
+  if (( _n > 1 )); then
+    _redpath_plan_refused "SHARD=1/$(( _n - 1 )) against shards=${_n}" arg=CONFIG_GEN_REDPATH_SHARD \
+      CONFIG_GEN_REDPATH_SHARD="1/$(( _n - 1 ))"
+  fi
+  _redpath_plan_refused "SHARD with ONLY" arg=CONFIG_GEN_REDPATH_SHARD \
+    CONFIG_GEN_REDPATH_SHARD="1/${_n}" CONFIG_GEN_REDPATH_ONLY=lint
+  _redpath_plan_refused "ONLY naming no case" case=no-such-case CONFIG_GEN_REDPATH_ONLY='lint no-such-case'
+  grep -v $'^lint\t' <<<"${_real}" > "${_tsv}"
+  _redpath_plan_refused "lint's row deleted" case=lint CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  grep -v $'^rerun\t' <<<"${_real}" > "${_tsv}"
+  _redpath_plan_refused "rerun's row deleted" case=rerun CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  printf '%s\nrerun\t1\n' "${_real}" > "${_tsv}"
+  _redpath_plan_refused "rerun given two rows" case=rerun CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  printf '%s\nno-such\t1\n' "${_real}" > "${_tsv}"
+  _redpath_plan_refused "a row naming no case" case=no-such CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  sed $'s/^lint\t.*/lint\t'"$(( _n + 1 ))"'/' <<<"${_real}" > "${_tsv}"
+  _redpath_plan_refused "lint on shard $(( _n + 1 )) of ${_n}" case=lint CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  sed $'s/^lint\t.*/lint\t0/' <<<"${_real}" > "${_tsv}"
+  _redpath_plan_refused "lint on shard 0" case=lint CONFIG_GEN_REDPATH_SHARD="1/${_n}"
+  sed "1s/.*/# shards=$(( _n + 1 ))/" <<<"${_real}" > "${_tsv}"
+  _redpath_plan_refused "shards=$(( _n + 1 )) with no row on shard $(( _n + 1 ))" "shard=$(( _n + 1 ))" \
+    CONFIG_GEN_REDPATH_SHARD="1/$(( _n + 1 ))"
+}
+
+# why: The redpath runs its cases one after another, so a job's time is the
+# sum of every case's build (base#1547). With CONFIG_GEN_REDPATH_JOBS=4 up
+# to four cases run at once. fmt, vet, lint and race each wait at a barrier
+# until all four have reached the runner: a serial loop leaves the first
+# one waiting alone until its stub gives up and exits 9, so only cases run
+# at the same time pass.
+@test "config_gen_redpath.sh: with CONFIG_GEN_REDPATH_JOBS=4, four cases run at the same time (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _c
+  for _c in fmt vet lint race; do : > "${S}/canned/${_c}.barrier"; done
+  _redpath_exec CONFIG_GEN_REDPATH_JOBS=4 CONFIG_GEN_REDPATH_ONLY='fmt vet lint race'
+  local _missed
+  _missed="$(ls "${S}" | sed -n 's/^barrier\.missed\.//p' | LC_ALL=C sort | paste -sd' ')"
+  assert_equal "missed:${_missed}" 'missed:'
+  assert_equal "$(ls "${S}" | grep -c '^barrier\.arrived\.')" 4
+  assert_success
+}
+
+# why: CONFIG_GEN_REDPATH_JOBS is how many cases run at once (base#1547).
+# 0, a negative number or a word is not a pool size, so the redpath
+# refuses each as usage, exit 2, naming the variable, before the runner is
+# called at all. Each value runs under `timeout 30`, so a redpath that
+# loops on a bad value fails here instead of hanging the suite.
+@test "config_gen_redpath.sh: a CONFIG_GEN_REDPATH_JOBS of 0, -1 or x is refused as usage before any runner call (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _j
+  for _j in 0 -1 x; do
+    rm -f "${S}/runner.order"
+    run --separate-stderr timeout 30 env -u CONFIG_GEN_REDPATH_ACTIVE -u CONFIG_GEN_REDPATH_ONLY \
+        REDPATH_TOP="${BASHPID}" PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+        CONFIG_GEN_REDPATH_JOBS="${_j}" CONFIG_GEN_REDPATH_ONLY=vet \
+        bash "${S}/repo/script/test/config_gen_redpath.sh"
+    assert_refusal 2 config_gen_usage_invalid arg=CONFIG_GEN_REDPATH_JOBS
+    if [[ -s "${S}/runner.order" ]]; then
+      fail "JOBS=${_j}: the runner was called: $(paste -sd' ' "${S}/runner.order")"
+    fi
+  done
+}
+
+# _procs_with <argv> -- the pid of every live process whose argv, words
+# joined by single spaces, is exactly <argv>, read from /proc so no
+# pgrep flavour decides what matches.
+_procs_with() {
+  local _f _p
+  local -a _w
+  for _f in /proc/[0-9]*/cmdline; do
+    _w=()
+    mapfile -d '' -t _w < "${_f}" 2>/dev/null || continue
+    [[ "${_w[*]:-}" == "${1}" ]] || continue
+    _p="${_f#/proc/}"
+    echo "${_p%/cmdline}"
+  done
+}
+
+# why: Cases run in the background (base#1547), and a background child of
+# a bash script outlives the script when the script is stopped: a
+# cancelled CI job would leave docker builds running into the next job.
+# So SIGTERM to the redpath stops every running case with it. vet's stub
+# sleeps for a marker number of seconds no other process uses; once that
+# sleep is live the redpath gets SIGTERM, and within 10 s of it exiting no
+# process may still be running that sleep. Any left over are killed here
+# before the test fails, so a red run leaves nothing behind.
+@test "config_gen_redpath.sh: SIGTERM to the redpath leaves no case process running (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _mark=$(( 900000 + BASHPID )) _rp _t _left
+  printf '%s\n' "${_mark}" > "${S}/canned/vet.sleep"
+  env -u CONFIG_GEN_REDPATH_ACTIVE -u CONFIG_GEN_REDPATH_ONLY \
+    REDPATH_TOP="${BASHPID}" PATH="${S}/bin:${PATH}" LOG_FORMAT=json \
+    CONFIG_GEN_REDPATH_ONLY=vet \
+    bash "${S}/repo/script/test/config_gen_redpath.sh" > "${S}/term.out" 2> "${S}/term.err" &
+  _rp=$!
+  for (( _t = 0; _t < 100; _t++ )); do
+    [[ -z "$(_procs_with "sleep ${_mark}")" ]] || break
+    sleep 0.1
+  done
+  if [[ -z "$(_procs_with "sleep ${_mark}")" ]]; then
+    kill -KILL "${_rp}" 2>/dev/null
+    fail "vet's stub never reached its sleep: $(paste -sd' ' "${S}/runner.order" 2>/dev/null)"
+  fi
+  kill -TERM "${_rp}"
+  wait "${_rp}" || true
+  for (( _t = 0; _t < 100; _t++ )); do
+    _left="$(_procs_with "sleep ${_mark}")"
+    [[ -n "${_left}" ]] || break
+    sleep 0.1
+  done
+  if [[ -n "${_left}" ]]; then
+    kill -KILL ${_left} 2>/dev/null
+    fail "SIGTERM to the redpath left vet's stub running: pid(s) $(paste -sd' ' <<<"${_left}")"
+  fi
+}
+
+# why: mut-timeout's expected record counts a timed-out mutant (3 killed,
+# 1 timed out), and a timeout count depends on how loaded the host is
+# while the mutants run, so the case must not share the host with other
+# cases once cases run in parallel (base#1547). With JOBS=4 and four cases
+# selected, each stub sleeps 1 s and logs its own start and end: fmt, vet
+# and lint overlap one another (the pool is parallel), and mut-timeout's
+# interval overlaps none of theirs. fmt, vet and lint also wait at the
+# barrier for one another, so their overlap does not rest on the 1 s
+# sleep: on a loaded host each case builds its own copy first and the
+# three reached the stub up to 3 s apart, after the earlier ones had
+# already ended.
+@test "config_gen_redpath.sh: mut-timeout runs alone, its call overlapping no other case's, while the others run in parallel (base#1547)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _c
+  for _c in fmt vet lint mut-timeout; do
+    printf '1\n' > "${S}/canned/${_c}.sleep"
+    : > "${S}/canned/${_c}.span"
+  done
+  for _c in fmt vet lint; do : > "${S}/canned/${_c}.barrier"; done
+  _redpath_exec CONFIG_GEN_REDPATH_JOBS=4 CONFIG_GEN_REDPATH_ONLY='fmt vet lint mut-timeout'
+  assert_success
+  [[ -s "${S}/runner.spans" ]] || fail "no stub logged a span"
+  # _span <case> <start|end> -- the time the case's stub logged.
+  _span() { awk -v c="${1}" -v k="${2}" '$1 == c && $2 == k { print $3 }' "${S}/runner.spans"; }
+  for _c in fmt vet lint mut-timeout; do
+    [[ -n "$(_span "${_c}" start)" && -n "$(_span "${_c}" end)" ]] \
+      || fail "${_c}'s stub logged no full span: $(paste -sd' ' "${S}/runner.spans")"
+  done
+  # _overlap <a> <b> -- true when the two cases' stub calls overlapped.
+  _overlap() {
+    awk -v s1="$(_span "${1}" start)" -v e1="$(_span "${1}" end)" \
+        -v s2="$(_span "${2}" start)" -v e2="$(_span "${2}" end)" \
+        'BEGIN { exit !(s1 < e2 && s2 < e1) }'
+  }
+  _overlap fmt vet && _overlap vet lint \
+    || fail "fmt, vet and lint did not run at the same time: $(paste -sd' ' "${S}/runner.spans")"
+  for _c in fmt vet lint; do
+    if _overlap mut-timeout "${_c}"; then
+      fail "mut-timeout ran at the same time as ${_c}: $(paste -sd' ' "${S}/runner.spans")"
+    fi
+  done
+}
+
+# why: The runner's attribute filter matched no file= or reason= word
+# under en_US.UTF-8 on a glibc host until _cg_attr_ok pinned LC_ALL=C
+# (base#1465); a host whose own locale is C never runs that filter under
+# any other. stale-edit-locale is the case that does: its runner call, and
+# only its, runs under LC_ALL=en_US.UTF-8 whatever the redpath inherited.
+# The test-tools image is musl, the one libc let through on the name as it
+# is, so it goes through with no LOCPATH.
+@test "config_gen_redpath.sh: stale-edit-locale runs the runner under LC_ALL=en_US.UTF-8, stale-edit under the caller's locale (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # One case at a time, so the calls reach the runner in run order
+  # (base#1547: cases otherwise run in parallel).
+  _run_redpath LC_ALL=C CONFIG_GEN_REDPATH_JOBS=1 stale-edit stale-edit-locale
+  assert_success
+  local _n _got=""
+  for (( _n = 1; _n <= $(cat "${S}/runner.n"); _n++ )); do
+    _got+="$(cat "${S}/runner.${_n}.case") $(cat "${S}/runner.${_n}.locale")"$'\n'
+  done
+  assert_equal "${_got%$'\n'}" "stale-edit C|unset
+stale-edit-locale en_US.UTF-8|unset
+rerun C|unset
+rerun C|unset"
+}
+
+# _glibc_getconf -- put a getconf on ${S}/bin that answers
+# GNU_LIBC_VERSION as glibc 2.35 does and hands every other query to the
+# real one, so the redpath takes this host for glibc (base#1465).
+_glibc_getconf() {
+  local real
+  real="$(command -v getconf || echo false)"
+  printf '#!%s\n[[ "${1:-}" == GNU_LIBC_VERSION ]] && { echo "glibc 2.35"; exit 0; }\nexec %s "$@"\n' \
+    "$(command -v bash)" "${real}" > "${S}/bin/getconf"
+  chmod +x "${S}/bin/getconf"
+}
+
+# why: A localedef that yields no en_US.UTF-8 in which [!-~] drops the
+# word leaves the case with a locale that proves nothing; it must fail as
+# locale_not_affected, before any runner call, not pass on the C behaviour
+# it falls back to (base#1465). In the musl test-tools image bash matches
+# the word under every locale, so a glibc getconf and a stub localedef
+# that writes nothing are that host.
+@test "config_gen_redpath.sh: stale-edit-locale fails as locale_not_affected when localedef makes no locale that drops the word (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _glibc_getconf
+  printf '#!%s\nexit 0\n' "$(command -v bash)" > "${S}/bin/localedef"
+  chmod +x "${S}/bin/localedef"
+  _redpath_exec CONFIG_GEN_REDPATH_ONLY='stale-edit-locale'
+  assert_failure 1
+  assert_equal "$(_case_failures)" "stale-edit-locale|locale_not_affected"
+  assert_equal "$(_ran_cases | paste -sd' ')" 'rerun rerun'
+}
+
+# why: A glibc host with no localedef and no en_US.UTF-8 installed falls
+# back to C behaviour under LC_ALL=en_US.UTF-8, so the case would pass with
+# _cg_attr_ok's LC_ALL=C taken out and prove nothing (base#1465, review
+# round 2). A missing localedef is no reason to run the case: only a musl
+# libc is let through under the name as it is. The musl test-tools image
+# has no localedef; a glibc getconf makes it that glibc host.
+@test "config_gen_redpath.sh: stale-edit-locale fails as locale_not_affected on a glibc host with no localedef and no affected locale (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _glibc_getconf
+  assert_equal "$(PATH="${S}/bin:${PATH}" command -v localedef || echo none)" none
+  _redpath_exec CONFIG_GEN_REDPATH_ONLY='stale-edit-locale'
+  assert_failure 1
+  assert_equal "$(_case_failures)" "stale-edit-locale|locale_not_affected"
+  assert_equal "$(_ran_cases | paste -sd' ')" 'rerun rerun'
+}
+
+# why: The go.mod oracle step (base#1463) runs the scanner from
+# script/watch with the logger from dist/script/docker/lib over
+# test/fixtures/gomod, all relative to its own root; a scratch copy without
+# them turns every redpath case red on the step instead of on its gate.
+@test "config_gen_redpath.sh: each scratch root carries script/watch, the log library and the go.mod fixtures (base#1463)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # shellcheck disable=SC2086 # one word per case
+  _run_redpath ${_ONE_PER_KIND}
+  assert_success
+  local _n _want
+  _want="$(printf '%s\n' script/watch/lib.sh dist/script/docker/lib/log.sh test/fixtures/gomod)"
+  for (( _n = 1; _n <= $(cat "${S}/runner.n"); _n++ )); do
+    assert_equal "${_n}:$(cat "${S}/runner.${_n}.copied" 2>/dev/null)" "${_n}:${_want}"
+  done
+}
+
+# why: The row-loop tests call _redpath_repo 10-11 times each. When every
+# call regenerated all the canned answers, that took 74-83% of the wall of
+# tests 32/34/35 across 68 spec runs on hosted runners and brought them to
+# the 480s mutation-required bound (base#1555). The answers depend only on /source and the row table, so
+# they are made once per file, in setup_file, and each call copies them.
+@test "config_gen_redpath.sh: the canned answers are generated once per file and never by _redpath_repo (base#1555)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  rm -rf "${S}/repo" "${S}/canned"
+  _redpath_repo
+  assert_equal "$(cat "${BATS_FILE_TMPDIR}/canned.generations" 2>/dev/null)" \
+    "${BATS_FILE_TMPDIR}/canned-template"
+}
+
+# why: A missing canned template means setup_file did not run or did not
+# finish. Rebuilding it inside _redpath_repo would hide that and bring back
+# the per-call cost that took the row-loop tests to the 480s bound
+# (base#1555), so _redpath_repo refuses instead, naming base#1555.
+@test "config_gen_redpath.sh: _redpath_repo refuses a missing canned template instead of rebuilding it (base#1555)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  mkdir -p "${S}/empty"
+  BATS_FILE_TMPDIR="${S}/empty" run _redpath_repo
+  assert_failure
+  assert_output --partial "base#1555"
+  assert [ ! -e "${S}/empty/canned.generations" ]
+}
+
+# why: The redpath's copies run the real steps, and the 00-manifest step
+# (base#1464) reads Git history: each copy must be a Git checkout with
+# origin/main, and must run with context pr and no override whatever the
+# caller inherited -- a CI main push exports main-push, and HEAD^1 does not
+# exist in a one-commit copy.
+@test "config_gen_redpath.sh: every copy is a Git checkout run with context pr and no base override (base#1464)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # shellcheck disable=SC2086 # one word per case
+  _run_redpath CONFIG_GEN_MUTATION_CONTEXT=main-push CONFIG_GEN_MUTATION_BASE=deadbeef ${_ONE_PER_KIND}
+  assert_success
+  local _calls
+  _calls="$(cat "${S}/runner.n")"
+  assert_equal "$(grep -c . "${S}/runner.mutenv")" "${_calls}"
+  assert_equal "$(grep -cvx 'ctx=pr base=' "${S}/runner.mutenv")" 0
+  assert_equal "$(grep -c . "${S}/runner.git")" "${_calls}"
+  assert_equal "$(grep -cEx '[0-9a-f]{40}' "${S}/runner.git")" "${_calls}"
+}
+
+# why: A gate that never goes red is indistinguishable from a working one on
+# a clean tree; each verdict below is a way a broken gate would otherwise
+# pass the redpath. Every case is reported before the run fails.
+@test "config_gen_redpath.sh: a case whose runner exited 0 fails with reason rc_zero, and the rest still run (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf '0\n' > "${S}/canned/vet.rc"
+  # lint runs after vet; _run_redpath fails the test unless it still ran.
+  _run_redpath vet lint
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=vet reason=rc_zero gate=vet
+}
+
+# why: A red gate's build ends the way every refusal does, exit 1; a runner
+# that crashed with another status after logging the gate's id is not a gate
+# that went red, and must not pass the redpath (base#1465).
+@test "config_gen_redpath.sh: a gate case whose runner exited other than 1 fails with reason rc_not_one (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _rc
+  for _rc in 2 42; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    printf '%s\n' "${_rc}" > "${S}/canned/vet.rc"
+    _run_redpath vet
+    assert_equal "${_rc}:${status}" "${_rc}:1"
+    assert_equal "${_rc}:$(_case_failures)" "${_rc}:vet|rc_not_one"
+  done
+}
+
+# why: A verdict RUN the build cache served prints no line, so a runner
+# that excluded only `test` (or only `admit`) from the cache passes its
+# first call and reports cache state on the next. The rerun case calls the
+# runner twice on one unchanged copy and holds each call to the six ok
+# lines exactly (base#1465).
+@test "config_gen_redpath.sh: a second rerun call missing the admission line fails with reason stdout_mismatch (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf 'gate=%s ok\n' fmt vet lint race coverage > "${S}/canned/rerun.2.out"
+  cp "${S}/canned/rerun.err" "${S}/canned/rerun.2.err"
+  cp "${S}/canned/rerun.rc" "${S}/canned/rerun.2.rc"
+  _run_redpath rerun
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=rerun call=2 reason=stdout_mismatch
+}
+
+# why: A refusal or stale case passes only on the runner's own records of
+# the refusal, after a run that ended the way every refusal must. Each row
+# breaks exactly one part of a correct answer, and each part is a separate
+# guard that would otherwise let a build that never refused (or that ran go
+# on the unchecked snapshot first) pass the redpath (base#1465).
+@test "config_gen_redpath.sh: a refusal, stale or rerun answer missing any part of its contract fails with that part's reason (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason _case _st="${S}/canned/stale-edit"
+  for _row in rc0 rc2 stdout unregistered goparse gostep nogate nostale detail ctxwrong rerunrc; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    _case=stale-edit
+    case "${_row}" in
+      rc0) printf '0\n' > "${_st}.rc"; _reason=rc_zero ;;
+      rc2) printf '2\n' > "${_st}.rc"; _reason=rc_not_one ;;
+      stdout) printf 'gate=admission ok\n' > "${_st}.out"; _reason=stdout_not_empty ;;
+      unregistered) printf 'FATAL: unregistered log body "x"\n' >> "${_st}.err"; _reason=unregistered_body ;;
+      goparse) printf 'go: errors parsing go.mod:\n' >> "${_st}.err"; _reason=go_ran_before_admission ;;
+      gostep) printf '#11 [test 5/9] RUN --mount=type=cache,target=/root/.cache/go-build     g=vet; go vet ./... || exit 1\n' \
+          >> "${_st}.err"; _reason=go_ran_before_admission ;;
+      nogate) sed -i '/"body":"config_gen_gate_admission_failed"/d' "${_st}.err"; _reason=gate_record_missing ;;
+      nostale) sed -i '/"body":"config_gen_manifest_stale"/d' "${_st}.err"; _reason=stale_record_missing ;;
+      detail) sed -i 's/"reason":"sha_mismatch"/"reason":"missing"/' "${_st}.err"; _reason=stale_detail_mismatch ;;
+      ctxwrong) sed -i 's/"body":"config_gen_manifest_missing"/"body":"config_gen_build_failed"/' "${S}/canned/no-context.err"
+        _case=no-context _reason=wrong_id ;;
+      rerunrc) printf '1\n' > "${S}/canned/rerun.rc"; _case=rerun _reason=rc_not_zero ;;
+    esac
+    # A failing first rerun call ends the case before a second.
+    RERUN_CALLS=1 _run_redpath "${_case}"
+    assert_equal "${_row}:${status}" "${_row}:1"
+    # Read with jq, not assert_logged_event: the unregistered row's planted
+    # notice is streamed back with the case's log, which that helper refuses.
+    assert_equal "${_row}:$(_case_failures)" "${_row}:${_case}|${_reason}"
+  done
+}
+
+# why: A green case proves admission accepts a baseline the producer
+# writes and every gate still runs after it; a call that exits non-zero,
+# or that prints anything but the six ok lines, is a producer output
+# admission refused or a gate that did not run (base#1465).
+@test "config_gen_redpath.sh: a green case that exits non-zero or prints other than the six ok lines fails by reason (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason
+  for _row in rc stdout; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      rc) printf '1\n' > "${S}/canned/rename-move.rc"; _reason=rc_not_zero ;;
+      stdout) _ok_lines coverage > "${S}/canned/rename-move.out"; _reason=stdout_mismatch ;;
+    esac
+    _run_redpath rename-move
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:rename-move|${_reason}"
+  done
+}
+
+# why: A coverage case passes only when the ratchet refused it: after
+# exactly the five earlier gates, exiting exactly 1 like every refusal,
+# with the coverage gate's record and the row's own event record naming the
+# row's package (and file). Each row breaks one part, which would otherwise
+# let a runner that crashed with another status, a ratchet that never fired,
+# or one that fired the rule on another package or fragment pass (base#1465).
+@test "config_gen_redpath.sh: a coverage case missing any part of its contract fails with that part's reason (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason _case _c
+  for _row in rc0 rc2 rc42 stdout unregistered gate event pkg nopkg file; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    _case=cov-lowered _c="${S}/canned/cov-lowered"
+    case "${_row}" in
+      rc0) printf '0\n' > "${_c}.rc"; _reason=rc_zero ;;
+      rc2) printf '2\n' > "${_c}.rc"; _reason=rc_not_one ;;
+      rc42) printf '42\n' > "${_c}.rc"; _reason=rc_not_one ;;
+      stdout) _ok_lines "" > "${_c}.out"; _reason=stdout_mismatch ;;
+      unregistered) printf 'FATAL: unregistered log body "x"\n' >> "${_c}.err"; _reason=unregistered_body ;;
+      gate) sed -i 's/"body":"config_gen_gate_coverage_failed"/"body":"config_gen_gate_race_failed"/' "${_c}.err"; _reason=wrong_id ;;
+      event) sed -i 's/"body":"config_gen_coverage_floor_lowered"/"body":"config_gen_coverage_floor_stale"/' "${_c}.err"
+        _reason=event_record_missing ;;
+      pkg) sed -i '/"body":"config_gen_coverage_floor_lowered"/s#"pkg":"[^"]*"#"pkg":"internal/zz"#' "${_c}.err"
+        _reason=event_detail_mismatch ;;
+      nopkg) sed -i '/"body":"config_gen_coverage_floor_lowered"/s#"pkg":"[^"]*",##' "${_c}.err"
+        _reason=event_detail_mismatch ;;
+      file) _case=cov-duplicate _c="${S}/canned/cov-duplicate"
+        sed -i '/"body":"config_gen_coverage_floor_duplicate"/s#"file":"[^"]*"#"file":"s1z.txt"#' "${_c}.err"
+        _reason=event_detail_mismatch ;;
+    esac
+    # The planted change must have reached the canned event record.
+    case "${_row}" in
+      pkg) assert grep -q '"body":"config_gen_coverage_floor_lowered".*"pkg":"internal/zz"' "${_c}.err" ;;
+      nopkg) refute grep -q '"body":"config_gen_coverage_floor_lowered".*"pkg"' "${_c}.err" ;;
+      file) assert grep -q '"body":"config_gen_coverage_floor_duplicate".*"file":"s1z.txt"' "${_c}.err" ;;
+    esac
+    _run_redpath "${_case}"
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:${_case}|${_reason}"
+  done
+}
+
+# why: A mutation or sensitivity case passes only on the gate's own
+# verdict for what the case planted: an uncommitted change (dirty=yes in
+# the manifest the build was handed), the runner's one package failure
+# record naming the planted package by pkg= with its reason and measured
+# efficacy, the weak record for the planted golden, and the mapping's
+# refusal record naming the planted file. Each row breaks one part, which
+# would otherwise let a gate that judged another package, failed one with
+# no pkg= attribution, or refused for another reason, pass the redpath
+# (base#1467).
+@test "config_gen_redpath.sh: a mutation or sensitivity case missing any part of its contract fails with that part's reason (base#1467)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason _case _c
+  for _row in clean staged-clean measured recpkg recreason norecord tworecords weak noevent eventfile twoevents; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      clean) _case=mut-unstaged; sed -i 's/ dirty=yes / dirty=no /' "${S}/canned/${_case}.err"; _reason=not_dirty ;;
+      staged-clean) _case=mut-staged; sed -i 's/ dirty=yes / dirty=no /' "${S}/canned/${_case}.err"; _reason=not_dirty ;;
+      measured) _case=mut-timeout
+        sed -i '/"body":"config_gen_mutation_package_failed"/s#"measured":"75.0"#"measured":"50.0"#' \
+          "${S}/canned/${_case}.err"
+        _reason=mutation_record_mismatch ;;
+      recpkg) _case=mut-unstaged
+        sed -i '/"body":"config_gen_mutation_package_failed"/s#/internal/zzmut"#/internal/zzother"#' \
+          "${S}/canned/${_case}.err"
+        _reason=mutation_record_mismatch ;;
+      recreason) _case=mut-staged
+        sed -i '/"body":"config_gen_mutation_package_failed"/s#"reason":"below"#"reason":"report"#' \
+          "${S}/canned/${_case}.err"
+        _reason=mutation_record_mismatch ;;
+      norecord) _case=mut-untracked-lived
+        sed -i '/"body":"config_gen_mutation_package_failed"/d' "${S}/canned/${_case}.err"
+        _reason=mutation_record_mismatch ;;
+      tworecords) _case=corpus _c="${S}/canned/corpus.err"
+        grep '"body":"config_gen_mutation_package_failed"' "${_c}" > "${S}/twice"
+        cat "${S}/twice" >> "${_c}"
+        _reason=mutation_record_mismatch ;;
+      weak) _case=sens-per-golden
+        sed -i '/"body":"config_gen_corpus_sensitivity_weak"/s#"file":"[^"]*"#"file":"golden/s1/seed.golden"#' \
+          "${S}/canned/${_case}.err"
+        _reason=weak_records_mismatch ;;
+      noevent) _case=notes; sed -i '/"body":"config_gen_mutation_unmapped"/d' "${S}/canned/${_case}.err"
+        _reason=mutation_event_mismatch ;;
+      eventfile) _case=notes
+        sed -i '/"body":"config_gen_mutation_unmapped"/s#"file":"[^"]*"#"file":"dockerfile/config-gen/zz.txt"#' \
+          "${S}/canned/${_case}.err"
+        _reason=mutation_event_mismatch ;;
+      twoevents) _case=notes _c="${S}/canned/notes.err"
+        grep '"body":"config_gen_mutation_unmapped"' "${_c}" > "${S}/twice"
+        cat "${S}/twice" >> "${_c}"
+        _reason=mutation_event_mismatch ;;
+    esac
+    # The planted change must have reached the canned record.
+    case "${_row}" in
+      measured) assert grep -q '"measured":"50.0"' "${S}/canned/${_case}.err" ;;
+      recpkg) assert grep -q '/internal/zzother"' "${S}/canned/${_case}.err" ;;
+      recreason) assert grep -q '"body":"config_gen_mutation_package_failed".*"reason":"report"' \
+        "${S}/canned/${_case}.err" ;;
+      norecord) refute grep -q '"body":"config_gen_mutation_package_failed"' "${S}/canned/${_case}.err" ;;
+      tworecords) assert_equal "$(grep -c '"body":"config_gen_mutation_package_failed"' "${_c}")" 2 ;;
+    esac
+    _run_redpath "${_case}"
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:${_case}|${_reason}"
+  done
+}
+
+# why: An after-admit case passes only when the ignored-input gate refused
+# it after every S1b gate: exit exactly 1, the six ok lines, the gate's
+# record first, and one record of its event naming the planted file. Each
+# row breaks one part (base#1467).
+@test "config_gen_redpath.sh: an after-admit case missing any part of its contract fails with that part's reason (base#1467)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason _c="${S}/canned/ign"
+  for _row in rc0 rc2 stdout unregistered gate event file; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      rc0) printf '0\n' > "${_c}.rc"; _reason=rc_zero ;;
+      rc2) printf '2\n' > "${_c}.rc"; _reason=rc_not_one ;;
+      stdout) _ok_lines coverage > "${_c}.out"; _reason=stdout_mismatch ;;
+      unregistered) printf 'FATAL: unregistered log body "x"\n' >> "${_c}.err"; _reason=unregistered_body ;;
+      gate) sed -i 's/"body":"config_gen_gate_ignored_failed"/"body":"config_gen_gate_mutation_failed"/' "${_c}.err"
+        _reason=wrong_id ;;
+      event) sed -i 's/"body":"config_gen_mutation_ignored_input"/"body":"config_gen_mutation_unmapped"/' "${_c}.err"
+        _reason=event_record_missing ;;
+      file) sed -i '/"body":"config_gen_mutation_ignored_input"/s#"file":"[^"]*"#"file":"dockerfile/config-gen/zz.go"#' "${_c}.err"
+        _reason=after_admit_detail_mismatch ;;
+    esac
+    _run_redpath ign
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:ign|${_reason}"
+  done
+}
+
+# why: The retro case passes only on a clean run from the empty base it
+# planted that judged every package of the module and mapped every module
+# file: a run that exited non-zero, printed other than the six ok lines,
+# was handed a dirty manifest, refused a file as unmapped or judged another
+# package set is each a gate that did not see the whole module (base#1467).
+@test "config_gen_redpath.sh: a retro answer missing any part of its contract fails with that part's reason (base#1467)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _reason _c="${S}/canned/retro"
+  for _row in rc stdout dirty unmapped nopkg extrapkg; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      rc) printf '1\n' > "${_c}.rc"; _reason=rc_not_zero ;;
+      stdout) _ok_lines coverage > "${_c}.out"; _reason=stdout_mismatch ;;
+      dirty) : > "${_c}.dirty"; _reason=not_clean ;;
+      unmapped) printf '#30 1.00 cg_event config_gen_mutation_unmapped file=dockerfile/config-gen/zz.txt\n' >> "${_c}.err"
+        _reason=unmapped ;;
+      nopkg) sed -i '$d' "${_c}.err"; _reason=package_set_mismatch ;;
+      extrapkg) printf '#30 1.00 example.com/zz no-mutants\n' >> "${_c}.err"; _reason=package_set_mismatch ;;
+    esac
+    _run_redpath retro
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:retro|${_reason}"
+  done
+}
+
+# why: BuildKit merges the mutation gate's streams into one step log, and a
+# package's verdict can land after gremlins' unfinished progress text on the
+# same line. The ok row is the base#1443 ship's build log verbatim (lines
+# 955-956), where the retro run judged cmd/cg-gates; the no-mutants row is
+# the same two lines with the gate's other passing verdict. Each replaces
+# that package's sole passing line, and the verdict is still that
+# package's, so the retro case must count either form (base#1546).
+@test "config_gen_redpath.sh: a retro verdict glued after gremlins' Gathering coverage progress still counts (base#1546)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _verdict _c="${S}/canned/retro.err" _pkg='github.com/ycpss91255-lab/base/dockerfile/config-gen/cmd/cg-gates'
+  for _row in glued_ok glued_no_mutants; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      glued_ok) _verdict='ok efficacy=100.0' ;;
+      glued_no_mutants) _verdict='no-mutants' ;;
+    esac
+    assert grep -qxF "#30 1.00 ${_pkg} ok efficacy=100.0" "${_c}"
+    awk -v want="#30 1.00 ${_pkg} ok efficacy=100.0" -v verdict="${_verdict}" '
+      $0 == want {
+        print "#24 3.653 Starting..."
+        print "#24 3.653 Gathering coverage... github.com/ycpss91255-lab/base/dockerfile/config-gen/cmd/cg-gates " verdict
+        next
+      }
+      { print }' "${_c}" > "${_c}.new"
+    mv "${_c}.new" "${_c}"
+    refute grep -qF "#30 1.00 ${_pkg} " "${_c}"
+    assert_equal "${_row}:$(grep -cF " ${_pkg} " "${_c}")" "${_row}:1"
+    assert grep -qxF "#24 3.653 Gathering coverage... ${_pkg} ${_verdict}" "${_c}"
+    _run_redpath retro
+    assert_equal "${_row}:${status}:$(_case_failures)" "${_row}:0:"
+  done
+}
+
+# why: The glued form the retro case counts is gremlins' own progress
+# literal and nothing else. A line with other text before the verdict
+# (a forged prefix, or progress text that already finished), or a verdict
+# cut short, is not that package's verdict, so the retro case must still
+# report package_set_mismatch. The partial rows run on a plain line and on
+# one glued after gremlins' progress, so the glued form is held to the same
+# full verdict as the plain one, and the rows cover both passing verdicts,
+# ok and no-mutants (base#1546).
+@test "config_gen_redpath.sh: a retro verdict after other text than gremlins' progress, or cut short, does not count (base#1546)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _line _c="${S}/canned/retro.err" _pkg='github.com/ycpss91255-lab/base/dockerfile/config-gen/cmd/cg-gates'
+  for _row in forged_fail forged_done partial_digit partial_value glued_partial_digit glued_partial_value \
+    forged_fail_no_mutants partial_no_mutants glued_partial_no_mutants; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    case "${_row}" in
+      forged_fail) _line="#30 1.00 FAIL ${_pkg} ok efficacy=100.0" ;;
+      forged_done) _line="#30 1.00 Gathering coverage... done in 1s ${_pkg} ok efficacy=100.0" ;;
+      partial_digit) _line="#30 1.00 ${_pkg} ok efficacy=100" ;;
+      partial_value) _line="#30 1.00 ${_pkg} ok efficacy=" ;;
+      glued_partial_digit) _line="#30 1.00 Gathering coverage... ${_pkg} ok efficacy=100" ;;
+      glued_partial_value) _line="#30 1.00 Gathering coverage... ${_pkg} ok efficacy=" ;;
+      forged_fail_no_mutants) _line="#30 1.00 FAIL ${_pkg} no-mutants" ;;
+      partial_no_mutants) _line="#30 1.00 ${_pkg} no-mutant" ;;
+      glued_partial_no_mutants) _line="#30 1.00 Gathering coverage... ${_pkg} no-mutant" ;;
+    esac
+    assert grep -qxF "#30 1.00 ${_pkg} ok efficacy=100.0" "${_c}"
+    awk -v want="#30 1.00 ${_pkg} ok efficacy=100.0" -v line="${_line}" '
+      $0 == want { print line; next }
+      { print }' "${_c}" > "${_c}.new"
+    mv "${_c}.new" "${_c}"
+    assert grep -qxF "${_line}" "${_c}"
+    _run_redpath retro
+    assert_equal "${_row}:${status}" "${_row}:1"
+    assert_equal "${_row}:$(_case_failures)" "${_row}:retro|package_set_mismatch"
+  done
+}
+
+# why: The docs-only green case is a change outside the module: the
+# mutation gate must be handed the no-change marker and say it tests
+# nothing, not pass because it tested something else. A green case whose
+# build log lacks the line its row names fails (base#1467).
+@test "config_gen_redpath.sh: a green case whose build log lacks its line fails with reason green_line_missing (base#1467)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  : > "${S}/canned/docs-only.err"
+  _run_redpath docs-only
+  assert_equal "${status}" 1
+  assert_equal "$(_case_failures)" "docs-only|green_line_missing"
+}
+
+# why: The six producer-state green cases plant only non-Go files, so the
+# mutation gate must judge exactly the one small package that holds them,
+# cmd/config-gen. The before row is the five verdict lines a real untrack
+# run printed at d7abca73, when the plant sat under the module-root
+# testdata/ and was mapped to every corpus importer; the none row is a gate
+# that judged nothing; the after row is the one line a real run prints once
+# the plant sits under cmd/config-gen/testdata/. Only the after row is the
+# case's scope, so the other two must fail mutation_scope_mismatch rather
+# than pass slowly or vacuously (base#1615).
+@test "config_gen_redpath.sh: a producer-state green case passes only when the mutation gate judged exactly cmd/config-gen (base#1615)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  local _row _case _want _p='github.com/ycpss91255-lab/base/dockerfile/config-gen'
+  local -a _cases=(names rename-recreate untrack rename-move copies typechange)
+  for _row in before none after; do
+    rm -rf "${S}/repo" "${S}/canned" "${S}"/runner.* "${S}"/calls.* "${S}/nested"
+    _redpath_repo
+    _want=''
+    for _case in "${_cases[@]}"; do
+      case "${_row}" in
+        before)
+          printf '#22 1.076 %s ok efficacy=100.0\n' "${_p}/cmd/config-gen" > "${S}/canned/${_case}.err"
+          printf '#22 173.8 %s ok efficacy=98.2\n' "${_p}/internal/locate" >> "${S}/canned/${_case}.err"
+          printf '#22 255.0 %s ok efficacy=94.5\n' "${_p}/internal/schema" >> "${S}/canned/${_case}.err"
+          printf '#22 257.8 %s ok efficacy=100.0\n' "${_p}/internal/tables" >> "${S}/canned/${_case}.err"
+          printf '#22 259.2 %s ok efficacy=100.0\n' "${_p}/internal/testcorpus" >> "${S}/canned/${_case}.err"
+          _want+="${_case}|mutation_scope_mismatch"$'\n'
+          ;;
+        none)
+          printf '#22 1.00 mutation targets none\n' > "${S}/canned/${_case}.err"
+          _want+="${_case}|mutation_scope_mismatch"$'\n'
+          ;;
+        after)
+          printf '#22 3.643 %s ok efficacy=100.0\n' "${_p}/cmd/config-gen" > "${S}/canned/${_case}.err"
+          ;;
+      esac
+    done
+    _run_redpath "${_cases[@]}"
+    assert_equal "${_row}:$(_case_failures | LC_ALL=C sort)" "${_row}:$(printf '%s' "${_want}" | LC_ALL=C sort)"
+    if [[ "${_row}" == after ]]; then
+      assert_equal "${_row}:${status}" "${_row}:0"
+    else
+      assert_equal "${_row}:${status}" "${_row}:1"
+    fi
+  done
+}
+
+# why: A stale case's change must happen after 00-manifest wrote the
+# baseline and 01-admit installed the checker, or the baseline already
+# holds it and admission has nothing to refuse; a green case's change must
+# reach 00-manifest as the git state it names. The steps and module each
+# call ran with are what the real build would see (base#1465).
+@test "config_gen_redpath.sh: a stale case changes the copy in a step after every real one, and a green case reaches the runner as its git state (base#1465)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _run_redpath stale-edit rename-move
+  assert_success
+  local _n _steps
+  _n="$(_redpath_call stale-edit)"
+  # The runner runs config_gen_steps/*.sh in C-locale glob order.
+  _steps="$(cd "${S}/runner.${_n}.steps" && printf '%s\n' *.sh | LC_ALL=C sort | tail -n 1)"
+  assert_equal "${_steps}" 99-zz-stale-edit.sh
+  # The module the runner got is the unchanged one: the step edits it.
+  run diff -r "${S}/runner.${_n}.mod" "${S}/repo/dockerfile/config-gen"
+  assert_success
+  _n="$(_redpath_call rename-move)"
+  local _g="${S}/runner.${_n}.mod/cmd/config-gen/testdata/zzg"
+  [[ -f "${_g}/a.txt" && -f "${_g}/d.txt" ]] \
+    || fail "rename-move did not leave cmd/config-gen/testdata/zzg/a.txt and d.txt"
+  [[ ! -e "${_g}/c.txt" ]] || fail "rename-move left cmd/config-gen/testdata/zzg/c.txt"
+  assert_equal "$(cat "${_g}/a.txt")" c
+}
+
+# why: The mutation gate maps a file under the module-root testdata/ to
+# every corpus importer, so a green case planted there re-mutates four
+# unchanged packages. Each producer-state green case, and untrack-ignored
+# that shares its path, must leave its files under the one small package's
+# cmd/config-gen/testdata/ and nothing under the module-root testdata/zzg
+# or testdata/zznames; a half move or a leftover copy would keep the slow
+# mapping (base#1615).
+@test "config_gen_redpath.sh: the producer-state green cases plant under cmd/config-gen/testdata, not the module-root testdata (base#1615)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  local _case _n _m _row
+  # case|file the case's git state leaves in the copy, under cmd/config-gen/testdata/
+  local -a _rows=(
+    'names|zznames/a b.txt'
+    'rename-recreate|zzg/d.txt'
+    'untrack|zzg/a.txt'
+    'rename-move|zzg/d.txt'
+    'untrack-ignored|zzg/a.txt'
+    'copies|zzg/e.txt'
+    'typechange|zzg/c.txt'
+  )
+  _run_redpath names rename-recreate untrack rename-move untrack-ignored copies typechange
+  for _row in "${_rows[@]}"; do
+    _case="${_row%%|*}"
+    _n="$(_redpath_call "${_case}")"
+    _m="${S}/runner.${_n}.mod"
+    [[ -f "${_m}/cmd/config-gen/testdata/${_row#*|}" ]] \
+      || fail "${_case} did not plant cmd/config-gen/testdata/${_row#*|}"
+    [[ ! -e "${_m}/testdata/zzg" && ! -e "${_m}/testdata/zznames" ]] \
+      || fail "${_case} left a plant under the module-root testdata/"
+  done
+}
+
+@test "config_gen_redpath.sh: a case that went red on another gate's id fails with reason wrong_id (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _gate_record config_gen_gate_vet_failed gate=vet status=1 display=vet > "${S}/canned/lint.err"
+  _run_redpath lint
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=lint reason=wrong_id gate=lint
+}
+
+# why: The id a case must produce is the runner's own record of the gate
+# that went red. A substring scan over stderr would also accept the id
+# quoted inside unrelated text, a longer id that starts with it, or the
+# build log line the runner streams ahead of its verdict; each of those is
+# a run that did not report the planted gate.
+@test "config_gen_redpath.sh: the id only quoted in text or in the build log, with no record, is wrong_id (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf 'unrelated: config_gen_gate_fmt_failed_extra\n#9 0.31 config_gen_gate_fmt_failed\n' > "${S}/canned/fmt.err"
+  printf 'unrelated: config_gen_gate_vet_failed\n' > "${S}/canned/vet.err"
+  _run_redpath fmt vet
+  assert_equal "${status}" 1
+  _assert_case_failed fmt reason=wrong_id gate=fmt
+  grep -F '"body":"config_gen_redpath_case_failed"' <<<"${stderr}" | grep -F '"case":"vet"' | grep -qF '"reason":"wrong_id"' \
+    || fail "case vet passed on an id quoted in text: ${stderr}"
+}
+
+# why: Even among JSON records only the body names the gate that went red;
+# a match on a body prefix, or on display text, would let an unrelated
+# event or a longer id stand in for the planted gate's record.
+@test "config_gen_redpath.sh: a record whose body is a longer id, or another event naming the id, is wrong_id (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _gate_record config_gen_gate_fmt_failed gate=fmt status=1 display=fmt \
+    | sed 's/"body":"config_gen_gate_fmt_failed"/"body":"config_gen_gate_fmt_failed_extra"/' > "${S}/canned/fmt.err"
+  grep -qF '"body":"config_gen_gate_fmt_failed_extra"' "${S}/canned/fmt.err" || fail "fixture: no suffixed body"
+  _gate_record config_gen_build_failed status=1 "display=not config_gen_gate_vet_failed" > "${S}/canned/vet.err"
+  _run_redpath fmt vet
+  assert_equal "${status}" 1
+  _assert_case_failed fmt reason=wrong_id gate=fmt
+  grep -F '"body":"config_gen_redpath_case_failed"' <<<"${stderr}" | grep -F '"case":"vet"' | grep -qF '"reason":"wrong_id"' \
+    || fail "case vet passed on another event naming its id: ${stderr}"
+}
+
+# why: The verdict reads JSON records; a caller exporting LOG_FORMAT=text
+# would otherwise turn every case into wrong_id, or (with a looser parse)
+# into a scrape of display text.
+@test "config_gen_redpath.sh: runs the runner with JSON logging whatever the caller's LOG_FORMAT (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  # shellcheck disable=SC2086 # one word per case
+  _run_redpath LOG_FORMAT=text ${_ONE_PER_KIND}
+  assert_success
+  assert_equal "$(sort -u "${S}/runner.formats")" json
+}
+
+@test "config_gen_redpath.sh: a case whose earlier gate printed no ok fails with reason earlier_gate_missing (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf 'gate=admission ok\ngate=fmt ok\ngate=vet ok\n' > "${S}/canned/race.out"
+  _run_redpath race
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=race reason=earlier_gate_missing gate=race
+}
+
+@test "config_gen_redpath.sh: the race-fuzz case must produce the race gate's id (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _gate_record config_gen_gate_coverage_failed gate=coverage status=1 display=coverage > "${S}/canned/race-fuzz.err"
+  _run_redpath race-fuzz
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=race-fuzz reason=wrong_id gate=race
+}
+
+# why: A _test.go file is outside `go build`, so a syntax error there
+# passes the build stage and reaches the fmt gate first. gofmt then exits
+# non-zero instead of listing a file; a fmt RUN that let that status kill
+# it before printing its own id would report the case as a build failure,
+# and the fmt gate would be green on a file it never read (base#1462).
+@test "config_gen_redpath.sh: the fmt-parse case plants a _test.go file gofmt cannot parse and must produce the fmt gate's id (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _run_redpath fmt-parse
+  assert_success
+  local _mod _new
+  _mod="${S}/runner.$(_redpath_call fmt-parse).mod"
+  _new="$(cd "${_mod}" && find . -type f | sort | comm -23 - <(cd /source/dockerfile/config-gen && find . -type f | sort))"
+  assert_equal "${_new}" "./cmd/config-gen/zz_parse_test.go"
+  # Unbalanced braces: no Go parser accepts the file.
+  local _open _close
+  _open="$(tr -cd '{' < "${_mod}/cmd/config-gen/zz_parse_test.go" | wc -c)"
+  _close="$(tr -cd '}' < "${_mod}/cmd/config-gen/zz_parse_test.go" | wc -c)"
+  (( _open != _close )) || fail "zz_parse_test.go balances its braces: $(cat "${_mod}/cmd/config-gen/zz_parse_test.go")"
+  # A build-failure record in place of the fmt id fails the case.
+  rm -rf "${S}"/runner.* "${S}"/calls.*
+  _gate_record config_gen_build_failed status=1 display=build > "${S}/canned/fmt-parse.err"
+  _run_redpath fmt-parse
+  assert_equal "${status}" 1
+  assert_logged_event config_gen_redpath_case_failed case=fmt-parse reason=wrong_id gate=fmt
+}
+
+# why: ADR-00000039 requires GOTOOLCHAIN=local so every gate runs the
+# pinned toolchain or fails, never one go fetches for a newer go.mod. The
+# golang image pinned today sets it itself, but a GO_IMAGE override or bump
+# need not. admit, build and test are FROM goenv, so one ENV in goenv,
+# ahead of its first RUN, covers every go command in all three (base#1462,
+# base#1465).
+@test "Dockerfile.config-gen: the goenv stage sets GOTOOLCHAIN=local before its first RUN, and nothing overrides it (base#1462)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  _df_instructions > "${S}/df"
+  run awk -F'\t' '$1 == "goenv" && $2 ~ /^(ENV|RUN) / {print $2; exit}' "${S}/df"
+  assert_success
+  assert_output 'ENV GOTOOLCHAIN=local'
+  run awk -F'\t' '/GOTOOLCHAIN/ && $2 != "ENV GOTOOLCHAIN=local" {print}' "${S}/df"
+  assert_success
+  assert_output ""
+  run awk -F'\t' '$2 ~ /^FROM / {print $2}' "${S}/df"
+  assert_line --regexp '^FROM goenv (AS|as) admit$'
+  assert_line --regexp '^FROM goenv (AS|as) build$'
+  assert_line --regexp '^FROM goenv (AS|as) test$'
+}
+
+# _admit_run <setup> -- run the admit stage's RUN as the build would,
+# outside a build: the RUN text is taken from the Dockerfile (its flags
+# parsed, not assumed), every bind --mount target and the file the test
+# stage copies from admit are moved under ${S}/adm, and the body runs under
+# the goenv SHELL with the module bind as its working directory; stdout,
+# stderr and status as `run --separate-stderr` leaves them, and the moved
+# admitted file in ${ADMITTED}. <setup> fills the mutation bind: sentinel
+# (the placeholder's file beside a passing checker), none (empty), dir
+# (admit.sh a directory), fail (a checker that prints a stale line and
+# exits 1), pass (a checker that records its arguments and exits 0).
+_admit_run() {
+  local _a="${S}/adm" _run _body _word _t _copy _from _to
+  rm -rf "${_a}"
+  mkdir -p "${_a}/mutation" "${_a}/src" "${_a}/root"
+  _df_instructions > "${S}/df"
+  _run="$(awk -F'\t' '$1 == "admit" && $2 ~ /^RUN / {print $2}' "${S}/df")"
+  [[ -n "${_run}" && "$(grep -c . <<<"${_run}")" == 1 ]] || fail "admit has not exactly one RUN: ${_run}"
+  _body="${_run#RUN }"
+  local -a _targets=()
+  while [[ "${_body}" =~ ^[[:space:]]*(--[^[:space:]]+)[[:space:]]+(.*)$ ]]; do
+    _word="${BASH_REMATCH[1]}" _body="${BASH_REMATCH[2]}"
+    [[ "${_word}" == --mount=* && ",${_word#--mount=}," == *,type=bind,* ]] \
+      || fail "an admit RUN flag is not a bind mount: ${_word}"
+    _targets+=("$(tr ',' '\n' <<<"${_word#--mount=}" | sed -n 's/^target=//p')")
+  done
+  _copy="$(awk -F'\t' '$1 == "test" && $2 ~ /^COPY --from=admit / {print $2}' "${S}/df")"
+  _from="${_copy#COPY --from=admit }"
+  _from="${_from%% *}"
+  [[ "${_from}" == /* ]] || fail "the test stage copies no absolute path from admit: ${_copy}"
+  for _t in "${_targets[@]}" "${_from}"; do
+    case "${_t}" in
+      /mutation) _to="${_a}/mutation" ;;
+      /src) _to="${_a}/src" ;;
+      *) _to="${_a}/root${_t}" ;;
+    esac
+    _body="$(sed -E "s#${_t}([/ ;]|\$)#${_to}\\1#g" <<<"${_body}")"
+  done
+  ADMITTED="${_a}/root${_from}"
+  printf 'package main\n' > "${_a}/src/main.go"
+  local _m="${_a}/mutation"
+  case "${1}" in
+    sentinel) : > "${_m}/no-mutation-context"
+      printf 'exit 0\n' > "${_m}/admit.sh" ;;
+    none) ;;
+    dir) mkdir "${_m}/admit.sh" ;;
+    fail) printf 'echo "cg_event config_gen_manifest_stale file=x reason=missing"\nexit 1\n' > "${_m}/admit.sh" ;;
+    pass) printf 'printf "%%s\\n" "$@" > "%s/args"\nexit 0\n' "${_a}" > "${_m}/admit.sh" ;;
+  esac
+  # The goenv SHELL's -euo pipefail is set inside _w, not on the bash
+  # command line: under `just test coverage-path` a top-level
+  # `bash -euo pipefail -c` printed "BASH_SOURCE: unbound variable" to
+  # stderr before the RUN text ran (the same shape as the manifest
+  # writer test in config_gen_mutation_targets_spec).
+  run --separate-stderr bash -c \
+    'cd "$1" && _w() { set -euo pipefail; eval "$2"; }; _w "$@"' _ "${_a}/src" "${_body}"
+}
+
+# why: The admit RUN is the build's admission barrier, reached only through
+# a real build, which no bats tier runs; each of its guards is a
+# required-kill row (base#1465), so each needs a test that runs the RUN's
+# own text and dies with the guard. Each row breaks one guard: the sentinel
+# refused before the checker runs, an absent or non-file checker refused as
+# stale admit.sh, a red checker stopping the RUN with the gate's id and no
+# ok line, and a green checker, run on the context and the module, leaving
+# the ok line and the file the test stage copies.
+@test "Dockerfile.config-gen: the admit RUN refuses the sentinel, an absent or non-file checker and a red checker, and admits a green one (base#1465)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  _admit_run sentinel
+  assert_equal "sentinel:${status}" sentinel:1
+  assert_equal "sentinel:${output}" sentinel:
+  assert_equal "sentinel:${stderr}" "sentinel:cg_event config_gen_manifest_missing"
+  [[ ! -e "${ADMITTED}" ]] || fail "sentinel: admitted"
+  local _setup
+  for _setup in none dir; do
+    _admit_run "${_setup}"
+    assert_equal "${_setup}:${status}" "${_setup}:1"
+    assert_equal "${_setup}:${output}" "${_setup}:cg_event config_gen_manifest_stale file=admit.sh reason=absent"
+    assert_equal "${_setup}:${stderr}" "${_setup}:config_gen_gate_admission_failed"
+    [[ ! -e "${ADMITTED}" ]] || fail "${_setup}: admitted"
+  done
+  _admit_run fail
+  assert_equal "fail:${status}" fail:1
+  assert_equal "fail:${output}" "fail:cg_event config_gen_manifest_stale file=x reason=missing"
+  assert_equal "fail:${stderr}" "fail:config_gen_gate_admission_failed"
+  [[ ! -e "${ADMITTED}" ]] || fail "fail: admitted"
+  _admit_run pass
+  assert_equal "pass:${status}" pass:0
+  assert_equal "pass:${output}" "pass:gate=admission ok"
+  assert_equal "pass:${stderr}" pass:
+  [[ -f "${ADMITTED}" ]] || fail "pass: ${ADMITTED} not written"
+  assert_equal "$(cat "${S}/adm/args")" "$(printf '%s\n' "${S}/adm/mutation" "${S}/adm/src")"
+}
+
+# _test_gate_run <gate> <rc> -- run the test-stage RUN that sets g=<gate>
+# as the build would, outside a build, with cg-gates stubbed: the RUN text
+# is taken from the Dockerfile, each bind --mount target is moved under
+# ${S}/tg (a cache mount is dropped), /tmp/cg-gates is a stub that records
+# its argv and GOFLAGS in ${S}/tg/argv and exits <rc>, the corpus root
+# record the race RUN writes holds `example.com/m/internal/testcorpus.root=
+# ${S}/tg/root`, and `go list -m` answers example.com/m (base#1467).
+_test_gate_run() {
+  local _a="${S}/tg" _run _body _word _t
+  rm -rf "${_a}"
+  mkdir -p "${_a}/mutation" "${_a}/ctx" "${_a}/src" "${_a}/bin"
+  _df_instructions > "${S}/df"
+  _run="$(awk -F'\t' -v g="g=${1};" '$1 == "test" && $2 ~ /^RUN / && index($2, g) {print $2}' "${S}/df")"
+  [[ -n "${_run}" && "$(grep -c . <<<"${_run}")" == 1 ]] || fail "the test stage has not exactly one RUN with g=${1}: ${_run}"
+  _body="${_run#RUN }"
+  while [[ "${_body}" =~ ^[[:space:]]*(--[^[:space:]]+)[[:space:]]+(.*)$ ]]; do
+    _word="${BASH_REMATCH[1]}" _body="${BASH_REMATCH[2]}"
+    [[ "${_word}" == --mount=* ]] || fail "a ${1} RUN flag is not a mount: ${_word}"
+    [[ ",${_word#--mount=}," == *,type=cache,* ]] && continue
+    [[ ",${_word#--mount=}," == *,type=bind,* ]] || fail "a ${1} RUN mount is neither cache nor bind: ${_word}"
+    _t="$(tr ',' '\n' <<<"${_word#--mount=}" | sed -n 's/^target=//p')"
+    case "${_t}" in
+      /mutation | /ctx) _body="$(sed -E "s#${_t}([/ ;]|\$)#${_a}${_t}\\1#g" <<<"${_body}")" ;;
+      *) fail "a ${1} RUN binds an unexpected target: ${_t}" ;;
+    esac
+  done
+  _body="$(sed -e "s#/tmp/cg-gates#${_a}/bin/cg-gates#g" -e "s#/tmp/config-gen-corpus-root#${_a}/corpus-root#g" <<<"${_body}")"
+  printf 'example.com/m/internal/testcorpus.root=%s/root\n' "${_a}" > "${_a}/corpus-root"
+  printf '#!%s\nprintf "%%s\\n" "$@" "GOFLAGS=${GOFLAGS-unset}" > "%s/argv"\necho "cg-gates said"\nexit %s\n' \
+    "$(command -v bash)" "${_a}" "${2}" > "${_a}/bin/cg-gates"
+  printf '#!%s\n[[ "$*" == "list -m" ]] && { echo example.com/m; exit 0; }\nexit 9\n' "$(command -v bash)" > "${_a}/bin/go"
+  chmod +x "${_a}/bin/cg-gates" "${_a}/bin/go"
+  run --separate-stderr env PATH="${_a}/bin:${PATH}" bash -c \
+    'cd "$1" && _w() { set -euo pipefail; eval "$2"; }; _w "$@"' _ "${_a}/src" "${_body}"
+}
+
+# why: The ignored-input, corpus sensitivity and mutation gates are RUNs
+# of the test stage, reached only through a real build, which no bats tier
+# runs; each one's refusal is a required-kill row (base#1467). Each RUN
+# must hand cg-gates the mutation context's inputs, the bound build
+# context and the corpus root the race RUN wrote, stop with its gate's id
+# when cg-gates refuses, and print neither the id nor an ok line when it
+# passes (the green callers expect exactly the six S1b ok lines).
+@test "Dockerfile.config-gen: the ignored, corpus_sensitivity and mutation RUNs run cg-gates on their inputs and stop with the gate's id on its refusal (base#1467)" {
+  assert_spec_subject "${DOCKERFILE}" "the config generator's build/test/final Dockerfile (base#1462)"
+  local _g _want
+  for _g in ignored corpus_sensitivity mutation; do
+    _test_gate_run "${_g}" 1
+    assert_equal "${_g}:${status}" "${_g}:1"
+    assert_equal "${_g}:${output}" "${_g}:cg-gates said"
+    assert_equal "${_g}:${stderr}" "${_g}:config_gen_gate_${_g}_failed"
+    _test_gate_run "${_g}" 0
+    assert_equal "${_g}:${status}" "${_g}:0"
+    assert_equal "${_g}:${output}" "${_g}:cg-gates said"
+    assert_equal "${_g}:${stderr}" "${_g}:"
+    case "${_g}" in
+      ignored) _want="$(printf '%s\n' ignored --list "${S}/tg/mutation/ignored.sha256" --context "${S}/tg/ctx" GOFLAGS=unset)" ;;
+      corpus_sensitivity) _want="$(printf '%s\n' sensitivity --module example.com/m --root "${S}/tg/root" --work)" ;;
+      mutation) _want="$(printf '%s\n' mutation --manifest "${S}/tg/mutation/manifest" --module example.com/m --reports)" ;;
+    esac
+    [[ "$(cat "${S}/tg/argv")" == "${_want}"* ]] || fail "${_g}: cg-gates argv $(cat "${S}/tg/argv"), want ${_want}..."
+  done
+  # The mutation RUN hands every go test gremlins runs the corpus root.
+  assert_equal "$(tail -n 1 "${S}/tg/argv")" "GOFLAGS=-ldflags=-X=example.com/m/internal/testcorpus.root=${S}/tg/root"
+}
+
+# why: A control whose runner exited non-zero means the copy itself is red,
+# so no case's red can be attributed to its defect. rerun's first call is
+# the control (base#1547): a scoped run that does not name rerun still
+# runs it, and a red first call fails the run as case=rerun call=1.
+@test "config_gen_redpath.sh: a red control (rerun call 1) fails the run (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  printf '1\n' > "${S}/canned/rerun.rc"
+  _redpath_exec CONFIG_GEN_REDPATH_ONLY=vet
+  assert_equal "${status}" 1
+  assert_equal "$(_ran_cases | paste -sd' ')" 'vet rerun'
+  assert_logged_event config_gen_redpath_case_failed case=rerun call=1 reason=rc_not_zero
+}
+
+# why: `just test go` runs the redpath, and the redpath runs the runner; a
+# redpath that reached `just test go` again would recurse without bound. The
+# guard refuses a nested entry and runs nothing.
+@test "config_gen_redpath.sh: a nested entry is refused with config_gen_redpath_reentered and runs nothing (base#1462)" {
+  assert_spec_subject "${REDPATH}" "the config-gen redpath (base#1462)"
+  _redpath_repo
+  _redpath_exec CONFIG_GEN_REDPATH_ACTIVE=1
+  assert_refusal 1 config_gen_redpath_reentered
+  [[ ! -e "${S}/runner.n" ]] || fail "the guarded redpath still called the runner $(cat "${S}/runner.n") time(s)"
+  [[ ! -s "${S}/nested" ]] || fail "the guarded redpath reached just or docker: $(cat "${S}/nested")"
+}
+
+# ── the recipe ──────────────────────────────────────────────────────────────
+
+# _recipe_repo <runner-rc> -- a scratch repo holding the justfiles and two
+# stubs at ${S}/j. The runner stub logs `gates out=<set|unset>` to
+# ${S}/order, writes `stub-verdict` to CONFIG_GEN_STEPS_VERDICT_OUT when
+# that is set, and exits <runner-rc>. The redpath stub logs `redpath
+# only=<ONLY> shard=<SHARD> verdict=<the file's line>`, each `unset` when
+# not set.
+_recipe_repo() {
+  local _r="${S}/j"
+  mkdir -p "${_r}/script/test"
+  cp /source/justfile "${_r}/justfile"
+  cp /source/script/test/justfile.test "${_r}/script/test/justfile.test"
+  cat > "${_r}/script/test/config_gen_gates.sh" <<STUB
+#!$(command -v bash)
+if [[ -n "\${CONFIG_GEN_STEPS_VERDICT_OUT:-}" ]]; then
+  echo "gates out=set" >> "${S}/order"
+  echo stub-verdict > "\${CONFIG_GEN_STEPS_VERDICT_OUT}"
+else
+  echo "gates out=unset" >> "${S}/order"
+fi
+exit ${1}
+STUB
+  cat > "${_r}/script/test/config_gen_redpath.sh" <<STUB
+#!$(command -v bash)
+v=unset
+[[ -z "\${CONFIG_GEN_STEPS_VERDICT:-}" ]] || v="\$(cat "\${CONFIG_GEN_STEPS_VERDICT}" 2>/dev/null || echo missing)"
+echo "redpath only=\${CONFIG_GEN_REDPATH_ONLY-unset} shard=\${CONFIG_GEN_REDPATH_SHARD-unset} verdict=\${v}" >> "${S}/order"
+exit 0
+STUB
+  chmod +x "${_r}/script/test/"config_gen_*.sh
+}
+
+# why: The one command a developer, the pre-PR mirror and the self-hosted
+# job run. The order matters: the redpath on a tree whose gates are already
+# red proves nothing, and `;` would run it after a red runner and report
+# the redpath's status instead. The redpath it runs is the whole one: a
+# CONFIG_GEN_REDPATH_ONLY or CONFIG_GEN_REDPATH_SHARD left in the caller's
+# environment does not reach it (base#1465, base#1547). The runner writes
+# its steps verdict to a file the recipe then hands the redpath, so steps
+# 20 and 30 run once in the whole recipe, not once in the runner and again
+# in the redpath's shared pass (base#1547 review round 1 finding 4).
+@test "just test go: runs the runner, then the redpath, and stops at a red runner (base#1462)" {
+  _recipe_repo 0
+  run env CONFIG_GEN_REDPATH_ONLY=vet CONFIG_GEN_REDPATH_SHARD=2/5 bash -c "cd '${S}/j' && just test go"
+  assert_success
+  assert_equal "$(paste -sd' ' "${S}/order")" "gates out=set redpath only=unset shard=unset verdict=stub-verdict"
+  rm -f "${S}/order"
+  _recipe_repo 1
+  run bash -c "cd '${S}/j' && just test go"
+  assert_failure
+  assert_equal "$(paste -sd' ' "${S}/order")" "gates out=set"
+}
+
+# why: CI splits `just test go` into one gates job and one job per redpath
+# shard so each ends inside its bound (base#1547). go-gates is the runner
+# alone; go-redpath <n>/<N> is the redpath on that shard, with no ONLY
+# from the caller and no steps verdict to reuse, so each shard job runs
+# its own shared pass. `just test go` runs these same two recipes.
+@test "just test go-gates and go-redpath: the runner alone, and the redpath on one shard (base#1547)" {
+  _recipe_repo 0
+  run env CONFIG_GEN_REDPATH_ONLY=vet bash -c "cd '${S}/j' && just test go-gates"
+  assert_success
+  assert_equal "$(paste -sd' ' "${S}/order")" "gates out=unset"
+  rm -f "${S}/order"
+  run env CONFIG_GEN_REDPATH_ONLY=vet bash -c "cd '${S}/j' && just test go-redpath 2/5"
+  assert_success
+  assert_equal "$(paste -sd' ' "${S}/order")" "redpath only=unset shard=2/5 verdict=unset"
+}
+
+# why: CONFIG_GEN_REDPATH_ONLY is the one selector that appends rerun to a
+# run by force (base#1547), so a CI job that set it would run the
+# unmodified copy once per job again. Only the specs scope with it: no
+# workflow names it, and every justfile.test line that does drops it.
+@test "config-gen: no workflow sets CONFIG_GEN_REDPATH_ONLY, and the recipes only drop it (base#1547)" {
+  run grep -rn CONFIG_GEN_REDPATH_ONLY /source/.github/workflows
+  assert_failure
+  run grep -n CONFIG_GEN_REDPATH_ONLY /source/script/test/justfile.test
+  assert_success
+  local _l
+  while IFS= read -r _l; do
+    [[ "${_l}" =~ ^[0-9]+:[[:space:]]*(#|unset\ CONFIG_GEN_REDPATH_ONLY\ ) || "${_l}" == *'-u CONFIG_GEN_REDPATH_ONLY'* ]] \
+      || fail "justfile.test sets CONFIG_GEN_REDPATH_ONLY: ${_l}"
+  done <<<"${output}"
+}

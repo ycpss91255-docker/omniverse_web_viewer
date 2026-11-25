@@ -1,0 +1,106 @@
+# Manage the `.base` subtree dependency (just). The `base` module of the
+# layered consumer entry (ADR-00000011): `mod?`'d by dist/script/justfile
+# (symlinked as <repo>/script/base/justfile.base) so the recipes resolve as
+# the `base` namespace -- `just base upgrade` / `just base update`.
+#
+# Apt-aligned (ADR-00000011): `update` reports whether a newer base tag is
+# available (refresh/check, the former docker `upgrade-check`); `upgrade`
+# applies the subtree pull (the former docker `upgrade`); `init` (re-)wires
+# the repo's symlinks + .gitignore; `completions` installs/uninstalls shell
+# tab-completion (opt-in, no host rc edits). The `init.sh` / `upgrade.sh`
+# scripts live under `.base/dist/script/base/` (relocated in
+# ADR-00000011 §8 / ADR-00000006); they self-locate the subtree root via a
+# walk-up, so the deep invocation path is the only change here.
+#
+# A module recipe's default cwd is this file's own directory; the recipes
+# call ./.base/dist/script/base/<script> at the repo root, so
+# `set working-directory := '../..'` pins them to the repo root. Reached via
+# the consumer symlink (<repo>/script/base/justfile.base), `../..` resolves
+# to the repo root.
+set working-directory := '../..'
+
+# Arguments reach a recipe body as "$@", not as an unquoted {{args}}
+# interpolation, which hands the recipe's own shell a string to re-split.
+# Measured against recorders on this file before the change: `just base
+# upgrade --to 'v1 2'` reached upgrade.sh as THREE arguments, and `just
+# base init 'foo|bar'` became a shell pipeline that died with `bar: not
+# found` at 127. base#1284 swept script/test/justfile.test; base#1289 is
+# the same sweep across the namespace modules, and this is its last
+# slice.
+#
+# The precondition, re-established for THIS file: before this change
+# `grep -nE '\$[0-9@*]'` over it matched nothing. `update` below is a
+# SHEBANG recipe, so the setting gives its body `$@` as well -- it read
+# neither then, so the setting changed the meaning of no existing line.
+#
+# `update`'s `-h` scan reads `"$@"` too (base#1304): it used to split
+# `{{args}}`, so `just base update 'x -h'` exec'd `upgrade.sh --help`
+# because the split saw a bare `-h`. No `{{args}}` remains in this file.
+set positional-arguments := true
+
+# source_file (not justfile) is this module's own file: inside a mod?'d
+# module justfile resolves to the ROOT entry, so listing it would show the
+# entry's namespaces instead of the base verbs. source_file pins
+# --list to THIS module.
+# just base -> list the base-management verbs
+default:
+    @just --justfile '{{source_file()}}' --list
+
+# `help` is a named twin of `default` reachable as `just base help` (and
+# `just base h`), since the dashed `just base --help` cannot be a just
+# recipe/alias -- with a `help` recipe present just then hints "Did you mean
+# 'help'?" instead of a bare error. Bare `just base` still lists via `default`.
+alias h := help
+
+# just base help (or `just base h`) -> language-aware recipe listing:
+# translated one-line summaries via the shared `_msg help` i18n renderer
+# (honours $LANG / --lang). Bare `just base` and `just --list` stay English.
+# The blank line below detaches this rationale from the --list doc, which
+# just takes from the last comment line above the recipe (base#1326).
+
+# List the base recipes in your language (--lang / $LANG)
+help *args:
+    @"$(dirname "$(readlink -f '{{source_file()}}')")/../docker/lib/help.sh" base "$@"
+
+# just base upgrade [vX.Y.Z] -> pull the .base subtree (empty = latest)
+upgrade *args:
+    ./.base/dist/script/base/upgrade.sh "$@"
+
+# `*args` on `update` is a `--help` shim only: a bare update runs the check
+# and never upgrades. An argument that IS `-h` or `--help` reaches upgrade.sh's
+# usage WITHOUT the network check (a dashed name cannot be a just recipe, so
+# the entry cannot intercept `just base update --help` -- the recipe does).
+# Any other argument is refused by name, before the check, with exit 1 --
+# upgrade.sh's own status for an unknown argument (base#1304). The blank line
+# below detaches this rationale from the --list doc.
+
+# just base update -> report whether a newer base tag is available (apt-style)
+update *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    _help=0
+    for _a in "$@"; do
+      case "${_a}" in
+        -h|--help) _help=1 ;;
+        *) printf 'update: unknown argument: %s\n' "${_a}" >&2; exit 1 ;;
+      esac
+    done
+    if [ "${_help}" -eq 1 ]; then
+      exec ./.base/dist/script/base/upgrade.sh --help
+    fi
+    # --check exits 1 for "update available", which is not a failure here;
+    # 2 and above (the check itself failed) propagate as-is (base#1370).
+    _rc=0
+    ./.base/dist/script/base/upgrade.sh --check || _rc=$?
+    if [ "${_rc}" -ne 1 ]; then exit "${_rc}"; fi
+
+# just base init -> (re-)wire repo symlinks + .gitignore
+init *args:
+    ./.base/dist/script/base/init.sh "$@"
+
+# Opt-in shell tab-completion; never edits a shell rc. The blank line
+# below detaches this note from the --list doc (base#1326).
+
+# just base completions install|uninstall [--shell bash|zsh|fish|all]
+completions *args:
+    script/base/completions.sh "$@"

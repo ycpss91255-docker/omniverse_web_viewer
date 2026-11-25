@@ -1,0 +1,192 @@
+name: Multi-distro build dispatcher
+
+# Two-job dispatcher reusable workflow (#325 B-1, extended to N-D via
+# #344). Resolves a per-event matrix (full JSON `include`-shape array)
+# and fans it out across `build-worker.yaml` matrix shards, so
+# multi-distro / multi-variant callers (`env/ros_distro`,
+# `env/ros2_distro`, `app/ros1_bridge`) don't have to copy-paste a
+# `${{ github.event_name == 'pull_request' && fromJSON('[...]') || ... }}`
+# expression into every main.yaml.
+#
+# Pull-request events use `pr_matrix`; tag pushes, main pushes, and
+# workflow_dispatch use `tag_matrix` (the full validation matrix).
+# Each matrix entry is an `include`-shape object with REQUIRED `name`
+# (used for image_name suffix + cache scope) and `build_args` (forwarded
+# verbatim to build-worker.yaml). Callers may include arbitrary other
+# fields per entry — the dispatcher ignores them.
+#
+# A `ci-passed` rollup job aggregates the matrix result for branch
+# protection — matches the existing rollup naming used by env/ros_distro
+# / env/ros2_distro per CLAUDE.md's status-check table, so downstream
+# branch protection contexts don't need to change when adopting this
+# dispatcher.
+#
+# BREAKING vs v0.31.x (#344): the 1D inputs `pr_distros` / `tag_distros`
+# / `distro_input_name` / `extra_build_args` are removed; callers must
+# migrate to `pr_matrix` / `tag_matrix` with explicit `name` +
+# `build_args` per entry. Migration guide: include one entry per cell
+# with `{"name": "<distro>", "build_args": "<distro_input_name>=<distro>"}`.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+        description: |
+          Base image name. The dispatcher derives each shard's image
+          name as `<image_name>-<matrix.name>` so multi-cell callers
+          don't have to template that expression themselves. Hyphen
+          matches the existing org convention (#339 / v0.29.1 fix).
+      pr_matrix:
+        required: true
+        type: string
+        description: |
+          JSON array of `include`-shape entries used on `pull_request`
+          events. Each entry MUST include `name` (used for image_name
+          suffix + cache scope) and `build_args` (forwarded verbatim
+          to build-worker.yaml as the per-shard build_args). Arbitrary
+          other fields are allowed but ignored by the dispatcher.
+          Example: `'[{"name":"humble","build_args":"ROS2_DISTRO=humble"}]'`
+      tag_matrix:
+        required: true
+        type: string
+        description: |
+          JSON array of `include`-shape entries used on tag push, main
+          push, and `workflow_dispatch` events. Same per-entry contract
+          as `pr_matrix`: each entry MUST include `name` + `build_args`
+          (arbitrary other fields ignored). This is the "release-
+          validation" matrix — everything that ships needs to pass here.
+      # === Forwarded to build-worker.yaml (defaults mirror build-worker
+      # so existing semantics are preserved when caller omits) ===
+      build_runtime:
+        required: false
+        type: boolean
+        default: true
+      platforms:
+        required: false
+        type: string
+        default: "linux/amd64"
+      context_path:
+        required: false
+        type: string
+        default: "."
+      dockerfile_path:
+        required: false
+        type: string
+        default: ""
+      build_contexts:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    # Every job of a worker bounds itself: GitHub's default is six hours,
+    # and it applies per matrix shard. `call-build` carries none because
+    # `timeout-minutes` is not accepted on a job that `uses:` another
+    # workflow -- its bound lives on build-worker's own jobs, which is
+    # where the work is.
+    timeout-minutes: 5
+    # This is a REUSABLE workflow: a job with no `permissions:` runs on
+    # the CALLING repo's whole grant. The job picks one of two inputs and
+    # writes it to GITHUB_OUTPUT -- it does not even check out -- so it
+    # declares the read-only block rather than inheriting a caller's
+    # `contents: write` (#957).
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.r.outputs.matrix }}
+    steps:
+      - id: r
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_MATRIX: ${{ inputs.pr_matrix }}
+          TAG_MATRIX: ${{ inputs.tag_matrix }}
+        # PR event -> pr_matrix subset. Every other event
+        # (push to main, push of a v* tag, workflow_dispatch) ->
+        # tag_matrix full matrix. Tag pushes specifically benefit
+        # from full validation since they cut releases; main pushes
+        # benefit because the same code path is what tag-cut will see.
+        #
+        # GITHUB_OUTPUT's `name=value` form holds one line, and a caller may
+        # write its matrix as a block scalar: written as given, the second
+        # line fails the step (base#2160). So the value is read as JSON and
+        # written compact. Anything but one strict JSON array is refused here,
+        # by the input's name; `fromJSON` alone is laxer (a trailing comma, a
+        # comment) and would name neither.
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            input=pr_matrix value="${PR_MATRIX}"
+          else
+            input=tag_matrix value="${TAG_MATRIX}"
+          fi
+          one_array='if length == 1 and (.[0] | type) == "array" then .[0] else error("expected one array") end'
+          if ! matrix="$(jq -cs "${one_array}" <<< "${value}")"; then
+            echo "::error::${input} is not one JSON array of matrix entries."
+            exit 1
+          fi
+          printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT}"
+
+  call-build:
+    needs: resolve-matrix
+    # Job-level permissions on a `uses:` job are the CEILING every job of
+    # the called workflow runs under. build-worker.yaml's five jobs each
+    # declare `contents: read` and nothing else, so this is the narrowest
+    # ceiling that satisfies all of them -- and it stops a caller's
+    # `packages: write` reaching them through this hop (#957).
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.matrix) }}
+    uses: ./.github/workflows/build-worker.yaml
+    with:
+      # Per-shard image_name includes the matrix cell name so the GHCR
+      # tag disambiguates multi-cell builds from the same caller repo
+      # (e.g. ros1_bridge-humble, ros_distro-noetic-ros-base). Hyphen
+      # matches the existing org convention (#339 v0.29.1 fix).
+      image_name: ${{ inputs.image_name }}-${{ matrix.name }}
+      # Caller fully owns per-cell build_args. Multi-line KEY1=v1\nKEY2=v2
+      # works because build_args is a string passed straight to
+      # docker/build-push-action.
+      build_args: ${{ matrix.build_args }}
+      build_runtime: ${{ inputs.build_runtime }}
+      platforms: ${{ inputs.platforms }}
+      context_path: ${{ inputs.context_path }}
+      dockerfile_path: ${{ inputs.dockerfile_path }}
+      build_contexts: ${{ inputs.build_contexts }}
+      # Per-cell buildx cache scope so cells don't evict each other's
+      # cache. Matches the `cache_variant` contract added in #272.
+      cache_variant: ${{ matrix.name }}
+
+  ci-passed:
+    name: ci-passed
+    needs: call-build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads `needs.call-build.result` and exits. `contents: read` rather
+    # than `{}` keeps the block uniform with its siblings (#957).
+    permissions:
+      contents: read
+    steps:
+      - name: Aggregate matrix results
+        env:
+          NEEDS_RESULT: ${{ needs.call-build.result }}
+        # Rollup gate for downstream branch protection. The matrix
+        # `result` is `success` only when every shard finished with
+        # `conclusion: success`; any failure or cancellation surfaces
+        # here. `if: always()` ensures the rollup runs even when one
+        # matrix shard failed, otherwise branch protection would see a
+        # missing required check rather than a failed one.
+        run: |
+          set -euo pipefail
+          if [[ "${NEEDS_RESULT}" != "success" ]]; then
+            echo "call-build matrix did not all succeed: ${NEEDS_RESULT}"
+            exit 1
+          fi
+          echo "All matrix cells passed."

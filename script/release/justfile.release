@@ -1,0 +1,107 @@
+# base self-release / publish tooling (`just release <recipe>`). SKELETON.
+#
+# ADR-00000010 lays this namespace as part of the base/downstream split
+# (test and release are kept as separate namespaces, not a merged one);
+# ADR-00000011 renames it `cd` -> `release` (action-named). The actual
+# release / publish pipeline recipes are deferred to a follow-up issue;
+# today the release flow still lives in .github/workflows/ (self-test.yaml
+# `release` job + release-worker.yaml).
+#
+# `set working-directory` mirrors script/test/justfile.test so future recipes
+# run from the repo root whether reached via the `release` module or `just -f`.
+set working-directory := '../..'
+
+# Arguments reach a recipe body as "$@", not as an unquoted {{args}}
+# interpolation, which hands the recipe's own shell a string to re-split.
+# Measured against RECORDERS on this file before the change: `just
+# release coverage-badge --note 'two words'` reached the script as THREE
+# arguments and the recorder exited 0, and `just release changelog-index
+# 'foo|bar'` became a shell pipeline that died with `bar: not found` at
+# 127. The real coverage_badge.sh would have refused `--note` with exit
+# 2; what the interpolation broke is the ARGUMENT LIST, which a recorder
+# shows without a script's own validation in the way. base#1284 swept
+# script/test/justfile.test onto "$@"; base#1289 is the same sweep across
+# the namespace modules, and this is its release slice.
+#
+# The precondition for the setting, re-established for THIS file rather
+# than inherited: `grep -nE '\$[0-9@*]'` over it matches nothing, and the
+# only recipes are `default` (no arguments) and the two `*args`
+# forwarders below. Nothing here reads a positional, so the setting
+# changes the meaning of no existing line.
+set positional-arguments := true
+
+# source_file (not justfile) is this module's own file: inside a mod?'d
+# module justfile resolves to the ROOT entry, so listing it would show the
+# entry's namespaces instead of the release recipes. source_file
+# pins --list to THIS module.
+# Default: list available recipes
+default:
+    @just --justfile '{{source_file()}}' --list
+
+# just release coverage-badge -> regenerate doc/badge/coverage.svg, the
+# per-release coverage figure the README draws (ADR-00000008, per-release
+# figure amendment).
+#
+# The figure refreshes ONCE PER RELEASE, never per merge, and rides the
+# `chore: release vX.Y.Z` commit alongside `.version` and the CHANGELOG
+# promotion, so the badge, the tag and the changelog entry are the same
+# commit or none of them are.
+#
+# TODAY THAT IS A HAND-RUN STEP. The release bump that should call it
+# (.claude/scripts/release-bump.sh) lives in the harness repo, not here;
+# wiring it up is docker_harness#289. Until then: run this yourself at
+# bump time, BEFORE the release commit is made -- afterwards HEAD is no
+# longer the commit the coverage run measured and the generator refuses.
+# Forgetting it is caught by coverage_badge_spec (the committed badge must
+# name the current .version), but only after the tag, as a red main.
+#
+# THE RELEASE ORDER, and it is not free to permute:
+#
+#   1. `just test coverage` -- the FULL run, no shard argument, on the
+#      UNMODIFIED tree
+#   2. bump `.version` (and promote the CHANGELOG section)
+#   3. `just release coverage-badge`
+#   4. the `chore: release vX.Y.Z` commit
+#
+# Steps 1 and 2 are the pair that gets swapped, and swapping them costs a
+# whole second coverage run. Bumping first makes coverage_badge_spec's
+# "the committed badge names the released version" fail -- the committed
+# badge still names the PREVIOUS version at that point -- so the coverage
+# run goes red over a badge that has not been regenerated yet, and a red
+# run produces no stamp, so the badge then refuses too. Neither is a
+# defect in the tree; both are the order.
+#
+# It reads the kcov reports under coverage/, so run `just test coverage` on
+# the commit being released first -- the FULL run, with no shard argument.
+# It REFUSES -- writing nothing, leaving the previous badge in place --
+# when there is no report, when the reports do not record the sha they were
+# produced from or that sha is not HEAD, when they do not record that the
+# whole suite produced them (`just test coverage 1/4` writes its slice into
+# the same coverage/ tree, and a quarter of the suite is not the project's
+# rate), when a report predates the commit, or when instrumented sources
+# are modified in the worktree: a release whose coverage never ran -- or
+# ran over part of the suite -- must not publish a stale, a partial or an
+# invented number.
+#
+# `just release coverage-badge --unmeasured` renders "not measured" for the
+# current .version. That is for a version that genuinely has no measurement;
+# the bump must never pass it.
+coverage-badge *args:
+    ./script/release/coverage_badge.sh "$@"
+
+# just release changelog-index -> re-render the generated series index in
+# doc/changelog/CHANGELOG.md from the series files themselves.
+#
+# The changelog is one file per 0.Y series and CHANGELOG.md is the index.
+# An index is a roster, and a roster nothing re-derives goes stale on the
+# first series nobody remembers to add -- with the worst possible failure
+# mode, because a missing row reads exactly like a series that does not
+# exist. So the block between the `changelog-index` markers is DERIVED, this
+# recipe derives it, and `just test lint --changelog-layout` re-derives it
+# and fails on any difference. Run this after cutting a new 0.Y series file
+# or after a section's dates change; there is nothing to hand-edit.
+#
+# Print-only (no --write) with a directory argument, which is what the lint
+# runs:  ./script/release/changelog_index.sh doc/changelog
+changelog-index *args:
+    ./script/release/changelog_index.sh --write "$@"
