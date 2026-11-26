@@ -27,19 +27,27 @@ test('builds a DIRECT config for a valid server + numeric port', () => {
   assert.equal(cfg.authenticate, false);
 });
 
-// The reconnect budget had no assertion at all, which is how it survived a
-// library change that redefined it. Under 5.x it reached the library as
-// `maxSessionStartRetry` and bought only startup grace; under ov-web-rtc 6.x
-// (#98) it is a real connection-attempt budget spaced by `reconnectDelay`
-// (~2 s), so the product of the two is how long the viewer spends reconnecting.
-// It is pinned HERE because that product has to stay inside
-// TERMINAL_ESCALATION_MS (15 s) in apps/stream-only/src/streamStatus.js: if the
-// budget outlasts the window, the viewer declares the source gone while the
-// library is still successfully retrying. 6 x ~2 s is ~12 s, inside 15 s.
-// Raising this means revisiting that window, not just this number.
-test('pins the reconnect budget inside the terminal escalation window (#98)', () => {
+// The reconnect budget is pinned, and for a different reason than before (#101).
+//
+// #98 pinned it at 6 so that "6 x ~2 s is ~12 s" would finish inside the 15 s
+// escalation window. That model was wrong and is withdrawn, not reworded:
+// measured against 6.8.2, each attempt costs ~10 s of the library's INTERNAL
+// sign-in timeout (`let e=1e4` in the bundle -- not `reconnectDelay`, not
+// `connectivityTimeout`, and not in the public config at all) plus the 2 s
+// delay. 6 attempts took 49 s against a refused port and 83 s against a
+// black-holed host, while the viewer declared the source gone at 20 s.
+//
+// The budget is not computable from this config, so no window can be sized
+// against it. The terminal readout is therefore driven by the library's own
+// STOPPED status now, and this number no longer has to fit anything: it is
+// how long the viewer keeps genuinely trying. 5 is the library's own default,
+// written down so it cannot move underneath us, and measures at ~37 s (refused
+// -- a Kit process that is down) / ~71 s (black-holed -- a host that is
+// unreachable). That outlasts a cold Kit boot (~22 s to first frame, rc2), so a
+// producer that is restarting is picked up without a reload.
+test('pins the reconnect budget at the library default (#101)', () => {
   const cfg = buildStreamConfig('127.0.0.1', 49100);
-  assert.equal(cfg.maxReconnects, 6);
+  assert.equal(cfg.maxReconnects, 5);
 });
 
 test('accepts a numeric string port and coerces it to a number', () => {

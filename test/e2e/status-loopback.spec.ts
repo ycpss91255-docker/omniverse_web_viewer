@@ -40,17 +40,28 @@ const MODE = process.env.OWV_MODE || 'stream-only';
 const BASE_COLOR = 'rgb(139, 148, 158)'; // #8b949e
 const ERROR_COLOR = 'rgb(248, 81, 73)'; // #f85149
 
-// Wall-clock budget for the states the app derives from its own timers:
-// ~5 s of stalled frames to announce the recoverable state, then
-// TERMINAL_ESCALATION_MS (15 s) to escalate. Kept as generous single values
-// rather than mirrored constants -- this spec asserts the OBSERVED behaviour,
-// not the app's numbers.
+// Wall-clock budget for the states the app derives. Kept as generous single
+// values rather than mirrored constants -- this spec asserts the OBSERVED
+// behaviour, not the app's numbers.
+//
+// ~5 s of stalled frames announces the recoverable state.
 const RECOVERABLE_TIMEOUT_MS = 15_000;
-const TERMINAL_TIMEOUT_MS = 30_000;
-// The never-connected case (#63) has no media at all: the page is left dialing
-// the dead test host and the app's own connect window (CONNECT_ESCALATION_MS,
-// 20 s) is what ends the wait. Generous, for the same reason as the two above.
-const NEVER_STARTED_TIMEOUT_MS = 45_000;
+// The two verdicts -- "the source is gone" and "it never started" -- wait for
+// the streaming library to stop trying (#101). They used to come from the
+// app's own 15 s / 20 s windows, and measured against ov-web-rtc 6.8.2 the
+// library was still dialing for a minute after those fired. Against this dead
+// test host, a black-holed address, the library gives up ~71 s after its first
+// attempt: six attempts (maxReconnects 5), each ~10 s of its internal sign-in
+// timeout plus the 2 s reconnect delay.
+const TERMINAL_TIMEOUT_MS = 100_000;
+const NEVER_STARTED_TIMEOUT_MS = 100_000;
+// How long the library must stay silent after a verdict before "it had stopped"
+// is believed. One attempt interval against this host is ~12 s, so 15 s of no
+// new socket means it was not merely between two attempts.
+const QUIET_AFTER_VERDICT_MS = 15_000;
+// When the late producer of the #73 / #101 spec starts: past the 20 s at which
+// the old connect window used to declare, and well inside the library's ~71 s.
+const LATE_PRODUCER_MS = 25_000;
 
 interface Loopback {
   sender: RTCRtpSender;
@@ -61,6 +72,7 @@ interface Loopback {
 declare global {
   interface Window {
     __OWV_LOOPBACK__?: Loopback;
+    __OWV_WS_OPENED__?: number[];
   }
 }
 
@@ -205,12 +217,39 @@ function statusDisplay(page: Page): Promise<string> {
   );
 }
 
+/** `performance.now()` of every WebSocket the page has opened so far (#101). */
+function socketsOpened(page: Page): Promise<number[]> {
+  return page.evaluate(() => window.__OWV_WS_OPENED__ ?? []);
+}
+
+function pageNow(page: Page): Promise<number> {
+  return page.evaluate(() => performance.now());
+}
+
 test.beforeEach(async ({ page }) => {
   test.skip(MODE !== 'stream-only', 'the loopback drives OUR app; usd-viewer is black-box');
   // Setting up the loopback plus waiting for the first decoded frame does not
   // fit the shared 30 s default; the states derived from the app's own timers
   // raise it further per test.
   test.setTimeout(60_000);
+  // Every connection attempt the library makes opens a signaling WebSocket, so
+  // recording the constructions is a direct view of whether it is still trying
+  // (#101). Only the timestamp is recorded: the real socket is built and
+  // returned untouched, the same way config-dial.spec.ts wraps it. A console
+  // line would be the library's WORDING, which #98 already learned can change
+  // underneath a spec without anything else changing.
+  await page.addInitScript(() => {
+    const opened: number[] = [];
+    window.__OWV_WS_OPENED__ = opened;
+    const Real = window.WebSocket;
+    const Recorded = function (url: string | URL, protocols?: string | string[]) {
+      opened.push(performance.now());
+      return protocols === undefined ? new Real(url) : new Real(url, protocols);
+    } as unknown as typeof WebSocket;
+    Recorded.prototype = Real.prototype;
+    Object.assign(Recorded, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+    window.WebSocket = Recorded;
+  });
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 });
 
@@ -235,10 +274,16 @@ test('the initial readout is visible and carries the stylesheet base styling', a
 // never arms; no session ever starts, so the library's `onStop` never fires and
 // the #58 escalation was never armed either. The page used to sit on
 // `streaming <server>:<port>` -- styled as success -- indefinitely.
-test('a viewer whose producer never answers stops claiming a connection (#63)', async ({
+//
+// And #101: that readout is a verdict, so it is only true once the library has
+// actually stopped trying. Measured with the shipped config before the fix, on
+// this same host: "it never started. ... reload" appeared at 20 s, and the
+// library went on dialing until 83 s -- five more attempts, each one a real
+// socket, behind a message telling the user it was over.
+test('a viewer whose producer never answers says so only once nothing is still trying (#63, #101)', async ({
   page,
 }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
   const status = page.locator('#stream-status');
 
   // Deliberately NO loopback: this is the served app dialing the dead test
@@ -248,13 +293,27 @@ test('a viewer whose producer never answers stops claiming a connection (#63)', 
   await expect(status).not.toContainText(/streaming/i);
   await expect(status).not.toHaveClass(/error/);
 
-  // The connect window elapses with no picture: an actionable readout, in the
+  // The library stops trying with no picture: an actionable readout, in the
   // real error colour, instead of a permanent false success.
   await expect(status).toContainText(/no video/i, { timeout: NEVER_STARTED_TIMEOUT_MS });
+  const declaredAt = await pageNow(page);
   await expect(status).toContainText(/reload/i);
   await expect(status).not.toContainText(/streaming|waiting|reconnect/i);
   await expect(status).toHaveClass(/error/);
   expect(await statusColor(page)).toBe(ERROR_COLOR);
+
+  // Nothing may still be dialing behind it. The silence is waited out rather
+  // than sampled once: right after a verdict the library is, at worst, between
+  // two attempts, and only a full interval with no new socket rules that out.
+  await page.waitForTimeout(QUIET_AFTER_VERDICT_MS);
+  const opened = await socketsOpened(page);
+  expect(opened.length, 'the library never dialed, so this proved nothing').toBeGreaterThan(1);
+  const afterVerdict = opened.filter((t) => t > declaredAt).map((t) => Math.round(t));
+  expect(
+    afterVerdict,
+    `the library was still dialing after the viewer said it never started ` +
+      `(verdict at ${Math.round(declaredAt)} ms)`,
+  ).toEqual([]);
 });
 
 test('real frames hide the readout through the real stylesheet (#53)', async ({ page }) => {
@@ -302,7 +361,7 @@ test('stalled frames announce the recoverable state, resumed frames clear it (#6
 test('an unrecovered stall escalates to a distinct terminal state, which a real stream then clears (#57, #58, #62, #73)', async ({
   page,
 }) => {
-  test.setTimeout(120_000);
+  test.setTimeout(200_000);
   const status = page.locator('#stream-status');
   await startLoopback(page);
   await expectFramesFlowing(page);
@@ -315,9 +374,11 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
   });
   const recoverableColor = await statusColor(page);
 
-  // Nothing came back inside the escalation window: the producer is declared
-  // gone. This is the state #58 shipped unreachable -- no human, no GPU and no
-  // library callback involved in getting here.
+  // Nothing came back, and the library has stopped trying: the producer is
+  // declared gone. This is the state #58 shipped unreachable. Since #101 it is
+  // the library's own STOPPED that ends the recoverable state, not a 15 s timer
+  // of ours -- which is why this wait is long: the recoverable readout stays up,
+  // truthfully, for as long as the library is still dialing the dead host.
   await expect(status).toContainText(/source is gone/i, { timeout: TERMINAL_TIMEOUT_MS });
   await expect(status).toContainText(/reload/i);
   await expect(status).not.toContainText(/reconnect|waiting/i);
@@ -344,6 +405,14 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
   // v0.3.0-rc2 hit: a red error over a picture that was visibly playing. The
   // latch outranks the library's CLAIMS, not the media itself.
   //
+  // Since #101 this sequence no longer occurs in production: a verdict now
+  // means the library has stopped trying -- it said STOPPED, or the viewer
+  // stopped it -- so no picture can follow one without a reload. The rule it
+  // locks has not gone away, though. "Observation outranks a verdict" is what
+  // makes it safe for a library callback to END the recoverable state at all,
+  // and this is the one place it is proved against a real element and the real
+  // stylesheet rather than a fake.
+  //
   // It is a NEW loopback rather than a resumed one on purpose: putting the
   // original track back after it had been cut for the entire escalation window
   // did not restart decoding in the element (observed, not assumed -- the frame
@@ -352,13 +421,11 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
   //
   // Held against teardown (#98). The library nulls `#remote-video.srcObject` at
   // the start of every session-start attempt, which is what
-  // `holdAgainstTeardown` exists for -- and under ov-web-rtc 6.x it keeps
-  // attempting: `maxReconnects` is a real budget there, spaced ~2 s, where 5.x
-  // retried only the initial session setup. So by this point the library is
-  // actively reconnecting, and an unheld loopback has its media nulled out from
-  // under it before a frame can decode (observed: the counter stayed at 0 for
-  // the full 20 s window). The hold ignores teardowns only; real media still
-  // reaches the element, so nothing about the app's own path is faked.
+  // `holdAgainstTeardown` exists for, and by this point the viewer has also
+  // told it to terminate (#101). Whether terminate tears the element down as
+  // well has not been separated out; the hold makes this step independent of
+  // it. It ignores teardowns only -- real media still reaches the element, so
+  // nothing about the app's own path is faked.
   await startLoopback(page, true);
   await expectFramesFlowing(page);
 
@@ -366,40 +433,65 @@ test('an unrecovered stall escalates to a distinct terminal state, which a real 
   expect(await statusDisplay(page)).toBe('none');
 });
 
-// The exact shape of the v0.3.0-rc2 failure, at browser level: the producer is
-// not there when the page loads, the app's connect window (#63) elapses and
-// declares the attempt failed -- and THEN the producer starts delivering. The
-// picture was never in doubt in that run (1920x1080, meanLuma 151.99); only the
-// readout was wrong, and it was wrong permanently.
+// The v0.3.0-rc2 failure, at browser level, and what #101 found underneath it.
+// On that tag run the producer was not up when the page loaded; the app's
+// connect window (#63) declared the attempt failed at 20 s, and the producer
+// started delivering ~2 s later. The picture was never in doubt (1920x1080,
+// meanLuma 151.99); only the readout was wrong. #73 fixed the symptom, by
+// letting real frames withdraw the verdict.
 //
-// This is the class the loopback harness exists for: real frames on the real
-// element, after a real escalation on the app's own clock, with no GPU, no Kit
-// and no Tier B runner involved.
-test('a producer that starts after the connect window has elapsed clears the readout (#73)', async ({
+// What it did not ask was why a picture could arrive after the viewer had said
+// it never would. The library had never stopped trying: measured against
+// ov-web-rtc 6.8.2, that window declared at 20 s while the library dialed on
+// until 83 s, so the producer at 22 s was picked up by an attempt the viewer
+// had already announced as hopeless. With the verdict driven by the library's
+// own STOPPED, the case never shows one -- the viewer is still, truthfully,
+// connecting when the picture arrives.
+//
+// This REPLACES the spec that used to sit here, "a producer that starts after
+// the connect window has elapsed clears the readout". Its premise -- a verdict
+// shown while the producer could still arrive -- is the defect, so it is gone
+// rather than kept and weakened. The rule that spec proved (observation
+// outranks a verdict) is still proved, by the escalation spec above.
+test('a producer that starts while the library is still retrying is picked up with no verdict in between (#73, #101)', async ({
   page,
 }) => {
   test.setTimeout(120_000);
   const status = page.locator('#stream-status');
 
-  // No loopback yet: the served app is dialing the dead test host, so the
-  // connect window runs out exactly as it did on the tag run.
-  await expect(status).toContainText(/no video/i, { timeout: NEVER_STARTED_TIMEOUT_MS });
-  await expect(status).toHaveClass(/error/);
-  expect(await statusColor(page)).toBe(ERROR_COLOR);
+  // No loopback yet: the served app is dialing the dead test host. Sampled the
+  // whole way, because the defect was a verdict that APPEARED and was later
+  // withdrawn -- a single look at the end would miss it entirely.
+  const startedAt = Date.now();
+  const verdicts: string[] = [];
+  while (Date.now() - startedAt < LATE_PRODUCER_MS) {
+    if (await status.evaluate((el) => el.classList.contains('error'))) {
+      const at = ((Date.now() - startedAt) / 1000).toFixed(1);
+      verdicts.push(`+${at}s ${JSON.stringify((await status.textContent()) ?? '')}`);
+    }
+    await page.waitForTimeout(250);
+  }
+  expect(verdicts, 'a verdict was shown while the library was still retrying').toEqual([]);
+  await expect(status).toContainText(/connecting to/i);
 
   // The stream starts late. Nothing else changes -- no reload, no retry driven
-  // from the test, just media arriving on the element.
-  await startLoopback(page);
+  // from the test, just media arriving on the element. Held against teardown
+  // because the library is, by design, still attempting at this point, and it
+  // nulls `#remote-video.srcObject` at the start of every attempt (#98).
+  await startLoopback(page, true);
   await expectFramesFlowing(page);
 
   await expect(status).toBeHidden({ timeout: RECOVERABLE_TIMEOUT_MS });
   expect(await statusDisplay(page)).toBe('none');
+  await expect(status).not.toHaveClass(/error/);
 });
 
 // #75, and the reason this file is where it had to be proved: the claims are
 // REAL here. The page dials the dead test host, so the streaming library keeps
-// retrying session start on its own (`maxReconnects` 20, ~5 s apart), and every
-// one of those retries calls `onStart`, which the app maps onto connecting().
+// retrying on its own -- against this black-holed address, an attempt every
+// ~12 s (#101 measured it: ~10 s of internal sign-in timeout plus the 2 s
+// reconnect delay) -- and every one of those retries calls `onStart`, which
+// the app maps onto connecting().
 // No test-only seam manufactures the claim; the only thing the harness does is
 // keep the picture alive across the library's teardown of the element.
 //

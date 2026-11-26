@@ -12,9 +12,17 @@ function start(): void {
   // makes it visible; it auto-hides once #remote-video actually renders (first
   // `playing` / `loadeddata`), so the connect-time confirmation stops obscuring
   // the viewport (#53). Re-showing on error/reconnect un-hides it again.
+  //
+  // `abandon` is how a verdict stops the library (#101), so that "the source
+  // is gone" is never on screen while something is still dialing it. The
+  // stream does not exist yet -- the target is resolved and validated first --
+  // so the controller is handed a function that reaches it once it does.
+  let stopStreaming: () => void = () => {};
   const status = createStatusController(
     document.getElementById('stream-status'),
     document.getElementById('remote-video'),
+    console,
+    { abandon: () => stopStreaming() },
   );
 
   // The `?server=&port=&media=` override exists for `npm run dev`, where no
@@ -76,12 +84,16 @@ function start(): void {
   // one stall window late -- it is an accelerator, and the controller ignores
   // whichever of the two arrives second.
   //
-  // onTerminate is belt-and-braces ONLY. This library build never invokes it
-  // (#58: in the shipped bundle the name appears solely as an error-code enum,
-  // an error string and a null default -- no call site), which is exactly why
-  // the terminal state is now derived from a timer in streamStatus.js instead.
-  // Keeping the handler costs nothing if a future library build starts calling
-  // it; do NOT treat its presence here as evidence that it fires.
+  // onTerminate is belt-and-braces ONLY. The 5.x build never invoked it (#58);
+  // 6.8.2 has two call sites (#98), but none has been observed firing against
+  // a dying producer, so do NOT treat its presence here as evidence that it
+  // does. Keeping the handler costs nothing.
+  //
+  // onGaveUp is the library's own verdict (#101): stream-core reports it when
+  // the library says STOPPED, which it does only once every reconnect attempt
+  // is exhausted. That -- not a timer of ours -- is what ends the recoverable
+  // and connecting states now. Measured before it was wired, the viewer told
+  // the user to reload at 20 s while the library dialed on for up to a minute.
   //
   // onStart is NOT "the stream is live" (#63). It fires when a connect attempt
   // BEGINS and re-fires on every session-start retry (observed five times
@@ -91,18 +103,27 @@ function start(): void {
   // controller ignores the repeats rather than pushing its deadline back, and
   // the readout is cleared by a rendered frame (#53), which is the only
   // evidence that a stream exists.
-  connectStream(streamConfig, {
+  const stream = connectStream(streamConfig, {
     onStart: () => status.connecting(dialing),
     onStop: () => status.stopped(),
     onTerminate: () => status.terminated(),
-  }).catch((e: unknown) =>
+    onGaveUp: () => status.gaveUp(),
+  });
+  // A failed stop is logged, not shown: by the time the controller asks for
+  // one, its verdict is already on screen and there is nothing further the
+  // user could act on.
+  stopStreaming = () => {
+    stream.terminate().catch((e: unknown) =>
+      console.warn(`[stream] stopping the library failed: ${describeStreamError(e)}`));
+  };
+  stream.connected.catch((e: unknown) =>
     // NOT String(e). This library rejects with plain objects
-    // (`throw{action,status,info:"..."}`, eighteen sites in the shipped
-    // bundle), so String() rendered every real connect failure as
-    // `connection failed: [object Object]` and threw away the one
-    // sentence the user could act on. describeStreamError lives in
-    // stream-core because that is the only module that knows the
-    // library's shapes, and it is unit-tested there.
+    // (`throw{action,status,info:"..."}`, 22 sites in the 6.8.2 bundle), so
+    // String() rendered every real connect failure as
+    // `connection failed: [object Object]` and threw away the one sentence
+    // the user could act on. describeStreamError lives in stream-core because
+    // that is the only module that knows the library's shapes, and it is
+    // unit-tested there.
     status.show(`connection failed: ${describeStreamError(e)}`, true));
 }
 

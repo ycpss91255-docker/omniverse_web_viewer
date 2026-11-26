@@ -116,6 +116,35 @@
 // reading is usually still moving, so guarding it would cost the acceleration
 // it exists for. What it writes is withdrawn a poll later if the picture was
 // in fact fine, which is the same rule doing the work from the other side.
+//
+// The verdicts wait for the library (issue #101). Both escalation windows
+// existed because nothing could report whether the streaming library had
+// stopped trying, so they GUESSED -- and #98 sized the reconnect budget to fit
+// inside them as "6 x ~2 s is ~12 s". Measured against ov-web-rtc 6.8.2 the
+// guess was out by a factor of four to seven: each attempt costs ~10 s of an
+// internal sign-in timeout that no public config field reaches, so the connect
+// window declared "it never started" at 20 s while the library dialed on until
+// 49 s (a refused port) or 83 s (a black-holed host). Telling a user to reload
+// while the library is still trying is precisely the kind of untrue statement
+// this file exists to refuse.
+//
+// The library does say so now: `onStreamStatusChange` (6.7.0) reports STOPPED
+// only once every reconnect attempt is exhausted, and stream-core passes that
+// single status on as gaveUp(). So:
+//   - gaveUp() declares at once, with whichever verdict the pending window
+//     would have declared -- the fact replaces the guess and nothing else
+//     changes. With no window pending, a frame did render (that is what
+//     cancels the connect window) and no loss had been announced yet: the
+//     stream started, so what ended is the stream.
+//   - both windows stay, as CEILINGS, for a library that never says anything.
+//   - every verdict also stops the library, through the injected `abandon`.
+//     When the library got there first that is harmless; when a ceiling did,
+//     it is what makes the verdict true rather than merely announced. Either
+//     way "terminal" implies "nothing is still trying", as a property of this
+//     state machine rather than of which callback happened to arrive first.
+// gaveUp() is a claim like any other and passes the same media guard as every
+// verdict (#75): a picture that is playing outranks it, and stopping the
+// library then would take that picture away, so `abandon` is not called.
 
 // display:none toggle lives in index.html CSS (`#stream-status.hidden`).
 const HIDDEN_CLASS = 'hidden';
@@ -131,14 +160,15 @@ const HIDDEN_CLASS = 'hidden';
 // never reconnected to and the word promised a recovery that could not happen.
 // The migration reversed that premise rather than making it inconvenient.
 //
-// The budget is sized to finish INSIDE the escalation window (see
-// buildStreamConfig: 6 attempts at ~2 s is ~12 s against a 15 s window), which
-// is what keeps both messages honest -- this one while the library is retrying,
-// and the terminal one below when it replaces this because the library stopped.
+// It stays up for as long as the library is still trying, and the terminal
+// message below replaces it only once the library has stopped (#101) -- which
+// is what keeps both honest. #98 tried to guarantee that ordering by sizing the
+// reconnect budget to fit inside a 15 s window; measured, the budget did not
+// fit, so the ordering is now taken from the library itself.
 const STOPPED_TEXT = 'stream stopped -- reconnecting...';
-// Terminal: the escalation window elapsed with no frame, so the producer is
-// treated as gone. Only a reload can recover, so this stays on screen as an
-// error.
+// Terminal: the library has stopped trying and no frame came back (#101), so
+// the producer is gone. Only a reload can recover, so this stays on screen as
+// an error.
 const TERMINATED_TEXT = 'stream ended -- the source is gone. Reload once it is back.';
 // Terminal, but a different piece of news (#63): the connect window elapsed
 // without a single frame ever rendering, so there is nothing to say ended. What
@@ -152,49 +182,51 @@ const NEVER_STARTED_TEXT =
 const VIDEO_READY_EVENTS = ['playing', 'loadeddata'];
 
 /**
- * How long a stopped stream may stay in the waiting state before it is declared gone
- * (#58). Chosen as a compromise: long enough that a stream which does come back
- * clears the readout on its own (and, incidentally, far longer than the window
- * in which the config-dial e2e asserts `#stream-status` carries no `error`
- * class while dialing a dead host), short enough that a user staring at a dead
- * viewer is told to reload rather than left waiting indefinitely.
+ * The ceiling on the recoverable state (#58, #101): how long a stopped stream
+ * may wait for the library's own verdict before this controller gives one.
+ *
+ * It used to BE the verdict -- 15 s, a compromise between letting a stream
+ * come back on its own and not leaving a user staring at a dead picture -- and
+ * #101 measured the library still retrying for up to a minute after it fired.
+ * The verdict now comes from the library's STOPPED (gaveUp()). This bounds only
+ * a library that never sends one, and when it fires it stops the library as it
+ * declares, so even this path cannot announce something still being attempted.
+ *
+ * So it has to OUTLAST the library's budget, or it becomes the trigger again
+ * and cuts short a recovery the library could still make. With maxReconnects 5
+ * that budget measures at ~37 s (refused port) and ~71 s (black-holed host); a
+ * unit spec locks the ceiling above the larger. It also still outlasts the
+ * window in which the config-dial e2e asserts `#stream-status` carries no
+ * `error` class while dialing a dead host, by a wide margin.
  */
-export const TERMINAL_ESCALATION_MS = 15_000;
+export const TERMINAL_ESCALATION_MS = 120_000;
 
 /**
- * How long a viewer may sit on the connect readout before the attempt is
- * declared a failure (#63). Armed from the connect attempt, not from a loss,
- * because a stream that never starts reaches no loss trigger at all.
+ * The ceiling on a connect attempt that never produces a frame (#63, #101).
+ * Armed from the attempt, not from a loss, because a stream that never starts
+ * reaches no loss trigger at all.
  *
- * Longer than TERMINAL_ESCALATION_MS on purpose: a viewer opened before the Kit
- * app has finished booting is the ordinary case, and declaring failure over a
- * producer that is merely slow to come up would be the #60 mistake in the other
- * direction.
+ * Like TERMINAL_ESCALATION_MS it used to be the verdict -- 20 s -- and it is
+ * the one #101 caught in the act: "it never started" at 20 s while the library
+ * dialed on until 83 s. The verdict now waits for the library's STOPPED; this
+ * bounds only a library that never sends one, stops it as it declares, and
+ * outlasts the measured budget for the same reason as the ceiling above.
  *
- * The length used to be justified partly by the library retrying session start
- * meanwhile (`maxReconnects` -> `maxSessionStartRetry`, 20). That mechanism does
- * not exist in ov-web-rtc 6.x -- `maxSessionStartRetry`, `sessionStartRetryLeft`
- * and `onSessionStartResult` are all absent from the 6.8.2 bundle (#98) -- so
- * that half of the reasoning is withdrawn rather than reworded. The NUMBER is
- * unchanged, and what still defends it is below: the config-dial window and the
- * #73 trade. What 6.x does against a producer that never answers at all has to
- * be re-established by watching a real host, not by reading the bundle.
+ * #98 left a question open here: what 6.x does against a producer that never
+ * answers had to be re-established by watching, not by reading the bundle.
+ * #101 is that observation (a real browser against a refused port and a
+ * black-holed host). #73's trade -- whether a window that fires early costs
+ * more than one that fires late -- no longer applies, because neither window
+ * decides when the verdict lands in the ordinary case: the rc2 producer that
+ * came up ~22 s after page load now finds the library still trying, and the
+ * readout still, truthfully, connecting.
  *
- * It must also outlast the window in which
- * the config-dial e2e dials a DEAD host and asserts `#stream-status` carries no
- * `error` class -- that suite finishes in well under a second per mode, so the
- * margin is large, and a unit spec locks the lower bound.
- *
- * Left at 20 s by #73, deliberately rather than by default. Lengthening it
- * would trade a shorter false message for a slower true one, and #73 changes
- * which side of that trade matters: a window that now ends in a verdict a real
- * frame can WITHDRAW costs, when it fires early, a message that clears itself
- * as soon as the picture arrives -- while every second added to it is a second
- * a genuinely dead producer goes unreported. The rc2 producer's first frame was
- * ~22 s after page load, so the message does still appear briefly against a
- * cold producer; that is the intended remaining cost.
+ * It must also outlast the window in which the config-dial e2e dials a DEAD
+ * host and asserts `#stream-status` carries no `error` class -- that suite
+ * finishes in well under a second per mode, and a unit spec locks the lower
+ * bound.
  */
-export const CONNECT_ESCALATION_MS = 20_000;
+export const CONNECT_ESCALATION_MS = 120_000;
 
 /**
  * How often the frame-progress watchdog samples the video element, and how many
@@ -243,13 +275,15 @@ function readFrameProgress(el) {
  * @param {{addEventListener: Function} | null} videoEl  the #remote-video element
  * @param {{info: Function, error: Function}} [logger=console]  injectable for tests
  * @param {{terminalDelayMs?: number, connectDelayMs?: number, stallPollMs?: number,
- *   stallSamples?: number, setTimer?: Function, clearTimer?: Function}}
+ *   stallSamples?: number, setTimer?: Function, clearTimer?: Function,
+ *   abandon?: Function}}
  *   [options]  clock seam for the escalations and the frame-progress watchdog:
  *   injected wholesale by the unit tests so they exercise every timeout path
- *   without any real waiting
+ *   without any real waiting. `abandon` stops the streaming library; it is
+ *   called once, when a verdict latches (#101)
  * @returns {{show: (text: string, isError?: boolean) => void, hide: () => void,
  *   connecting: (text: string) => void, stopped: () => void,
- *   terminated: () => void}}
+ *   terminated: () => void, gaveUp: () => void}}
  */
 export function createStatusController(statusEl, videoEl, logger = console, options = {}) {
   const {
@@ -259,6 +293,7 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     stallSamples = FRAME_STALL_SAMPLES,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (id) => clearTimeout(id),
+    abandon = () => {},
   } = options;
 
   // Once terminal, nothing DERIVED FROM A CALLBACK may quietly clear or
@@ -271,8 +306,12 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
   // observation, and observation outranks a verdict inferred from a timer. Null
   // means no such evidence can exist here, so nothing reopens the state.
   let terminalProgress = null;
-  // Pending stopped() -> terminated() escalation, if any (#58).
+  // Pending escalation ceiling, if any (#58, #63), and the verdict it would
+  // declare. The verdict is kept beside the timer because gaveUp() (#101)
+  // replaces the window's guess with the library's own word -- and the window
+  // is what knows whether the stream had ever started.
   let escalation = null;
+  let escalationVerdict = null;
   // Pending frame-progress sample, if any (#62). Armed by the first rendered
   // frame; the terminal state repurposes it into a recovery watch rather than
   // disarming it (#73), and only an element that reports no progress stops it.
@@ -293,6 +332,18 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
       clearTimer(escalation);
       escalation = null;
     }
+    escalationVerdict = null;
+  }
+
+  // Arm a ceiling that declares `verdict` if the library has not concluded by
+  // the time `ms` elapses.
+  function armEscalation(verdict, ms) {
+    escalationVerdict = verdict;
+    escalation = setTimer(() => {
+      escalation = null;
+      escalationVerdict = null;
+      terminate(verdict);
+    }, ms);
   }
 
   function cancelSampler() {
@@ -410,16 +461,14 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     // session-start retry, so re-arming here would move the deadline out by a
     // whole window each time -- i.e. back to never.
     if (escalation === null) {
-      escalation = setTimer(() => {
-        escalation = null;
-        terminate(NEVER_STARTED_TEXT);
-      }, connectDelayMs);
+      armEscalation(NEVER_STARTED_TEXT, connectDelayMs);
     }
   }
 
-  // The stream ended and may still come back: say so, and arm the escalation.
+  // The stream ended and may still come back: say so, and arm the ceiling.
   // Whichever happens first wins -- a rendered frame calls hide() and cancels
-  // it, or the window elapses and we declare the producer gone ourselves (#58).
+  // it, the library reports that it has stopped trying (gaveUp(), #101), or
+  // the ceiling elapses with the library silent and we conclude for it (#58).
   function stopped() {
     if (terminal) {
       return;
@@ -427,17 +476,27 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     show(STOPPED_TEXT);
     lossAnnounced = true;
     cancelEscalation(); // a repeated stop restarts the window, never stacks
-    escalation = setTimer(() => {
-      escalation = null;
-      terminated();
-    }, terminalDelayMs);
+    armEscalation(TERMINATED_TEXT, terminalDelayMs);
+  }
+
+  // The library has stopped trying (#101): its own STOPPED, which it reports
+  // only once every reconnect attempt is exhausted. It replaces whichever
+  // window was guessing at this moment with the moment itself, and declares
+  // what that window would have. No window pending means a frame did render
+  // -- that is what cancels the connect window -- and no loss had been
+  // announced yet: the stream started, so what ended is the stream.
+  function gaveUp() {
+    if (terminal) {
+      return;
+    }
+    terminate(escalationVerdict ?? TERMINATED_TEXT);
   }
 
   // Latch the readout on an actionable error. Two windows end here (#58, #63)
   // with different news -- a stream that ended vs. one that never started --
-  // so the copy is the argument; everything else about being terminal is the
-  // same. show() runs before the latch closes, which is the one write that is
-  // allowed through it.
+  // and so does the library's own verdict (#101); the copy is the argument,
+  // and everything else about being terminal is the same. show() runs before
+  // the latch closes, which is the one write that is allowed through it.
   function terminate(text) {
     // A verdict is a conclusion ABOUT the media, so the media outranks it too
     // (#75). Both windows that end here are armed by claims -- a connect
@@ -450,6 +509,7 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
       hide();
       return;
     }
+    const wasTerminal = terminal;
     cancelEscalation();
     show(text, true);
     terminal = true;
@@ -467,12 +527,20 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     } else {
       scheduleSample();
     }
+    // A verdict is only true if nothing is still trying, so it stops the
+    // library (#101): harmless when the library's own STOPPED got here first,
+    // and what makes a ceiling's verdict true when the library said nothing.
+    // Once per latch, and only AFTER it has closed, so anything the library
+    // calls back with while it stops finds the state already terminal.
+    if (!wasTerminal) {
+      abandon();
+    }
   }
 
-  // The stream is over for good: the escalation window elapsed with no frame
-  // (the only path this library build actually reaches -- see the header note;
-  // the loss it escalates may have been reported by onStop or noticed by the
-  // watchdog), or the library surprised us by invoking onTerminate after all.
+  // The library's `onTerminate` (see the header note: 6.8.2 has call sites,
+  // not yet observed firing against a dying producer). The ordinary ways to the
+  // same verdict are gaveUp() and the loss ceiling; this is kept for the case
+  // the library reports a termination before either.
   function terminated() {
     terminate(TERMINATED_TEXT);
   }
@@ -556,5 +624,5 @@ export function createStatusController(statusEl, videoEl, logger = console, opti
     }
   }
 
-  return { show, hide, connecting, stopped, terminated };
+  return { show, hide, connecting, stopped, terminated, gaveUp };
 }

@@ -3,8 +3,8 @@
 // The library this package wraps is the one thing about stream-core that a
 // caller cannot discover from its API, and nothing asserted it: the dependency
 // could be swapped, or drift back, with every other test in the repo still
-// green. connectStream's `_connect` seam deliberately keeps the library off the
-// test path (so these specs run without the @nvidia registry), which is the
+// green. connectStream's `_lib` seam deliberately keeps the real library off
+// the test path (so these specs run without the @nvidia registry), which is the
 // right trade for testing behaviour and exactly why the DECLARATION needs its
 // own assertion.
 //
