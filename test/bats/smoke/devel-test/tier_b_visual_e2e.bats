@@ -218,7 +218,19 @@ _write_passing_docker_stub() {
     'sub="${1:-}"' \
     'shift || true' \
     'case "${sub}" in' \
-    '  image | pull | rm | inspect | stop | kill) exit 0 ;;' \
+    '  image | pull)' \
+    '    # OWV_STUB_MISSING_IMAGE: an image reference containing this text is' \
+    '    # neither present locally nor pullable.' \
+    '    if [ -n "${OWV_STUB_MISSING_IMAGE:-}" ]; then' \
+    '      for a in "$@"; do' \
+    '        case "${a}" in' \
+    '          *"${OWV_STUB_MISSING_IMAGE}"*) exit 1 ;;' \
+    '        esac' \
+    '      done' \
+    '    fi' \
+    '    exit 0' \
+    '    ;;' \
+    '  rm | inspect | stop | kill) exit 0 ;;' \
     '  run)' \
     '    printf "%s\\n" "$*" >>"${OWV_STUB_ARGV}"' \
     '    # The attestation verifier runs in a container too. A stub that' \
@@ -339,6 +351,20 @@ for a in "$@"; do
     *) cmd+=("${a}") ;;
   esac
 done
+
+# A verifier that exits 0 but prints something other than the one summary
+# line, for the driver's output-shape check: OWV_STUB_VERIFIER_REPLACE_STDOUT
+# replaces its stdout, OWV_STUB_VERIFIER_EXTRA_LINE appends a line to it.
+if [ -n "${OWV_STUB_VERIFIER_REPLACE_STDOUT:-}" ]; then
+  env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}" >/dev/null
+  printf '%s\n' "${OWV_STUB_VERIFIER_REPLACE_STDOUT}"
+  exit 0
+fi
+if [ -n "${OWV_STUB_VERIFIER_EXTRA_LINE:-}" ]; then
+  env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}"
+  printf '%s\n' "${OWV_STUB_VERIFIER_EXTRA_LINE}"
+  exit 0
+fi
 
 exec env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}"
 EMU
@@ -498,9 +524,15 @@ _write_attestation() {
     GITHUB_RUN_ID=777
   [ "${status}" -eq 0 ]
 
-  # The viewer is the last container the driver starts.
-  grep -q -- '-e GITHUB_SHA=abc0000000000000000000000000000000000abc' "${ARGV_LOG}"
-  grep -q -- '-e GITHUB_RUN_ID=777' "${ARGV_LOG}"
+  # ONLY the acceptance (viewer) container's command line -- the one that runs
+  # run-tier-b.sh. The attestation verifier is a container too (#124) and is
+  # handed the same two flags, so grepping the whole argv log would stay green
+  # even if the viewer stopped receiving them.
+  local viewer_argv
+  viewer_argv="$(grep -- 'run-tier-b.sh' "${ARGV_LOG}")"
+  [ "$(printf '%s\n' "${viewer_argv}" | wc -l)" -eq 1 ]
+  [[ "${viewer_argv}" == *"-e GITHUB_SHA=abc0000000000000000000000000000000000abc"* ]]
+  [[ "${viewer_argv}" == *"-e GITHUB_RUN_ID=777"* ]]
 }
 
 # An attestation planted before the run is not this run's evidence.
@@ -561,10 +593,13 @@ _write_attestation() {
   run _run_driver_to_completion PATH="$(_path_without_python)" \
     GITHUB_SHA=2222222222222222222222222222222222222222
   [ "${status}" -ne 0 ]
-  grep -qiE 'commit' "${DRIVER_LOG}"
+  # The VERIFIER's refusal, not merely a non-zero exit: a driver that never
+  # verified at all exits non-zero too.
+  grep -qF "attestation commit is '1111111111111111111111111111111111111111', but this run publishes '2222222222222222222222222222222222222222'" "${DRIVER_LOG}"
 }
 
-# why: Same for a run that is not this run
+# why: Same for a run that is not this run -- asserted on the verifier's
+# own refusal, since a run that never verified also exits non-zero
 @test "tier_b: with no python3 on the host, a different run is still rejected" {
   _write_passing_docker_stub
   _write_attestation run_id=111
@@ -572,25 +607,66 @@ _write_attestation() {
   run _run_driver_to_completion PATH="$(_path_without_python)" \
     GITHUB_RUN_ID=222
   [ "${status}" -ne 0 ]
-  grep -qiE 'run' "${DRIVER_LOG}"
+  grep -qF "attestation run_id is '111', but this run publishes '222'" "${DRIVER_LOG}"
 }
 
-# why: Same for a degenerate (black) frame
+# why: Same for a degenerate (black) frame, asserted on the verifier's
+# refusal
 @test "tier_b: with no python3 on the host, a black frame is still rejected" {
   _write_passing_docker_stub
   _write_attestation meanLuma=0 maxLuma=0 brightFraction=0
 
   run _run_driver_to_completion PATH="$(_path_without_python)"
   [ "${status}" -ne 0 ]
+  grep -qF "attested frame is black" "${DRIVER_LOG}"
 }
 
-# why: Same for an attestation that is not JSON at all
+# why: Same for an attestation that is not JSON at all, asserted on the
+# verifier's refusal
 @test "tier_b: with no python3 on the host, an unparseable attestation is rejected" {
   _write_passing_docker_stub
   printf '%s\n' '{"commit": ' > "${ATT_SRC}"
 
   run _run_driver_to_completion PATH="$(_path_without_python)"
   [ "${status}" -ne 0 ]
+  grep -qF "tier-b-attestation.json is not valid JSON" "${DRIVER_LOG}"
+}
+
+# why: The verifier image cannot be pulled (registry down, no network):
+# nothing verified the picture, so the driver must exit non-zero
+@test "tier_b: a verifier image that cannot be pulled is a failure, not a pass" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_MISSING_IMAGE='/library/python@sha256:'
+  [ "${status}" -ne 0 ]
+  grep -qF "cannot pull the attestation verifier image" "${DRIVER_LOG}"
+}
+
+# why: The summary is what publish-image is handed; a verifier container
+# that exits 0 having printed more than the one summary line must not be
+# read as a picture
+@test "tier_b: verifier output with an extra line is not a frame summary" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_VERIFIER_EXTRA_LINE='ok'
+  [ "${status}" -ne 0 ]
+  grep -qF "attestation verifier printed no frame summary" "${DRIVER_LOG}"
+}
+
+# why: Same for a verifier container that exits 0 printing something that
+# is not the summary shape at all
+@test "tier_b: verifier output that is not the summary shape is refused" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_VERIFIER_REPLACE_STDOUT='ok'
+  [ "${status}" -ne 0 ]
+  grep -qF "attestation verifier printed no frame summary" "${DRIVER_LOG}"
 }
 
 # why: The verifier container is what decides the gate, so it must be the
@@ -613,7 +689,12 @@ _write_attestation() {
 
   local verify_argv
   verify_argv="$(grep -- 'verify_tier_b_attestation.py' "${ARGV_LOG}")"
+  [ "$(printf '%s\n' "${verify_argv}" | wc -l)" -eq 1 ]
   [[ "${verify_argv}" == *"--network=none"* ]]
+  [[ "${verify_argv}" == *"--read-only"* ]]
+  [[ "${verify_argv}" == *":/verify:ro "* ]]
+  [[ "${verify_argv}" == *":/attest/tier-b-attestation.json:ro "* ]]
+  [[ "${verify_argv}" == *"python3 -I -B /verify/verify_tier_b_attestation.py"* ]]
   [[ "${verify_argv}" == *"-e GITHUB_SHA=abc0000000000000000000000000000000000abc"* ]]
   [[ "${verify_argv}" == *"-e GITHUB_RUN_ID=777"* ]]
   [[ "${verify_argv}" == *"--name owv-tierb-${STUB_INSTANCE}-verifier"* ]]

@@ -122,7 +122,7 @@ Guards `script/ci/derive_image_tag.sh`, which decides the GHCR image tag for the
 | `a truncated version tag is refused` | `v0.3` is not MAJOR.MINOR.PATCH |
 | `a dispatch input that is not a version is refused` | Same validation on the escape-hatch path |
 
-## test/bats/smoke/devel-test/tier_b_visual_e2e.bats (17)
+## test/bats/smoke/devel-test/tier_b_visual_e2e.bats (20)
 
 Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. Its header says `Exit 0 = a real browser saw a real, non-black frame`, and the workflow's picture gate believes exactly that -- so exiting 0 without having asserted a picture is the one failure this script may never have. It could: `cleanup()` took `local rc=$?` and ended `exit "${rc}"` while trapped on `EXIT INT TERM`, and on a signal path `$?` is the last COMPLETED command (the boot-wait `sleep 5`, i.e. 0). No GPU, Kit or docker daemon is involved -- a stub `docker` on `PATH` answers just enough for the driver to reach its boot-wait loop and stay there, which is the state under test. The script is copied into the image at `/ci/`.
 
@@ -134,9 +134,12 @@ Guards the EXIT STATUS of `script/ci/tier_b_visual_e2e.sh`, the Tier B driver. I
 | `teardown runs exactly once on a signal path` | The signal handler and the EXIT handler used to be the same function, so its own `exit` re-entered it and `producer.log` was written twice |
 | `with no python3 on the host, a matching attestation is verified` | The GPU runner host has no python3; a real, matching attestation must still be verified there, inside a container, and exit 0 |
 | `with no python3 on the host, a different commit is still rejected` | Moving the verifier into a container must not open the gate: a commit that is not this run's is still refused with no host python3 |
-| `with no python3 on the host, a different run is still rejected` | Same for a run that is not this run |
-| `with no python3 on the host, a black frame is still rejected` | Same for a degenerate (black) frame |
-| `with no python3 on the host, an unparseable attestation is rejected` | Same for an attestation that is not JSON at all |
+| `with no python3 on the host, a different run is still rejected` | Same for a run that is not this run -- asserted on the verifier's own refusal, since a run that never verified also exits non-zero |
+| `with no python3 on the host, a black frame is still rejected` | Same for a degenerate (black) frame, asserted on the verifier's refusal |
+| `with no python3 on the host, an unparseable attestation is rejected` | Same for an attestation that is not JSON at all, asserted on the verifier's refusal |
+| `a verifier image that cannot be pulled is a failure, not a pass` | The verifier image cannot be pulled (registry down, no network): nothing verified the picture, so the driver must exit non-zero |
+| `verifier output with an extra line is not a frame summary` | The summary is what publish-image is handed; a verifier container that exits 0 having printed more than the one summary line must not be read as a picture |
+| `verifier output that is not the summary shape is refused` | Same for a verifier container that exits 0 printing something that is not the summary shape at all |
 | `the verifier runs offline in a digest-pinned image with the commit and run passed in` | The verifier container is what decides the gate, so it must be the image the driver names (pinned by digest: GHCR/Hub tags are mutable), run offline, and handed the commit and run it binds the attestation to -- an unset GITHUB_SHA reads as "not applicable" to the verifier, so a missing `-e` would silently disable the commit check |
 
 ## test/bats/smoke/devel-test/require_attestation.bats (17)
