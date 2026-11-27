@@ -260,18 +260,12 @@ jobs:
       && !(github.event_name == 'workflow_dispatch'
            && inputs.publish_image_tag != '')
     # Back on a released base tag: the temporary commit-SHA pin from #66 is
-    # gone and #67's condition is met. v0.42.0's archive step copies
-    # `Dockerfile script/ .hadolint.yaml test/bats/smoke/ .base/ README.md
-    # doc/` and hard-fails on any path the consumer lacks (upstream robustness
-    # fix base#914 is still open); this tree now satisfies all seven, the last
-    # of them because the bats specs moved to test/bats/smoke/ -- base's own
-    # ADR-00000012 layout -- rather than because the list was worked around.
+    # gone and #67's condition is met. The archive contents come from the
+    # release worker's archive manifest (base#914, closed), not from a fixed
+    # path list that hard-failed on any path the consumer lacked.
     #
-    # call-docker-build stays on v0.41.0 ON PURPOSE. Moving the build worker is
-    # a separate change with its own verification (#37); the mixed pinning is
-    # deliberate, not an oversight. Likewise the .base subtree stays at v0.41.0
-    # -- base#915 records that the v0.42.0 upgrade path is broken for a v0.41.0
-    # consumer, and only the workflow ref moves here.
+    # call-docker-build, this job and the .base subtree are on the same base
+    # release (.base/.version); `just base upgrade` moves all three together.
     # The ONLY job that needs write. release-worker runs
     # softprops/action-gh-release, which creates a GitHub Release; GitHub's
     # default GITHUB_TOKEN is read-only, and reusable-workflow permissions
