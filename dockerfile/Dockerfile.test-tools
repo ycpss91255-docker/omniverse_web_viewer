@@ -414,10 +414,10 @@ FROM alpine-apk
 # green spec all said downstream repos inherited a TOML parser here.
 # Alpine's python3 is 3.12, whose stdlib carries `tomllib` (PEP 680), so
 # the `tomli` backport the script falls back to on Python < 3.11 is never
-# reached and is not installed: the standalone
-# dockerfile/Dockerfile.toml-bridge keeps it for the runtimes that need
-# it. Measured cost of the package on alpine 3.22: 8.3 MB -> 49.2 MB for
-# a bare alpine, about +41 MB uncompressed on a 350 MB image.
+# reached and is not installed; the standalone
+# dockerfile/Dockerfile.toml-bridge pins 3.13 and does not install it
+# either. Measured cost of the package on alpine 3.22: 8.3 MB -> 49.2 MB
+# for a bare alpine, about +41 MB uncompressed on a 350 MB image.
 # util-linux-misc (base#1469): the config-gen output-failure spec
 # (test/bats/integration/config_gen_bridge_golden_spec.bats) needs
 # `prlimit --fsize` to make the binary's one stdout write take some bytes

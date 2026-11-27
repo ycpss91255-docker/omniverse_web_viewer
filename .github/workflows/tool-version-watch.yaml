@@ -108,9 +108,11 @@ jobs:
         # than yielding an empty matrix, which would look exactly like a
         # clean week.
         run: |
-          set -uo pipefail
-          drift="$(./script/watch/check.sh --drift-tsv 2>/tmp/watch-report.txt)"
-          status=$?
+          set -euo pipefail
+          # The runner starts this with `-e`: a status that is not caught on
+          # the command's own line ends the step before anything reads it.
+          status=0
+          drift="$(./script/watch/check.sh --drift-tsv 2>/tmp/watch-report.txt)" || status=$?
           cat /tmp/watch-report.txt
           if [[ "${status}" -eq 1 ]]; then
             echo "::error::a pin's upstream could not be resolved (see UNRESOLVED above). Nothing was compared for it, so this run proves nothing about that pin."

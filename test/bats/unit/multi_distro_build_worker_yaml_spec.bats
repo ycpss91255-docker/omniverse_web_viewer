@@ -12,8 +12,8 @@
 #    `pull_request` -> `pr_matrix` (subset); everything else (tag push,
 #    main push, workflow_dispatch) -> `tag_matrix` (full release matrix).
 #
-# 2. `call-build` — strategy.matrix job invoking
-#    `./.github/workflows/build-worker.yaml` per matrix cell. Each cell
+# 2. `call-build` — strategy.matrix job invoking `build-worker.yaml` by
+#    its full path at this release's tag, per matrix cell. Each cell
 #    MUST have `name` (used for image_name suffix + cache scope) and
 #    `build_args` (forwarded verbatim to build-worker.yaml). Derives
 #    per-shard `image_name` as `<image_name>-<matrix.name>` so GHCR tags
@@ -47,7 +47,7 @@
 # anything else (tag push, main push, `workflow_dispatch`) -> `tag_matrix`
 # (release validation matrix).
 #
-# 2. **`call-build`** — strategy.matrix job invoking the local
+# 2. **`call-build`** — strategy.matrix job invoking
 # `build-worker.yaml` per matrix cell. Derives per-shard `image_name` as
 # `<image_name>-<matrix.name>`, forwards `matrix.build_args` verbatim as
 # `build_args`, and shards buildx GHA cache by name via `cache_variant: ${{
@@ -87,7 +87,8 @@
 #
 # - `resolve-matrix` branches on `github.event_name == 'pull_request'`
 #
-# - `call-build` `uses: ./.github/workflows/build-worker.yaml`
+# - `call-build` calls `build-worker.yaml` by its full path at the release in
+# `.version`; no reusable workflow calls its next level by a `./` path
 #
 # - `call-build` matrix `include:
 # fromJSON(needs.resolve-matrix.outputs.matrix)`
@@ -349,10 +350,61 @@ readonly _SINGLE='[{"name":"humble","build_args":"ROS2_DISTRO=humble"}]'
 
 # ── call-build matrix job ────────────────────────────────────────────
 
-@test "multi-distro-build-worker.yaml: call-build uses local build-worker via ./.github/workflows/build-worker.yaml (#325 B-1)" {
+# why: base#2171. A caller that names the dispatcher by an annotated tag hands
+# a `./` call the tag object's sha as the next level's ref, and push and
+# workflow_dispatch runs then fail at startup. A full path with a ref is
+# resolved as written. `uses:` takes no expression, so the ref is a literal;
+# a release bump that moves `.version` without it fails here.
+@test "multi-distro-build-worker.yaml: call-build calls build-worker by its full path at the .version release (base#2171)" {
+  local _version _line
+  local -a _uses=()
+  _version="$(< /source/.version)"
+  # shellcheck disable=SC1091
+  source /source/dist/script/base/upstream.sh
   run yaml_job_lines "${WF}" call-build
   assert_success
-  assert_output --partial 'uses: ./.github/workflows/build-worker.yaml'
+  for _line in "${lines[@]}"; do
+    if [[ "${_line}" =~ ^[[:space:]]*uses:[[:space:]]*(.*)$ ]]; then
+      _uses+=("${BASH_REMATCH[1]}")
+    fi
+  done
+  [ "${#_uses[@]}" -eq 1 ] || fail "call-build has ${#_uses[@]} uses: lines, expected 1"
+  [ "${_uses[0]}" = "${BASE_UPSTREAM_SLUG}/.github/workflows/build-worker.yaml@${_version}" ] \
+    || fail "call-build uses: ${_uses[0]}"
+}
+
+# why: base#2171. The startup failure belongs to the `./` form, not to this
+# dispatcher, so every workflow a downstream repo can call is held to the rule.
+# `$/` is the other same-repository form and carries no ref either.
+@test "no reusable workflow calls its next level by a same-repository path (base#2171)" {
+  local _file _found _hits="" _reusable=0
+  for _file in /source/.github/workflows/*.yaml /source/.github/workflows/*.yml; do
+    [[ -f "${_file}" ]] || continue
+    grep -qE '^[[:space:]]+workflow_call:' "${_file}" || continue
+    _reusable=$(( _reusable + 1 ))
+    _found="$(strip_comments < "${_file}" \
+      | grep -E "^[[:space:]]*uses:[[:space:]]*[\"']?[.\$]/\.github/workflows/" || true)"
+    [[ -z "${_found}" ]] || _hits+="${_file##*/}: ${_found}"$'\n'
+  done
+  (( _reusable > 0 )) || fail "no workflow declares workflow_call, so nothing was checked"
+  [ -z "${_hits}" ] || fail "reusable workflow with a same-repository uses: ${_hits}"
+}
+
+# why: base#2171. A full-path call names its release as a literal, so one left
+# at another release runs that release's worker under this one's dispatcher.
+@test "base workflows name a base workflow only at the .version release (base#2171)" {
+  local _version _file _found _hits=""
+  _version="$(< /source/.version)"
+  # shellcheck disable=SC1091
+  source /source/dist/script/base/upstream.sh
+  for _file in /source/.github/workflows/*.yaml /source/.github/workflows/*.yml; do
+    [[ -f "${_file}" ]] || continue
+    _found="$(strip_comments < "${_file}" \
+      | grep -E "^[[:space:]]*uses:[[:space:]]*[\"']?${BASE_UPSTREAM_SLUG}/" \
+      | grep -vE "@${_version//./\\.}[\"']?([[:space:]]+#.*)?[[:space:]]*\$" || true)"
+    [[ -z "${_found}" ]] || _hits+="${_file##*/}: ${_found}"$'\n'
+  done
+  [ -z "${_hits}" ] || fail "base workflow ref not at ${_version}: ${_hits}"
 }
 
 @test "multi-distro-build-worker.yaml: call-build matrix is include: fromJSON(needs.resolve-matrix.outputs.matrix) (#344 N-D)" {

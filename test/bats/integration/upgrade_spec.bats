@@ -334,6 +334,76 @@ EOF
 - main.yaml: moved to ${BASE_UPSTREAM_SLUG}: ${_w}"
 }
 
+# why: A ref pinned to a commit sha has no version for the rewrite to match, so
+# an upgrade left it at the old commit and said nothing. A sha whose line names
+# the release it is moves to the target's commit; any other sha that is not
+# that commit is named with its line (base#2172)
+@test "upgrade.sh v0.9.7: a worker ref pinned to a commit sha is moved or reported (base#2172)" {
+  cd "${DOWN_DIR}"
+  local _path="${BASE_UPSTREAM_SLUG}/.github/workflows" _w="${DOWN_WORKERS[0]}"
+  local _old _new
+  _old="$(git -C "${TMPL_WORK}" rev-parse 'v0.9.5^{commit}')"
+  _new="$(git -C "${TMPL_WORK}" rev-parse 'v0.9.7^{commit}')"
+  cat > .github/workflows/main.yaml <<EOF
+jobs:
+  a:
+    uses: ${_path}/${_w}@${_old} # v0.9.5
+  b:
+    uses: ${_path}/${_w}@${_old}
+  c:
+    uses: ${_path}/${_w}@${_old} # v0.9.5 kept back on purpose
+  d:
+    uses: ${_path}/${_w}@${_new}
+  e:
+    uses: other/repo/.github/workflows/${_w}@${_old} # v0.9.5
+  f:
+    uses: "${_path}/${_w}@${_old}"  #v0.9.5-rc1
+EOF
+  git add .github/workflows/main.yaml
+  git commit -q -m "refs pinned to a commit sha"
+  local _before
+  _before="$(cat .github/workflows/main.yaml)"
+
+  run env TEMPLATE_REMOTE="file://${TMPL_BARE}" ./.base/dist/script/base/upgrade.sh v0.9.7
+  assert_success
+  assert_output --partial '2 base worker ref(s) in .github/workflows/main.yaml are not at v0.9.7'
+  assert_output --partial "main.yaml:5: ${_path}/${_w}@${_old}"
+  assert_output --partial "main.yaml:7: ${_path}/${_w}@${_old}"
+  refute_output --partial 'main.yaml:3:'
+  refute_output --partial 'main.yaml:9:'
+  refute_output --partial 'main.yaml:11:'
+  refute_output --partial 'main.yaml:13:'
+
+  local _want="${_before/@${_old} # v0.9.5$'\n'/@${_new} # v0.9.7$'\n'}"
+  _want="${_want/@${_old}\"  #v0.9.5-rc1/@${_new}\"  #v0.9.7}"
+  [ "$(cat .github/workflows/main.yaml)" = "${_want}" ]
+  run bash -c "git log -1 --format=%B | grep '^- main\.yaml:'"
+  assert_output "- main.yaml: @ref updated to v0.9.7 for ${_w}"
+}
+
+# why: An annotated tag has a sha of its own, and a workflow ref written with
+# it does not start. The sha written is the commit the tag points at (base#2172)
+@test "upgrade.sh v0.9.7: a sha ref is moved to the commit of an annotated tag, not to the tag object (base#2172)" {
+  cd "${DOWN_DIR}"
+  local _path="${BASE_UPSTREAM_SLUG}/.github/workflows" _w="${DOWN_WORKERS[0]}"
+  local _old _new _tag_object
+  _old="$(git -C "${TMPL_WORK}" rev-parse 'v0.9.5^{commit}')"
+  _new="$(git -C "${TMPL_WORK}" rev-parse 'v0.9.7^{commit}')"
+  git -C "${TMPL_BARE}" -c user.name=t -c user.email=t@t tag -f -a -m "v0.9.7" v0.9.7 "${_new}"
+  _tag_object="$(git -C "${TMPL_BARE}" rev-parse v0.9.7)"
+  [ "${_tag_object}" != "${_new}" ]
+  # CRLF, as an editor on Windows leaves it: the line keeps its ending.
+  printf 'jobs:\r\n  a:\r\n    uses: %s/%s@%s # v0.9.5\r\n' "${_path}" "${_w}" "${_old}" \
+    > .github/workflows/main.yaml
+  git add .github/workflows/main.yaml
+  git commit -q -m "a ref pinned to a commit sha"
+
+  run env TEMPLATE_REMOTE="file://${TMPL_BARE}" ./.base/dist/script/base/upgrade.sh v0.9.7
+  assert_success
+  refute_output --partial 'base worker ref(s)'
+  grep -Fxq "    uses: ${_path}/${_w}@${_new} # v0.9.7"$'\r' .github/workflows/main.yaml
+}
+
 # ── Step 5: declarative Dockerfile/entrypoint migrations ───────
 # upgrade.sh Step 5 sources lib/dockerfile_migrate.sh and runs the
 # apply_migrations dispatcher over the repo-root Dockerfile (and its sibling

@@ -1,0 +1,4 @@
+[environment]
+env_1 = "SIGNALING_SERVER=localhost"
+env_2 = "LOG_LEVEL=debug"
+

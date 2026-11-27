@@ -346,6 +346,63 @@ printf "%s\n" "${_COVERAGE_JOBS_HOSTED_DEFAULT}"')"
 }
 
 # ════════════════════════════════════════════════════════════════════
+# The slices of one shard are balanced by weight
+# ════════════════════════════════════════════════════════════════════
+
+# _slice_loads <kcov_log> <weights>
+#   `max=<n> total=<n>`: the heaviest instrumented kcov run's summed spec
+#   weight, and the sum over every run. A spec <weights> does not list
+#   weighs 1, its `@test` count in the parity root.
+_slice_loads() {
+  awk '
+    NR == FNR { w[$2] = $1; next }
+    /^--merge/ { next }
+    {
+      load = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i !~ /\.bats$/) continue
+        k = $i
+        sub(/^.*\/pool\//, "", k)
+        load += (k in w) ? w[k] : 1
+      }
+      total += load
+      if (load > max) max = load
+    }
+    END { printf "max=%d total=%d\n", max, total }
+  ' "${2}" "${1}"
+}
+
+# why: a shard's slices run at the same time, so its heaviest slice is its
+# wall time; here the best possible one is the 300 spec alone.
+@test "_run_coverage: a shard's specs are dealt to slices by weight, not in turn (base#2189)" {
+  local _log="${BATS_TEST_TMPDIR}/kcov.log"
+  _make_parity_root >/dev/null
+  _install_parity_mocks "${_log}"
+
+  # delta outweighs the rest of the pool together, so it is shard 1/2 and
+  # every other spec is shard 2/2.
+  local _wf="${BATS_TEST_TMPDIR}/weights"
+  printf '%s\n' \
+    '10000 test/bats/integration/delta_spec.bats' \
+    '300 test/bats/unit/alpha_spec.bats' \
+    '100 test/bats/integration/apk_mirror_spec.bats' \
+    '100 test/bats/unit/apk_mirror_spec.bats' \
+    '100 test/bats/unit/beta_spec.bats' \
+    '100 test/bats/unit/sub/gamma_spec.bats' > "${_wf}"
+
+  run bash -c 'REPO_ROOT="${BATS_TEST_TMPDIR}/pool"
+'"$(_driver_prelude)"'
+export SHARD_WEIGHTS_FILE="${BATS_TEST_TMPDIR}/weights"
+COVERAGE_JOBS=4 _run_coverage 2/2 >/dev/null 2>&1'
+  assert_success
+
+  # 714 is the shard's total weight: 300, four of 100, fourteen of 1.
+  run _slice_loads "${_log}" "${_wf}"
+  assert_success
+  assert_output "max=300 total=714"
+}
+
+# ════════════════════════════════════════════════════════════════════
 # 1. The local entry runs CI's partition
 # ════════════════════════════════════════════════════════════════════
 

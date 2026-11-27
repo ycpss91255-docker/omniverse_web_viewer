@@ -62,7 +62,8 @@ hosted reading), a `matrix: ${{ fromJSON(...) }}` whose label set is
 computed at runtime, `${{ inputs.runner }}` or any other expression, and a
 job with no `runs-on` that calls a **remote** reusable workflow (a local
 `uses: ./...` is exempt, because the callee's own jobs are checked where
-they are defined).
+they are defined; so is a call by this repo's own slug to a workflow this
+tree ships, which is how one reusable worker has to name the next).
 
 **Why a label-family pattern rather than a roster.** Those three families
 are reserved by GitHub and cannot be claimed by a self-hosted runner, so
