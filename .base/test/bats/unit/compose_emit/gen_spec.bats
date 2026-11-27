@@ -307,7 +307,7 @@ teardown() {
   # `bridge` as the fourteenth positional is now part of the condition:
   # base#1094 made `[network] mode` decide here too, so a name beside
   # `mode = host` is reported and ignored rather than silently winning.
-  # The sibling case lives in validated_key_reach_spec.
+  # The sibling case lives in validated_key_explicit_spec.
   local _extras=()
   generate_compose_yaml "${COMPOSE_OUT}" "myrepo" \
     "false" "false" "0" "gpu" _extras "mynet" "" "" "" "" "" "bridge"

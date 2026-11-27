@@ -163,6 +163,12 @@ services:
       - HOST_UID=${HOST_UID:?set by 'just test' / 'just test system' -- run one of those instead of driving docker compose directly}
       - HOST_GID=${HOST_GID:?set by 'just test' / 'just test system' -- run one of those instead of driving docker compose directly}
       - MOUNT_DOCKER_SOCK=1
+      # Bare keys: compose forwards the caller's value, or omits the key.
+      # A tag the caller pinned cannot be derived in the container.
+      - TEST_TOOLS_IMAGE
+      # Makes _run_system refuse a skip. `ci` must not carry it: the
+      # in-image lint refuses a runner.
+      - GITHUB_ACTIONS
     entrypoint: /bin/bash
     command:
       - -c

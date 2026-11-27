@@ -745,21 +745,15 @@ _acceptance_code() {
   refute_output --partial "if: needs.classify.outputs.code_changed == 'true'"
 }
 
-# why: PR base#1559 changed one spec and two docs, code_changed was true,
-# and config-gen ran 111 min (run 42549448309). base#1584 has a pull
-# request run a heavy job only when classify's map selected it, so
-# config-gen must read its own select_config_gen output, not the
-# shared code_changed answer. base#1547 split config-gen into
-# config-gen-gates and the config-gen-redpath matrix; both read the same
-# inputs, so both gate on the one select_config_gen key, the whole `if:`
-# compared, not a substring.
-@test "self-test.yaml: both config-gen jobs' job-level if: gates on classify's select_config_gen (base#1584)" {
-  local _j
-  for _j in config-gen-gates config-gen-redpath; do
-    run env LP_J="${_j}" yq '.jobs[strenv(LP_J)].if' "${WF}"
-    assert_success
-    assert_output "needs.classify.outputs.select_config_gen == 'true'"
-  done
+# why: the diff decides the gates and the event the redpath, so one key
+# cannot gate both; the whole `if:` is compared, not a substring.
+@test "self-test.yaml: each config-gen job's job-level if: gates on a classify key of its own (base#1584, base#2176)" {
+  run yq '.jobs["config-gen-gates"].if' "${WF}"
+  assert_success
+  assert_output "needs.classify.outputs.select_config_gen == 'true'"
+  run yq '.jobs["config-gen-redpath"].if' "${WF}"
+  assert_success
+  assert_output "needs.classify.outputs.select_config_gen_redpath == 'true'"
 }
 
 # ── buildx GHA cache on test-tools builds ────────────────
@@ -4173,19 +4167,22 @@ _lint_probe_fixture() {
 #
 # TEST.md is the one file in doc/test/ with no generated block (the doc-count
 # generator's TEST.md pass was removed), so nothing re-derived either half.
-# These two guards do, from the same table this spec already reads for the
-# CI-join completeness check: the row SET is _LINT_TOOLS, and every job name
-# the table cites is a job self-test.yaml actually declares. The "Enforces"
-# column stays authored -- it is prose a person writes, not a figure.
+# These three guards do, from the same table this spec already reads for the
+# CI-join completeness check: the row SET is _LINT_TOOLS, every job name the
+# table cites is a job self-test.yaml actually declares, and the flags and
+# the condition a row states are that job's own. The "Enforces" column stays
+# authored -- it is prose a person writes, not a figure.
 
 TEST_MD='/source/doc/test/TEST.md'
 
-# Print `<lint><TAB><ci-job>` for each row of the static-lint table. The job
-# is the first code span of the CI-job cell, taken whole: a row naming a job
-# that does not exist is exactly the defect, so the cell is not trimmed down
-# to something that happens to resolve. `\|` inside a cell is an escaped
-# pipe, not a column break (the errexit-bang cell carries several), so it is
-# protected before the split.
+# Print `<lint>|<ci-job>|<flags>|<gate>` for each row of the static-lint
+# table. The job is the first code span of the CI-job cell, taken whole: a
+# row naming a job that does not exist is exactly the defect, so the cell is
+# not trimmed down to something that happens to resolve. `\|` inside a cell
+# is an escaped pipe, not a column break (the errexit-bang cell carries
+# several), so it is protected before the split.
+# Flags: the CI-job cell's second code span, empty when absent. Joined by
+# `|` because `read` drops an empty field between tabs.
 _test_md_lint_rows() {
   awk '
     /^\| Lint \| Enforces \| CI job \| Gated\? \|/ { inside = 1; next }
@@ -4198,13 +4195,21 @@ _test_md_lint_rows() {
       split(line, cell, "|")
       lint = cell[2]
       job  = cell[4]
+      gate = cell[5]
       gsub(/`/, "", lint)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", lint)
+      gsub(/`/, "", gate)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", gate)
       jobname = ""
+      flags = ""
       if (match(job, /`[^`]*`/)) {
         jobname = substr(job, RSTART + 1, RLENGTH - 2)
+        job = substr(job, RSTART + RLENGTH)
+        if (match(job, /`[^`]*`/)) {
+          flags = substr(job, RSTART + 1, RLENGTH - 2)
+        }
       }
-      if (lint != "") { print lint "\t" jobname }
+      if (lint != "") { print lint "|" jobname "|" flags "|" gate }
     }
   ' "${TEST_MD}"
 }
@@ -4242,7 +4247,7 @@ _lint_tools_table() {
   local -a _listed=()
   local _row
   for _row in "${_rows[@]}"; do
-    _listed+=( "${_row%%$'\t'*}" )
+    _listed+=( "${_row%%|*}" )
   done
 
   local _t _missing='' _extra=''
@@ -4276,8 +4281,7 @@ _lint_tools_table() {
 
   local _row _lint _job _bad=''
   for _row in "${_rows[@]}"; do
-    _lint="${_row%%$'\t'*}"
-    _job="${_row#*$'\t'}"
+    IFS='|' read -r _lint _job _ <<<"${_row}"
     [[ -n "${_job}" ]] \
       || fail "TEST.md's row for '${_lint}' names no CI job at all"
     printf '%s\n' "${_jobs[@]}" | grep -qx -- "${_job}" \
@@ -4285,6 +4289,37 @@ _lint_tools_table() {
   done
   [[ -z "${_bad}" ]] \
     || fail "TEST.md cites CI job names that do not exist in ${WF}:${_bad} -- a reader looking for that check in the checks list will not find it"
+}
+
+# why: a row's flags and condition must be what the CI job it cites really has
+@test "TEST.md: each static-lint row states the flags and the condition of the CI job it cites (base#2175)" {
+  local -a _rows=()
+  mapfile -t _rows < <(_test_md_lint_rows)
+  [ "${#_rows[@]}" -ge 13 ] \
+    || fail "TEST.md yielded ${#_rows[@]} table rows; the table did not parse"
+
+  local _row _lint _job _flags _gate _call _if _bad=''
+  for _row in "${_rows[@]}"; do
+    IFS='|' read -r _lint _job _flags _gate <<<"${_row}"
+    _call="$(yq ".jobs[\"${_job}\"].steps[].run // \"\"" "${WF}" \
+      | sed -n 's|^\./script/test/test\.sh \(--lint .*\)$|\1|p')"
+    [[ -n "${_call}" ]] \
+      || fail "TEST.md's row for '${_lint}' cites job '${_job}', which runs no test.sh --lint step"
+    # A group leg is named by position, so its rows have no flag to state.
+    if [[ "${_call}" == '--lint --group '* ]]; then
+      _call=''
+    fi
+    [[ "${_flags}" == "${_call}" ]] \
+      || _bad+=$'\n'"${_lint}: flags '${_flags}', job runs '${_call}'"
+
+    _if="$(yq ".jobs[\"${_job}\"].if // \"ungated\"" "${WF}")"
+    _if="${_if#needs.classify.outputs.}"
+    _if="${_if% == \'true\'}"
+    [[ "${_gate}" == "${_if}" ]] \
+      || _bad+=$'\n'"${_lint}: condition '${_gate}', job has '${_if}'"
+  done
+  [[ -z "${_bad}" ]] \
+    || fail "TEST.md's static-lint table disagrees with ${WF}:${_bad}"
 }
 
 # ── The bats-fragile job's account of what it preserves ──────────────────────
@@ -4403,8 +4438,8 @@ ${_bad}"
 
 # ── config-gen: the Go gates job, in both workflows (base#1462) ──────────────
 #
-# `just test go` is the one command every environment runs for the config
-# generator's gates (ADR-00000039). A job that merely MENTIONS it is not a
+# The self-hosted workflow runs `just test go`, the hosted one its two
+# recipes in a job each. A job that merely MENTIONS its command is not a
 # job that runs it: an `if: false` on the step, a `shell:` that never starts
 # bash, a `continue-on-error`, a workflow-level BASH_ENV that exits 0 before
 # the step body runs -- each leaves the job green with the gates unrun. So
@@ -4426,7 +4461,8 @@ ${_bad}"
 # updated; that friction is intended, and the message names file, layer
 # and key set.
 
-CG_GATE_IF="needs.classify.outputs.select_config_gen == 'true'"
+CG_GATES_IF="needs.classify.outputs.select_config_gen == 'true'"
+CG_REDPATH_IF="needs.classify.outputs.select_config_gen_redpath == 'true'"
 CG_STEP_NAME='Run the config-gen gates'
 CG_STEP_RUN='just test go'
 # The hosted workflow splits `just test go` into its two recipes (base#1547):
@@ -4548,8 +4584,8 @@ _cg_job_id() {
 }
 
 # _cg_expected_job <self-test|self-test-redpath|coverage-local> -- that
-# job less its free-text name and timeout, canonical JSON. Both hosted
-# jobs gate on the one select_config_gen key (CG_GATE_IF, base#1584);
+# job less its free-text name and timeout, canonical JSON. Each hosted
+# job gates on its own classify key (CG_GATES_IF, CG_REDPATH_IF);
 # coverage-local's `if` is the fork guard its sibling job carries. The redpath matrix is
 # shard 1..N, N read from the shard table's header and never from the
 # workflow, with the shard holding rerun's one row labelled (base#1547).
@@ -4566,10 +4602,10 @@ _cg_expected_job() {
   esac
   case "${1}" in
     self-test)
-      CG_IF="${CG_GATE_IF}" CG_STEPS="${_steps}" yq -n -o json -I0 \
+      CG_IF="${CG_GATES_IF}" CG_STEPS="${_steps}" yq -n -o json -I0 \
         '{"if": strenv(CG_IF), "needs": ["classify"], "runs-on": "ubuntu-latest", "steps": env(CG_STEPS)} | sort_keys(..)' ;;
     self-test-redpath)
-      CG_IF="${CG_GATE_IF}" CG_STEPS="${_steps}" CG_SHARD_LIST="[$(seq -s, 1 "${_n}")]" CG_K="${_k}" \
+      CG_IF="${CG_REDPATH_IF}" CG_STEPS="${_steps}" CG_SHARD_LIST="[$(seq -s, 1 "${_n}")]" CG_K="${_k}" \
         yq -n -o json -I0 '{"if": strenv(CG_IF), "needs": ["classify"], "runs-on": "ubuntu-latest",
           "strategy": {"fail-fast": false, "matrix": {"shard": env(CG_SHARD_LIST),
             "include": [{"shard": env(CG_K), "label": " + rerun, the baseline"}]}},
@@ -4921,21 +4957,22 @@ _rollup_honours_every_need() {
   assert_output ""
 }
 
-# why: config-gen skips where classify's map deselects it; the rollup must
-# read that skip as a pass and a failure or cancel as red. The skip passes
-# only on the classify answer it came from (select_config_gen=false); a
-# skip classify did not decide fails, whatever code_changed says
-# (base#1584).
-@test "self-test.yaml: ci-rollup passes config-gen success and a decided skip, fails failure and cancelled (base#1462)" {
-  local _j
-  for _j in config-gen-gates config-gen-redpath; do
+# why: a skip passes only on the job's own key, whatever the other config-gen
+# job's key or code_changed says; a failure or a cancel never passes.
+@test "self-test.yaml: ci-rollup passes config-gen success and a decided skip, fails failure and cancelled (base#1462, base#2176)" {
+  local _j _k _other
+  while read -r _j _k _other; do
     assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"success\"")" 0
-    assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.select_config_gen = \"false\"")" 0
-    assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.select_config_gen = \"true\"")" 1
+    assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.${_k} = \"false\"")" 0
+    assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.${_k} = \"true\"")" 1
+    assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.${_other} = \"false\"")" 1
     assert_equal "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"skipped\" | .classify.outputs.code_changed = \"false\"")" 1
     [[ "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"failure\"")" != 0 ]] || fail "ci-rollup passes a failed ${_j}"
     [[ "$(_rollup_rc "${WF}" ".[\"${_j}\"].result = \"cancelled\"")" != 0 ]] || fail "ci-rollup passes a cancelled ${_j}"
-  done
+  done <<'JOBS'
+config-gen-gates select_config_gen select_config_gen_redpath
+config-gen-redpath select_config_gen_redpath select_config_gen
+JOBS
 }
 
 # why: The rollup check must see a need the verify step leaves out, or it
@@ -4955,9 +4992,8 @@ _rollup_honours_every_need() {
 
 # ── the required-kill roster runs in every CI environment (base#1461) ────────
 #
-# Local `just test`, the hosted mutation-roster matrix (base#1571; the
-# hosted lint-static legs ran it before that) and the self-hosted
-# coverage-local workflow all run `just test mutation-required`. Which
+# The hosted mutation-roster matrix and the self-hosted coverage-local
+# workflow run `just test mutation-required`. Which
 # steps run it is decided the way the lint parity is (base#1412): by
 # RUNNING every `run:` step of the job in a checkout copy whose roster
 # driver is a recorder, not by reading the step text. A quoted, variable

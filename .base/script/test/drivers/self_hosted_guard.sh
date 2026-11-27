@@ -70,6 +70,13 @@
 #     (`uses: owner/repo/...@ref`): the callee picks the machine and the
 #     callee is not in this tree. A LOCAL call (`uses: ./...`) is exempt,
 #     because the callee's own jobs are checked where they are defined.
+#     So is a call that names a workflow THIS tree ships by this repo's
+#     own slug (`uses: <slug>/.github/workflows/<file>@<ref>`): a reusable
+#     workflow cannot call its next level by `./` and still start for a
+#     caller that names it by an annotated tag, so that is how one worker
+#     calls another, and the callee's jobs are again the ones checked
+#     here. The ref is held to this tree's release by
+#     multi_distro_build_worker_yaml_spec.bats.
 #
 # Why the hosted allow-list is a label FAMILY pattern rather than a job
 # roster: `ubuntu-*`, `windows-*` and `macos-*` are reserved by GitHub and
@@ -369,7 +376,7 @@ _shg_eligibility_reason() {
   elif [[ "${#_SHG_RUNSON_ITEMS[@]}" -gt 0 ]]; then
     _labels=("${_SHG_RUNSON_ITEMS[@]}")
   elif [[ -n "${_SHG_USES}" ]]; then
-    if [[ "${_SHG_USES}" == ./* ]]; then
+    if [[ "${_SHG_USES}" == ./* ]] || _shg_calls_own_workflow "${_SHG_USES}"; then
       return 1
     fi
     printf "calls the remote reusable workflow '%s', which picks its own runner\n" \
@@ -388,6 +395,29 @@ _shg_eligibility_reason() {
     fi
   done
   return 0
+}
+
+# _shg_calls_own_workflow <uses>
+#
+# Success when <uses> names, by this repo's own slug, a workflow file this
+# tree ships. The slug is read from the one file that defines it; a tree
+# without that file, or a callee this tree does not carry, is not exempt.
+_shg_calls_own_workflow() {
+  local _uses="${1}" _upstream="${REPO_ROOT}/dist/script/base/upstream.sh"
+  local _slug _file
+  [[ -r "${_upstream}" ]] || return 1
+  _slug="$(
+    unset _BASE_UPSTREAM_SOURCED BASE_UPSTREAM_SLUG
+    # shellcheck source=dist/script/base/upstream.sh
+    source "${_upstream}" >/dev/null 2>&1 || true
+    printf '%s' "${BASE_UPSTREAM_SLUG:-}"
+  )"
+  [[ -n "${_slug}" ]] || return 1
+  [[ "${_uses}" == "${_slug}/${_SHG_WORKFLOW_DIR_REL}/"*@?* ]] || return 1
+  _file="${_uses#"${_slug}/${_SHG_WORKFLOW_DIR_REL}/"}"
+  _file="${_file%%@*}"
+  [[ "${_file}" != */* ]] || return 1
+  [[ -f "${REPO_ROOT}/${_SHG_WORKFLOW_DIR_REL}/${_file}" ]]
 }
 
 # _shg_classify_job

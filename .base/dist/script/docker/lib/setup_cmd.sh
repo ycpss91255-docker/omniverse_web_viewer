@@ -102,10 +102,11 @@ _setup_refuse_unknown_key() {
 # by the row its first entry would take (the bridge's --empty-families
 # view), so a family its table does not read is refused like a key.
 #
-# Tables are judged from the layer's own table list (the bridge's
-# --tables view), not only from its key/value rows: a table with no
-# entry -- `[deploy2]` alone, or holding only `args = []` -- projects no
-# row, and a row walk passed it with exit 0 (base#1328 review).
+# Tables are judged from the layer's own table list (config_gen_tables,
+# the config-gen `tables` view, base#1937), not only from its key/value
+# rows: a table with no entry -- `[deploy2]` alone, or holding only
+# `args = []` -- projects no row, and a row walk passed it with exit 0
+# (base#1328 review).
 #
 # A [stage:<name>] table, and anything under it, is not judged here:
 # its keys already pass _validate_stage_override_key where the stage is
@@ -125,7 +126,7 @@ _setup_conf_check_known() {
     local -n _sck_k=_SCK_CONF__keys
     local -A _sck_reported=()
     local _sck_tables=""
-    _sck_tables="$(toml_bridge_parse "${_layer}" --tables)" || return 1
+    config_gen_tables "${_layer}" _sck_tables || return 1
     while IFS= read -r _sect; do
       [[ -z "${_sect}" || "${_sect}" == stage:* ]] && continue
       _setup_known_section "${_sect}" && continue
@@ -1825,6 +1826,33 @@ _setup_apply() {
   if [[ -z "${_base_path}" ]]; then
     _base_path="$(cd -- "${_SETUP_SCRIPT_DIR}/../../../../.." && pwd -P)"
   fi
+
+  # Each tool image is resolved once, here in the top-level shell: the
+  # readers below run inside $(...), where a memo written is lost and every
+  # call would inspect the image again (base#1844). A native binary needs
+  # no image; an override (TOML_BRIDGE_IMAGE / CONFIG_GEN_IMAGE) is taken
+  # verbatim by the resolver.
+  if ! _toml_bridge_use_native; then
+    _toml_bridge_resolve_image || return 1
+  fi
+  # The native verdict is taken once too, and handed down as a dynamically
+  # scoped pin: _config_gen_use_native re-derives the image tag (a digest
+  # over the build inputs) on every call, and config_gen_tables asks it
+  # once per layer (base#1844).
+  local _CONFIG_GEN_NATIVE_PINNED=0
+  if _config_gen_use_native; then
+    _CONFIG_GEN_NATIVE_PINNED=1
+  else
+    config_gen_resolve || return 1
+  fi
+
+  # One merge per layer chain for the whole command: _conf_load_layers keeps
+  # its merged rows in this directory, removed when the command returns
+  # (base#2234).
+  local _CONF_LAYERS_MEMO_DIR=""
+  _CONF_LAYERS_MEMO_DIR="$(mktemp -d 2>/dev/null)" || _CONF_LAYERS_MEMO_DIR=""
+  # shellcheck disable=SC2064  # the path is fixed now, on purpose
+  [[ -n "${_CONF_LAYERS_MEMO_DIR}" ]] && trap "rm -rf -- '${_CONF_LAYERS_MEMO_DIR}'; trap - RETURN" RETURN
 
   _announce_template_default_fallback "${_base_path}"
 

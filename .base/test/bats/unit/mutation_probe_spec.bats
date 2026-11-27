@@ -1452,6 +1452,24 @@ _fallback_runner() {
   assert_output "1"
 }
 
+# why: a red whole-spec baseline is a fault of the suite in the probe's
+# sandbox, and the names of the red tests do not say what went wrong in
+# them. The refusal quotes what bats printed under each red test, so the
+# reader can tell a failed assertion from a test that never finished
+# without a second run. What a passing test printed is left out.
+@test "_mutation_probe: a red whole-spec baseline is refused with what each red test printed (base#2225)" {
+  local _root _runner="${BATS_TEST_TMPDIR}/runner-red-output"
+  _root="$(_probe_fixture)"
+  _fallback_runner "${_runner}" \
+    '  printf "ok 1 the witness\nnot ok 2 the other test\n# (in test file x_spec.bats, line 9)\n#   the reason it failed\nok 3 a later test\n# a note under a passing test\n"; exit 1'
+  run env MUTATION_PROBE_RUNNER="${_runner}" bash -c "source '${PROBE}'; _mutation_probe '${_root}' --subject subject.sh --spec test/bats/unit/x_spec.bats --filter '^the witness\$' --mutate 'sed -i s/right/wrong/ subject.sh'"
+  assert_equal "${status}" 3
+  assert_output --partial "the whole-spec baseline is already red: 2 ok / 1 not ok"
+  assert_output --partial "# (in test file x_spec.bats, line 9)"
+  assert_output --partial "#   the reason it failed"
+  refute_output --partial "a note under a passing test"
+}
+
 # why: a whole-spec baseline that printed no test result is no baseline,
 # so the fall-back has nothing to compare its whole-spec run against and
 # refuses (base#1582).

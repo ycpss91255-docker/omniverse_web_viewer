@@ -558,7 +558,7 @@ td {
 
 <rect x="560" y="414" width="240" height="50" rx="3" fill="var(--surface)" stroke="var(--gen)" stroke-width="1.2"/>
 <text x="680" y="432" text-anchor="middle" font-size="9" fill="var(--text-1)" font-weight="600">toml-bridge</text>
-<text x="680" y="446" text-anchor="middle" font-size="7.5" fill="var(--text-2)">docker run toml-bridge:pinned（Python + tomli）</text>
+<text x="680" y="446" text-anchor="middle" font-size="7.5" fill="var(--text-2)">docker run toml-bridge:pinned（Python + tomllib）</text>
 <text x="680" y="458" text-anchor="middle" font-size="7" fill="var(--gen)">type-aware merge（scalar key-level / array replace）</text>
 
 <!-- Converge -->
@@ -721,7 +721,7 @@ td {
 </figure>
 
 <div class="callout callout-infra">
-<strong>TOML 解析工具（已決）:</strong> 獨立 <code>toml-bridge</code> container image（<code>dockerfile/Dockerfile.toml-bridge</code>），內含 alpine + Python 3 + vendored <code>tomli</code>（PEP 680 backport）。Host 不安裝 Python 或任何額外工具。<code>test-tools</code> 透過 <code>COPY --from</code> 取得 TOML 能力，downstream repo 經 <code>test-tools-stage</code> 繼承。
+<strong>TOML 解析工具（已決）:</strong> 獨立 <code>toml-bridge</code> container image（<code>dockerfile/Dockerfile.toml-bridge</code>），內含 alpine + Python 3，以標準函式庫的 <code>tomllib</code>（PEP 680）解析。Host 不安裝 Python 或任何額外工具。<code>test-tools</code> 透過 <code>COPY --from</code> 取得 TOML 能力，downstream repo 經 <code>test-tools-stage</code> 繼承。
 </div>
 
 <!-- 6. Dockerfile Stageflow -->
@@ -740,7 +740,7 @@ Dockerfile，<code>test-tools</code> 用 <code>COPY --from</code> 取得它的�
 <rect x="20" y="20" width="200" height="80" rx="4" fill="var(--infra-fill)" stroke="var(--infra)" stroke-width="1.5"/>
 <text x="120" y="42" text-anchor="middle" font-size="11" fill="var(--text-1)" font-weight="600">Dockerfile.toml-bridge</text>
 <text x="120" y="58" text-anchor="middle" font-size="8" fill="var(--text-2)">alpine + Python 3</text>
-<text x="120" y="72" text-anchor="middle" font-size="8" fill="var(--text-2)">vendored tomli（PEP 680）</text>
+<text x="120" y="72" text-anchor="middle" font-size="8" fill="var(--text-2)">stdlib tomllib（PEP 680）</text>
 <text x="120" y="86" text-anchor="middle" font-size="7" fill="var(--infra)">dockerfile/Dockerfile.toml-bridge</text>
 
 <line x1="223" y1="60" x2="318" y2="60" stroke="var(--arrow)" stroke-width="1.2" marker-end="url(#ar6)"/>

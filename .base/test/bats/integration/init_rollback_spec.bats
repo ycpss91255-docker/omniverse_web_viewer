@@ -186,6 +186,7 @@ _assert_consumer_unchanged() {
   assert [ ! -e "${CONSUMER}/script/local" ]
   assert [ ! -e "${CONSUMER}/config" ]
   assert [ ! -e "${CONSUMER}/.dockerignore" ]
+  assert [ ! -e "${CONSUMER}/.gitattributes" ]
   assert [ ! -e "${CONSUMER}/.github/workflows/base-version-monitor.yaml" ]
 
   # The pre-relocation root wrapper the resync deletes before relinking.

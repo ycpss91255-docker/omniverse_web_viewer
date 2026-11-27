@@ -750,9 +750,10 @@ states the rule and the placement together -- "this repo already decided
 that the PR body is the canonical decision record, enforced by a hook on
 `gh pr create` ... A changelog entry answers two questions -- what
 changed, and does it affect me. Not why, and not what was rejected";
-ADR-00000013 (drop the transient issue number from a code comment, keep
-the sentence -- the number's reader is in the tracker, the sentence's
-reader is in the file); ADR-00000027 sec.3 (the release classification's
+ADR-00000013 (a code comment says only what the code does and its
+non-obvious constraints -- the issue number and the reason for a change
+have their reader in the tracker and in git, not in the file);
+ADR-00000027 sec.3 (the release classification's
 reasoning is recorded so a wrong call is reviewable rather than
 invisible).
 *Serves:* invariant 10 -- this is its "authored, not derived" half asked

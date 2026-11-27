@@ -4,7 +4,7 @@
 # pinned golang image (base#1440).
 #
 # A config-gen step: script/test/config_gen_gates.sh runs it before the
-# gates, in every environment `just test go` reaches, and the redpath runs
+# gates, in every environment, and the redpath runs
 # it again on each scratch copy. It reads everything relative to its own
 # root (three directories up), never the caller's checkout.
 #

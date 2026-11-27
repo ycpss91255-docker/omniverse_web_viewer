@@ -163,6 +163,8 @@ source "${SCRIPT_DIR}/drivers/log_event_registry.sh"
 source "${SCRIPT_DIR}/drivers/toml_fixture.sh"
 # shellcheck source=script/test/drivers/canonical_ignore_sync.sh
 source "${SCRIPT_DIR}/drivers/canonical_ignore_sync.sh"
+# shellcheck source=script/test/drivers/tracked_crlf.sh
+source "${SCRIPT_DIR}/drivers/tracked_crlf.sh"
 # shellcheck source=script/test/drivers/shell_metrics.sh
 source "${SCRIPT_DIR}/drivers/shell_metrics.sh"
 
@@ -211,6 +213,7 @@ readonly _LINT_TOOLS=(
   test-name-backtick
   toml-fixture
   canonical-ignore-sync
+  tracked-crlf
 )
 
 # ORDER IS NOT A FAIL-FAST LEVER. It reads like one -- put the cheap
@@ -508,6 +511,7 @@ _run_lint_tool() {
     log-event-registry) _run_log_event_registry ;;
     toml-fixture)     _run_toml_fixture ;;
     canonical-ignore-sync) _run_canonical_ignore_sync ;;
+    tracked-crlf)     _run_tracked_crlf ;;
     # The three implementation-standard metric lints and their combined
     # report (base#994 phase 2). Dispatchable here -- this is the one
     # place a lint driver is run, and the ERR trap above is what names
@@ -873,6 +877,11 @@ Options:
                           refuses leaves an empty config handle, so a test
                           asserting a schema default passes without its
                           fixture ever being read)
+  --tracked-crlf          With --lint: run only the tracked CRLF lint (no
+                          tracked file is stored with CRLF line endings
+                          in the git index unless .gitattributes marks
+                          its path `-text`; the root .gitattributes rule
+                          `* text=auto eol=lf` covers the checkout side)
   --just-provenance       With --lint: run only the just provenance pin
                           lint (every site under dockerfile/,
                           .github/workflows/, dist/ or script/ that
@@ -1106,6 +1115,7 @@ Examples:
   just test lint --test-name-backtick # @test name backtick lint only
   just test lint --log-event-registry # log event registry lint only
   just test lint --toml-fixture   # TOML fixture body gate only
+  just test lint --tracked-crlf   # tracked CRLF lint only
   ./test.sh --shellcheck-only     # Direct shellcheck, no compose
   ./test.sh --doc-counts-only     # Direct doc/test count drift gate, no compose
   ./test.sh --readme-sync-only    # Direct localized README sync lint, no compose
@@ -1131,6 +1141,7 @@ Examples:
   ./test.sh --log-event-registry-only # Direct log event registry lint, no compose
   ./test.sh --toml-fixture-only   # Direct TOML fixture body gate, no compose
   ./test.sh --canonical-ignore-sync-only # Direct canonical ignore-sync lint, no compose
+  ./test.sh --tracked-crlf-only   # Direct tracked CRLF lint, no compose
   ./test.sh --hadolint-only       # Hadolint only (inside ci container)
   ./test.sh --bats-only           # Compose-bats only, skip ShellCheck
   ./test.sh --bats-unit-shard 1/2 # Compose-bats unit shard 1 of 2
@@ -2930,6 +2941,7 @@ main() {
       --test-name-backtick) lint_tool="test-name-backtick"; shift ;;
       --log-event-registry) lint_tool="log-event-registry"; shift ;;
       --toml-fixture) lint_tool="toml-fixture"; shift ;;
+      --tracked-crlf) lint_tool="tracked-crlf"; shift ;;
       --group) lint_group="${2:?--group expects <n>/<total>}"; shift 2 ;;
       --shellcheck-only) host_lint="shellcheck"; shift ;;
       --issueref-only) host_lint="issueref"; shift ;;
@@ -2960,6 +2972,7 @@ main() {
       --log-event-registry-only) host_lint="log-event-registry"; shift ;;
       --toml-fixture-only) host_lint="toml-fixture"; shift ;;
       --canonical-ignore-sync-only) host_lint="canonical-ignore-sync"; shift ;;
+      --tracked-crlf-only) host_lint="tracked-crlf"; shift ;;
       --nesting-depth-only) host_lint="nesting-depth"; shift ;;
       --function-length-only) host_lint="function-length"; shift ;;
       --positional-params-only) host_lint="positional-params"; shift ;;
@@ -3494,24 +3507,10 @@ main() {
       elif [[ "${bats_only}" == "1" ]]; then
         BATS_ONLY=1 _run_via_compose ci 0
       else
-        # The no-flag `just test` is split around the required-kill roster
-        # (base#1461): it runs on the host, because it builds sandbox
-        # copies and its probe drives compose itself, after the lint phase
-        # and before bats, and a red roster stops the run before bats.
-        LINT_ONLY=1 _run_via_compose ci 0
-        _run_mutation_required \
-          || _die ci_mutation_required_failed "the required-kill mutation roster failed; see the mutation_required_* events above"
-        BATS_ONLY=1 _run_via_compose ci 0
+        _run_via_compose ci 0
       fi
       ;;
   esac
-}
-
-# _run_mutation_required -- the required-kill roster over this checkout
-# (base#1461), on the host. Its own function so the dispatch above can be
-# read, and specced, apart from the probes it runs.
-_run_mutation_required() {
-  bash "${REPO_ROOT}/script/test/drivers/mutation_required.sh" --root "${REPO_ROOT}"
 }
 
 # ── End-of-run reclaim ───────────────────────────────────────────────────────

@@ -13,8 +13,8 @@ on:
     tags:
       - 'v*'
   pull_request:
-  # The merge queue runs the full suite on the queued group before it
-  # reaches main (base#1587).
+  # The merge queue runs all but the release-only jobs on the queued group
+  # before it reaches main.
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -185,7 +185,7 @@ jobs:
     #                          under test (#1011). The script's header
     #                          carries the reasoning for each line.
     # Non-PR events (push / tag / workflow_dispatch) default to 'true' on
-    # both outputs so post-merge / release builds run the full suite.
+    # both outputs, so no diff narrows a post-merge or release build.
     # See issue #317 for the classifier's design; #1011 for why the system
     # pathspecs live in a script rather than in a list.
     needs: actionlint
@@ -206,8 +206,10 @@ jobs:
       # select_<job>: whether the diff can affect each classify-gated job
       # (base#1584). Each gated job's `if:` reads its own key, and the
       # rollup passes that job's skip only when the same key is `false`.
-      # The names are script/ci/check_selection.sh --jobs.
+      # The names are script/ci/check_selection.sh --jobs, and the diff
+      # step's release_jobs.
       select_config_gen: ${{ steps.diff.outputs.select_config_gen }}
+      select_config_gen_redpath: ${{ steps.diff.outputs.select_config_gen_redpath }}
       select_coverage: ${{ steps.diff.outputs.select_coverage }}
       select_coverage_gate: ${{ steps.diff.outputs.select_coverage_gate }}
       select_acceptance: ${{ steps.diff.outputs.select_acceptance }}
@@ -240,6 +242,7 @@ jobs:
       - id: diff
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
           BASE_REF: ${{ github.base_ref }}
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -278,8 +281,18 @@ jobs:
             echo "::warning::could not derive the tooling image's inputs;" \
                  "rebuilding the test-tools image from source"
           fi
+          # The release-only jobs (ADR-00000042): the event and the ref alone
+          # decide, and one the case does not name runs them.
+          release_jobs=(mutation_roster config_gen_redpath)
+          release_run=true
+          case "${EVENT_NAME}:${EVENT_REF:-}" in
+            pull_request:* | merge_group:* | push:refs/heads/*) release_run=false ;;
+          esac
+          for job in "${release_jobs[@]}"; do
+            echo "select_${job}=${release_run}" >> "${GITHUB_OUTPUT}"
+          done
           if [[ "${EVENT_NAME}" != "pull_request" ]]; then
-            # push to main / tag push / workflow_dispatch -- full suite.
+            # push to main / tag push / workflow_dispatch -- no diff narrows it.
             #
             # testtools_changed used to be the literal false here, on every
             # non-PR event including the ONE that can answer it: a push
@@ -312,11 +325,10 @@ jobs:
               echo "code_changed=true"
               echo "system_relevant=true"
               echo "testtools_changed=${testtools}"
-              # Every gated job is selected off a pull request, so main
-              # runs the full suite (owner decision, base#1584).
+              # Every job a diff can affect is selected off a pull request.
               for job in config_gen coverage coverage_gate acceptance system \
                          worker_selftest shellcheck hadolint bats_fragile \
-                         mutation_roster test_tools_image_arm64; do
+                         test_tools_image_arm64; do
                 echo "select_${job}=true"
               done
             } >> "${GITHUB_OUTPUT}"
@@ -359,7 +371,7 @@ jobs:
           fi
           for job in config-gen coverage coverage-gate acceptance system \
                      worker-selftest shellcheck hadolint bats-fragile \
-                     mutation-roster test-tools-image-arm64; do
+                     test-tools-image-arm64; do
             val="$(sed -n "s/^${job}=//p" <<< "${sel_out}")"
             [[ "${val}" == "false" ]] || val=true
             echo "select_${job//-/_}=${val}" >> "${GITHUB_OUTPUT}"
@@ -914,6 +926,14 @@ jobs:
     #                     entry added to the function fails until the file
     #                     agrees. One-directional (extras allowed), which
     #                     is what _sync_dockerignore does for a consumer
+    #   tracked-crlf      no tracked file is stored with CRLF line endings
+    #                     in the git index unless .gitattributes marks its
+    #                     path `-text`. The root .gitattributes rule
+    #                     `* text=auto eol=lf` fixes the checkout side;
+    #                     this reads the index side, which is the same
+    #                     bytes on a Windows clone and on this runner, and
+    #                     which `text=auto` leaves alone for a file
+    #                     already committed with a CR
     #
     # GROUPED, not one job per driver, and not one job for the phase
     # (base#1071). One job per driver read best in the checks list -- the
@@ -1112,8 +1132,7 @@ jobs:
           bash script/ci/single_issue_pr.sh
 
   mutation-roster:
-    # The required-kill mutation roster (base#1461), the hosted leg of the
-    # check the no-flag `just test` runs between lint and bats. It ran
+    # The required-kill mutation roster: `just test mutation-required`. It ran
     # inside the lint-static legs until base#1571, where it took most of
     # each leg's time and the checks page named it as a lint group; it is
     # a job of its own so its name says what it runs. Every leg runs it,
@@ -1132,10 +1151,8 @@ jobs:
     # case "every mutation-roster leg's list-scheduling bound over its
     # worker slots fits 240 s", a bound over seconds.txt, not a timed job.
     #
-    # A docs-only pull request skips it: no row mutates a document, and the
-    # cases the rows' witnesses name read none (base#2110). Every other run has it whole, because choosing roster
-    # rows from a diff belongs to base#1604, not to the job selection of
-    # base#1584.
+    # Release-only (ADR-00000042): a tag push and workflow_dispatch run it,
+    # and the tag's `release` job needs it.
     needs: [actionlint, classify, test-tools-image-amd64]
     if: needs.classify.outputs.select_mutation_roster == 'true'
     runs-on: ubuntu-latest
@@ -1961,9 +1978,8 @@ jobs:
     # P3 (#317) gated this on the narrower `system_relevant` output so
     # PRs that change pure lint / unit-test / doc paths don't burn the
     # docker.sock-mounted compose run (script/ci/system_paths.sh, #1011).
-    # Since base#1584 classify's map decides, like every gated job: docs
-    # and unit or integration `*_spec.bats` leaves drop it; a system spec,
-    # a justfile and any other path run it.
+    # classify's map decides: docs and unit or integration `*_spec.bats`
+    # leaves drop it; a system spec, a justfile and any other path run it.
     if: needs.classify.outputs.select_system == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -2094,12 +2110,8 @@ jobs:
     if: needs.classify.outputs.select_config_gen == 'true'
     # The config generator's Go gates (ADR-00000039): fmt, vet, lint, race
     # and coverage in dockerfile/Dockerfile.config-gen's test stage and the
-    # binary's usage contract, as ONE command, `just test go-gates`. With
-    # the config-gen-redpath matrix below it is `just test go`, the command
-    # the self-hosted coverage-local.yaml job and the pre-PR mirror run, so
-    # a green here and a green there are one claim. The two were one job
-    # until base#1547: the redpath's serial cases took that job to about 91
-    # minutes.
+    # binary's usage contract, as ONE command, `just test go-gates`, which
+    # the pre-PR mirror runs too.
     #
     # Each config-gen job is compared WHOLE by self_test_yaml_spec.bats: its
     # keys, its `if`, its steps (the checkout, the three just-pin steps
@@ -2111,11 +2123,8 @@ jobs:
     # `continue-on-error`, a job or workflow `env:` such as BASH_ENV, a
     # `defaults:` block, a setup step that exports BASH_ENV through
     # $GITHUB_ENV -- fails that spec rather than leaving this job green
-    # with the gates unrun. Both config-gen jobs read the same inputs, so
-    # both gate on the one classify key select_config_gen (base#1584): the
-    # map drops it for docs, spec leaves and exact config-gen deny-list
-    # paths, and ci-rollup passes either job's skip only when that key is
-    # `false`.
+    # with the gates unrun. The map drops select_config_gen for docs, spec
+    # leaves and exact config-gen deny-list paths.
     runs-on: ubuntu-latest
     # The gates' test and final stages: two docker builds and the mutation
     # gate over the changed packages. A ceiling, not a budget; not raised
@@ -2159,7 +2168,10 @@ jobs:
   config-gen-redpath:
     name: Config-gen redpath shard ${{ matrix.shard }}/5${{ matrix.label }} (base#1547)
     needs: [classify]
-    if: needs.classify.outputs.select_config_gen == 'true'
+    if: needs.classify.outputs.select_config_gen_redpath == 'true'
+    # Release-only (ADR-00000042): a tag push and workflow_dispatch run it,
+    # and the tag's `release` job needs it.
+    #
     # The redpath, which plants one defect per gate in a scratch copy and
     # requires each to go red on its own gate, split into the shards
     # script/test/config_gen_redpath_shards.tsv names (base#1547): each job
@@ -2262,12 +2274,10 @@ jobs:
     # Conditionally-gated jobs (shellcheck / hadolint / bats-fragile /
     # coverage / coverage-gate / acceptance / system / worker-selftest /
     # mutation-roster / test-tools-image-arm64) each run under `if: needs.classify.outputs.select_<job> == 'true'`;
-    # config-gen-gates and config-gen-redpath both run under
-    # `select_config_gen` (base#1547 split one job into two). Each key is
-    # one classify writes from the base side's map
-    # (script/ci/selection_at_base.sh). The `if:` and this rollup read the
-    # same key, so a skip passes only where classify decided it (#317
-    # P1/P3, #376, #377, #615, #677, base#1584).
+    # config-gen-gates runs under `select_config_gen` and config-gen-redpath
+    # under `select_config_gen_redpath`. classify writes each key, from the
+    # base side's map (script/ci/selection_at_base.sh) or, for a release-only
+    # job, from the event.
     #
     # `coverage` is IN `needs:` (#615, ADR-00000008): a sharded kcov PR
     # gate -- a kcov test failure fails the matrix and this rollup. The
@@ -2320,9 +2330,9 @@ jobs:
           # is excused only when the classify key the job's `if:` reads is
           # exactly "false"; a failed classify leaves every key empty, so
           # then no skip is. The job-to-key map is explicit, never a
-          # rewrite of the job name: config-gen-gates and
-          # config-gen-redpath both read select_config_gen (base#1547),
-          # and a job the map does not name has no key, so its skip fails.
+          # rewrite of the job name: config-gen-gates reads
+          # select_config_gen, and a job the map does not name has no key,
+          # so its skip fails.
           verdicts="$(jq -r '
             {
               "shellcheck": "select_shellcheck",
@@ -2334,7 +2344,7 @@ jobs:
               "system": "select_system",
               "worker-selftest": "select_worker_selftest",
               "config-gen-gates": "select_config_gen",
-              "config-gen-redpath": "select_config_gen",
+              "config-gen-redpath": "select_config_gen_redpath",
               "mutation-roster": "select_mutation_roster",
               "test-tools-image-arm64": "select_test_tools_image_arm64"
             } as $keys
@@ -2385,7 +2395,7 @@ jobs:
             if [[ "${doc_only}" == "true" ]]; then
               echo "::notice::Passed as a doc-only change: the diff touched nothing but Markdown under doc/, README.md, LICENSE and CONTEXT.md, so every gated job above skipped by design. This green means the classification held, not that the suite ran."
             else
-              echo "::notice::Passed with jobs classify deselected for this diff, skipped by design:${deselected}"
+              echo "::notice::Passed with jobs classify deselected for this run, skipped by design:${deselected}"
             fi
           fi
           exit "${fail}"

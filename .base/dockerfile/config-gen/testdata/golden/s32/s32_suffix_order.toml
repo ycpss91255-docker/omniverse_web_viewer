@@ -1,0 +1,24 @@
+[[image.rules]]
+rule = "prefix:docker_"
+
+[[image.rules]]
+rule = "@basename"
+
+[[image.rules]]
+
+[[image.rules]]
+
+[[image.rules]]
+
+[[image.rules]]
+
+[[image.rules]]
+
+[[image.rules]]
+rule = "@parent"
+
+[[image.rules]]
+
+[[image.rules]]
+rule = "suffix:_ws"
+

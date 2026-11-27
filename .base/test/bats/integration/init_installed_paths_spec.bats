@@ -22,11 +22,20 @@ setup() {
   export LOG_FORMAT=text
   load "${BATS_TEST_DIRNAME}/../unit/test_helper"
 
+  # setup.sh reads the declared tables through config_gen_tables; the test
+  # container has no docker daemon (base#1937).
+  create_mock_dir
+  mock_config_gen_docker
+
   CONSUMER="${BATS_TEST_TMPDIR}/consumer"
   # The consumer's OWN vendored copy, not /source: base's checkout carries
   # .git, which the self-run guard reads as "this is the template source"
   # and refuses. The vendored copy is also what a real upgrade executes.
   INIT="./.base/dist/script/base/init.sh"
+}
+
+teardown() {
+  cleanup_mock_dir
 }
 
 # _seed_consumer

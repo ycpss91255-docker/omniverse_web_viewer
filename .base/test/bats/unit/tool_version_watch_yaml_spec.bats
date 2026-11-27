@@ -34,6 +34,45 @@ _job() {
   awk -v j="  ${1}:" '$0 == j {flag=1; next} /^  [a-z]/{flag=0} flag' "${WF}"
 }
 
+# What the stand-in check.sh writes: the report on stderr, and on stdout two
+# rows in the shape `--drift-tsv` prints.
+readonly _REPORT='stand-in report line'
+readonly _ROWS=$'toola\tv1.0.0\tv1.1.0\tdockerfile/Dockerfile.a\t12\ntoolb\t2.0\t3.0\tdir/b.yaml\t7\n'
+readonly _MATRIX='[{"name":"toola","from":"v1.0.0","to":"v1.1.0","file":"dockerfile/Dockerfile.a","line":"12"},{"name":"toolb","from":"2.0","to":"3.0","file":"dir/b.yaml","line":"7"}]'
+
+# _run_scan <status> <rows> -- run the scan step's script as the runner does
+# (`bash -e`); check.sh takes only `--drift-tsv`, prints <rows>, exits <status>.
+_run_scan() {
+  SCAN="${BATS_TEST_TMPDIR}/scan"
+  mkdir -p "${SCAN}/script/watch"
+  : > "${SCAN}/output"
+  : > "${SCAN}/summary"
+  cat > "${SCAN}/script/watch/check.sh" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" != '--drift-tsv' ]]; then
+  printf 'unexpected arguments: %s\n' "$*" >&2
+  exit 64
+fi
+printf '%s' "${STUB_ROWS}"
+printf '%s\n' "${STUB_REPORT}" >&2
+exit "${STUB_STATUS}"
+STUB
+  chmod +x "${SCAN}/script/watch/check.sh"
+
+  local _body
+  _body="$(yaml_step_run "${WF}" scan scan)" || fail "${_body}"
+  [[ -n "${_body}" ]] || fail "no scan step with a run script in ${WF}"
+  # /tmp is shared by parallel cases; give each its own directory.
+  [[ "${_body}" == *'/tmp/'* ]] \
+    || fail "the scan step writes nothing under /tmp; give its report file a per-test path here"
+  printf '%s\n' "${_body//\/tmp\//${SCAN}/}" > "${SCAN}/step.sh"
+
+  cd "${SCAN}"
+  run env STUB_STATUS="${1}" STUB_ROWS="${2}" STUB_REPORT="${_REPORT}" \
+    GITHUB_OUTPUT="${SCAN}/output" GITHUB_STEP_SUMMARY="${SCAN}/summary" \
+    bash -e "${SCAN}/step.sh"
+}
+
 # ════════════════════════════════════════════════════════════════════
 # It runs on a schedule, and by hand
 # ════════════════════════════════════════════════════════════════════
@@ -237,6 +276,60 @@ _job() {
   run _job scan
   assert_success
   assert_output --partial '-ne 10'
+}
+
+# why: the cases below run the step as `bash -e`, true only while no shell is set
+@test "tool-version-watch: nothing sets a shell for the scan step, so the runner uses bash -e (base#2135)" {
+  run _yaml_eval "${WF}" '.defaults | tag'
+  assert_output '!!null'
+  run _yaml_eval "${WF}" '.jobs.scan | has("defaults")'
+  assert_output 'false'
+  run _yaml_eval "${WF}" '.jobs.scan.steps[] | select(.id == "scan") | has("shell")'
+  assert_output 'false'
+}
+
+# why: a failed comparison must print its report and hand bump nothing
+@test "tool-version-watch: check.sh exiting 1 fails the scan step with the report printed (base#2135)" {
+  _run_scan 1 "${_ROWS}"
+  assert_failure 1
+  assert_output --partial "${_REPORT}"
+  assert_line --regexp '^::error::.*UNRESOLVED'
+  run cat "${SCAN}/output"
+  assert_output ''
+}
+
+# why: drift must pass the step and reach bump as a matrix
+@test "tool-version-watch: check.sh exiting 10 passes the scan step and hands bump the matrix (base#2135)" {
+  _run_scan 10 "${_ROWS}"
+  assert_success
+  assert_output --partial "${_REPORT}"
+  run sed -n 's/^drift=//p' "${SCAN}/output"
+  assert_output "${_MATRIX}"
+  run sed -n 's/^count=//p' "${SCAN}/output"
+  assert_output '2'
+  run cat "${SCAN}/summary"
+  assert_output --partial "${_REPORT}"
+}
+
+# why: a week with no drift ends green with count=0, which skips bump
+@test "tool-version-watch: check.sh exiting 0 passes the scan step with an empty matrix (base#2135)" {
+  _run_scan 0 ''
+  assert_success
+  assert_output --partial "${_REPORT}"
+  run sed -n 's/^drift=//p' "${SCAN}/output"
+  assert_output '[]'
+  run sed -n 's/^count=//p' "${SCAN}/output"
+  assert_output '0'
+}
+
+# why: an unknown status is not a clean week; it fails with its report
+@test "tool-version-watch: check.sh exiting any other status fails the scan step with that status (base#2135)" {
+  _run_scan 2 "${_ROWS}"
+  assert_failure 2
+  assert_output --partial "${_REPORT}"
+  assert_line --regexp '^::error::.*2'
+  run cat "${SCAN}/output"
+  assert_output ''
 }
 
 # why: Two walks can disagree, and each costs a request per pin against a 60/hour

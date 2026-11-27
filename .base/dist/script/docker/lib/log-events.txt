@@ -287,6 +287,8 @@ gitignore_managed_block_orphans
 gitignore_prune_mode_failed
 gitignore_untrack_ls_files_failed
 gitignore_untrack_rm_failed
+gitattributes_managed_block_invalid
+gitattributes_sync_failed
 
 # template_guard.sh (init/upgrade self-run guard)
 base_self_run_refused
@@ -299,6 +301,7 @@ ci_invalid_shard
 ci_empty_shard
 ci_no_docker_socket
 ci_no_docker_cli
+ci_system_skip
 ci_unknown_option
 ci_bats_path_not_found
 ci_bats_path_system
@@ -337,6 +340,7 @@ ci_test_name_backtick
 ci_log_event_registry
 ci_toml_fixture
 ci_canonical_ignore_sync
+ci_tracked_crlf
 ci_home_literal
 ci_arch_literal
 ci_moving_tag
@@ -510,8 +514,7 @@ config_gen_input_not_regular
 config_gen_input_unreadable
 config_gen_output_failed
 
-# script/test/drivers/mutation_required.sh (the required-kill roster runner,
-# base#1461) and the no-flag `just test` dispatch that runs it.
+# script/test/drivers/mutation_required.sh (the required-kill roster runner).
 mutation_required_usage_invalid
 mutation_required_roster_empty
 mutation_required_row_invalid
@@ -524,7 +527,6 @@ mutation_required_pinned
 mutation_required_interrupted
 mutation_required_row_timed
 mutation_required_row_dealt
-ci_mutation_required_failed
 
 # script/watch/lib.sh (the go.mod scanner of the pin registry) and
 # script/test/config_gen_steps/20-gomod-oracle.sh, which holds that scanner

@@ -246,6 +246,10 @@ compose.yaml     <- from setup.toml (infrastructure)
 for base are the Go `config-gen`; toml-bridge remains for Python
 consumers.*
 
+*Amended by #2184 (2026-11-26): the standalone image no longer vendors
+`tomli`. It pins Python 3.13, whose stdlib `tomllib` the bridge imports
+first, so the vendored copy was never loaded.*
+
 **Containerised parsing.** TOML is parsed before `docker compose up`
 -- the parse results ARE its inputs. The parser runs in a dedicated
 container image (`toml-bridge`), not on the host: the host contract
@@ -253,10 +257,9 @@ is Docker + Git + `just` and nothing else, and a host-side Python or
 binary would add a fourth dependency whose version the project cannot
 control across Ubuntu 16.04--24.04 machines. Docker is already
 required, so invoking the parser via `docker run` adds no new
-prerequisite. Inside the container the parser is Python with vendored
-`tomli` (the backport accepted into the stdlib as `tomllib` via
-PEP 680), which is zero-dependency, ~1000 lines, MIT-licensed, and
-supports Python 3.6+. The merge logic (type-aware: scalar key-level,
+prerequisite. Inside the container the parser is Python with its stdlib
+`tomllib` (PEP 680, Python 3.11+), so the image installs no package
+beside the interpreter. The merge logic (type-aware: scalar key-level,
 array replace) also runs in Python where the type information is
 native (`dict` vs `list`). The `toml-bridge` image is a standalone
 Dockerfile (`dockerfile/Dockerfile.toml-bridge`).
@@ -277,8 +280,8 @@ inside the suite, and the smoke step of `release-test-tools.yaml` before
 any tag names the published content.
 
 Alpine's `python3` is 3.12, whose stdlib carries `tomllib`, so the
-`tomli` fallback is not installed there; it stays in the standalone
-image, which is the one that has to work on a 3.6--3.10 runtime.
+`tomli` fallback is not installed there. The standalone image pins 3.13
+and does not install it either (#2184).
 
 ## Alternatives
 
