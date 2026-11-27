@@ -41,6 +41,10 @@ setup() {
   STARTED="${TMP}/producer-started"
   ARGV_LOG="${TMP}/docker-argv.log"
   ATT_SRC="${TMP}/staged-attestation.json"
+  VERIFIER_IMAGES="${TMP}/verifier-images.log"
+  # Recorded while python3 is still on PATH: the verifier emulator uses it in
+  # place of the verifier image's interpreter, after a test removes python3.
+  STUB_PYTHON="$(command -v python3 || true)"
 
   mkdir -p "${STUB_BIN}" "${ARTIFACTS}"
   _write_docker_stub
@@ -214,10 +218,32 @@ _write_passing_docker_stub() {
     'sub="${1:-}"' \
     'shift || true' \
     'case "${sub}" in' \
-    '  image | pull | rm | inspect | stop | kill) exit 0 ;;' \
+    '  image | pull)' \
+    '    # OWV_STUB_MISSING_IMAGE: an image reference containing this text is' \
+    '    # neither present locally nor pullable.' \
+    '    if [ -n "${OWV_STUB_MISSING_IMAGE:-}" ]; then' \
+    '      for a in "$@"; do' \
+    '        case "${a}" in' \
+    '          *"${OWV_STUB_MISSING_IMAGE}"*) exit 1 ;;' \
+    '        esac' \
+    '      done' \
+    '    fi' \
+    '    exit 0' \
+    '    ;;' \
+    '  rm | inspect | stop | kill) exit 0 ;;' \
     '  run)' \
-    '    : >"${OWV_STUB_STARTED}"' \
     '    printf "%s\\n" "$*" >>"${OWV_STUB_ARGV}"' \
+    '    # The attestation verifier runs in a container too. A stub that' \
+    '    # answered it with exit 0 would wave every forged attestation' \
+    '    # through, so it is handed to an emulator that really runs it.' \
+    '    for a in "$@"; do' \
+    '      case "${a}" in' \
+    '        */verify_tier_b_attestation.py)' \
+    '          exec "$(dirname "$0")/docker-run-verifier" "$@"' \
+    '          ;;' \
+    '      esac' \
+    '    done' \
+    '    : >"${OWV_STUB_STARTED}"' \
     '    # Standing in for the acceptance container: the evidence appears' \
     '    # DURING the run, written by the thing that saw the frame -- which' \
     '    # is the only way it appears for real. A test that pre-plants it is' \
@@ -249,6 +275,121 @@ _write_passing_docker_stub() {
     'esac' \
     > "${STUB_BIN}/docker"
   chmod 0755 "${STUB_BIN}/docker"
+  _write_verifier_run_emulator
+}
+
+# `docker run` for the attestation verifier, emulated without a daemon.
+#
+# The verifier must be run, not stubbed: the wrong-commit, wrong-run and
+# black-frame cases below only mean something if a real verifier reads the
+# real attestation. So this parses the `docker run` command line the driver
+# emits and runs the command it names, the way a container would see it:
+#   - ONLY the `-e` values on that command line reach it (`env -i`), so a
+#     driver that forgets `-e GITHUB_SHA` disables nothing here silently --
+#     the wrong-commit case would pass and go red;
+#   - container paths are translated through the `-v` mounts, so a file the
+#     driver did not mount is a file the verifier cannot find;
+#   - `python3` resolves to the interpreter recorded BEFORE the test strips
+#     python3 from PATH (OWV_STUB_PYTHON), standing in for the image's own.
+# An option it does not know fails the run (125, docker's own code for "the
+# run did not start") rather than being skipped over.
+_write_verifier_run_emulator() {
+  cat > "${STUB_BIN}/docker-run-verifier" <<'EMU'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = "run" ] && shift
+mounts=()
+envs=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rm | --read-only) shift ;;
+    --network=* | --name=* | --user=* | --pull=*) shift ;;
+    --network | --name | --user | --pull) shift 2 ;;
+    -v | --volume) mounts+=("$2"); shift 2 ;;
+    -e | --env) envs+=("$2"); shift 2 ;;
+    -*) printf 'docker-run-verifier: unsupported option %s\n' "$1" >&2; exit 125 ;;
+    *) break ;;
+  esac
+done
+[ "$#" -ge 2 ] || { printf 'docker-run-verifier: no image/command\n' >&2; exit 125; }
+printf '%s\n' "$1" >>"${OWV_STUB_VERIFIER_IMAGES}"
+shift
+
+to_host() {
+  local p="$1" m src rest dst
+  for m in "${mounts[@]}"; do
+    src="${m%%:*}"
+    rest="${m#*:}"
+    dst="${rest%%:*}"
+    case "${p}" in
+      "${dst}") printf '%s' "${src}"; return 0 ;;
+      "${dst}"/*) printf '%s' "${src}${p#"${dst}"}"; return 0 ;;
+    esac
+  done
+  # Not under any mount: inside a container it would not exist either.
+  printf '/nonexistent-in-container%s' "${p}"
+}
+
+cenv=()
+for kv in "${envs[@]}"; do
+  case "${kv}" in
+    *=*)
+      key="${kv%%=*}"
+      value="${kv#*=}"
+      case "${value}" in /*) value="$(to_host "${value}")" ;; esac
+      cenv+=("${key}=${value}")
+      ;;
+    *) cenv+=("${kv}=${!kv:-}") ;;
+  esac
+done
+
+cmd=()
+for a in "$@"; do
+  case "${a}" in
+    python3) cmd+=("${OWV_STUB_PYTHON}") ;;
+    /*) cmd+=("$(to_host "${a}")") ;;
+    *) cmd+=("${a}") ;;
+  esac
+done
+
+# A verifier that exits 0 but prints something other than the one summary
+# line, for the driver's output-shape check: OWV_STUB_VERIFIER_REPLACE_STDOUT
+# replaces its stdout, OWV_STUB_VERIFIER_EXTRA_LINE appends a line to it.
+if [ -n "${OWV_STUB_VERIFIER_REPLACE_STDOUT:-}" ]; then
+  env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}" >/dev/null
+  printf '%s\n' "${OWV_STUB_VERIFIER_REPLACE_STDOUT}"
+  exit 0
+fi
+if [ -n "${OWV_STUB_VERIFIER_EXTRA_LINE:-}" ]; then
+  env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}"
+  printf '%s\n' "${OWV_STUB_VERIFIER_EXTRA_LINE}"
+  exit 0
+fi
+
+exec env -i PATH=/nonexistent "${cenv[@]}" "${cmd[@]}"
+EMU
+  chmod 0755 "${STUB_BIN}/docker-run-verifier"
+}
+
+# A PATH carrying every command the test PATH does EXCEPT python*, i.e. the
+# GPU runner host: docker, git and just are installed there and python3 is not.
+# Symlinks to the real tools, so nothing else about the environment changes.
+_path_without_python() {
+  local nopy="${TMP}/nopy" dir tool name
+  local -a dirs
+  mkdir -p "${nopy}"
+  IFS=: read -r -a dirs <<<"${PATH}"
+  for dir in "${dirs[@]}"; do
+    [ -d "${dir}" ] || continue
+    [ "${dir}" = "${STUB_BIN}" ] && continue
+    for tool in "${dir}"/*; do
+      name="${tool##*/}"
+      case "${name}" in python*) continue ;; esac
+      [ -x "${tool}" ] || continue
+      [ -e "${nopy}/${name}" ] || ln -s "${tool}" "${nopy}/${name}"
+    done
+  done
+  printf '%s' "${STUB_BIN}:${nopy}"
 }
 
 # Run the driver to completion against the passing stub. Extra env assignments
@@ -262,6 +403,8 @@ _run_driver_to_completion() {
     OWV_STUB_STARTED="${STARTED}" \
     OWV_STUB_ARGV="${ARGV_LOG}" \
     OWV_STUB_ATT_SRC="${ATT_SRC}" \
+    OWV_STUB_PYTHON="${STUB_PYTHON}" \
+    OWV_STUB_VERIFIER_IMAGES="${VERIFIER_IMAGES}" \
     OWV_STUB_ATT_DST="${ARTIFACTS}/${ATTESTATION_NAME}" \
     TIER_B_INSTANCE="${STUB_INSTANCE}" \
     TIER_B_PRODUCER_IMAGE="stub/producer:0.0.0" \
@@ -381,9 +524,15 @@ _write_attestation() {
     GITHUB_RUN_ID=777
   [ "${status}" -eq 0 ]
 
-  # The viewer is the last container the driver starts.
-  grep -q -- '-e GITHUB_SHA=abc0000000000000000000000000000000000abc' "${ARGV_LOG}"
-  grep -q -- '-e GITHUB_RUN_ID=777' "${ARGV_LOG}"
+  # ONLY the acceptance (viewer) container's command line -- the one that runs
+  # run-tier-b.sh. The attestation verifier is a container too (#124) and is
+  # handed the same two flags, so grepping the whole argv log would stay green
+  # even if the viewer stopped receiving them.
+  local viewer_argv
+  viewer_argv="$(grep -- 'run-tier-b.sh' "${ARGV_LOG}")"
+  [ "$(printf '%s\n' "${viewer_argv}" | wc -l)" -eq 1 ]
+  [[ "${viewer_argv}" == *"-e GITHUB_SHA=abc0000000000000000000000000000000000abc"* ]]
+  [[ "${viewer_argv}" == *"-e GITHUB_RUN_ID=777"* ]]
 }
 
 # An attestation planted before the run is not this run's evidence.
@@ -400,4 +549,153 @@ _write_attestation() {
 
   run _run_driver_to_completion
   [ "${status}" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# NO python3 ON THE HOST (#124).
+#
+# The GPU runner host carries docker, git and just -- and nothing else, by
+# rule. The driver used to verify the attestation with the HOST's python3, so
+# on that host a run whose browser step had already passed (`1 passed`,
+# `tier-b: PASS`) still ended `python3 is required to verify the attestation`,
+# exit 1. Fail-closed, so nothing unsafe shipped; but the picture gate could
+# never go green there.
+#
+# These cases run the driver with python3 REMOVED from PATH and only the docker
+# stub available, which is that host. The verifier must still run -- in a
+# container -- and must still refuse everything it refused before.
+
+# why: The GPU runner host has no python3; a real, matching attestation must
+# still be verified there, inside a container, and exit 0
+@test "tier_b: with no python3 on the host, a matching attestation is verified" {
+  _write_passing_docker_stub
+  _write_attestation commit=abc0000000000000000000000000000000000abc run_id=777
+  local host_path
+  host_path="$(_path_without_python)"
+
+  # The premise, checked rather than assumed.
+  run env PATH="${host_path}" bash -c 'command -v python3'
+  assert_failure
+
+  run _run_driver_to_completion PATH="${host_path}" \
+    GITHUB_SHA=abc0000000000000000000000000000000000abc \
+    GITHUB_RUN_ID=777
+  [ "${status}" -eq 0 ]
+  grep -q 'attestation verified: 1920x1080 meanLuma=' "${DRIVER_LOG}"
+}
+
+# why: Moving the verifier into a container must not open the gate: a
+# commit that is not this run's is still refused with no host python3
+@test "tier_b: with no python3 on the host, a different commit is still rejected" {
+  _write_passing_docker_stub
+  _write_attestation commit=1111111111111111111111111111111111111111
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    GITHUB_SHA=2222222222222222222222222222222222222222
+  [ "${status}" -ne 0 ]
+  # The VERIFIER's refusal, not merely a non-zero exit: a driver that never
+  # verified at all exits non-zero too.
+  grep -qF "attestation commit is '1111111111111111111111111111111111111111', but this run publishes '2222222222222222222222222222222222222222'" "${DRIVER_LOG}"
+}
+
+# why: Same for a run that is not this run -- asserted on the verifier's
+# own refusal, since a run that never verified also exits non-zero
+@test "tier_b: with no python3 on the host, a different run is still rejected" {
+  _write_passing_docker_stub
+  _write_attestation run_id=111
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    GITHUB_RUN_ID=222
+  [ "${status}" -ne 0 ]
+  grep -qF "attestation run_id is '111', but this run publishes '222'" "${DRIVER_LOG}"
+}
+
+# why: Same for a degenerate (black) frame, asserted on the verifier's
+# refusal
+@test "tier_b: with no python3 on the host, a black frame is still rejected" {
+  _write_passing_docker_stub
+  _write_attestation meanLuma=0 maxLuma=0 brightFraction=0
+
+  run _run_driver_to_completion PATH="$(_path_without_python)"
+  [ "${status}" -ne 0 ]
+  grep -qF "attested frame is black" "${DRIVER_LOG}"
+}
+
+# why: Same for an attestation that is not JSON at all, asserted on the
+# verifier's refusal
+@test "tier_b: with no python3 on the host, an unparseable attestation is rejected" {
+  _write_passing_docker_stub
+  printf '%s\n' '{"commit": ' > "${ATT_SRC}"
+
+  run _run_driver_to_completion PATH="$(_path_without_python)"
+  [ "${status}" -ne 0 ]
+  grep -qF "tier-b-attestation.json is not valid JSON" "${DRIVER_LOG}"
+}
+
+# why: The verifier image cannot be pulled (registry down, no network):
+# nothing verified the picture, so the driver must exit non-zero
+@test "tier_b: a verifier image that cannot be pulled is a failure, not a pass" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_MISSING_IMAGE='/library/python@sha256:'
+  [ "${status}" -ne 0 ]
+  grep -qF "cannot pull the attestation verifier image" "${DRIVER_LOG}"
+}
+
+# why: The summary is what publish-image is handed; a verifier container
+# that exits 0 having printed more than the one summary line must not be
+# read as a picture
+@test "tier_b: verifier output with an extra line is not a frame summary" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_VERIFIER_EXTRA_LINE='ok'
+  [ "${status}" -ne 0 ]
+  grep -qF "attestation verifier printed no frame summary" "${DRIVER_LOG}"
+}
+
+# why: Same for a verifier container that exits 0 printing something that
+# is not the summary shape at all
+@test "tier_b: verifier output that is not the summary shape is refused" {
+  _write_passing_docker_stub
+  _write_attestation
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    OWV_STUB_VERIFIER_REPLACE_STDOUT='ok'
+  [ "${status}" -ne 0 ]
+  grep -qF "attestation verifier printed no frame summary" "${DRIVER_LOG}"
+}
+
+# why: The verifier container is what decides the gate, so it must be the
+# image the driver names (pinned by digest: GHCR/Hub tags are mutable), run
+# offline, and handed the commit and run it binds the attestation to -- an
+# unset GITHUB_SHA reads as "not applicable" to the verifier, so a missing
+# `-e` would silently disable the commit check
+@test "tier_b: the verifier runs offline in a digest-pinned image with the commit and run passed in" {
+  _write_passing_docker_stub
+  _write_attestation commit=abc0000000000000000000000000000000000abc run_id=777
+
+  run _run_driver_to_completion PATH="$(_path_without_python)" \
+    GITHUB_SHA=abc0000000000000000000000000000000000abc \
+    GITHUB_RUN_ID=777
+  [ "${status}" -eq 0 ]
+
+  run cat "${VERIFIER_IMAGES}"
+  assert_success
+  assert_output --regexp '^[^[:space:]]+@sha256:[0-9a-f]{64}$'
+
+  local verify_argv
+  verify_argv="$(grep -- 'verify_tier_b_attestation.py' "${ARGV_LOG}")"
+  [ "$(printf '%s\n' "${verify_argv}" | wc -l)" -eq 1 ]
+  [[ "${verify_argv}" == *"--network=none"* ]]
+  [[ "${verify_argv}" == *"--read-only"* ]]
+  [[ "${verify_argv}" == *":/verify:ro "* ]]
+  [[ "${verify_argv}" == *":/attest/tier-b-attestation.json:ro "* ]]
+  [[ "${verify_argv}" == *"python3 -I -B /verify/verify_tier_b_attestation.py"* ]]
+  [[ "${verify_argv}" == *"-e GITHUB_SHA=abc0000000000000000000000000000000000abc"* ]]
+  [[ "${verify_argv}" == *"-e GITHUB_RUN_ID=777"* ]]
+  [[ "${verify_argv}" == *"--name owv-tierb-${STUB_INSTANCE}-verifier"* ]]
 }

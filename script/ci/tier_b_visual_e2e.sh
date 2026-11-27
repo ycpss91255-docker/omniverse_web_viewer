@@ -83,6 +83,23 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PRODUCER_IMAGE_DEFAULT="ghcr.io/ycpss91255-lab/isaac-stream-source@sha256:cb765323fcfa05a86fbc194c37fa37362f4d8879af0136d9218679010b654bb5"
 PRODUCER_IMAGE="${TIER_B_PRODUCER_IMAGE:-${PRODUCER_IMAGE_DEFAULT}}"
 
+# The image the attestation verifier runs in (#124): the official
+# python:3.13-slim, PINNED BY DIGEST (the OCI index, re-resolved from the
+# registry), for the producer's reason above -- tags are mutable.
+#
+# A container, because the GPU runner host carries docker, git and just and
+# nothing else; the verifier used to run on the host's python3, which that host
+# does not have. NOT the e2e-test image under test: nothing in the Dockerfile
+# installs python3 there (runtime is a node image), and the image that took the
+# picture is the wrong thing to have check the picture. The verifier is stdlib
+# only (json, math, os, sys), so a bare interpreter is all it needs.
+#
+# Deliberately NOT overridable from the environment. TIER_B_PRODUCER_IMAGE is,
+# and $GITHUB_ENV aiming it at busybox was one of round 8's bypasses -- which
+# the attestation closes. An override here would hand that same one-line edit
+# the verifier itself: point it at an image whose `python3` prints a summary.
+VERIFIER_IMAGE="docker.io/library/python@sha256:7249d5587b78209a006dc4a3b5340678f84ea729239193aa559962cd8c1fce50"
+
 # `--print-producer-image` prints the resolved producer reference and exits, so
 # the workflow's separate pull step (kept so a registry problem is
 # distinguishable from an acceptance failure, and so a multi-GB pull does not
@@ -103,6 +120,7 @@ ORPHAN_MAX_AGE_MIN="${TIER_B_ORPHAN_MAX_AGE_MIN:-120}"
 NAME_PREFIX="owv-tierb-${INSTANCE}"
 PRODUCER_NAME="${NAME_PREFIX}-producer"
 VIEWER_NAME="${NAME_PREFIX}-viewer"
+VERIFIER_NAME="${NAME_PREFIX}-verifier"
 
 # The producer's own scene-ready marker, read from OUR container's log only.
 #
@@ -443,10 +461,11 @@ fi
 # behind: an attestation the acceptance spec writes only after it has sampled
 # a frame that passed every threshold.
 #
-# This fails CLOSED by construction. Missing file, unparseable file, absent
-# python3, wrong commit, wrong run, degenerate frame -- every one of them
-# exits non-zero, which blocks call-release and publish-image. A gate that
-# cannot prove the picture must never let the picture be claimed.
+# This fails CLOSED by construction. Missing file, unparseable file, a
+# verifier container that cannot be pulled or started, wrong commit, wrong
+# run, degenerate frame -- every one of them exits non-zero, which blocks
+# call-release and publish-image. A gate that cannot prove the picture must
+# never let the picture be claimed.
 ATTESTATION="${ARTIFACT_DIR}/tier-b-attestation.json"
 
 if [ ! -f "${ATTESTATION}" ]; then
@@ -455,20 +474,54 @@ if [ ! -f "${ATTESTATION}" ]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  fail "python3 is required to verify the attestation; refusing to claim an unverified picture"
+# The verifier runs in VERIFIER_IMAGE, never on the host (#124): the GPU
+# runner host has no python3. Pulled here, quietly, so a registry problem is
+# its own named failure and no pull progress can reach the summary below.
+if ! docker image inspect "${VERIFIER_IMAGE}" >/dev/null 2>&1 \
+  && ! docker pull --quiet "${VERIFIER_IMAGE}" >/dev/null; then
+  fail "cannot pull the attestation verifier image ${VERIFIER_IMAGE}; refusing to claim an unverified picture"
   exit 1
 fi
 
 # Bound the frame thresholds to the single-source values in
 # script/ci/visual_thresholds.json (shared with tier-b-visual.spec.ts and
-# verify_tier_b_attestation.py). The verifier reads the JSON directly; env
-# vars are no longer needed here since the Python script loads the same file.
+# verify_tier_b_attestation.py). The verifier reads the JSON from beside
+# itself, so the whole script/ci directory is mounted, read-only.
+#
+# What crosses into the container is exactly what is named here:
+#   - the attestation, read-only, and nothing else of the artifact dir;
+#   - GITHUB_SHA / GITHUB_RUN_ID, EXPLICITLY. The verifier reads an unset
+#     variable as "not applicable", so leaving either behind would silently
+#     switch the commit or run binding off;
+#   - no OWV_MIN_* threshold overrides: the job never sets them, and an
+#     override that only loosens could only ever loosen the gate.
+# No network, read-only root, `-I` (ignore PYTHON* env and user site) and
+# `-B` (write no bytecode). stdout is the summary alone; stderr is the
+# verifier's reason and stays in the step log.
 if ! ATTESTATION_SUMMARY="$(
-  OWV_ATTESTATION="${ATTESTATION}" \
-  python3 "${SCRIPT_DIR}/verify_tier_b_attestation.py"
+  docker run --rm \
+    --name "${VERIFIER_NAME}" \
+    --network=none \
+    --read-only \
+    -v "${SCRIPT_DIR}":/verify:ro \
+    -v "${ATTESTATION}":/attest/tier-b-attestation.json:ro \
+    -e OWV_ATTESTATION=/attest/tier-b-attestation.json \
+    -e GITHUB_SHA="${GITHUB_SHA:-}" \
+    -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
+    "${VERIFIER_IMAGE}" \
+    python3 -I -B /verify/verify_tier_b_attestation.py
 )"; then
   fail "attestation did not verify; refusing to claim a picture"
+  exit 1
+fi
+
+# The summary is what publish-image is handed, so it must BE a frame summary:
+# one line, the verifier's own shape (require_attestation.sh checks the same).
+# A container that exited 0 having printed anything else is not a picture.
+if ! printf '%s\n' "${ATTESTATION_SUMMARY}" \
+  | grep -qxE '[0-9]+x[0-9]+ meanLuma=[0-9.e+-]+ brightFraction=[0-9.e+-]+' \
+  || [ "$(printf '%s\n' "${ATTESTATION_SUMMARY}" | wc -l)" -ne 1 ]; then
+  fail "attestation verifier printed no frame summary: ${ATTESTATION_SUMMARY}"
   exit 1
 fi
 
