@@ -245,6 +245,76 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Run config-gen on each architecture before any tag names the image
+  # (base#1849). The merge job's smoke step runs on one runner and so one
+  # architecture; this job runs on every matrix runner, pulls the digest
+  # built for ITS platform, runs `config-gen version`, and compares the ELF
+  # machine byte (offset 18) of the binary with the platform. The bytes are
+  # from the ELF specification: 0x3e EM_X86_64, 0xb7 EM_AARCH64.
+  smoke-arch:
+    needs: [compute-matrix, build]
+    # Same-repository guard, same reason as the build job: `runs-on` is a
+    # runtime-computed matrix label, so the job is self-hosted-eligible by
+    # the static rule and must carry it.
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event_name != 'merge_group' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Check config-gen runs on ${{ matrix.platform }}
+        working-directory: /tmp/digests
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          ref=''
+          for _d in *; do
+            built="$(cat "${_d}")"
+            if [[ "${built}" == "${PLATFORM}" ]]; then
+              ref="${IMAGE}@sha256:${_d}"
+              break
+            fi
+          done
+          if [[ -z "${ref}" ]]; then
+            echo "::error::no digest this run pushed was built for" \
+              "${PLATFORM}; nothing to check on this runner." >&2
+            exit 1
+          fi
+          case "${PLATFORM}" in
+            linux/amd64) want=3e ;;
+            linux/arm64) want=b7 ;;
+            *)
+              echo "::error::no expected ELF machine byte for ${PLATFORM}" >&2
+              exit 1
+              ;;
+          esac
+          out="$(docker run --rm "${ref}" /usr/local/bin/config-gen version)"
+          printf '%s\n' "${out}"
+          if ! grep -q '^toolchain ' <<<"${out}"; then
+            echo "::error::config-gen version printed no toolchain line" >&2
+            exit 1
+          fi
+          got="$(docker run --rm "${ref}" od -An -tx1 -j 18 -N 1 /usr/local/bin/config-gen | tr -d ' \n')"
+          if [[ "${got}" != "${want}" ]]; then
+            echo "::error::config-gen ELF machine byte is ${got}, expected" \
+              "${want} for ${PLATFORM}" >&2
+            exit 1
+          fi
+          echo "binary architecture confirmed: ${PLATFORM} (${want})"
+
   # Verify the per-arch digests the build shards pushed, and only then
   # assemble the tagged multi-arch manifest that makes them reachable by
   # name.
@@ -264,7 +334,7 @@ jobs:
   # window between "pushed" and "verified" belongs to no consumer. The tag
   # is what consumers read, and it is attached last.
   merge:
-    needs: build
+    needs: [build, smoke-arch]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -339,6 +339,62 @@ _guard_lines() {
   [ "${status}" -eq 0 ]
 }
 
+# why: base#2171. A reusable workflow has to name its next level by full path,
+# so a call by this repo's own slug to a workflow this tree ships is the same
+# in-tree callee a `./` call names, and its jobs are checked where they are.
+@test "self-hosted guard: PASSES a call by this repo's own slug to a workflow the tree ships (base#2171)" {
+  mkdir -p "${SCRATCH}/dist/script/base"
+  cp /source/dist/script/base/upstream.sh "${SCRATCH}/dist/script/base/upstream.sh"
+  # shellcheck disable=SC1091
+  source /source/dist/script/base/upstream.sh
+  _workflow "callee.yaml" \
+    'on:' \
+    '  workflow_call:' \
+    'jobs:' \
+    '  build:' \
+    '    runs-on: ubuntu-latest' \
+    '    steps:' \
+    '      - run: make'
+  _workflow "wf.yaml" \
+    'on:' \
+    '  workflow_call:' \
+    'jobs:' \
+    '  call-build:' \
+    "    uses: ${BASE_UPSTREAM_SLUG}/.github/workflows/callee.yaml@v1.2.3"
+  run _run_self_hosted_guard
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"0 self-hosted-eligible"* ]]
+}
+
+# why: base#2171. The exemption is for a callee whose jobs this run checks. A
+# file the tree does not carry, or a tree that defines no slug, proves nothing.
+@test "self-hosted guard: FAILS a call by this repo's own slug to a workflow the tree does not ship (base#2171)" {
+  mkdir -p "${SCRATCH}/dist/script/base"
+  cp /source/dist/script/base/upstream.sh "${SCRATCH}/dist/script/base/upstream.sh"
+  # shellcheck disable=SC1091
+  source /source/dist/script/base/upstream.sh
+  _workflow "wf.yaml" \
+    'on:' \
+    '  workflow_call:' \
+    'jobs:' \
+    '  call-build:' \
+    "    uses: ${BASE_UPSTREAM_SLUG}/.github/workflows/gone.yaml@v1.2.3"
+  run _run_self_hosted_guard
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"remote reusable workflow"* ]]
+
+  _workflow "wf.yaml" \
+    'on:' \
+    '  workflow_call:' \
+    'jobs:' \
+    '  call-build:' \
+    "    uses: ${BASE_UPSTREAM_SLUG}/.github/workflows/wf.yaml@v1.2.3"
+  rm "${SCRATCH}/dist/script/base/upstream.sh"
+  run _run_self_hosted_guard
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"remote reusable workflow"* ]]
+}
+
 @test "self-hosted guard: PASSES an eligible job that carries the guard alone" {
   _workflow "wf.yaml" \
     'on:' \

@@ -1,0 +1,12 @@
+[build]
+target_arch = ""
+network = "auto"
+
+[[build.args]]
+key = "APT_MIRROR_UBUNTU"
+value = "tw.archive.ubuntu.com"
+
+[[build.args]]
+key = "TZ"
+value = "Asia/Taipei"
+

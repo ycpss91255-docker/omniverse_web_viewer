@@ -653,21 +653,60 @@ _workers_with_changed_ref() {
   printf '%s' "${_names% }"
 }
 
-# _collect_left_worker_refs <main.yaml> <target version>
+# _target_commit_sha <target version>
+#   The commit <target version> names on TEMPLATE_REMOTE, or nothing when it
+#   cannot be read. An annotated tag is listed twice, as the tag object and,
+#   under `^{}`, as the commit it points at; a workflow ref must be the
+#   commit, so the peeled line wins wherever it is in the listing.
+_target_commit_sha() {
+  local _tag="refs/tags/${1}" _sha _ref _plain="" _peeled=""
+  while read -r _sha _ref; do
+    case "${_ref}" in
+      "${_tag}^{}") _peeled="${_sha}" ;;
+      "${_tag}") _plain="${_sha}" ;;
+    esac
+  done < <(git ls-remote "${TEMPLATE_REMOTE}" "${_tag}" "${_tag}^{}" 2>/dev/null || true)
+  _sha="${_peeled:-${_plain}}"
+  [[ "${_sha}" =~ ^[0-9a-f]{40}$ ]] || return 0
+  printf '%s' "${_sha}"
+}
+
+# _rewrite_sha_worker_refs <main.yaml> <target version> <target commit>
+#   Move a base worker ref pinned to a commit sha to <target commit>, where
+#   the line says which release the sha is: a `uses:` with the sha directly
+#   behind it and a `# vX.Y.Z` comment as the rest of the line. The comment
+#   is moved to <target version> with it, and what ends the line (a CR) is
+#   kept. A sha with no such comment is a
+#   commit the user chose for a reason this cannot read, and stays.
+_rewrite_sha_worker_refs() {
+  local _file="${1}" _target="${2}" _sha="${3}"
+  [[ -n "${_sha}" ]] || return 0
+  sed -i -E "s%((^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?${BASE_UPSTREAM_SLUG//./\\.}/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@[0-9a-fA-F]{40}([\"']?[[:space:]]+#[[:space:]]*)v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([[:space:]]*)\$%\1@${_sha}\3${_target}\5%" "${_file}"
+}
+
+# _collect_left_worker_refs <main.yaml> <target version> [<target commit>]
 #   Record in _UPGRADE_LEFT_REFS the base worker refs that are still under
-#   the retired slug, or at another release, after Step 4. The rewrite needs
+#   the retired slug, at another release, or at a commit sha that is not
+#   <target commit>, after Step 4. The rewrite needs
 #   the ref directly behind its `uses:`; YAML also allows it on the next
 #   line, in a block scalar, or behind an anchor or a tag, and those are left
 #   to the user rather than guessed at. Read as text: whatever follows a
 #   blank and a `#` counts as a comment, even inside a quoted value, and a
 #   ref in a value that is not a `uses:` is recorded too.
 _collect_left_worker_refs() {
-  local _file="${1}" _target="${2}" _line _ref
+  local _file="${1}" _target="${2}" _target_sha="${3:-}" _line _ref
   local _slugs="(${BASE_UPSTREAM_RETIRED_RE}|${BASE_UPSTREAM_SLUG//./\\.})"
   _UPGRADE_LEFT_REFS=()
   while IFS=: read -r _line _ref; do
     # `grep -o` carries the one character that bounded the match on the left.
     [[ "${_ref}" == [A-Za-z0-9]* ]] || _ref="${_ref:1}"
+    # A commit sha names no release, so it is at the target only when it is
+    # the target's own commit; one that could not be resolved is recorded.
+    if [[ "${_ref}" =~ ^"${BASE_UPSTREAM_SLUG}"/.*@([0-9a-fA-F]{40})$ ]]; then
+      [[ "${BASH_REMATCH[1],,}" != "${_target_sha}" ]] || continue
+      _UPGRADE_LEFT_REFS+=("${_line}: ${_ref}")
+      continue
+    fi
     case "${_ref}" in
       "${BASE_UPSTREAM_SLUG}"/*@"${_target}") continue ;;
       "${BASE_UPSTREAM_SLUG}"/*@v[0-9]*.[0-9]*.[0-9]*) ;;
@@ -903,6 +942,11 @@ _upgrade() {
     sed -i -E "s#((^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?)${BASE_UPSTREAM_RETIRED_RE}(/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml@)#\1${BASE_UPSTREAM_SLUG}\3#g" "${main_yaml}"
     _relocated="$(cat "${main_yaml}")"
     sed -i -E "s#((^|[^A-Za-z0-9_-])uses[\"']?[[:space:]]*:[[:space:]]*[\"']?${BASE_UPSTREAM_SLUG//./\\.}/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?#\1@${target_ver}#g" "${main_yaml}"
+    # A ref pinned to a commit sha carries no version for the line above to
+    # match. It is moved only where its own line names the release it is.
+    local _target_sha
+    _target_sha="$(_target_commit_sha "${target_ver}")"
+    _rewrite_sha_worker_refs "${main_yaml}" "${target_ver}" "${_target_sha}"
     # What the commit message says is read off what CHANGED, not restated
     # from the rule above. The old message asserted "workflow @tag updated to
     # <ver>" unconditionally, which was false on exactly the repos whose
@@ -920,7 +964,7 @@ _upgrade() {
     [[ -n "${_bumped}" ]] && _ref_note="@ref updated to ${target_ver} for ${_bumped}"
     [[ -n "${_moved}" ]] \
       && _ref_note+=$'\n'"- main.yaml: moved to ${BASE_UPSTREAM_SLUG}: ${_moved}"
-    _collect_left_worker_refs "${main_yaml}" "${target_ver}"
+    _collect_left_worker_refs "${main_yaml}" "${target_ver}" "${_target_sha}"
     git add "${main_yaml}"
   fi
 
@@ -968,6 +1012,7 @@ chore: update template references to ${target_ver}
 
 - main.yaml: ${_ref_note}
 - .gitignore: synced canonical entries (template lib/gitignore.sh)
+- .gitattributes: synced the line-ending block (template lib/gitattributes.sh)
 - untracked any derived artifacts now covered by .gitignore
 COMMIT
 )" || _log upgrade_nothing_to_commit "No additional changes to commit"

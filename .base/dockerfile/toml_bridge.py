@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """TOML to JSON bridge for the base container toolchain.
 
-Reads TOML from stdin, writes JSON to stdout. Uses tomllib (stdlib 3.11+)
-with vendored tomli as fallback (Python 3.6+). ADR-37 sec. Containerised
-parsing.
+Reads TOML from stdin, writes JSON to stdout. Uses tomllib (stdlib 3.11+),
+which both images that ship this script carry; an older Python falls back
+to a tomli the caller installed. ADR-37 sec. Containerised parsing.
 
 --merge mode: reads multiple TOML files by path (not stdin), merges with
 type-aware semantics (table key-level merge, array-of-tables replace),

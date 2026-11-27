@@ -1,0 +1,6 @@
+[[devices.bindings]]
+path = "/dev:/dev"
+
+[[devices.cgroup_rules]]
+rule = "c 189:* rwm"
+

@@ -27,6 +27,7 @@ _run_nested() {
     COVERAGE_LOCAL_WORKDIR="${_work}" \
     bats --filter '_run_coverage' \
       "${BATS_TEST_DIRNAME}/ci_spec.bats" \
+      "${BATS_TEST_DIRNAME}/coverage_path_spec.bats" \
       "${BATS_TEST_DIRNAME}/coverage_shard_parity_spec.bats" \
       "${BATS_TEST_DIRNAME}/kcov_bash_instrumentation_spec.bats"
 }

@@ -8,6 +8,19 @@
 - **Relates to:** the `doc/adr/` references that this convention
   deliberately preserves
 
+> **Amendment (base#2182, 2026-11-26): 註解只說明程式本身。** 規則在 Decision 的
+> 「2026-11-26 修訂」，取代下列原文；其餘決定不變，`ADR-0000xxxx` 仍然保留。
+>
+> - 標題與 Decision 的 `what/why prose`、`drop the number, keep the sentence`：
+>   歷史與修改的原因不再保留。
+> - Decision 的範圍（五種檔案、沒有前綴的編號）：改為所有程式檔，帶前綴的編號也
+>   不寫。
+> - Decision 的 `A lint driver enforces this` 與 Consequences 的
+>   `a reintroduced #N in a comment fails just test`：只在 `issueref` 掃得到的範圍
+>   成立。
+> - Alternatives 的 `Convention without a lint`：只適用於沒有前綴的編號，那部分仍由
+>   `issueref` 擋；修訂的其他規則不加 lint。
+
 ## Context
 
 The historical convention threaded inline issue numbers (`#440`,
@@ -62,6 +75,26 @@ untouched:
 A lint driver (`script/test/drivers/issueref.sh`, wired into `just test`
 and `just test lint`) enforces this so the refs cannot creep back in.
 
+### 2026-11-26 修訂（base#2182）：註解只說明程式本身
+
+原本的決定只刪編號，歷史敘述與長篇說明因此留在註解裡。所有程式檔的註解改為：
+
+1. 註解只說明程式本身：這段程式做什麼、有什麼不明顯的前提或限制。長篇說明濃縮
+   成重點，一兩行為原則。
+2. 修改的情境不寫在註解：為什麼改、以前怎麼寫、哪個 issue 或事故、討論過程。
+   這些屬於 commit 訊息，或 issue 與 PR。
+3. issue 與 PR 的編號不寫在註解，包括帶 repo 前綴的（`base#1234`）與句尾單純的
+   編號。
+4. `.bats` 的 `# why:` 保留，內容只寫這個測試現在在保護什麼，不寫歷史與編號，
+   以一行為原則。
+5. 給工具讀的註解不動，例如 `shellcheck`、`hadolint`、`tool-pin:` 與各 lint 的
+   allow 標記；完整的表在 base#2182。spec 逐字比對的註解保留到剛好讓 spec 通過，
+   要拿掉得先改 spec。
+
+這份標準不加 lint，由 review 把關；`issueref` 維持原樣，它不擋不代表允許。它只掃
+`dist/`、`script/`、`test/` 底下的上述五種檔案與根目錄的 `compose.yaml`、`justfile`，
+只擋沒有前綴的 `#NNN`，並且跳過 `.bats` 的 `# why:` 區塊。
+
 ## Out of scope
 
 Issue references stay in commit messages, PR bodies, `CHANGELOG`,
@@ -82,6 +115,8 @@ the upgrade / fanout.
   than as change-logs.
 - The `issueref` lint makes the convention enforceable rather than
   aspirational; a reintroduced `#N` in a comment fails `just test`.
+- 2026-11-26 修訂之後，修改的原因只在 commit、issue 與 PR，commit 訊息要寫清楚。
+- 既有的註解由 base#2182 分批處理，完成之前新舊寫法並存。
 
 ## Alternatives considered
 
@@ -94,3 +129,8 @@ the upgrade / fanout.
 - **Convention without a lint.** Rejected: an unenforced style convention
   silently regresses; the lint is what makes the acceptance criterion
   hold over time.
+- **（2026-11-26 修訂）只刪歷史，保留長篇說明。** 否決：base#2183 的第一版照此
+  處理，長篇說明都還在。
+- **（2026-11-26 修訂）保留帶前綴的編號（`base#1234`）。** 否決：編號的讀者在
+  issue 與 PR，`git blame` 找得到。
+- **（2026-11-26 修訂）加 lint。** 否決：維護者決定不加。

@@ -10,8 +10,9 @@
 # It lives here now, next to the workflow it mirrors, and
 # test/bats/unit/pre_pr_mirror_parity_spec.bats holds it to that workflow:
 # every `ci-rollup` need is attested or excluded with a reason, only the
-# jobs no local machine can reproduce may be excluded, and an attested job
-# runs locally in the same mode (plain vs kcov) CI runs it.
+# jobs no local machine can reproduce and the release-only ones CI runs for
+# no pull request may be excluded, and an attested job runs locally in the
+# same mode (plain vs kcov) CI runs it.
 #
 # Usage:
 #   ./script/ci/pre_pr_mirror.sh [--base <ref>]
@@ -69,7 +70,7 @@
 #                     floor and the shard-union check, base#1411) -- the
 #                     same entry point CI, the self-hosted workflow and
 #                     `just test coverage-gate` end with. And `just test acceptance`, the amd64
-#                     acceptance scaffold, then `just test go`, the config
+#                     acceptance scaffold, then `just test go-gates`, the config
 #                     generator's Go gates (base#1462). "Code changed" is CI's own
 #                     classify rule: any path outside doc/**, README.md,
 #                     LICENSE and CONTEXT.md, and it is the `if:` CI puts on
@@ -134,7 +135,7 @@ readonly _CMD_VERDICT='bash ./script/test/drivers/coverage_gate.sh --verdict cov
 readonly _SHARDS_DIR='coverage-shards'
 readonly _CMD_SYSTEM='just test system'
 readonly _CMD_ACCEPTANCE='just test acceptance'
-readonly _CMD_GO='just test go'
+readonly _CMD_GO_GATES='just test go-gates'
 
 # The planned commands that measure the daemon's own architecture, for jobs
 # CI runs on amd64 runners only (base#1409).
@@ -145,7 +146,7 @@ readonly -a _AMD64_CMDS=("${_CMD_SYSTEM}" "${_CMD_ACCEPTANCE}")
 # Membership of `attested` is a claim about what the plan RUNS, on every
 # diff CI runs the job for; the parity spec checks the plan against each
 # job's `if:` gate and the run against the plan. `excluded` is the honest way to narrow the claim, and only what no
-# local machine can reproduce belongs in it.
+# local machine can reproduce, or what is release-only, belongs in it.
 _table() {
   local t=$'\t'
   printf '%s\n' \
@@ -154,18 +155,18 @@ _table() {
     "attested${t}shellcheck${t}${_CMD_TEST}" \
     "attested${t}doc-counts${t}${_CMD_TEST}" \
     "attested${t}lint-static${t}${_CMD_TEST}" \
-    "attested${t}mutation-roster${t}${_CMD_TEST}" \
     "attested${t}hadolint${t}${_CMD_TEST}" \
     "attested${t}bats-fragile${t}${_CMD_TEST}" \
     "attested${t}coverage${t}${_CMD_COVERAGE}" \
     "attested${t}coverage-gate${t}${_CMD_MERGE} && ${_CMD_VERDICT}" \
     "attested${t}system${t}${_CMD_SYSTEM}" \
     "attested${t}acceptance${t}${_CMD_ACCEPTANCE}" \
-    "attested${t}config-gen-gates${t}${_CMD_GO}" \
-    "attested${t}config-gen-redpath${t}${_CMD_GO}" \
+    "attested${t}config-gen-gates${t}${_CMD_GO_GATES}" \
     "excluded${t}acceptance/arm64${t}the native arm64 runner leg; a local run measures the host's own arch, and there is no local arm64 runner to stand in for it" \
     "excluded${t}classify${t}CI's own path classifier computing the other jobs' if: gates; the plan applies the same two rules itself, and there is no repo-content verdict to reproduce" \
     "excluded${t}compute-shards${t}CI plumbing: it publishes the shard list and the cached weights blob; --coverage-shards applies its shard-count rule to the same CI_SHARDS, and the cache it restores is CI state no run before the push can read" \
+    "excluded${t}config-gen-redpath${t}release-only (base#2176): CI runs it on a tag push and on workflow_dispatch, for no pull request; run just test go-redpath before a release" \
+    "excluded${t}mutation-roster${t}release-only (base#2177): CI runs it on a tag push and on workflow_dispatch, for no pull request; run just test mutation-required before a release" \
     "excluded${t}single-issue-pr${t}reads the pull request live through the GitHub API (base#1629); before the push there is no pull request to read, and the script's own unit spec runs under just test" \
     "excluded${t}test-tools-image-amd64${t}CI plumbing (base#1588): it obtains the run's test-tools image for the other jobs and writes the GHA layer cache on a push to main only; every attested local command obtains that image itself, and the cache is CI state no run before the push can write" \
     "excluded${t}test-tools-image-arm64${t}CI plumbing (base#1588): the arm64 twin of test-tools-image-amd64, on the native arm64 runner; there is no local arm64 runner to stand in for it" \
@@ -241,7 +242,7 @@ _commands() {
     printf '%s\n' "${_CMD_SYSTEM}"
   fi
   if (( code )); then
-    printf '%s\n' "${_CMD_ACCEPTANCE}" "${_CMD_GO}"
+    printf '%s\n' "${_CMD_ACCEPTANCE}" "${_CMD_GO_GATES}"
   fi
 }
 

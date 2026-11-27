@@ -91,7 +91,7 @@ _hand_maintained_paths() {
   cat <<'EOF'
 LICENSE
 CONTEXT.md
-.gitattributes
+.github/dependabot.yml
 .github/workflows/self-test.yaml
 EOF
 }

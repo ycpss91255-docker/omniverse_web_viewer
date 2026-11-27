@@ -1,0 +1,25 @@
+rc=0
+mode=640
+--- file
+a
+# managed by template (do not remove)
+.env
+.env.local
+.env.local.toml
+.env.generated
+.env.bak
+.env.local.bak
+env.local.toml
+.setup.conf.bak
+setup.toml.bak
+.setup.conf.local
+.setup.conf.local.bak
+setup.local.toml
+coverage/
+.Dockerfile.generated
+.docker.xauth
+log/
+/deploy/
+compose.yaml
+--- stdout
+--- stderr

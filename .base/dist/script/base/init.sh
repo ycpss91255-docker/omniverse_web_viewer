@@ -59,6 +59,8 @@ source "${SCRIPT_DIR}/just-version.sh"
 # shellcheck disable=SC1091
 source "${TEMPLATE_DIR}/dist/script/docker/lib/gitignore.sh"
 # shellcheck disable=SC1091
+source "${TEMPLATE_DIR}/dist/script/docker/lib/gitattributes.sh"
+# shellcheck disable=SC1091
 source "${TEMPLATE_DIR}/dist/script/docker/lib/_lib.sh"
 # shellcheck disable=SC1091
 source "${TEMPLATE_DIR}/dist/script/docker/lib/template_guard.sh"
@@ -583,6 +585,12 @@ YAML
   _sync_dockerignore "${REPO_ROOT}/.dockerignore"
   _log "  Created .dockerignore"
 
+  # .gitattributes: the line-ending block from lib/gitattributes.sh, so a
+  # new repo's text files are LF in every checkout from its first commit,
+  # whatever core.autocrlf a contributor's machine carries (base#2246).
+  _sync_gitattributes "${REPO_ROOT}/.gitattributes"
+  _log "  Created .gitattributes"
+
   # doc/
   mkdir -p doc/test doc/changelog
   cat > README.md <<MD
@@ -730,6 +738,7 @@ _INIT_ROLLBACK_PREV_TRAP=""
 _init_installed_paths() {
   cat <<'EOF'
 .dockerignore
+.gitattributes
 .github/workflows/base-version-monitor.yaml
 .gitignore
 .hadolint.yaml
@@ -796,6 +805,10 @@ EOF
 #       is, "the common case for an up-to-date repo" in its own comment --
 #       and whose hand-maintained region above the managed block it never
 #       touches at all;
+#     - .gitattributes, whose line-ending block the sync writes once and
+#       then rewrites only when a release changes the block's own text;
+#       the repo's rules outside the marker pair are never touched
+#       (lib/gitattributes.sh);
 #     - setup.toml, which setup.sh writes on a first-time bootstrap or a
 #       stale-mount_1 rewrite and leaves alone otherwise.
 #
@@ -822,6 +835,7 @@ EOF
 _init_conditional_paths() {
   cat <<'EOF'
 .dockerignore
+.gitattributes
 .github/workflows/base-version-monitor.yaml
 .gitignore
 .hadolint.yaml
@@ -878,7 +892,8 @@ _init_record_write() {
 #     _create_symlinks             justfile, script/, config/,
 #                                  .hadolint.yaml, and the pre-relocation
 #                                  root wrappers it deletes on sight
-#     _sync_existing_gitignore     .gitignore, .dockerignore
+#     _sync_existing_gitignore     .gitignore, .dockerignore,
+#                                  .gitattributes
 #     _create_hook_stubs           script/hooks/
 #     _sync_base_monitor_workflow  the generated monitor workflow
 #     _migrate_smoke_tree          test/smoke AND test/bats/smoke. Both,
@@ -938,6 +953,7 @@ justfile
 .hadolint.yaml
 .gitignore
 .dockerignore
+.gitattributes
 .env
 .env.local
 setup.toml
@@ -1794,11 +1810,15 @@ YAML
 _sync_existing_gitignore() {
   local _gitignore="${REPO_ROOT}/.gitignore"
   local _dockerignore="${REPO_ROOT}/.dockerignore"
+  local _attributes="${REPO_ROOT}/.gitattributes"
   local _git_before="" _docker_before="" _git_after="" _docker_after=""
+  local _attr_before="" _attr_after=""
   [[ -f "${_gitignore}" ]] \
     && _git_before="$(cat -- "${_gitignore}" 2> /dev/null; printf x)"
   [[ -f "${_dockerignore}" ]] \
     && _docker_before="$(cat -- "${_dockerignore}" 2> /dev/null; printf x)"
+  [[ -f "${_attributes}" ]] \
+    && _attr_before="$(cat -- "${_attributes}" 2> /dev/null; printf x)"
 
   _sync_gitignore "${_gitignore}"
   _untrack_canonical_in_repo "${REPO_ROOT}"
@@ -1810,15 +1830,25 @@ _sync_existing_gitignore() {
   # tied to init/upgrade lifecycle so the file stays consistent even
   # when setup.toml changed between wrapper invocations.
   _sync_logging_gitignore "${REPO_ROOT}"
+  # The line-ending block (lib/gitattributes.sh, base#2246). Placed at the
+  # top of an existing .gitattributes and rewritten in place on later
+  # runs; the repo's own rules below it are never touched and keep
+  # winning. It sets what a future `git add` stores and a checkout writes
+  # -- it does NOT renormalize files already committed with CRLF.
+  _sync_gitattributes "${_attributes}"
 
   [[ -f "${_gitignore}" ]] \
     && _git_after="$(cat -- "${_gitignore}" 2> /dev/null; printf x)"
   [[ -f "${_dockerignore}" ]] \
     && _docker_after="$(cat -- "${_dockerignore}" 2> /dev/null; printf x)"
+  [[ -f "${_attributes}" ]] \
+    && _attr_after="$(cat -- "${_attributes}" 2> /dev/null; printf x)"
   [[ "${_git_after}" == "${_git_before}" ]] \
     || _init_record_write ".gitignore"
   [[ "${_docker_after}" == "${_docker_before}" ]] \
     || _init_record_write ".dockerignore"
+  [[ "${_attr_after}" == "${_attr_before}" ]] \
+    || _init_record_write ".gitattributes"
   return 0
 }
 

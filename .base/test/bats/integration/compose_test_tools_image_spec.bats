@@ -103,3 +103,38 @@ _resolution() {
   assert_output --partial "just test"
   assert_output --partial "instead of driving docker compose directly"
 }
+
+# ════════════════════════════════════════════════════════════════════
+# The environment ci-system forwards into its container
+# ════════════════════════════════════════════════════════════════════
+
+# _system_env <KEY>: the value compose resolves for <KEY> in ci-system's
+# environment, empty when it sets none.
+_system_env() {
+  docker compose -f "${ROOT}/compose.yaml" config --format json ci-system \
+    | jq -r --arg key "${1}" '.services["ci-system"].environment[$key] // ""'
+}
+
+# why: a tag the caller pinned cannot be derived inside the container
+@test "compose.yaml: ci-system hands the container the TEST_TOOLS_IMAGE it runs (base#2173)" {
+  export HOST_UID=1 HOST_GID=1 BASE_CHECKOUT_PATH=/source
+  export TEST_TOOLS_IMAGE=test-tools:ci-1-1
+  run _system_env TEST_TOOLS_IMAGE
+  assert_success
+  assert_output "test-tools:ci-1-1"
+}
+
+# why: GITHUB_ACTIONS is how _run_system knows a CI runner from a local run
+@test "compose.yaml: ci-system forwards GITHUB_ACTIONS when it is set, and nothing when it is not (base#2173)" {
+  export HOST_UID=1 HOST_GID=1 BASE_CHECKOUT_PATH=/source
+  export TEST_TOOLS_IMAGE=test-tools:ci-1-1
+  export GITHUB_ACTIONS=true
+  run _system_env GITHUB_ACTIONS
+  assert_success
+  assert_output "true"
+
+  unset GITHUB_ACTIONS
+  run _system_env GITHUB_ACTIONS
+  assert_success
+  assert_output ""
+}

@@ -33,6 +33,11 @@ setup() {
   export LOG_FORMAT=text
   load "${BATS_TEST_DIRNAME}/../unit/test_helper"
 
+  # setup.sh reads the declared tables through config_gen_tables; the test
+  # container has no docker daemon (base#1937).
+  create_mock_dir
+  mock_config_gen_docker
+
   REPO_NAME="myapp_test"
   TMP_ROOT="$(mktemp -d)"
   REPO_DIR="${TMP_ROOT}/${REPO_NAME}"
@@ -63,6 +68,7 @@ setup() {
 }
 
 teardown() {
+  cleanup_mock_dir
   rm -rf "${TMP_ROOT}"
 }
 

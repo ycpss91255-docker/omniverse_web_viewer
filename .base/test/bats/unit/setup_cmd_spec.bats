@@ -4418,3 +4418,93 @@ EOF
   # they never asked for.
   refute_stderr_contains "Unknown section"
 }
+
+# why: base#1937 -- the per-layer declared-table read of
+# _setup_conf_check_known goes through config_gen_tables (the config-gen
+# image's `tables` command), not the bridge's `--tables` view. A docker
+# shim records every argv; one layer check must record one config-gen run
+# whose arguments end `tables --name <layer> -`, and no run carrying
+# `--tables`.
+@test "_setup_conf_check_known reads a layer's tables through config-gen, one run (base#1937)" {
+  printf '[gui]\nmode = "wayland"\n' > "${TEMP_DIR}/setup.toml"
+  local _log="${TEMP_DIR}/docker.argv"
+  : > "${_log}"
+  mock_cmd docker "printf '%s\n' \"\$*\" >> '${_log}'; exit 0"
+  export CONFIG_GEN_IMAGE=config-gen:test1937 CONFIG_GEN_FORCE_DOCKER=1
+  PATH="${MOCK_DIR}:${PATH}" LOG_FORMAT=json \
+    run --separate-stderr _setup_conf_check_known "${TEMP_DIR}"
+  assert_success
+  run grep -c -- " tables --name ${TEMP_DIR}/setup.toml -\$" "${_log}"
+  assert_output 1
+  run grep -c -- "--tables" "${_log}"
+  assert_output 0
+}
+
+# _seed_resolve_once_sandbox
+#   A consumer layout the docker path runs from: the vendored subtree at
+#   .base (version marker, dist/ and the tools' build inputs, so both tool
+#   image tags derive from the real digests), the shipped template as the
+#   dist layer and a one-key setup.toml above it. The docker shim logs each
+#   call's argv to ${_RO_LOG}, answers `image inspect` present, and serves a
+#   bridge run from the in-container bridge and a config-gen `tables` run
+#   from its --tables view (the same stand-ins mock_config_gen_docker uses).
+_seed_resolve_once_sandbox() {
+  _RO_SB="${TEMP_DIR}/sandbox"
+  _RO_LOG="${TEMP_DIR}/docker.argv"
+  mkdir -p "${_RO_SB}/.base" "${TEMP_DIR}/shim"
+  cp -a /source/.version /source/dist /source/dockerfile "${_RO_SB}/.base/"
+  cp /source/dist/setup.toml "${_RO_SB}/.base/dist/setup.toml"
+  printf '[gui]\nmode = "wayland"\n' > "${_RO_SB}/setup.toml"
+  : > "${_RO_LOG}"
+  mock_cmd docker 'printf "%s\n" "$*" >> "'"${_RO_LOG}"'"
+case "$1" in
+  image) exit 0 ;;
+  run)
+    shift
+    while (($# > 0)); do
+      case "$1" in
+        toml-bridge:*) shift; exec /usr/local/bin/toml-bridge "$@" ;;
+        config-gen:*) exec /usr/local/bin/toml-bridge --tables ;;
+      esac
+      shift
+    done
+    exit 1 ;;
+  *) exit 1 ;;
+esac'
+}
+
+# why: base#1844 -- each tool image is resolved once per top-level
+# `setup apply`, in the top-level shell, before any $(...) that runs it.
+# toml_bridge_parse / toml_bridge_merge run inside command substitutions,
+# so a memo written there is lost and every call inspected the image again.
+# Expected, from the issue's acceptance: 2 inspects (one per image, 12 hex
+# tag each), both before the first `docker run`; the run counts do not move
+# (measured on main after #1937: 13 inspects, 12 bridge runs, 2 config-gen
+# runs on this two-layer layout, not the 15 / 14 / 2 the issue assumed).
+@test "setup apply resolves each tool image once, before any run (base#1844)" {
+  _seed_resolve_once_sandbox
+  unset CONFIG_GEN_IMAGE TOML_BRIDGE_IMAGE
+  PATH="${MOCK_DIR}:${PATH}" TOML_BRIDGE_FORCE_DOCKER=1 CONFIG_GEN_FORCE_DOCKER=1 \
+    run bash "${_RO_SB}/.base/dist/script/docker/wrapper/setup.sh" apply \
+      --base-path "${_RO_SB}"
+  assert_success
+  run grep -c '^image inspect ' "${_RO_LOG}"
+  assert_output 2
+  run grep -cE '^image inspect toml-bridge:[0-9a-f]{12}$' "${_RO_LOG}"
+  assert_output 1
+  run grep -cE '^image inspect config-gen:[0-9a-f]{12}$' "${_RO_LOG}"
+  assert_output 1
+  # base#2234: 12 -> 5 -- the two-layer merge once, each single layer
+  # once, `--empty-families` twice (not a merged load, not memoised).
+  run grep -c '^run .* toml-bridge:' "${_RO_LOG}"
+  assert_output 5
+  run grep -c '^run .* config-gen:' "${_RO_LOG}"
+  assert_output 2
+  # Both inspects come before the first run: the first run's line number
+  # is greater than the line number of the last inspect.
+  local _first_run _last_inspect
+  _first_run="$(grep -n '^run ' "${_RO_LOG}" | head -n1 | cut -d: -f1)"
+  _last_inspect="$(grep -n '^image inspect ' "${_RO_LOG}" | tail -n1 | cut -d: -f1)"
+  ((_last_inspect < _first_run)) \
+    || fail "an image inspect (line ${_last_inspect}) follows the first docker run (line ${_first_run})"
+}
