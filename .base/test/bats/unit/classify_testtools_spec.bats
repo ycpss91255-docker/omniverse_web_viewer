@@ -29,9 +29,9 @@ setup() {
 # _classify_event <event> <repo-relative-path> [--root]
 #   Runs self-test's OWN classify step against a synthetic history whose
 #   head commit changes <path> and nothing else, reported to the step as
-#   <event>. With `--root` the history is ONE commit, so `HEAD^` does not
-#   resolve and the diff cannot be taken at all. Prints the GITHUB_OUTPUT
-#   the step wrote.
+#   <event> on CLASSIFY_REF (default refs/heads/main). With `--root` the
+#   history is ONE commit, so `HEAD^` does not resolve and the diff cannot
+#   be taken at all. Prints the GITHUB_OUTPUT the step wrote.
 _classify_event() {
   local _e="${1:?BUG: _classify_event expects an event}"
   local _p="${2:?BUG: _classify_event expects a path}"
@@ -55,7 +55,8 @@ _classify_event() {
   : > "${_d}/out"
   (
     cd "${_d}" || return 2
-    env EVENT_NAME="${_e}" BASE_REF= GITHUB_OUTPUT="${_d}/out" bash step.sh
+    env EVENT_NAME="${_e}" EVENT_REF="${CLASSIFY_REF-refs/heads/main}" BASE_REF= \
+        GITHUB_OUTPUT="${_d}/out" bash step.sh
   ) >/dev/null 2>&1
   cat "${_d}/out"
 }
@@ -123,7 +124,8 @@ _classify_pr() {
   : > "${BATS_TEST_TMPDIR}/out"
   (
     cd "${_d}" || return 2
-    env EVENT_NAME=pull_request BASE_REF=main IS_FORK_PR="${CLASSIFY_IS_FORK-false}" \
+    env EVENT_NAME=pull_request EVENT_REF=refs/pull/1/merge BASE_REF=main \
+        IS_FORK_PR="${CLASSIFY_IS_FORK-false}" \
         DEFAULT_BRANCH="${CLASSIFY_DEFAULT_BRANCH-main}" \
         GITHUB_OUTPUT="${BATS_TEST_TMPDIR}/out" bash "${BATS_TEST_TMPDIR}/step.sh"
   ) >/dev/null 2>"${BATS_TEST_TMPDIR}/step.err"
@@ -169,8 +171,7 @@ _context_copy_paths() {
   assert_line 'testtools_changed=false'
 }
 
-# why: A non-PR event still runs the full suite. The flag being
-# computable now must not narrow what a push runs.
+# why: the flag being computable must not narrow what a push runs.
 @test "classify: a push is still code-changed and system-relevant (#1010)" {
   run _classify_push doc/guide.md
   assert_success
@@ -259,12 +260,11 @@ _context_copy_paths() {
   assert_line 'testtools_changed=true'
 }
 
-# The eleven select_* keys classify writes (nine from design r7 sec. 2, two
-# from base#2110). Each
-# self-test.yaml job whose `if:` reads classify reads one of them, and
-# select_config_gen gates both config-gen jobs (base#1547 split one job
-# in two), so twelve jobs read these eleven keys (cycle 4 below).
-SELECT_KEYS="select_config_gen select_coverage select_coverage_gate select_acceptance select_system select_worker_selftest select_shellcheck select_hadolint select_bats_fragile select_mutation_roster select_test_tools_image_arm64"
+# The select_* keys classify writes, one per gated job; config-gen-gates
+# reads select_config_gen.
+SELECT_KEYS="select_config_gen select_config_gen_redpath select_coverage select_coverage_gate select_acceptance select_system select_worker_selftest select_shellcheck select_hadolint select_bats_fragile select_mutation_roster select_test_tools_image_arm64"
+# The release-only ones of those: the event decides them, not the diff.
+RELEASE_KEYS="select_mutation_roster select_config_gen_redpath"
 
 # _assert_keys <output> <value> [<key>...] -- every select_* key named (all
 # of them when none is) is exactly <value> in <output>.
@@ -278,32 +278,73 @@ _assert_keys() {
   [[ -z "${_bad}" ]] || fail "not ${_v}:${_bad}"$'\n'"output:"$'\n'"${_out}"
 }
 
-# why: cycle 6. Main runs the full suite (owner decision, base#1584), so
-# the push arm writes every select_* key `true`.
-@test "classify: a push writes every gated job's selection as true (base#1584)" {
+# _assert_all_but_release <output> -- every select_* key is `true` in
+# <output> except the release-only ones, which are `false`.
+_assert_all_but_release() {
+  local _k _rest=""
+  for _k in ${SELECT_KEYS}; do
+    [[ " ${RELEASE_KEYS} " == *" ${_k} "* ]] || _rest+=" ${_k}"
+  done
+  _assert_keys "$1" true ${_rest}
+  _assert_keys "$1" false ${RELEASE_KEYS}
+}
+
+# The ref a merge_group run is for, in the form GitHub names it.
+MERGE_GROUP_REF=refs/heads/gh-readonly-queue/main/pr-1-0123456789abcdef0123456789abcdef01234567
+
+# why: a push is not narrowed by its diff; only the jobs that wait for a tag
+# skip on it.
+@test "classify: a push to main or master selects every gated job but the release-only ones (base#1584, base#2177)" {
   run _classify_push doc/guide.md
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
+  CLASSIFY_REF=refs/heads/master run _classify_push doc/guide.md
+  assert_success
+  _assert_all_but_release "${output}"
 }
 
-# why: a merge group is the last run before main (base#1587), and only a
-# pull request narrows the selection (base#1584). So a merge_group run
-# writes every select_* key `true` even when its diff is docs only,
-# or the queue would land a commit whose gated jobs never ran.
-@test "classify: a merge_group run writes every gated job's selection as true (base#1584, base#1587)" {
-  run _classify_event merge_group doc/guide.md
+# why: a merge group is the last run before main, so even a docs-only one is
+# not narrowed, or the queue would land a commit its gated jobs never ran on.
+@test "classify: a merge_group run selects every gated job but the release-only ones (base#1584, base#1587, base#2177)" {
+  CLASSIFY_REF="${MERGE_GROUP_REF}" run _classify_event merge_group doc/guide.md
+  assert_success
+  _assert_all_but_release "${output}"
+}
+
+# why: the tag's `release` job needs the release-only jobs, and
+# workflow_dispatch gives their answer before the tag exists.
+@test "classify: a tag push and workflow_dispatch select every gated job, the release-only ones included (base#2177)" {
+  CLASSIFY_REF=refs/tags/v1.2.3 run _classify_push doc/guide.md
+  assert_success
+  _assert_keys "${output}" true
+  run _classify_event workflow_dispatch doc/guide.md
   assert_success
   _assert_keys "${output}" true
 }
 
-# why: cycle 6. A docs-only pull request cannot change a roster row's
-# verdict, so mutation-roster is gated on its own key (base#2110; choosing
-# rows from a diff belongs to base#1604). The workflow's job list is main's
-# (`git show origin/main:.github/workflows/self-test.yaml`, re-measured in
-# redesign r6). base#1588 adds the two ungated test-tools-image builders
-# after classify; base#1629 adds the ungated single-issue-pr before
-# mutation-roster. base#1989 adds the ungated commit-attribution job
-# before ci-rollup.
+# why: fail closed: a trigger or a kind of ref added later runs the
+# release-only jobs until the step names it, and cannot drop them by omission.
+@test "classify: a push to no known branch, or an event the step does not name, selects the release-only jobs (base#2177)" {
+  local _ref
+  for _ref in '' refs/notes/x main; do
+    CLASSIFY_REF="${_ref}" run _classify_push doc/guide.md
+    assert_success
+    _assert_keys "${output}" true
+  done
+  run _classify_event schedule doc/guide.md
+  assert_success
+  _assert_keys "${output}" true
+}
+
+# why: any other binding makes a tag push read as a branch, or a branch push
+# as a tag.
+@test "classify: the diff step reads the run's own ref (base#2177)" {
+  run yq '.jobs.classify.steps[] | select(.id == "diff") | .env.EVENT_REF' "${SELF_WF}"
+  assert_output "\${{ github.ref }}"
+}
+
+# why: with a key of its own the event can skip the roster and nothing else,
+# and no job joins or leaves the workflow without this list changing.
 @test "self-test.yaml: mutation-roster is gated on its own key and the job list is main's (base#1584, base#2110)" {
   run yq '.jobs."mutation-roster".if' "${SELF_WF}"
   assert_output "needs.classify.outputs.select_mutation_roster == 'true'"
@@ -332,13 +373,12 @@ ci-rollup
 release"
 }
 
-# why: cycle 24, the issue's fail-closed rule: a pull request touching a
-# path the map does not know runs every gated job. `zz-new/thing.txt`
-# names no directory the repo has.
-@test "classify: a pull request touching an unknown path writes every gated job's selection as true (base#1584)" {
+# why: fail closed: a path the map does not know skips no job the map
+# decides. `zz-new/thing.txt` names no directory the repo has.
+@test "classify: a pull request touching an unknown path selects every gated job but the release-only ones (base#1584, base#2177)" {
   run _classify_pr zz-new/thing.txt
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
 }
 
 # why: cycle 21 (RR3-F1). A docs path selects nothing: the map's doc row is
@@ -367,21 +407,21 @@ release"
   assert_line 'select_acceptance=false'
   assert_line 'select_system=false'
   assert_line 'select_worker_selftest=false'
+  assert_line 'select_mutation_roster=false'
+  assert_line 'select_config_gen_redpath=false'
   assert_line 'select_coverage=true'
   _assert_keys "${output}" true select_coverage_gate select_shellcheck \
-      select_hadolint select_bats_fragile select_mutation_roster \
-      select_test_tools_image_arm64
+      select_hadolint select_bats_fragile select_test_tools_image_arm64
 }
 
-# why: base#2110. A fork's pull request is never narrowed: classify answers
-# `true` for every key, and so does a run that cannot say whether it is a
-# fork.
+# why: a diff narrows only a run known to be same-repo; any other is still a
+# pull request, so the release-only jobs skip on it.
 @test "classify: a fork pull request, or one not known to be same-repo, selects every gated job (base#2110)" {
   local _v
   for _v in true ''; do
     CLASSIFY_IS_FORK="${_v}" run _classify_pr doc/x.md
     assert_success
-    _assert_keys "${output}" true
+    _assert_all_but_release "${output}"
   done
   run yq '.jobs.classify.steps[] | select(.id == "diff") | .env.IS_FORK_PR' "${SELF_WF}"
   assert_output "\${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}"
@@ -397,7 +437,7 @@ release"
   for _v in other Main ''; do
     CLASSIFY_DEFAULT_BRANCH="${_v}" run _classify_pr doc/x.md
     assert_success
-    _assert_keys "${output}" true
+    _assert_all_but_release "${output}"
   done
   run yq '.jobs.classify.steps[] | select(.id == "diff") | .env.DEFAULT_BRANCH' "${SELF_WF}"
   assert_output "\${{ github.event.repository.default_branch }}"
@@ -418,7 +458,7 @@ _pr_shadows_base_with_a_tag() {
 @test "classify: a tag named like the base branch does not stand in for it (base#2110)" {
   CLASSIFY_PR_HOOK=_pr_shadows_base_with_a_tag run _classify_pr doc/x.md
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
 }
 
 # _pr_edits_selection_at_base -- the PR side's selection_at_base.sh answers
@@ -433,7 +473,7 @@ _pr_edits_selection_at_base() {
 @test "classify: a pull request's own selection_at_base.sh does not judge it (base#2110)" {
   CLASSIFY_PR_HOOK=_pr_edits_selection_at_base run _classify_pr doc/x.md
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
 }
 
 # _base_map_fails -- the base side's map exits 1.
@@ -454,7 +494,7 @@ _base_map_drops_acceptance() {
 @test "classify: a base map that fails or leaves a job out selects it (base#1584)" {
   CLASSIFY_BASE_HOOK=_base_map_fails run _classify_pr doc/x.md
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
   grep -q 'reason=base_map_failed' "${BATS_TEST_TMPDIR}/step.err" \
     || fail "stderr: $(cat "${BATS_TEST_TMPDIR}/step.err")"
   CLASSIFY_BASE_HOOK=_base_map_drops_acceptance run _classify_pr doc/x.md
@@ -463,7 +503,8 @@ _base_map_drops_acceptance() {
   _assert_keys "${output}" false select_config_gen select_coverage \
       select_coverage_gate select_system select_worker_selftest \
       select_shellcheck select_hadolint select_bats_fragile \
-      select_mutation_roster select_test_tools_image_arm64
+      select_mutation_roster select_config_gen_redpath \
+      select_test_tools_image_arm64
 }
 
 # _pr_map_selects_nothing_for_row5 -- the PR side's map: row 5 (`*`)
@@ -492,13 +533,13 @@ _pr_edits_the_readers() {
 @test "classify: a pull request that edits a selection file is judged by the base map (base#1584)" {
   CLASSIFY_PR_HOOK=_pr_map_selects_nothing_for_row5 run _classify_pr doc/x.md
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
   CLASSIFY_PR_HOOK=_pr_deny_list_adds_the_map run _classify_pr -
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
   CLASSIFY_PR_HOOK=_pr_edits_the_readers run _classify_pr -
   assert_success
-  _assert_keys "${output}" true
+  _assert_all_but_release "${output}"
 }
 
 # _base_without_map -- the base predates the map (main before base#1584);
@@ -518,17 +559,15 @@ _pr_restores_selection() {
     CLASSIFY_BASE_HOOK="${_hook}" CLASSIFY_PR_HOOK=_pr_restores_selection \
       run _classify_pr doc/x.md
     assert_success
-    _assert_keys "${output}" true
+    _assert_all_but_release "${output}"
     grep -q 'reason=map_missing_on_base' "${BATS_TEST_TMPDIR}/step.err" \
       || fail "${_hook}: stderr: $(cat "${BATS_TEST_TMPDIR}/step.err")"
   done
 }
 
-# why: cycle 29. The classify step cannot invent a `false`: its one
-# selection call is selection_at_base.sh, the only `false` it can write
-# for a select_* key is the one it read (`[[ "${val}" == "false" ]]`), and
-# no line writes a literal select_*=false.
-@test "classify: the diff step's only select_* false is the selection's own (base#1584)" {
+# why: the step must not invent a `false` for a job the map decides: it has
+# one selection call, and passes on only the `false` it read there.
+@test "classify: the diff step's only select_* false is the selection's own or a release-only job's (base#1584, base#2177)" {
   local _step
   _step="$(yaml_step_run "${SELF_WF}" classify diff | grep -v '^[[:space:]]*#')"
   [[ -n "${_step}" ]] || fail "could not read classify's diff step"
@@ -562,10 +601,11 @@ _chain_classify_outputs() {
 }
 
 # _chain_results <classify-output>
-#   Prints `<job> <success|skipped>` for every job of the workflow, in file
-#   order, for a pull_request run whose classify diff step wrote
-#   <classify-output> (GITHUB_OUTPUT lines) and in which every job that runs
-#   succeeds. Composes the step's output through the classify job's own
+#   Prints `<job> <success|failure|skipped>` for every job of the workflow,
+#   in file order, for a run on CHAIN_REF (unset: a ref that is no tag)
+#   whose classify diff step wrote <classify-output> (GITHUB_OUTPUT lines)
+#   and in which every job that runs succeeds, but CHAIN_FAIL, which fails.
+#   Composes the step's output through the classify job's own
 #   `outputs:` map and each job's parsed `if:`, so a key the step writes but
 #   the job does not export reads empty, as it does on GitHub. A job runs
 #   when its `if:` holds and every job it needs succeeded (the implicit
@@ -594,12 +634,18 @@ _chain_results() {
     elif [[ "${_if}" == "always()" ]]; then
       _ok=1
     elif [[ "${_if}" == "startsWith(github.ref, 'refs/tags/')" ]]; then
-      _ok=0
+      [[ "${CHAIN_REF:-}" == refs/tags/* ]] || _ok=0
     else
       echo "BUG: ${_j} has an if: this reader cannot evaluate: ${_if}"
       return 2
     fi
-    if [[ "${_ok}" -eq 1 ]]; then _res["${_j}"]=success; else _res["${_j}"]=skipped; fi
+    if [[ "${_ok}" -eq 0 ]]; then
+      _res["${_j}"]=skipped
+    elif [[ "${_j}" == "${CHAIN_FAIL:-}" ]]; then
+      _res["${_j}"]=failure
+    else
+      _res["${_j}"]=success
+    fi
     printf '%s %s\n' "${_j}" "${_res[${_j}]}"
   done < <(yaml_job_names "${SELF_WF}")
 }
@@ -679,15 +725,14 @@ _gated_jobs() {
 # why: cycle 1, end to end on a PR that changes one unit spec. The expected
 # set comes from the issue and the design, not from the map: a unit spec
 # cannot affect config-gen, acceptance, system or worker-selftest, so
-# those skip (config-gen is two jobs since base#1547, config-gen-gates
-# and config-gen-redpath, on one key); it is code, so shellcheck, hadolint, bats-fragile,
-# coverage and coverage-gate run; and mutation-roster runs on every PR
-# that is not docs only (base#2110). Read through classify's real step, its `outputs:` map, every
+# those skip; it is code, so shellcheck, hadolint, bats-fragile,
+# coverage and coverage-gate run; and the release-only jobs skip.
+# Read through classify's real step, its `outputs:` map, every
 # job's parsed `if:` and the real rollup step, so a gate that reads the
 # wrong output, an output classify does not export, or a classify that
 # never carries a `false` all change the set, and the rollup must pass
 # the run that results.
-@test "chain: a PR changing one unit spec runs the code checks and mutation-roster, skips the other gated jobs, and the rollup passes (base#1584)" {
+@test "chain: a PR changing one unit spec runs the code checks, skips the other gated jobs, and the rollup passes (base#1584, base#2177)" {
   local _out _results
   _out="$(_classify_pr test/bats/unit/ci_spec.bats)"
   run _chain_results "${_out}"
@@ -695,17 +740,15 @@ _gated_jobs() {
   _results="${output}"
   _chain_check "${_results}" shellcheck=success hadolint=success \
       bats-fragile=success coverage=success coverage-gate=success \
-      mutation-roster=success config-gen-gates=skipped \
+      mutation-roster=skipped config-gen-gates=skipped \
       config-gen-redpath=skipped acceptance=skipped \
       system=skipped worker-selftest=skipped
   run _chain_rollup "${_out}" "${_results}"
   assert_success
 }
 
-# why: cycle 2. A docs-only PR skips every gated job (twelve: the eleven
-# keys, with select_config_gen gating both config-gen jobs),
-# mutation-roster and the arm64 image among them (base#2110), runs the
-# documentation checks, and the rollup passes and says so.
+# why: a docs-only PR can affect no gated job; the documentation checks still
+# run, and the rollup says which kind of pass it is.
 @test "chain: a docs-only PR skips every gated job, mutation-roster included, and the rollup passes as doc-only (base#1584, base#2110)" {
   local _out _results _j
   local -a _want=(mutation-roster=skipped test-tools-image-arm64=skipped
@@ -725,37 +768,135 @@ _gated_jobs() {
   assert_output --partial 'Passed as a doc-only change'
 }
 
-# why: cycle 3, issue criterion 1: a workflow change, a driver change and
-# an unknown path each skip no gated job.
-@test "chain: a workflow, driver or unknown-path PR skips no gated job (base#1584)" {
-  local _p _out _results _j
+# The release-only jobs, by job name.
+RELEASE_JOBS="mutation-roster config-gen-redpath"
+
+# _chain_gated <results> <release-only-result> -- every gated job got
+# `success`, but the release-only ones, which got <release-only-result>.
+_chain_gated() {
+  local _results="$1" _rel="$2" _j
+  local -a _want=()
+  while IFS= read -r _j; do
+    [[ -n "${_j}" ]] || continue
+    if [[ " ${RELEASE_JOBS} " == *" ${_j} "* ]]; then
+      _want+=("${_j}=${_rel}")
+    else
+      _want+=("${_j}=success")
+    fi
+  done < <(_gated_jobs)
+  [[ "${#_want[@]}" -eq 12 ]] || fail "expected twelve gated jobs, read ${#_want[@]}"
+  _chain_check "${_results}" "${_want[@]}"
+}
+
+# why: a workflow change, a driver change and an unknown path can each break
+# any job, so only the jobs that wait for a release skip.
+@test "chain: a workflow, driver or unknown-path PR skips no gated job but the release-only ones (base#1584, base#2177)" {
+  local _p _out
   for _p in .github/workflows/self-test.yaml script/test/drivers/bats.sh zz-new/thing.txt; do
     _out="$(_classify_pr "${_p}")"
     run _chain_results "${_out}"
     assert_success
+    _chain_gated "${output}" skipped
+  done
+}
+
+# why: branch protection requires the rollup, so the skips must pass it; and
+# it must name the jobs, so that its green is not read as a full run's.
+@test "chain: a PR, a merge group and a push to main skip the release-only jobs, and the rollup passes naming them (base#2176, base#2177)" {
+  local _run _out _results
+  for _run in pull_request merge_group push; do
+    case "${_run}" in
+      pull_request) _out="$(_classify_pr zz-new/thing.txt)" ;;
+      merge_group) _out="$(CLASSIFY_REF="${MERGE_GROUP_REF}" _classify_event merge_group zz-new/thing.txt)" ;;
+      push) _out="$(_classify_push zz-new/thing.txt)" ;;
+    esac
+    run _chain_results "${_out}"
+    assert_success
     _results="${output}"
-    local -a _want=()
-    while IFS= read -r _j; do
-      [[ -n "${_j}" ]] && _want+=("${_j}=success")
-    done < <(_gated_jobs)
-    _chain_check "${_results}" "${_want[@]}"
+    _chain_gated "${_results}" skipped
+    _chain_check "${_results}" release=skipped
+    run _chain_rollup "${_out}" "${_results}"
+    assert_success
+    assert_line '::notice::Passed with jobs classify deselected for this run, skipped by design: mutation-roster config-gen-redpath'
+  done
+}
+
+# _chain_config_gen <classify-output> <gates-result> -- config-gen-gates got
+# <gates-result> and config-gen-redpath skipped, and the rollup passes.
+_chain_config_gen() {
+  local _results
+  _results="$(_chain_results "$1")"
+  _chain_check "${_results}" "config-gen-gates=$2" config-gen-redpath=skipped
+  run _chain_rollup "$1" "${_results}"
+  assert_success
+}
+
+# why: the two config-gen keys must not be crossed, or skipping the redpath
+# would skip the gates too, or the gates' selection would run the redpath.
+@test "chain: config-gen-gates keeps its own selection where the redpath skips (base#2176)" {
+  _chain_config_gen "$(_classify_pr dockerfile/config-gen/cmd/config-gen/main.go)" success
+  _chain_config_gen "$(_classify_pr script/test/config_gen_redpath.sh)" success
+  _chain_config_gen "$(_classify_pr dist/env.toml)" skipped
+  _chain_config_gen "$(CLASSIFY_REF="${MERGE_GROUP_REF}" _classify_event merge_group doc/x.md)" success
+  _chain_config_gen "$(_classify_push doc/x.md)" success
+}
+
+# why: the tag is where the release-only jobs block, and a dispatch on a branch
+# is how they are checked before the tag exists, with nothing published.
+@test "chain: a tag push and workflow_dispatch run the release-only jobs, and only the tag releases (base#2176, base#2177)" {
+  local _out
+  _out="$(CLASSIFY_REF=refs/tags/v1.2.3 _classify_push zz-new/thing.txt)"
+  CHAIN_REF=refs/tags/v1.2.3 run _chain_results "${_out}"
+  assert_success
+  _chain_gated "${output}" success
+  _chain_check "${output}" release=success
+  run _chain_rollup "${_out}" "${output}"
+  assert_success
+  refute_output --partial 'skipped by design'
+
+  _out="$(_classify_event workflow_dispatch zz-new/thing.txt)"
+  CHAIN_REF=refs/heads/main run _chain_results "${_out}"
+  assert_success
+  _chain_gated "${output}" success
+  _chain_check "${output}" release=skipped
+  run _chain_rollup "${_out}" "${output}"
+  assert_success
+  refute_output --partial 'skipped by design'
+}
+
+# why: the rollup excuses a job classify deselected, so `release` cannot rest
+# on the rollup: it must need each release-only job itself.
+@test "chain: a tag on which a release-only job fails or never runs publishes no release (base#2176, base#2177)" {
+  local _out _j
+  _out="$(CLASSIFY_REF=refs/tags/v1.2.3 _classify_push zz-new/thing.txt)"
+  for _j in ${RELEASE_JOBS}; do
+    CHAIN_REF=refs/tags/v1.2.3 CHAIN_FAIL="${_j}" run _chain_results "${_out}"
+    assert_success
+    _chain_check "${output}" "${_j}=failure" release=skipped
+    run _chain_rollup "${_out}" "${output}"
+    assert_failure 1
+
+    CHAIN_REF=refs/tags/v1.2.3 run _chain_results "${_out}"$'\n'"select_${_j//-/_}=false"
+    assert_success
+    _chain_check "${output}" "${_j}=skipped" release=skipped
+    run _chain_rollup "${_out}"$'\n'"select_${_j//-/_}=false" "${output}"
+    assert_success
   done
 }
 
 # why: cycle 4. One source for every gate: the map's names,
-# the map's --jobs, classify's loop list and the keys the gated jobs'
-# `if:`s read are the same set. Each gated job reads exactly one
-# select_* key, the one its `if:` names; config-gen-gates and
-# config-gen-redpath both read select_config_gen (base#1547 split one job
-# into two, addendum point 2). The rollup must resolve each gated job to
+# the map's --jobs and classify's loop list are the same set, and with the
+# release-only jobs the keys the gated jobs' `if:`s read. Each gated job
+# reads exactly one select_* key, the one its `if:` names; config-gen-gates
+# reads select_config_gen. The rollup must resolve each gated job to
 # that same key: its skip fails while the key is `true` and passes once
 # that key alone is `false`. The key comes from the job's `if:`, never
 # from a rewrite of the job's name, so a rollup that guesses the key from
 # the name fails here.
-@test "chain: the gated jobs, the map's job list and classify's loop are one set, and each selected skip fails the rollup (base#1584)" {
+@test "chain: the gated jobs, the map's job list, classify's loop and the release-only jobs are one set, and each selected skip fails the rollup (base#1584, base#2177)" {
   local _gated _map _loop _names _jobs12 _keys _j _k _if
   _names="$(printf '%s\n' config-gen coverage coverage-gate acceptance system \
-      worker-selftest shellcheck hadolint bats-fragile mutation-roster \
+      worker-selftest shellcheck hadolint bats-fragile \
       test-tools-image-arm64 | LC_ALL=C sort)"
   _jobs12="$(printf '%s\n' config-gen-gates config-gen-redpath coverage coverage-gate \
       acceptance system worker-selftest shellcheck hadolint bats-fragile mutation-roster \
@@ -781,11 +922,12 @@ _gated_jobs() {
   done <<< "${_jobs12}"
   [[ -z "${_bad}" ]] || fail "${_bad}"
   _keys="$(for _k in "${_key[@]}"; do _k="${_k#select_}"; echo "${_k//_/-}"; done | LC_ALL=C sort -u)"
-  assert_equal "${_keys}" "${_names}"
+  assert_equal "${_keys}" "$(printf '%s\n' ${_names} ${RELEASE_JOBS} | LC_ALL=C sort)"
   assert_equal "${_key[config-gen-gates]}" select_config_gen
-  assert_equal "${_key[config-gen-redpath]}" select_config_gen
-  _out="$(_classify_pr zz-new/thing.txt)"
-  _results="$(_chain_results "${_out}")"
+  assert_equal "${_key[config-gen-redpath]}" select_config_gen_redpath
+  # A tag push: the run that selects every gated job, release-only included.
+  _out="$(CLASSIFY_REF=refs/tags/v1.2.3 _classify_push zz-new/thing.txt)"
+  _results="$(CHAIN_REF=refs/tags/v1.2.3 _chain_results "${_out}")"
   while IFS= read -r _j; do
     _k="${_key[${_j}]}"
     run _chain_rollup "${_out}" "$(sed -E "s/^${_j} .*/${_j} skipped/" <<< "${_results}")"

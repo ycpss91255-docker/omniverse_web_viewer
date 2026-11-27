@@ -69,7 +69,7 @@ _overlap() {
 
 # _input_texts <root> -- every config-gen input text under <root>: the
 # config-gen jobs' `run:` blocks as config_gen_readers.sh --run-blocks
-# reads them (every job that gates on select_config_gen; it fails when
+# reads them (every job that gates on a config-gen key; it fails when
 # there is none), dockerfile/Dockerfile.config-gen and every file under
 # script/test/config_gen* (steps included).
 _input_texts() {
@@ -243,9 +243,8 @@ ${_bad}"
   assert_output dist/env.toml
 }
 
-# why: review round 2. With no job that gates on select_config_gen, rule
-# (d) has no run block to read; that fails rather than passing on an
-# empty text.
+# why: with no config-gen job, rule (d) has no run block to read; that fails
+# rather than passing on an empty text.
 @test "config_gen_paths: rule (d) fails when no config-gen job is found (base#1584)" {
   local _r="${BATS_TEST_TMPDIR}/r" _deny="${BATS_TEST_TMPDIR}/deny"
   mkdir -p "${_r}/.github/workflows" "${_r}/dockerfile" "${_r}/script/test"

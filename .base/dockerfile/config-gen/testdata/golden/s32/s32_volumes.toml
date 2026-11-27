@@ -1,0 +1,5 @@
+[[volumes]]
+source = "/data/work"
+target = "/srv/work"
+mode = "rw"
+

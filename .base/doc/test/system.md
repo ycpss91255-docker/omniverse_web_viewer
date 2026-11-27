@@ -56,6 +56,25 @@ QEMU); the dedicated `template-system` buildx builder
 (created/pruned per test.sh run) isolates the cache from the host's
 default context.
 
+### A missing prerequisite: a skip locally, a failure on CI
+
+A spec skips when something it needs is absent: the docker socket or CLI,
+the compose plugin, `xz`, the tooling image, a host architecture the pin
+specs know. bats counts a skip as a pass, and locally that is the whole
+effect. (`_system_setup` refuses a missing socket or CLI before bats
+starts, so those two skip only when a spec is run directly.)
+
+On a CI runner a skip fails the run. `ci-system` forwards the runner's
+`GITHUB_ACTIONS`, and with it set to `true` `_run_system`
+(`script/test/drivers/bats.sh`) reads bats' junit report and exits with
+`ci_system_skip`, naming every test that skipped -- or saying that the
+report held no test. The `System Regression Test` job exists to supply the
+prerequisites, so every test listed below runs there.
+
+`ci-system` also forwards `TEST_TOOLS_IMAGE`, the tag it runs. The
+`smoke_harness_spec.bats` cases build FROM that image, and CI's tag is
+run-keyed, so it cannot be derived inside the container.
+
 ### Pointing the system suite at another daemon: `SYSTEM_DOCKER_SOCK`
 
 `_system_setup` (`script/test/drivers/bats.sh`) refuses to start unless a
@@ -112,7 +131,7 @@ with `deploy.sh down`. A tiny alpine `runtime` stage keeps it fast; the
 point is the orchestration (build -> save -> load -> compose up ->
 mount-wins override -> down), not a heavy image. Needs the `ci-system`
 service's docker.sock plus the `docker compose` plugin + `xz` baked into the
-test-tools image; auto-skips cleanly when any is absent.
+test-tools image; skips when any is absent, which fails a CI run.
 
 The fixture repo is a real git tree carrying a tag, with a run-unique
 basename: the deploy stamp resolves to that tag rather than the `unknown`

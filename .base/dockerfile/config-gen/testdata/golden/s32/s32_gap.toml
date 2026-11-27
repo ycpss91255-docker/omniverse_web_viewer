@@ -1,0 +1,10 @@
+[[volumes]]
+source = "/a"
+target = "/b"
+
+[[volumes]]
+
+[[volumes]]
+source = "/c"
+target = "/d"
+

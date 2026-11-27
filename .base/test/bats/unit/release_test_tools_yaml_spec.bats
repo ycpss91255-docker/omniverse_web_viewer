@@ -1937,3 +1937,104 @@ _filter_selects() {
   grep -E '^[0-9]+-[[:space:]]+_?[A-Za-z_]+="\$\(script/ci/config_gen_digest\.sh\)"$' <<<"${_body}" || fail \
       "the script is not assigned to a variable on its own line"
 }
+
+# ── smoke-arch: run config-gen on each architecture before any tag (base#1849) ──
+#
+# The merge job's smoke step runs on ubuntu-latest and picks the digest for
+# the host architecture, so the arm64 image is never run and the config-gen
+# binary is never checked on either. A per-architecture job closes that: it
+# runs on the matrix runner, pulls the digest built for its own platform,
+# runs `config-gen version`, and compares the ELF machine byte (offset 18)
+# with the platform. The expected bytes come from the ELF specification:
+# e_machine 0x3e is EM_X86_64, 0xb7 is EM_AARCH64.
+
+# _smoke_arch_job -- the code lines of the smoke-arch job.
+_smoke_arch_job() {
+  yaml_job_lines "${WF}" smoke-arch
+}
+
+# _merge_needs -- the `needs:` value of the merge job, whether written inline
+# (`needs: build`, `needs: [a, b]`) or as a block list.
+_merge_needs() {
+  yaml_job_lines "${WF}" merge | awk '
+    /^    needs:/ { flag=1; sub(/^    needs:[[:space:]]*/, ""); print; next }
+    flag && /^      - / { print; next }
+    flag { flag=0 }'
+}
+
+# why: the job has to exist, on the same matrix as build, behind build, or
+#      the arm64 image is still never run (base#1849).
+@test "release-test-tools.yaml: a smoke-arch job runs on the build matrix after build (base#1849)" {
+  run _smoke_arch_job
+  assert_success
+  [[ -n "${output}" ]] || fail "no smoke-arch job in the workflow"
+  # needs.compute-matrix is only readable when compute-matrix is a direct
+  # dependency, so the matrix expression requires both entries.
+  assert_output --regexp '(^|
+)    needs: \[[^]]*compute-matrix[^]]*\](
+|$)'
+  assert_output --regexp '(^|
+)    needs: \[[^]]*\bbuild\b[^]]*\](
+|$)'
+  assert_output --partial 'matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}'
+  assert_output --partial 'runs-on: ${{ matrix.runner }}'
+}
+
+# why: smoke-arch is self-hosted-eligible by the static rule, so it carries
+#      the same fork guard as build (base#1849).
+@test "release-test-tools.yaml: the smoke-arch job carries the same-repo guard (base#1849)" {
+  run _smoke_arch_job
+  assert_success
+  [[ -n "${output}" ]] || fail "no smoke-arch job in the workflow"
+  assert_output --partial "github.event_name != 'pull_request' &&"
+  assert_output --partial "github.event_name != 'merge_group' ||"
+  assert_output --partial 'github.event.pull_request.head.repo.full_name == github.repository'
+}
+
+# why: the merge job attaches the tags, so it has to wait for both
+#      architectures to pass (base#1849).
+@test "release-test-tools.yaml: merge needs both build and smoke-arch (base#1849)" {
+  run _merge_needs
+  assert_success
+  assert_output --regexp '(^|[^A-Za-z-])build([^A-Za-z-]|$)'
+  assert_output --regexp '(^|[^A-Za-z-])smoke-arch([^A-Za-z-]|$)'
+}
+
+# why: the job has to test the digest built for ITS platform, and refuse
+#      when none matches rather than pull nothing (base#1849).
+@test "release-test-tools.yaml: smoke-arch selects the digest whose content equals matrix.platform (base#1849)" {
+  run _smoke_arch_job
+  assert_success
+  [[ -n "${output}" ]] || fail "no smoke-arch job in the workflow"
+  assert_output --partial 'pattern: digests-*'
+  assert_output --partial 'matrix.platform'
+  assert_output --partial '::error::'
+  assert_output --partial 'exit 1'
+  assert_output --regexp '@sha256:'
+}
+
+# why: `config-gen version` is the run check; no `toolchain ` line in its
+#      output has to fail the job (base#1849).
+@test "release-test-tools.yaml: smoke-arch runs config-gen version and requires a toolchain line (base#1849)" {
+  run _smoke_arch_job
+  assert_success
+  [[ -n "${output}" ]] || fail "no smoke-arch job in the workflow"
+  assert_output --regexp 'docker run --rm .*config-gen version'
+  assert_output --partial 'toolchain '
+}
+
+# why: the ELF machine byte at offset 18 of the binary inside the image is
+#      the architecture the binary was built for: 3e amd64, b7 arm64
+#      (ELF e_machine EM_X86_64 / EM_AARCH64) (base#1849).
+@test "release-test-tools.yaml: smoke-arch compares the ELF machine byte of config-gen with the platform (base#1849)" {
+  run _smoke_arch_job
+  assert_success
+  [[ -n "${output}" ]] || fail "no smoke-arch job in the workflow"
+  assert_output --partial '/usr/local/bin/config-gen'
+  assert_output --regexp 'skip=18|offset.*18|-j *18'
+  assert_output --regexp '3e'
+  assert_output --regexp 'b7'
+  assert_output --partial 'linux/amd64'
+  assert_output --partial 'linux/arm64'
+  assert_output --partial 'binary architecture confirmed'
+}

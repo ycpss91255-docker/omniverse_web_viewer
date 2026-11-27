@@ -26,17 +26,11 @@ setup() {
   AT_BASE_SH=/source/script/ci/selection_at_base.sh
 }
 
-# The eleven map names, in the map's output order: the nine of base#1584
-# (design r7 sec. 2), then mutation-roster and test-tools-image-arm64,
-# which a docs-only pull request skips (base#2110). There is one
-# per select_* key classify writes. Each self-test.yaml job whose `if:`
-# reads classify reads one of these keys; config-gen names the one key,
-# select_config_gen, that both config-gen-gates and config-gen-redpath
-# read (base#1547 split one job in two). classify_testtools_spec.bats
-# (cycle 4) holds the workflow's gated jobs to these keys.
-GATED_JOBS="config-gen coverage coverage-gate acceptance system worker-selftest shellcheck hadolint bats-fragile mutation-roster test-tools-image-arm64"
+# The map's names, in its output order: one per select_* key the diff
+# decides. config-gen stands for config-gen-gates.
+GATED_JOBS="config-gen coverage coverage-gate acceptance system worker-selftest shellcheck hadolint bats-fragile test-tools-image-arm64"
 # Every gated job but config-gen: what a config-gen deny-list path runs.
-NOT_CONFIG_GEN="coverage coverage-gate acceptance system worker-selftest shellcheck hadolint bats-fragile mutation-roster test-tools-image-arm64"
+NOT_CONFIG_GEN="coverage coverage-gate acceptance system worker-selftest shellcheck hadolint bats-fragile test-tools-image-arm64"
 
 # _select <event> <path>...
 #   Runs the map with <path>... as the whole diff of a <event> run.
@@ -108,16 +102,15 @@ _commit() {
   assert_output "$(_expect)"
 }
 
-# why: cycle 4's job list. The map's names are the select_* keys, config-gen standing for both config-gen jobs; --jobs must
-# name exactly those, in the output order.
-@test "check_selection: --jobs prints the map names, one per select key (base#1584, base#2110)" {
+# why: classify reads these names. A release-only job is not one: no path's
+# answer for it could be used, because no change runs it.
+@test "check_selection: --jobs prints the map names, one per select key the diff decides (base#1584, base#2110, base#2177)" {
   run bash "${SELECTION_SH}" --jobs
   assert_success
   assert_output "$(tr ' ' '\n' <<<"${GATED_JOBS}")"
 }
 
-# why: the issue's rule "On push, tag and workflow_dispatch everything
-# runs" (main runs the full suite, owner 2026-11-10).
+# why: only a pull request may narrow the selection.
 @test "check_selection: a push run selects every gated job even when its diff is docs only (base#1584)" {
   run --separate-stderr _select push doc/x.md
   assert_success
@@ -304,7 +297,7 @@ _commit() {
 @test "check_selection: a unit spec runs coverage and the code checks only (base#1584)" {
   run _select pull_request test/bats/unit/ci_spec.bats
   assert_success
-  assert_output "$(_expect coverage coverage-gate shellcheck hadolint bats-fragile mutation-roster test-tools-image-arm64)"
+  assert_output "$(_expect coverage coverage-gate shellcheck hadolint bats-fragile test-tools-image-arm64)"
 }
 
 # why: the E1 row for a system spec: system runs the system specs, so it
@@ -312,7 +305,7 @@ _commit() {
 @test "check_selection: a system spec runs coverage, system and the code checks (base#1584)" {
   run _select pull_request test/bats/system/smoke_spec.bats
   assert_success
-  assert_output "$(_expect coverage coverage-gate system worker-selftest shellcheck hadolint bats-fragile mutation-roster test-tools-image-arm64)"
+  assert_output "$(_expect coverage coverage-gate system worker-selftest shellcheck hadolint bats-fragile test-tools-image-arm64)"
 }
 
 # why: every justfile loads with the root one, and a syntax error in one

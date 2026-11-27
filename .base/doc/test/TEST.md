@@ -12,15 +12,16 @@ sibling docs below.
 > edit. Ask the run instead: `just test` reports what it ran, and a
 > released version's figure belongs to that release.
 >
-> The `just test` self-test suite is **Unit + Integration** -- what runs
-> in the `Self Test` CI job. System and smoke specs are catalogued here
-> too but are **not** part of it: System specs need host docker access
-> and are opt-in, and smoke specs are Dockerfile `test`-stage build-time
-> assertions, not self-tests. Acceptance is a host-driven level with no
-> bats specs by design: it drives a real scaffolded consumer + built image
-> via `script/ci/acceptance.sh` -- the `acceptance` job in CI, `just test
-> acceptance` locally -- not the mounted-`/source` sandbox
-> (see [acceptance.md](acceptance.md)).
+> The `just test` self-test suite is **Unit + Integration** -- what CI runs
+> in the `coverage` matrix (under kcov) and the `bats-fragile` job (the
+> kcov-fragile tests, uninstrumented). System and smoke specs are
+> catalogued here too but are **not** part of it: System specs need host
+> docker access and are opt-in, and smoke specs are Dockerfile
+> `test`-stage build-time assertions, not self-tests. Acceptance is a
+> host-driven level with no bats specs by design: it drives a real
+> scaffolded consumer + built image via `script/ci/acceptance.sh` -- the
+> `acceptance` job in CI, `just test acceptance` locally -- not the
+> mounted-`/source` sandbox (see [acceptance.md](acceptance.md)).
 
 ## Test Docs by Level / Type
 
@@ -121,11 +122,10 @@ the local 4/8, and a local `just test coverage 1/8` never ran the failing specs
 at all (base#1410). Naming the path removes the question: the spec you name is
 the spec that runs, in both places.
 
-`--bats-path` (`just test` has no recipe for it; use
-`./script/test/test.sh --bats-path <spec>`) remains the FAST loop -- no
-ShellCheck, no kcov, on the `ci` service. It refuses `--coverage` and still
-does: that combination is this recipe, on the `coverage` service, which is
-where kcov lives.
+`just test bats-path <spec>` (above) remains the FAST loop -- no ShellCheck,
+no kcov, on the `ci` service. The runner flag behind it, `--bats-path`,
+refuses `--coverage` and still does: that combination is this recipe, on the
+`coverage` service, which is where kcov lives.
 
 ## A full-scope coverage run on all your cores: `just test coverage-local`
 
@@ -194,14 +194,14 @@ tool therefore needs its own join to `.github/workflows/self-test.yaml`:
 
 | Lint | Enforces | CI job | Gated? |
 |------|----------|--------|--------|
-| `shellcheck` | shell static analysis | `shellcheck` (`--shellcheck-only`) | `code_changed` |
-| `hadolint` | Dockerfile static analysis | `hadolint` (`--lint --hadolint`, in the test-tools image) | `code_changed` |
+| `shellcheck` | shell static analysis | `shellcheck` (`--lint --shellcheck`) | `select_shellcheck` |
+| `hadolint` | Dockerfile static analysis | `hadolint` (`--lint --hadolint`) | `select_hadolint` |
 | `issueref` | no transient `#NNN` in code comments (ADR-00000013) | `lint-static` (one group) | ungated |
 | `adr-numbering` | `doc/adr/` duplicate-free + well-formed | `lint-static` (one group) | ungated |
 | `adr-structure` | every ADR carries each required part exactly once at column 0 -- `> Serves:`, Context, Decision, Consequences, Alternatives, Status | `lint-static` (one group) | ungated |
 | `stale-setup-conf` | no legacy `config/docker/setup.conf` under `dist/` | `lint-static` (one group) | ungated |
 | `readme-sync` | localized READMEs still match `README.md` | `lint-static` (one group) | ungated |
-| `doc-counts` | the figures / catalog rows below | `doc-counts` (`--doc-counts-only`) | ungated |
+| `doc-counts` | the figures / catalog rows below | `doc-counts` (`--lint --doc-counts`) | ungated |
 | `home-literal` | no concrete username in a home path under `dist/` or `dockerfile/` (ADR-00000024) | `lint-static` (one group) | ungated |
 | `arch-literal` | no bare architecture literal in a shipped Dockerfile under `dist/` or `dockerfile/`; architecture comes from `ARG TARGETARCH`, and a mapping onto an upstream asset spelling opts out with a stated reason | `lint-static` (one group) | ungated |
 | `moving-tag` | no workflow, Dockerfile, compose file or script in base resolves the test-tools image by `:latest`, `:main`, no tag or a tag decided at run time, outside the per-line allow-list in `script/test/drivers/moving_tag.sh` (base#1647) | `lint-static` (one group) | ungated |
@@ -223,6 +223,7 @@ tool therefore needs its own join to `.github/workflows/self-test.yaml`:
 | `test-name-backtick` | a `@test` name is a literal -- a backtick in one is executed by bats at collection time | `lint-static` (one group) | ungated |
 | `toml-fixture` | every fixture body a spec writes to a `*.toml` path parses as TOML -- a body the bridge refuses leaves an empty config handle, so a test asserting a schema default passes without its fixture ever being read | `lint-static` (one group) | ungated |
 | `canonical-ignore-sync` | base's own root `.dockerignore` carries a line for every entry `_canonical_dockerignore_entries` emits -- the block is headed as a copy of that function, so both sides are derived and compared rather than the copy being re-synchronised by hand. One-directional: extras are allowed, and presence is a whole line (the `grep -qxF` the shipped sync applies) | `lint-static` (one group) | ungated |
+| `tracked-crlf` | no tracked file is stored with CRLF line endings in the git index unless `.gitattributes` marks its path `-text` -- the root rule `* text=auto eol=lf` fixes the checkout side, and this reads the index side, which `text=auto` leaves alone for a file already committed with a CR | `lint-static` (one group) | ungated |
 
 `lint-static` is a matrix of GROUPS, not of lints (base#1071): each entry is a
 position (`1/4` ... `4/4`) and `test.sh --lint --group N/T` computes which lints
@@ -250,7 +251,8 @@ them.
 The same spec holds this TABLE to it, which is how the table stopped being
 hand-maintained prose: one guard compares the row set against `_LINT_TOOLS` in
 both directions, another requires every CI job name cited above to be a job
-`self-test.yaml` declares. The table drifted to 15 of 26 rows over one release
+`self-test.yaml` declares, and a third requires the flags and the condition in
+a row to be that job's own. The table drifted to 15 of 26 rows over one release
 cycle, and carried a `lint-static (i18n-orphan)` row pointing at a check that
 has not existed since the matrix became a partition of groups. Only the
 "Enforces" column is authored: it is prose a person writes, not a figure.
@@ -526,16 +528,44 @@ finished, and a failing run publishes no pass. The first INT / TERM is
 forwarded to every row's probe, which restores and stops; the run exits
 130 / 143 with no verdict.
 
-**Where it runs.** The no-flag `just test` runs it on the host after the
-lint phase and before bats, and a red roster stops the run before bats.
-Every leg of the hosted `mutation-roster` job runs `just test
+**Where it runs.** It is a release-only check (ADR-00000042, base#2177). The
+hosted `mutation-roster` job runs on a tag push, whose `release` job needs
+it, and on `workflow_dispatch`; a pull request, a merge group and a push to
+`main` skip it. Every leg of that job runs `just test
 mutation-required --shard <its shard>` (rows are dealt by their seconds in
 `seconds.txt`, heaviest first, each to the shard holding the fewest seconds
-so far, so the twenty legs together probe every row; every leg still
+so far, so the legs together probe every row; every leg still
 validates every row), and the self-hosted `config-gen` job in
 `coverage-local.yaml` runs the whole roster; each as a step of its own, with
-no `if:` and no `continue-on-error`. The pre-PR mirror covers it through
-`just test`. `--lint`, `--ci` and the coverage modes do not run it.
+no `if:` and no `continue-on-error`. No `test.sh` mode runs it, the no-flag
+`just test` included, and the pre-PR mirror lists it as excluded.
+
+**Before a release**, run both release-only checks, this roster and the config
+generator's redpath, on the commit to be tagged: locally with the first two
+commands, or hosted with the third alone.
+
+```bash
+just test mutation-required                 # local: the roster
+just test go-redpath                        # local: the redpath, every case
+gh workflow run self-test.yaml --ref main   # hosted: the whole CI, both included
+```
+
+`just test go` runs the Go gates and then the redpath; a pull request and the
+pre-PR mirror run the gates alone (`just test go-gates`).
+
+The hosted run takes the branch's latest commit, so check that it is the one
+to be tagged. It shares one concurrency group with the pushes to `main`, which
+keeps a single pending run: a later merge cancels it while it waits, and it
+cancels a push run that waits.
+
+Nothing enforces this step. A release-only check that is red on the tag itself
+withholds the GitHub Release and nothing else:
+
+- The tag is pushed all the same: the `v*` ruleset asks for a green
+  `ci-rollup` on the commit, and the merge group's is green without them.
+- `upgrade.sh` and `init.sh` pick the newest `vX.Y.Z` tag, not the newest
+  GitHub Release, so a downstream upgrade takes it.
+- `release-test-tools.yaml` has published its images.
 
 ## Maintaining these docs
 

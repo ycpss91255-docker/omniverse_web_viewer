@@ -1,0 +1,11 @@
+[network]
+mode = "bridge"
+
+[[network.ports]]
+host = "8080"
+container = "80"
+
+[[network.ports]]
+host = "3000"
+container = "3000"
+

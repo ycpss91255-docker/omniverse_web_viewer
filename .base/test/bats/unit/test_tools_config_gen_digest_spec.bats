@@ -11,11 +11,12 @@
 # its output to `docker compose build test-tools` as CONFIG_GEN_DIGEST, and
 # compose.yaml must list the arg in the bare form so compose passes it on.
 #
-# The tree is a scratch copy so a config-gen source can be edited. The
-# expected digest is the literal observed from the shell library itself
-# (`tool_image_derive config_gen` -> config-gen:2173903f6c17 on the seeded
-# tree), not recomputed here. The seeded tree is the live
-# dockerfile/config-gen, so any edit to those sources moves this literal.
+# The tree is a scratch copy so a config-gen source can be edited. Its
+# dockerfile/ holds a small FIXED synthetic config-gen, not a copy of the live
+# dockerfile/config-gen, so adding a file there (a corpus testdata file, say)
+# cannot move the expected digest (base#2201, same as base#2104). The expected
+# digest is the literal observed from the shell library itself
+# (`tool_image_derive config_gen` on the seeded tree), not recomputed here.
 # Unit level (ADR-00000018).
 
 bats_require_minimum_version 1.5.0
@@ -25,8 +26,8 @@ setup() {
   load "${BATS_TEST_DIRNAME}/test_helper"
   create_mock_dir
   ROOT=/source
-  # Observed on the tree these sources are copied from.
-  WANT_DIGEST="2173903f6c17"
+  # Observed from the library on the fixed synthetic tree of _seed_tree.
+  WANT_DIGEST="c86a33f64423"
 }
 
 teardown() {
@@ -35,12 +36,21 @@ teardown() {
 
 # _seed_tree
 #   A scratch copy of the pieces test.sh and config_gen_digest.sh read.
+#   script, dist and compose.yaml come from ${ROOT}; dockerfile/ is a fixed
+#   synthetic Dockerfile.config-gen + config-gen/ context and Dockerfile.test-tools.
 _seed_tree() {
   SUB="${BATS_TEST_TMPDIR}/tree"
   mkdir -p "${SUB}"
   cp -a "${ROOT}/script" "${SUB}/script"
   cp -a "${ROOT}/dist" "${SUB}/dist"
-  cp -a "${ROOT}/dockerfile" "${SUB}/dockerfile"
+  mkdir -p "${SUB}/dockerfile/config-gen/internal"
+  printf 'FROM scratch\nCOPY . /src\n' > "${SUB}/dockerfile/Dockerfile.config-gen"
+  printf 'module example.test/config-gen\n\ngo 1.22\n' \
+    > "${SUB}/dockerfile/config-gen/go.mod"
+  printf 'package main\n\nfunc main() {}\n' \
+    > "${SUB}/dockerfile/config-gen/main.go"
+  printf 'package internal\n' > "${SUB}/dockerfile/config-gen/internal/a.go"
+  printf 'FROM scratch\n' > "${SUB}/dockerfile/Dockerfile.test-tools"
   cp -a "${ROOT}/compose.yaml" "${SUB}/compose.yaml"
   printf 'v0.0.0-test\n' > "${SUB}/.version"
 }
@@ -156,4 +166,25 @@ _ensure_recorded() {
   assert_success
   run cat "${_log}"
   assert_output ""
+}
+
+# why: base#2201. The spec must not read the live dockerfile/config-gen: a
+#      checkout whose config-gen holds an extra testdata file records the same
+#      pinned digest.
+@test "_ensure_test_tools_image: an extra testdata file in the live checkout does not move the digest" {
+  local _live="${BATS_TEST_TMPDIR}/live"
+  mkdir -p "${_live}/dockerfile/config-gen/testdata"
+  cp -a "${ROOT}/script" "${_live}/script"
+  cp -a "${ROOT}/dist" "${_live}/dist"
+  cp -a "${ROOT}/compose.yaml" "${_live}/compose.yaml"
+  cp -a "${ROOT}/dockerfile/Dockerfile.config-gen" "${_live}/dockerfile/"
+  printf '{}\n' > "${_live}/dockerfile/config-gen/testdata/new_corpus.json"
+  ROOT="${_live}"
+  _seed_tree
+  local _log="${BATS_TEST_TMPDIR}/digest.log"
+  _mock_docker "${_log}"
+  _ensure_recorded "${_log}"
+  assert_success
+  run cat "${_log}"
+  assert_output "${WANT_DIGEST}"
 }

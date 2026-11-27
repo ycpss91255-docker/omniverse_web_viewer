@@ -20,11 +20,8 @@ name: Coverage (local parallel kcov)
 # machine where the shard MATRIX buys nothing (one runner runs one job at a
 # time, so eight matrix entries run one after another).
 #
-# It also carries the self-hosted leg of the config generator's Go gates
-# (`config-gen`, base#1462): `just test go`, the command the pre-PR mirror
-# runs too, and the union of the go-gates and go-redpath recipes the hosted
-# self-test jobs split it into (base#1547), on the machine kind the hosted
-# runners are not.
+# It also runs `just test go` (`config-gen`), the Go gates and the redpath,
+# on the machine kind the hosted runners are not.
 #
 # -- Why it is manual ---------------------------------------------------
 #
@@ -161,10 +158,8 @@ jobs:
       github.event_name != 'merge_group' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, gpu]
-    # The self-hosted leg of `just test go`: the SAME command the pre-PR
-    # mirror runs, and the union of the two recipes the hosted self-test
-    # `config-gen-gates` job and `config-gen-redpath` matrix run
-    # (ADR-00000039, base#1547).
+    # `just test go`: the two recipes self-test.yaml's `config-gen-gates` and
+    # `config-gen-redpath` jobs run (ADR-00000039).
     # self_test_yaml_spec.bats compares this job whole -- keys, `if`,
     # runs-on, steps, each step against a literal the spec holds -- and
     # this workflow's top-level keys, so no edit to this workflow can
@@ -207,9 +202,7 @@ jobs:
         run: just test go
 
       - name: Run the required-kill mutation roster
-        # The self-hosted run of the roster that the no-flag `just test` and
-        # the hosted mutation-roster matrix also run (base#1461, base#1571),
-        # ungated. Which jobs run it is decided by the self_test_yaml_spec
+        # The whole roster, ungated. Its jobs are held by the self_test_yaml_spec
         # case "the required-kill roster runs once per mutation-roster leg".
         run: just test mutation-required
 

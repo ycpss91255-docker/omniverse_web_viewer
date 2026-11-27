@@ -73,6 +73,7 @@ default:
 # / `just test lint --test-name-backtick`
 # / `just test lint --toml-fixture`
 # / `just test lint --canonical-ignore-sync`
+# / `just test lint --tracked-crlf`
 # / `just test lint --log-event-registry` -- NOT in _LINT_TOOLS, so this
 #   one does not narrow the phase, it ADDS to it: the bare `lint` does not
 #   run the log event registry scan and no CI job does. base#1226 shipped
@@ -352,9 +353,8 @@ mutation-probe *args:
 # mutation that disables it. All rows are validated before any baseline,
 # each is probed by mutation-probe.sh in a private sandbox copy under its
 # own compose project, and the recipe exits 0 only when every row is
-# PINNED. MUTATION_REQUIRED_JOBS (default 4) rows run at once. The no-flag
-# `just test` runs it between the lint phase and bats; the hosted
-# lint-static legs and the self-hosted config-gen job run this recipe.
+# PINNED. MUTATION_REQUIRED_JOBS (default 4) rows run at once. Release-only
+# (ADR-00000042): no other recipe runs it.
 #
 #   just test mutation-required            # probe every row
 #   just test mutation-required --check    # validate the roster only
@@ -474,11 +474,9 @@ acceptance:
 # contract, through script/test/config_gen_gates.sh (go-gates); then
 # script/test/config_gen_redpath.sh (go-redpath, unsharded), which plants
 # one defect per gate in a scratch copy and requires each to go red on its
-# own gate. The SAME command runs in the self-hosted coverage-local
-# `config-gen` job and the pre-PR mirror; the hosted self-test workflow
-# runs its two recipes as the `config-gen-gates` job and the
-# `config-gen-redpath` shard matrix, so each job ends inside its bound
-# (base#1547). The two recipes run in order and a red runner stops this
+# own gate. The self-hosted coverage-local `config-gen` job runs it; the
+# hosted self-test workflow runs its two recipes as a job each.
+# The two recipes run in order and a red runner stops this
 # one: a redpath over gates that are already red proves nothing. The
 # runner writes its steps verdict to a scratch file the redpath then
 # reuses in place of its shared pass, so steps 20 and 30 run once here
@@ -494,13 +492,15 @@ go:
     CONFIG_GEN_STEPS_VERDICT="${tmp}/steps.verdict" just test go-redpath
 
 # just test go-gates -> the runner alone: the Go gates and the binary's
-# usage contract (base#1547). The hosted `config-gen-gates` job.
+# usage contract. The hosted `config-gen-gates` job and the pre-PR mirror
+# run it.
 go-gates:
     ./script/test/config_gen_gates.sh
 
 # just test go-redpath [<n>/<N>] -> the redpath alone (base#1547): with a
 # shard, the cases config_gen_redpath_shards.tsv puts on shard n of N, the
-# hosted `config-gen-redpath` matrix job; without one, every case. A
+# hosted `config-gen-redpath` matrix job; without one, every case.
+# Release-only (ADR-00000042). A
 # CONFIG_GEN_REDPATH_ONLY or CONFIG_GEN_REDPATH_SHARD in the caller's
 # environment is dropped, so the argument alone picks the cases.
 #

@@ -8,9 +8,8 @@
 # --steps-only runs step 1 below and stops before the docker build: the
 # redpath's shared pass (base#1547).
 #
-# The one command every environment reaches through `just test go`: the
-# hosted self-test job, the self-hosted coverage-local job, the pre-PR
-# mirror and a developer's shell. <dir> (default: this checkout) must hold
+# Every environment reaches it through `just test go-gates`, which
+# `just test go` also runs. <dir> (default: this checkout) must hold
 # dockerfile/Dockerfile.config-gen; script/test/config_gen_redpath.sh
 # points it at scratch copies carrying a planted defect.
 #

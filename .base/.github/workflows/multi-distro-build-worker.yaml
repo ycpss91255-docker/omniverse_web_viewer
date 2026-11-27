@@ -143,7 +143,15 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.resolve-matrix.outputs.matrix) }}
-    uses: ./.github/workflows/build-worker.yaml
+    # The full path at this release's own tag, not `./`. A caller that names
+    # this workflow by an annotated tag hands `./` the TAG OBJECT's sha as
+    # the ref of the next level, and GitHub then fails `push` and
+    # `workflow_dispatch` runs at startup with "workflow was not found"
+    # (`pull_request` runs start). A ref written out is resolved as written
+    # (base#2171). `uses:` takes no expression, so the tag is a literal that
+    # the release bump rewrites together with `.version`;
+    # multi_distro_build_worker_yaml_spec.bats fails when the two differ.
+    uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@v0.43.0-rc9
     with:
       # Per-shard image_name includes the matrix cell name so the GHCR
       # tag disambiguates multi-cell builds from the same caller repo

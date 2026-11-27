@@ -22,7 +22,8 @@
 #       filtered by <pattern> and reduced by version sort. The pattern is
 #       what makes "latest alpine" mean the newest 3.x SERIES tag rather
 #       than `edge` or `latest`: which tags are comparable is a property of
-#       the upstream's tagging scheme, so it is declared per pin.
+#       the upstream's tagging scheme, so it is declared per pin. Where the
+#       pattern fixes how a tag ends, `name=` asks for those tags only.
 #
 # ── When a source cannot be reached ─────────────────────────────────────────
 #
@@ -100,15 +101,25 @@ _watch_latest_github_release() {
   printf '%s\n' "${_tag}"
 }
 
+# _watch_tag_ending <pattern> -- text every match ends with, or nothing: the
+# plain characters and `\.` right before the closing `$`; none if it has `|`.
+_watch_tag_ending() {
+  local _re='(^|[^\\])((\\\.|[A-Za-z0-9-])+)\$$'
+  [[ "${1}" != *'|'* && "${1}" =~ ${_re} ]] || return 0
+  printf '%s' "${BASH_REMATCH[2]//\\./.}"
+}
+
 # _watch_latest_dockerhub <namespace/repo> <pattern>
 #
 # The highest tag matching <pattern>. Version sort, not "the first page's
 # first entry": Docker Hub orders by push time, and a patch release to an
 # older series is pushed after a newer series' first tag.
 _watch_latest_dockerhub() {
-  local _coord="${1}" _pattern="${2}" _body _tags
-  _body="$(_watch_fetch \
-    "${WATCH_DOCKERHUB_API}/repositories/${_coord}/tags?page_size=100")" || return 1
+  local _coord="${1}" _pattern="${2}" _url _ending _body _tags
+  _url="${WATCH_DOCKERHUB_API}/repositories/${_coord}/tags?page_size=100"
+  _ending="$(_watch_tag_ending "${_pattern}")"
+  [[ -z "${_ending}" ]] || _url+="&name=${_ending}"
+  _body="$(_watch_fetch "${_url}")" || return 1
   _tags="$(printf '%s' "${_body}" \
     | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
     | sed -e 's/.*"\([^"]*\)"$/\1/' \

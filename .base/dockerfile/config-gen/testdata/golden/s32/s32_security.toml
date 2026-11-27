@@ -1,0 +1,13 @@
+[security]
+privileged = false
+cap_drop = []
+
+[[security.cap_add]]
+cap = "SYS_ADMIN"
+
+[[security.cap_add]]
+cap = "NET_ADMIN"
+
+[[security.security_opt]]
+opt = "seccomp:unconfined"
+

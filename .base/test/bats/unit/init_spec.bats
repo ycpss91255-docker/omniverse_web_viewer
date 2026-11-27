@@ -1264,6 +1264,28 @@ fixtures/
   assert_line ".dockerignore"
 }
 
+# why: .gitattributes is the third file of the same shape -- the run that
+# creates the line-ending block wrote it, and it must land in the commit
+@test "the resync: stages the .gitattributes it wrote this run (base#2246)" {
+  _source_init
+  : > "${TMP_REPO}/Dockerfile"
+  _git_seed_consumer
+  _resync_and_stage
+  run git -C "${TMP_REPO}" diff --cached --name-only
+  assert_line ".gitattributes"
+}
+
+# why: once the block is current the sync writes nothing, so what the file
+# holds below it is the repo's own unfinished rule and must stay unstaged
+@test "the resync: leaves a .gitattributes it did not write unstaged (base#2246)" {
+  _source_init
+  _resync_twice_over_edit ".gitattributes" '# my own rule
+*.usd binary
+'
+  run git -C "${TMP_REPO}" diff --cached --name-only
+  refute_output --partial ".gitattributes"
+}
+
 # why: the ignore-file half of the same sentinel -- the [logging] block
 # sync re-emits the file line by line, so restoring a final newline a hand
 # edit dropped is a real pass whose ONLY change a substitution would eat

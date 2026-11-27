@@ -406,6 +406,22 @@ _coverage_pool_files() {
   done | LC_ALL=C sort
 }
 
+# _lpt_assign <bins>
+#   Read `<weight> <path>` lines, echo `<bin> <path>` (bins 1..<bins>):
+#   heaviest first, each to the lightest bin. Ties go by path and to the
+#   lowest bin, so the same input always gives the same bins.
+_lpt_assign() {
+  sort -k1,1nr -k2,2 \
+    | awk -v t="${1:?BUG: _lpt_assign expects <bins>}" '
+        BEGIN { for (i = 1; i <= t; i++) load[i] = 0 }
+        {
+          min = 1
+          for (i = 2; i <= t; i++) if (load[i] < load[min]) min = i
+          load[min] += $1
+          print min, $2
+        }'
+}
+
 _shard_unit_files() {
   # Shared shard-partition primitive for the coverage matrix. Echoes the
   # newline-separated subset of test/bats/unit/*_spec.bats for shard <n>
@@ -434,11 +450,6 @@ _shard_unit_files() {
        || (( _shard < 1 || _shard > _total )); then
     _die ci_invalid_shard "Invalid shard spec '${_spec}'. Need 1<=n<=total."
   fi
-  # Greedy longest-processing-time bin-packing. awk reads `<count> <path>`
-  # lines (heaviest first), maintains a running load per shard, assigns
-  # each spec to the lightest shard, and prints only the files landing in
-  # the requested shard. The `sort -k1` secondary on the path keeps the
-  # partition deterministic across runs (ties broken by name).
   # find, so the walk descends into per-lib sub-folders
   # (test/bats/unit/<lib>/<subunit>_spec.bats, ADR-00000015) exactly as
   # `bats --recursive` does; each foldered spec is still its own
@@ -449,16 +460,8 @@ _shard_unit_files() {
     while IFS= read -r _f; do
       printf '%s %s\n' "$(_spec_weight "${_f}")" "${_f}"
     done < <(_coverage_pool_files) \
-      | sort -k1,1nr -k2,2 \
-      | awk -v want="${_shard}" -v t="${_total}" '
-          BEGIN { for (i = 1; i <= t; i++) load[i] = 0 }
-          {
-            # pick the lightest shard (ties -> lowest index for stability)
-            min = 1
-            for (i = 2; i <= t; i++) if (load[i] < load[min]) min = i
-            load[min] += $1
-            if (min == want) print $2
-          }'
+      | _lpt_assign "${_total}" \
+      | awk -v want="${_shard}" '$1 == want { print $2 }'
   )
   if [[ -z "${_files}" ]]; then
     _die ci_empty_shard "No spec files matched shard ${_spec}. Empty test/bats/{unit,integration}/ ?"
@@ -636,7 +639,8 @@ _kcov_bash_method_args() {
 #
 #   Target selection is the caller's path, verbatim. It never consults
 #   _shard_unit_files, so neither the greedy-LPT partition nor the
-#   recorded weights can change what runs. (`just test coverage
+#   recorded weights can change what runs; for a directory the weights
+#   decide only which slice a spec runs in. (`just test coverage
 #   <n>/<total> <weights>` runs CI's shard <n> when handed the weights CI
 #   partitioned by, base#1410.)
 #
@@ -675,7 +679,7 @@ _run_coverage_path() {
     return 0
   fi
   local -a _slices=()
-  _coverage_round_robin _slices "${_njobs}" "${_files[@]}"
+  _coverage_weighted_slices _slices "${_njobs}" "${_files[@]}"
 
   # Container-local scratch, never the mounted checkout. Removed below
   # whether the spec passed or failed.
@@ -893,7 +897,7 @@ _run_coverage() {
   # runs traced children concurrently (a pipeline, a `&`) still writes
   # them into its slice's one pipe, and base#1418 tracks that case.
   local -a _slices=()
-  _coverage_round_robin _slices "${_njobs}" "${_targets[@]}"
+  _coverage_weighted_slices _slices "${_njobs}" "${_targets[@]}"
   local _work
   _work="$(_coverage_parallel_workdir)"
   local -a _pids=()
@@ -977,22 +981,32 @@ _coverage_slice_workdir() {
   printf '%s\n' "${_d}"
 }
 
-# _coverage_round_robin <out_array_name> <n> <target>...
-#   Deal the targets into <n> slices round-robin (<n> capped at the target
-#   count), each slice a newline-separated list. One kcov runs per slice
-#   (base#1414).
-_coverage_round_robin() {
-  local -n _crr_out="${1:?BUG: _coverage_round_robin expects <out_array_name>}"
-  local _n="${2:?BUG: _coverage_round_robin expects <n>}"
+# _coverage_weighted_slices <out_array_name> <n> <target>...
+#   Deal the targets into <n> slices by _spec_weight (<n> capped at the
+#   target count), each slice a newline-separated list. One kcov runs per
+#   slice. A single slice keeps the targets in the order given.
+_coverage_weighted_slices() {
+  local -n _cws_out="${1:?BUG: _coverage_weighted_slices expects <out_array_name>}"
+  local _n="${2:?BUG: _coverage_weighted_slices expects <n>}"
   shift 2
   (( _n > $# )) && _n=$#
-  (( _n < 1 )) && _n=1
-  _crr_out=()
-  local _i=0 _f
-  for _f in "$@"; do
-    _crr_out[_i % _n]+="${_f}"$'\n'
-    _i=$(( _i + 1 ))
-  done
+  _cws_out=()
+  local _f
+  if (( _n <= 1 )); then
+    for _f in "$@"; do
+      _cws_out[0]+="${_f}"$'\n'
+    done
+    return 0
+  fi
+  local _bins _bin _path
+  _bins="$(
+    for _f in "$@"; do
+      printf '%s %s\n' "$(_spec_weight "${_f}")" "${_f}"
+    done | _lpt_assign "${_n}"
+  )" || return 1
+  while read -r _bin _path; do
+    _cws_out[_bin - 1]+="${_path}"$'\n'
+  done <<< "${_bins}"
 }
 
 # _coverage_stderr_replay <file>
@@ -1292,5 +1306,22 @@ _run_system() {
   local _label
   _bats_args_with_label _bats_args _label
   echo "--- Running Bats System Runtime Tests (${_label}) ---"
-  bats "${_bats_args[@]}" "${REPO_ROOT}/test/bats/system/"
+  local _report_dir _rc=0 _ran _skipped
+  _report_dir="$(mktemp -d)"
+  bats "${_bats_args[@]}" --report-formatter junit --output "${_report_dir}" \
+    "${REPO_ROOT}/test/bats/system/" || _rc=$?
+  _ran="$(_junit_case_pairs "${_report_dir}/report.xml" all)"
+  _skipped="$(_junit_case_pairs "${_report_dir}/report.xml" skipped \
+    | tr '\t' ' ' | paste -sd ';' -)"
+  rm -rf "${_report_dir}"
+
+  # bats counts a skip as a pass. On a CI runner a skip means a missing
+  # prerequisite, and an empty report cannot rule one out: both fail.
+  if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+    [[ -n "${_ran}" ]] || _die ci_system_skip \
+      "the system run reported no test, so what it skipped is unknown."
+    [[ -z "${_skipped}" ]] || _die ci_system_skip \
+      "skipped on a CI runner, where a missing prerequisite fails the run: [${_skipped}]"
+  fi
+  return "${_rc}"
 }

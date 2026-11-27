@@ -1,0 +1,2 @@
+env_1 = TOKEN=abc=def
+env_2 = a = b

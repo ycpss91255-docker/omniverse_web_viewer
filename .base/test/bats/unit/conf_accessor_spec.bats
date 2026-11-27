@@ -944,3 +944,118 @@ EOF
   LOG_FORMAT=json run --separate-stderr _conf_split_nskey "logging.web.driver" _s _k
   assert_refusal 1 conf_subsection_registry_missing nskey=logging.web.driver
 }
+
+# ════════════════════════════════════════════════════════════════════
+# _conf_load_layers: 單一指令內 memo 合併結果 (base#2234)
+# ════════════════════════════════════════════════════════════════════
+
+# _seed_layer_memo
+#   Two TOML layers and a counting stand-in for toml_bridge_merge. The stub
+#   appends one line per call to ${_LM_CALLS} (a file, because the loader
+#   runs it inside $(...) and a counter variable would be lost), fails when
+#   ${_LM_FAIL} exists, and answers `gui<TAB>mode<TAB><value>` where the
+#   value is the `mode = "..."` of the last layer that names one. The memo
+#   directory is created here, in the test's top-level shell, the way
+#   setup.sh creates it for a command.
+_seed_layer_memo() {
+  _LM_CALLS="${TEMP_DIR}/bridge.calls"
+  _LM_FAIL="${TEMP_DIR}/bridge.fail"
+  _LM_DIST="${TEMP_DIR}/dist.toml"
+  _LM_REPO="${TEMP_DIR}/repo.toml"
+  : > "${_LM_CALLS}"
+  printf '[gui]\nmode = "wayland"\n' > "${_LM_DIST}"
+  printf '[gui]\nmode = "wayland"\n' > "${_LM_REPO}"
+  _CONF_LAYERS_MEMO_DIR="$(mktemp -d "${TEMP_DIR}/memo.XXXXXX")"
+  toml_bridge_merge() {
+    printf '%s\n' "$*" >> "${_LM_CALLS}"
+    [[ -e "${_LM_FAIL}" ]] && return 1
+    local _f _m=""
+    shift
+    for _f in "$@"; do
+      [[ -f "${_f}" ]] || continue
+      _m="$(sed -n 's/^mode = "\(.*\)"$/\1/p' "${_f}")"
+    done
+    printf 'gui\tmode\t%s\n' "${_m}"
+  }
+}
+
+# why: base#2234 -- the same layer chain loaded twice in one command runs
+# the bridge once. Expected from the issue's acceptance 1: one `--merge
+# --kv` for the two-layer chain however many times it is loaded, and both
+# loads answer the same value.
+@test "_conf_load_layers runs the bridge once for a chain loaded twice (base#2234)" {
+  _seed_layer_memo
+  _conf_load_layers A "${_LM_DIST}" "${_LM_REPO}"
+  _conf_load_layers B "${_LM_DIST}" "${_LM_REPO}"
+  run _conf_get A gui mode
+  assert_output "wayland"
+  run _conf_get B gui mode
+  assert_output "wayland"
+  run grep -c . "${_LM_CALLS}"
+  assert_output 1
+}
+
+# why: base#2234 acceptance 2 -- the key carries the layer's content, so a
+# layer edited between two loads is a miss. First load `wayland`, the
+# upper layer rewritten to `x11`, second load `x11`, two bridge calls.
+@test "_conf_load_layers re-runs the bridge when a layer changed in between (base#2234)" {
+  _seed_layer_memo
+  _conf_load_layers A "${_LM_DIST}" "${_LM_REPO}"
+  run _conf_get A gui mode
+  assert_output "wayland"
+  printf '[gui]\nmode = "x11"\n' > "${_LM_REPO}"
+  _conf_load_layers B "${_LM_DIST}" "${_LM_REPO}"
+  run _conf_get B gui mode
+  assert_output "x11"
+  run grep -c . "${_LM_CALLS}"
+  assert_output 2
+}
+
+# why: base#2234 acceptance 3 -- a failed merge is not remembered. The
+# stub exits 1 both times; each load returns 1 and logs
+# conf_toml_merge_failed, and the bridge is called twice.
+@test "_conf_load_layers does not memo a failed merge (base#2234)" {
+  _seed_layer_memo
+  : > "${_LM_FAIL}"
+  LOG_FORMAT=json run --separate-stderr _conf_load_layers A "${_LM_DIST}" "${_LM_REPO}"
+  assert_equal "${status}" 1
+  assert_logged_event conf_toml_merge_failed
+  LOG_FORMAT=json run --separate-stderr _conf_load_layers B "${_LM_DIST}" "${_LM_REPO}"
+  assert_equal "${status}" 1
+  assert_logged_event conf_toml_merge_failed
+  run grep -c . "${_LM_CALLS}"
+  assert_output 2
+}
+
+# why: base#2234 acceptance 4 -- the key holds only the layers that exist,
+# so a layer that shows up mid-command changes the key. First load sees
+# the dist layer alone (`wayland`), then the repo layer appears with
+# `x11`; the second load reads it and the bridge ran twice.
+@test "_conf_load_layers reads a layer that appears after the first load (base#2234)" {
+  _seed_layer_memo
+  rm -f "${_LM_REPO}"
+  _conf_load_layers A "${_LM_DIST}" "${_LM_REPO}"
+  run _conf_get A gui mode
+  assert_output "wayland"
+  printf '[gui]\nmode = "x11"\n' > "${_LM_REPO}"
+  _conf_load_layers B "${_LM_DIST}" "${_LM_REPO}"
+  run _conf_get B gui mode
+  assert_output "x11"
+  run grep -c . "${_LM_CALLS}"
+  assert_output 2
+}
+
+# why: base#2234 acceptance 5 -- a directory in a layer's place is still
+# refused by name with the real toml_bridge_merge, on every load, memo
+# directory present or not: merge_layer_not_regular, status 1.
+@test "a directory layer is still refused by name with a memo directory present (base#2234)" {
+  _seed_layer_memo
+  unset -f toml_bridge_merge
+  source /source/dist/script/docker/lib/toml_bridge.sh
+  mkdir "${TEMP_DIR}/layer.toml"
+  local _i
+  for _i in 1 2; do
+    LOG_FORMAT=json run --separate-stderr toml_bridge_merge --kv "${_LM_DIST}" "${TEMP_DIR}/layer.toml"
+    assert_refusal 1 merge_layer_not_regular "path=${TEMP_DIR}/layer.toml"
+  done
+}

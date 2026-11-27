@@ -27,6 +27,11 @@ setup() {
   export LOG_FORMAT=text
   load "${BATS_TEST_DIRNAME}/../unit/test_helper"
 
+  # setup.sh reads the declared tables through config_gen_tables; the test
+  # container has no docker daemon (base#1937).
+  create_mock_dir
+  mock_config_gen_docker
+
   # Stage a fake repo dir whose basename will become IMAGE_NAME
   REPO_NAME="myapp_test"
   TMP_ROOT="$(mktemp -d)"
@@ -48,6 +53,7 @@ setup() {
 }
 
 teardown() {
+  cleanup_mock_dir
   rm -rf "${TMP_ROOT}"
 }
 
@@ -267,6 +273,14 @@ call-release: contents: write'
 @test "new repo: .dockerignore contains compose.yaml (derived artifact) (#604)" {
   bash .base/dist/script/base/init.sh
   run grep -x 'compose.yaml' "${REPO_DIR}/.dockerignore"
+  assert_success
+}
+
+# why: a new repo's text files are LF in every checkout from its first
+# commit, whatever core.autocrlf a contributor's machine carries
+@test "new repo: .gitattributes exists and carries the LF rule (base#2246)" {
+  bash .base/dist/script/base/init.sh
+  run grep -xF '* text=auto eol=lf' "${REPO_DIR}/.gitattributes"
   assert_success
 }
 

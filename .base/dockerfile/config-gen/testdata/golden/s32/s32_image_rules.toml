@@ -1,0 +1,6 @@
+[[image.rules]]
+rule = "prefix:docker_"
+
+[[image.rules]]
+rule = "@basename"
+

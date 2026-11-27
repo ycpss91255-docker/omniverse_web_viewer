@@ -158,7 +158,8 @@
 #     `<slug>/.github/workflows/<file>.yaml@vX.Y.Z` in a downstream
 #     main.yaml on every upgrade, matched by SHAPE -- and it is not a
 #     marketplace action, so `.github/workflows/` holds no comparable ref
-#     for it: this repo calls the same worker LOCALLY, as `./`. BOTH halves
+#     for it: this repo calls the same worker LOCALLY, as `./`, or from
+#     another worker at its own release tag. BOTH halves
 #     of the callee are read: the file has to be one this repo ships, and
 #     the `<owner>/<repo>` half has to be this repo's own slug. Keyed on the
 #     file alone the exclusion was as wide as the basenames this repo
