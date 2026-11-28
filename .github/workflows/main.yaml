@@ -145,6 +145,9 @@ jobs:
     uses: ycpss91255-lab/base/.github/workflows/build-worker.yaml@v0.43.0-rc9
     with:
       image_name: omniverse_web_viewer
+      # merge_group payload 沒有 head repo 資訊；merge queue 只有 maintainer 能排入，
+      # 視為同 repo 可信來源，build job 才不會被 fork guard 略過（base#1587）。
+      merge_group_same_repo: 'true'
       submodules: recursive
       build_runtime: true
       # Tier-1 browser config-dial e2e (#47): an extra Dockerfile stage
