@@ -24,6 +24,9 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
+  # merge queue：組織的「main merge queue」ruleset 要求所有必要 CI 都有
+  # merge_group 觸發。PR 上依範圍跑當回饋，完整測試（含 Tier B）在佇列裡跑。
+  merge_group:
   # 沒有 `schedule`（#106，對齊 isaac#434）。Tier B 以前每晚跑一次，從
   # 2026-09-06 起每晚都紅、兩個多月沒有人處理（#104）：每晚跑的檢查沒有發揮
   # 作用。現在改成依變更範圍在 PR 上跑（`changes` job），push 到 main 和 tag
@@ -612,6 +615,7 @@ jobs:
     needs: [verify-tag-shape, verify-tag-on-main, changes]
     if: >-
       github.event_name == 'push'
+      || github.event_name == 'merge_group'
       || startsWith(github.ref, 'refs/tags/')
       || (github.event_name == 'pull_request'
           && needs.changes.outputs.viewer == 'true'
